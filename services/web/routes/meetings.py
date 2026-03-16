@@ -17,7 +17,7 @@ import httpx
 
 from auth import get_current_user, get_optional_user
 from database import get_connection
-from routes.actions import extract_actions_from_summary
+from services.action_engine import generate_actions_for_meeting
 
 logger = logging.getLogger(__name__)
 
@@ -495,12 +495,10 @@ async def summarize_meeting(meeting_id: str, current_user: Optional[dict] = Depe
     "3. Decisions made\n"
     "4. Action items with assignees if available. Each action item MUST include a "
     '"type" field with one of these values:\n'
-    '   - "email_draft" — for items that require sending an email (e.g. sharing MOM, follow-up emails)\n'
-    '   - "calendar_invite" — for items that require scheduling a meeting or blocking calendar time\n'
-    '   - "task" — for general to-do items that don\'t involve email or calendar\n'
-    '   IMPORTANT: You MUST always include this action item:\n'
-    '   {"task": "Send MOM of this meeting to all stakeholders", "assignee": null, '
-    '"due_date": null, "type": "email_draft"}\n'
+    '   - "email_draft" — for follow-ups that are naturally an email\n'
+    '   - "calendar_invite" — for next meetings or time-blocking commitments\n'
+    '   - "task" — for general human to-do items that don\'t involve email or calendar\n'
+    "   Only include action items that are explicitly grounded in the meeting.\n"
     "5. 3-5 topic hashtags\n"
     "6. Overall sentiment (single word or short phrase)\n\n"
     "Return **only** valid JSON in this shape:\n"
@@ -573,7 +571,13 @@ async def summarize_meeting(meeting_id: str, current_user: Optional[dict] = Depe
   finally:
     conn.close()
 
-  extract_actions_from_summary(meeting_id, data.get("action_items", []))
+  if current_user:
+    try:
+      generate_actions_for_meeting(meeting_id, current_user["id"])
+    except HTTPException:
+      raise
+    except Exception:
+      logger.exception("Agentic action generation failed for %s", meeting_id)
 
   return {
     "status": "generated",
@@ -637,6 +641,13 @@ async def summarize_meeting_local(meeting_id: str, current_user: Optional[dict] 
       }
     ),
   )
+  if current_user:
+    try:
+      generate_actions_for_meeting(meeting_id, current_user["id"])
+    except HTTPException:
+      pass
+    except Exception:
+      logger.exception("Agentic action generation request failed for %s", meeting_id)
   return {"status": "queued", "meeting_id": meeting_id}
 
 

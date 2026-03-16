@@ -1,70 +1,137 @@
 import { useState } from 'react'
-import { useNavigate } from 'react-router-dom'
-import { actionsApi } from '../../api/actions'
-import type { AgenticAction } from '../../types/action'
-import EmailDraft from './EmailDraft'
-import CalendarInvite from './CalendarInvite'
 import toast from 'react-hot-toast'
+import { actionsApi } from '../../api/actions'
+import type { AgenticAction, ActionArtifact } from '../../types/action'
 
 interface ActionCardProps {
   action: AgenticAction
-  onApproved: () => void
+  onChanged: () => void
 }
 
-export default function ActionCard({ action, onApproved }: ActionCardProps) {
-  const navigate = useNavigate()
-  const [isGenerating, setIsGenerating] = useState(false)
-  const [isDelivering, setIsDelivering] = useState(false)
-  const [isDismissing, setIsDismissing] = useState(false)
-  const [draftResult, setDraftResult] = useState<Record<string, unknown> | null>(() => {
-    const d = action.draft as Record<string, unknown> | undefined
-    return (d?.execution_result as Record<string, unknown>) ?? null
-  })
+const connectorLabels: Record<string, string> = {
+  internal: 'Saved in MeetingBox',
+  gmail: 'Gmail',
+  calendar: 'Google Calendar',
+  slack: 'Slack',
+  notion: 'Notion',
+}
 
-  const isTerminal = action.status === 'executed' || action.status === 'dismissed'
-  const isDraftReady = action.status === 'draft_ready' || draftResult !== null
-  const canRetry = action.status === 'delivery_failed'
+function ArtifactPreview({ artifact }: { artifact: ActionArtifact }) {
+  const sections = Array.isArray(artifact.sections) ? artifact.sections : []
 
-  const handleGenerateDraft = async () => {
-    try {
-      setIsGenerating(true)
-      if (action.status === 'pending') {
-        await actionsApi.approve(action.id)
-      }
-      const result = await actionsApi.execute(action.id)
-      setDraftResult(result.result)
-      toast.success('Draft generated! Review it below.')
-      onApproved()
-    } catch {
-      toast.error('Failed to generate draft')
-    } finally {
-      setIsGenerating(false)
-    }
+  return (
+    <div className="rounded-lg border border-emerald-200 bg-emerald-50/70 p-4 space-y-3">
+      {artifact.headline && <h4 className="text-base font-semibold text-emerald-900">{artifact.headline}</h4>}
+      {artifact.summary && <p className="text-sm text-emerald-900/80 whitespace-pre-wrap">{artifact.summary}</p>}
+      {sections.length > 0 && (
+        <div className="space-y-3">
+          {sections.map((section) => (
+            <div key={section.title}>
+              <h5 className="text-sm font-semibold text-emerald-900">{section.title}</h5>
+              <ul className="mt-1 space-y-1">
+                {section.bullets.map((bullet) => (
+                  <li key={bullet} className="text-sm text-emerald-950/80">
+                    - {bullet}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ))}
+        </div>
+      )}
+      {sections.length === 0 && (
+        <pre className="text-xs text-emerald-950/80 whitespace-pre-wrap">
+          {JSON.stringify(artifact, null, 2)}
+        </pre>
+      )}
+    </div>
+  )
+}
+
+function ResultPreview({ action }: { action: AgenticAction }) {
+  if (action.artifact) {
+    return <ArtifactPreview artifact={action.artifact} />
   }
 
-  const handleDeliver = async () => {
-    try {
-      setIsDelivering(true)
-      const result = await actionsApi.deliver(action.id)
-      const ds = result.delivery_status
+  if (action.connector_target === 'gmail') {
+    return (
+      <div className="rounded-lg border border-gray-200 bg-gray-50 p-4 space-y-2">
+        <div>
+          <p className="text-xs uppercase tracking-wide text-gray-500">Recipients</p>
+          <p className="text-sm text-gray-900">
+            {Array.isArray(action.payload.to) ? (action.payload.to as string[]).join(', ') : ''}
+          </p>
+        </div>
+        <div>
+          <p className="text-xs uppercase tracking-wide text-gray-500">Subject</p>
+          <p className="text-sm text-gray-900">{String(action.payload.subject ?? '')}</p>
+        </div>
+        <div>
+          <p className="text-xs uppercase tracking-wide text-gray-500">Body</p>
+          <p className="text-sm text-gray-700 whitespace-pre-wrap">{String(action.payload.body ?? '')}</p>
+        </div>
+      </div>
+    )
+  }
 
-      if (ds === 'sent_via_gmail') {
-        toast.success('Email sent via Gmail!')
-      } else if (ds === 'created_via_calendar') {
-        toast.success('Calendar event created!')
-      } else if (ds === 'gmail_not_connected' || ds === 'calendar_not_connected') {
-        toast.error('Integration not connected. Redirecting to Settings...')
-        navigate('/settings')
-        return
-      } else if (ds === 'gmail_send_failed' || ds === 'calendar_create_failed') {
-        toast.error('Delivery failed. You can retry.')
-        return
-      }
-      onApproved()
-    } catch {
-      toast.error('Failed to deliver')
+  if (action.connector_target === 'calendar') {
+    return (
+      <div className="rounded-lg border border-gray-200 bg-gray-50 p-4 space-y-2">
+        <div>
+          <p className="text-xs uppercase tracking-wide text-gray-500">Event</p>
+          <p className="text-sm text-gray-900">{String(action.payload.title ?? action.title)}</p>
+        </div>
+        <div>
+          <p className="text-xs uppercase tracking-wide text-gray-500">Suggested time</p>
+          <p className="text-sm text-gray-900">
+            {String(action.payload.suggested_date ?? '')} {String(action.payload.suggested_time ?? '')}
+          </p>
+        </div>
+        {typeof action.payload.calendar_link === 'string' && action.payload.calendar_link && (
+          <a
+            href={action.payload.calendar_link}
+            target="_blank"
+            rel="noreferrer"
+            className="text-sm font-medium text-primary-700 hover:text-primary-800"
+          >
+            Open calendar event
+          </a>
+        )}
+      </div>
+    )
+  }
+
+  return (
+    <div className="rounded-lg border border-gray-200 bg-gray-50 p-4">
+      <pre className="text-xs text-gray-700 whitespace-pre-wrap">{JSON.stringify(action.payload, null, 2)}</pre>
+    </div>
+  )
+}
+
+export default function ActionCard({ action, onChanged }: ActionCardProps) {
+  const [isExecuting, setIsExecuting] = useState(false)
+  const [isDismissing, setIsDismissing] = useState(false)
+
+  const isDone = action.status === 'executed'
+  const isDismissed = action.status === 'dismissed'
+  const sourceSignals = Array.isArray(action.payload.source_signals)
+    ? (action.payload.source_signals as string[])
+    : []
+
+  const handleExecute = async () => {
+    try {
+      setIsExecuting(true)
+      await actionsApi.execute(action.id)
+      toast.success(action.connector_target === 'internal' ? 'Action executed and saved' : 'Action executed')
+      onChanged()
+    } catch (error: unknown) {
+      const detail =
+        error && typeof error === 'object' && 'response' in error
+          ? ((error as { response?: { data?: { detail?: string } } }).response?.data?.detail ?? 'Execution failed')
+          : 'Execution failed'
+      toast.error(detail)
     } finally {
-      setIsDelivering(false)
+      setIsExecuting(false)
     }
   }
 
@@ -73,7 +140,7 @@ export default function ActionCard({ action, onApproved }: ActionCardProps) {
       setIsDismissing(true)
       await actionsApi.dismiss(action.id)
       toast.success('Action dismissed')
-      onApproved()
+      onChanged()
     } catch {
       toast.error('Failed to dismiss action')
     } finally {
@@ -81,144 +148,98 @@ export default function ActionCard({ action, onApproved }: ActionCardProps) {
     }
   }
 
-  const renderDraftPreview = () => {
-    if (!draftResult) return null
-
-    if (action.type === 'email_draft') {
-      return (
-        <EmailDraft
-          draft={{
-            to: (draftResult.to as string) || '',
-            subject: (draftResult.subject as string) || '',
-            body: (draftResult.body as string) || '',
-            context: draftResult.context as string | undefined,
-          }}
-        />
-      )
-    }
-
-    if (action.type === 'calendar_invite') {
-      return (
-        <CalendarInvite
-          draft={{
-            title: (draftResult.title as string) || '',
-            attendees: (draftResult.attendees as string[]) || [],
-            suggested_times: [],
-            duration: (draftResult.duration_minutes as number) || 30,
-            description: (draftResult.description as string) || '',
-            context: draftResult.context as string | undefined,
-          }}
-        />
-      )
-    }
-
-    return (
-      <div className="p-4 bg-gray-50 rounded-lg">
-        <pre className="text-sm text-gray-700 whitespace-pre-wrap">
-          {JSON.stringify(draftResult, null, 2)}
-        </pre>
-      </div>
-    )
-  }
-
-  const renderContent = () => {
-    if (isDraftReady && draftResult) {
-      return renderDraftPreview()
-    }
-
-    switch (action.type) {
-      case 'email_draft':
-        return <EmailDraft draft={action.draft as { to: string; subject: string; body: string; context?: string }} />
-      case 'calendar_invite':
-        return <CalendarInvite draft={action.draft as { title: string; attendees: string[]; suggested_times: { start: string; end: string; available: boolean }[]; duration: number; description: string; context?: string }} />
-      default:
-        return (
-          <div className="p-4 bg-gray-50 rounded-lg">
-            <pre className="text-sm text-gray-700 whitespace-pre-wrap">
-              {JSON.stringify(action.draft, null, 2)}
-            </pre>
-          </div>
-        )
-    }
-  }
-
-  const statusBadge = () => {
-    switch (action.status) {
-      case 'executed':
-        return <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-green-100 text-green-800">Sent</span>
-      case 'dismissed':
-        return <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-gray-100 text-gray-600">Dismissed</span>
-      case 'delivery_failed':
-        return <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-red-100 text-red-800">Delivery Failed</span>
-      case 'draft_ready':
-        return <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-blue-100 text-blue-800">Draft Ready</span>
-      case 'approved':
-        return <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-yellow-100 text-yellow-800">Approved</span>
-      default:
-        return null
-    }
-  }
-
-  const deliverLabel = action.type === 'calendar_invite' ? 'Add to Calendar' : 'Send Email'
-
   return (
-    <div className={`bg-white rounded-lg border overflow-hidden ${isTerminal ? 'border-gray-100 opacity-75' : 'border-gray-200'}`}>
-      {/* Header */}
-      <div className="px-6 py-4 bg-primary-50 border-b border-primary-100">
-        <div className="flex items-center justify-between">
-          <div>
-            <h3 className="text-lg font-semibold text-gray-900">{action.title}</h3>
-            {action.assignee && (
-              <p className="text-sm text-gray-600 mt-1">For: {action.assignee}</p>
-            )}
-          </div>
-          <div className="flex items-center space-x-2">
-            <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-primary-100 text-primary-800">
-              {action.type.replaceAll('_', ' ')}
-            </span>
-            {statusBadge()}
-            {action.confidence != null && (
-              <span className="text-xs text-gray-500">
-                {Math.round(action.confidence * 100)}% confidence
+    <div className={`overflow-hidden rounded-2xl border ${isDismissed ? 'border-gray-200 bg-gray-50/60 opacity-70' : 'border-gray-200 bg-white'}`}>
+      <div className="border-b border-gray-100 bg-gradient-to-r from-primary-50 via-white to-emerald-50 px-6 py-5">
+        <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+          <div className="space-y-2">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="rounded-full bg-primary-100 px-2.5 py-1 text-xs font-semibold uppercase tracking-wide text-primary-800">
+                {action.kind.replaceAll('_', ' ')}
               </span>
-            )}
+              <span className="rounded-full bg-gray-100 px-2.5 py-1 text-xs font-medium text-gray-700">
+                {connectorLabels[action.connector_target] ?? action.connector_target}
+              </span>
+              {isDone && (
+                <span className="rounded-full bg-emerald-100 px-2.5 py-1 text-xs font-medium text-emerald-800">
+                  Executed
+                </span>
+              )}
+              {isDismissed && (
+                <span className="rounded-full bg-gray-200 px-2.5 py-1 text-xs font-medium text-gray-700">
+                  Dismissed
+                </span>
+              )}
+            </div>
+            <div>
+              <h3 className="text-xl font-semibold text-gray-950">{action.title}</h3>
+              {action.description && <p className="mt-1 text-sm text-gray-600">{action.description}</p>}
+            </div>
           </div>
+          {action.confidence != null && (
+            <div className="rounded-xl bg-white/80 px-3 py-2 text-right shadow-sm ring-1 ring-gray-100">
+              <p className="text-[11px] uppercase tracking-wide text-gray-500">Confidence</p>
+              <p className="text-sm font-semibold text-gray-900">{Math.round(action.confidence * 100)}%</p>
+            </div>
+          )}
         </div>
       </div>
 
-      {/* Content */}
-      <div className="px-6 py-4">{renderContent()}</div>
+      <div className="grid gap-6 px-6 py-5 lg:grid-cols-[1.1fr_0.9fr]">
+        <div className="space-y-4">
+          <div>
+            <p className="text-xs uppercase tracking-wide text-gray-500">What happens on execute</p>
+            <p className="mt-1 text-sm text-gray-800">
+              {action.connector_target === 'internal'
+                ? 'MeetingBox will create and save an internal artifact you can review later.'
+                : `MeetingBox will complete this action through ${connectorLabels[action.connector_target] ?? action.connector_target}.`}
+            </p>
+          </div>
 
-      {/* Action buttons */}
-      {!isTerminal && (
-        <div className="px-6 py-4 bg-gray-50 border-t border-gray-200 flex items-center justify-between">
+          {sourceSignals.length > 0 && (
+            <div>
+              <p className="text-xs uppercase tracking-wide text-gray-500">Why this matters</p>
+              <div className="mt-2 flex flex-wrap gap-2">
+                {sourceSignals.map((signal) => (
+                  <span key={signal} className="rounded-full bg-amber-50 px-3 py-1 text-xs text-amber-800 ring-1 ring-amber-200">
+                    {signal}
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {action.error && (
+            <div className="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+              {action.error}
+            </div>
+          )}
+        </div>
+
+        <div className="space-y-3">
+          <p className="text-xs uppercase tracking-wide text-gray-500">
+            {isDone ? 'Saved output' : 'Prepared output'}
+          </p>
+          <ResultPreview action={action} />
+        </div>
+      </div>
+
+      {!isDone && !isDismissed && (
+        <div className="flex items-center justify-between border-t border-gray-100 bg-gray-50/70 px-6 py-4">
           <button
             onClick={handleDismiss}
             disabled={isDismissing}
-            className="px-4 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-lg hover:bg-gray-50 disabled:opacity-50"
+            className="rounded-lg border border-gray-300 bg-white px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50 disabled:opacity-50"
           >
             {isDismissing ? 'Dismissing...' : 'Dismiss'}
           </button>
-
-          <div className="flex items-center gap-2">
-            {isDraftReady && draftResult ? (
-              <button
-                onClick={handleDeliver}
-                disabled={isDelivering}
-                className="px-6 py-2 text-sm font-medium text-white bg-green-600 rounded-lg hover:bg-green-700 disabled:opacity-50"
-              >
-                {isDelivering ? 'Sending...' : deliverLabel}
-              </button>
-            ) : (
-              <button
-                onClick={handleGenerateDraft}
-                disabled={isGenerating}
-                className="px-6 py-2 text-sm font-medium text-white bg-primary-600 rounded-lg hover:bg-primary-700 disabled:opacity-50"
-              >
-                {isGenerating ? 'Generating...' : canRetry ? 'Retry Draft' : 'Create Draft'}
-              </button>
-            )}
-          </div>
+          <button
+            onClick={handleExecute}
+            disabled={isExecuting}
+            className="rounded-lg bg-primary-600 px-5 py-2 text-sm font-medium text-white hover:bg-primary-700 disabled:opacity-50"
+          >
+            {isExecuting ? 'Executing...' : 'Execute'}
+          </button>
         </div>
       )}
     </div>

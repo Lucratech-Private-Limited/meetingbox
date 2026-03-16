@@ -32,6 +32,7 @@ export default function MeetingDetailPage() {
   const [isDeleting, setIsDeleting] = useState(false)
   const [isEditingTitle, setIsEditingTitle] = useState(false)
   const [editTitle, setEditTitle] = useState('')
+  const [isGeneratingActions, setIsGeneratingActions] = useState(false)
 
   const loadMeetingData = useCallback(async () => {
     if (!id) return
@@ -52,8 +53,7 @@ export default function MeetingDetailPage() {
 
       try {
         const actionsData = await actionsApi.list(id)
-        const integrationTypes = new Set(['email_draft', 'calendar_invite'])
-        setActions(actionsData.filter((a) => integrationTypes.has(a.type)))
+        setActions(actionsData)
       } catch {
         setActions([])
       }
@@ -67,6 +67,30 @@ export default function MeetingDetailPage() {
   useEffect(() => {
     loadMeetingData()
   }, [loadMeetingData])
+
+  const handleGenerateActions = useCallback(async () => {
+    if (!id) return
+    try {
+      setIsGeneratingActions(true)
+      const generated = await actionsApi.generate(id)
+      setActions(generated)
+    } catch (err: unknown) {
+      const msg =
+        err && typeof err === 'object' && 'response' in err
+          ? ((err as { response?: { data?: { detail?: string } } }).response?.data?.detail ?? 'Failed to generate actions')
+          : 'Failed to generate actions'
+      toast.error(msg)
+    } finally {
+      setIsGeneratingActions(false)
+    }
+  }, [id])
+
+  useEffect(() => {
+    if (!meeting || !id) return
+    const hasSummarySource = !!meeting.summary || !!meeting.local_summary
+    if (!hasSummarySource || actions.length > 0 || isGeneratingActions) return
+    void handleGenerateActions()
+  }, [actions.length, handleGenerateActions, id, isGeneratingActions, meeting])
 
   const handleExport = async (fmt: 'pdf' | 'txt') => {
     if (!id) return
@@ -120,8 +144,7 @@ export default function MeetingDetailPage() {
     if (!id) return
     try {
       const actionsData = await actionsApi.list(id)
-      const integrationTypes = new Set(['email_draft', 'calendar_invite'])
-      setActions(actionsData.filter((a) => integrationTypes.has(a.type)))
+      setActions(actionsData)
     } catch {
       // keep current state
     }
@@ -312,10 +335,10 @@ export default function MeetingDetailPage() {
             </svg>
             <div className="ml-3">
               <h3 className="text-sm font-medium text-yellow-800">
-                {actions.length} pending action{actions.length > 1 ? 's' : ''} ready for review
+                {actions.length} AI action{actions.length > 1 ? 's' : ''} ready to execute
               </h3>
               <p className="mt-1 text-sm text-yellow-700">
-                Review and approve the AI-generated actions below.
+                These are connector-aware actions the AI can carry out from this meeting.
               </p>
             </div>
           </div>
@@ -367,14 +390,29 @@ export default function MeetingDetailPage() {
 
         {activeTab === 'actions' && (
           <div className="space-y-4">
+            <div className="flex items-center justify-between rounded-2xl border border-gray-200 bg-white px-5 py-4">
+              <div>
+                <h3 className="text-sm font-semibold text-gray-900">Agentic actions</h3>
+                <p className="text-sm text-gray-600">
+                  AI suggests only actions it can execute with active connectors or save in MeetingBox.
+                </p>
+              </div>
+              <button
+                onClick={() => void handleGenerateActions()}
+                disabled={isGeneratingActions}
+                className="rounded-lg border border-primary-200 bg-primary-50 px-4 py-2 text-sm font-medium text-primary-700 hover:bg-primary-100 disabled:opacity-50"
+              >
+                {isGeneratingActions ? 'Refreshing...' : 'Refresh Suggestions'}
+              </button>
+            </div>
             {actions.length === 0 ? (
               <div className="text-center py-12 bg-white rounded-lg border border-gray-200">
                 <svg className="mx-auto h-12 w-12 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
                 </svg>
-                <h3 className="mt-2 text-sm font-medium text-gray-900">No pending actions</h3>
+                <h3 className="mt-2 text-sm font-medium text-gray-900">No AI actions yet</h3>
                 <p className="mt-1 text-sm text-gray-500">
-                  All action items have been reviewed or no actions were generated.
+                  Generate suggestions after the summary is ready to see connector-aware actions here.
                 </p>
               </div>
             ) : (
@@ -382,7 +420,7 @@ export default function MeetingDetailPage() {
                 <ActionCard
                   key={action.id}
                   action={action}
-                  onApproved={handleActionApproved}
+                  onChanged={handleActionApproved}
                 />
               ))
             )}

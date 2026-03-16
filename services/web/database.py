@@ -134,17 +134,42 @@ def init_database() -> None:
               id TEXT PRIMARY KEY,
               meeting_id TEXT NOT NULL,
               type TEXT NOT NULL,
+              kind TEXT,
+              connector_target TEXT,
+              execution_mode TEXT,
               title TEXT,
+              description TEXT,
               assignee TEXT,
               confidence REAL,
               draft TEXT,
+              payload TEXT,
+              artifact TEXT,
               status TEXT DEFAULT 'pending',
+              delivery_status TEXT,
+              error TEXT,
+              selected_at TEXT,
               executed_at TEXT,
               created_at TEXT,
               FOREIGN KEY (meeting_id) REFERENCES meetings(id)
             )
             """
         )
+
+        for statement in [
+            "ALTER TABLE actions ADD COLUMN kind TEXT",
+            "ALTER TABLE actions ADD COLUMN connector_target TEXT",
+            "ALTER TABLE actions ADD COLUMN execution_mode TEXT",
+            "ALTER TABLE actions ADD COLUMN description TEXT",
+            "ALTER TABLE actions ADD COLUMN payload TEXT",
+            "ALTER TABLE actions ADD COLUMN artifact TEXT",
+            "ALTER TABLE actions ADD COLUMN delivery_status TEXT",
+            "ALTER TABLE actions ADD COLUMN error TEXT",
+            "ALTER TABLE actions ADD COLUMN selected_at TEXT",
+        ]:
+            try:
+                cursor.execute(statement)
+            except sqlite3.OperationalError:
+                pass
 
         cursor.execute(
             """

@@ -5,9 +5,11 @@ import logging
 import os
 import threading
 import time
+from pathlib import Path
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 import redis
 
 from database import init_database, get_connection
@@ -24,6 +26,7 @@ logger = logging.getLogger("meetingbox.web")
 init_database()
 
 REDIS_HOST = os.getenv("REDIS_HOST", "redis")
+STATIC_DIR = Path(os.getenv("STATIC_DIR", "/app/static"))
 
 
 class ConnectionManager:
@@ -196,6 +199,20 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
 @app.get("/health")
 async def health() -> dict:
   return {"status": "healthy", "service": "meetingbox-web"}
+
+
+if STATIC_DIR.exists():
+  @app.get("/")
+  async def serve_index() -> FileResponse:
+    return FileResponse(str(STATIC_DIR / "index.html"))
+
+
+  @app.get("/{full_path:path}")
+  async def serve_spa(full_path: str) -> FileResponse:
+    requested = STATIC_DIR / full_path
+    if requested.is_file():
+      return FileResponse(str(requested))
+    return FileResponse(str(STATIC_DIR / "index.html"))
 
 
 if __name__ == "__main__":

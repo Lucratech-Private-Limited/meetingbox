@@ -7,6 +7,7 @@ export interface ExecuteResult {
   id: string
   status: string
   delivery_status: string
+  artifact: Record<string, unknown> | null
   result: Record<string, unknown>
 }
 
@@ -16,8 +17,9 @@ export const actionsApi = {
     return response.data
   },
 
-  approve: async (actionId: string): Promise<void> => {
-    await client.post(`/api/actions/${actionId}/approve`)
+  generate: async (meetingId: string): Promise<AgenticAction[]> => {
+    const response = await client.post(`/api/meetings/${meetingId}/actions/generate`)
+    return response.data
   },
 
   dismiss: async (actionId: string): Promise<void> => {
@@ -29,13 +31,11 @@ export const actionsApi = {
     return response.data
   },
 
-  deliver: async (actionId: string): Promise<ExecuteResult> => {
-    const response = await client.post(`/api/actions/${actionId}/deliver`)
-    return response.data
-  },
-
-  update: async (actionId: string, draft: unknown): Promise<AgenticAction> => {
-    const response = await client.patch(`/api/actions/${actionId}`, { draft })
+  update: async (
+    actionId: string,
+    update: { title?: string; description?: string; payload?: Record<string, unknown> }
+  ): Promise<AgenticAction> => {
+    const response = await client.patch(`/api/actions/${actionId}`, update)
     return response.data
   },
 }

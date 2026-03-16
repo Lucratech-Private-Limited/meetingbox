@@ -8,7 +8,6 @@ interface ActionState {
   error: string | null
 
   fetchActions: (meetingId: string) => Promise<void>
-  approveAction: (actionId: string) => Promise<void>
   dismissAction: (actionId: string) => Promise<void>
 }
 
@@ -25,11 +24,6 @@ export const useActionStore = create<ActionState>((set, get) => ({
     } catch {
       set({ error: 'Failed to fetch actions', loading: false })
     }
-  },
-
-  approveAction: async (actionId: string) => {
-    await actionsApi.approve(actionId)
-    set({ actions: get().actions.map((a) => a.id === actionId ? { ...a, status: 'approved' } : a) })
   },
 
   dismissAction: async (actionId: string) => {

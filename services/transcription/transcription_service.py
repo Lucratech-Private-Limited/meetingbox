@@ -15,6 +15,7 @@ logger = logging.getLogger("meetingbox.transcription")
 
 REDIS_HOST = os.getenv("REDIS_HOST", "redis")
 TEMP_SEGMENTS_DIR = Path(os.getenv("TEMP_SEGMENTS_DIR", "/data/audio/temp"))
+DEFAULT_WHISPER_ROOT = Path(os.getenv("WHISPER_ROOT", "/opt/meetingbox/runtime/whisper.cpp"))
 
 
 class TranscriptionService:
@@ -28,8 +29,14 @@ class TranscriptionService:
 
     init_database()
 
-    self.whisper_bin = "/app/whisper.cpp/build/bin/whisper-cli"
-    self.model_path = "/app/whisper.cpp/models/ggml-medium.bin"
+    self.whisper_bin = os.getenv(
+      "WHISPER_BIN",
+      str(DEFAULT_WHISPER_ROOT / "build" / "bin" / "whisper-cli"),
+    )
+    self.model_path = os.getenv(
+      "WHISPER_MODEL_PATH",
+      str(DEFAULT_WHISPER_ROOT / "models" / "ggml-medium.bin"),
+    )
 
     logger.info("Service initialized, model=%s, DB=%s", self.model_path, DB_PATH)
 

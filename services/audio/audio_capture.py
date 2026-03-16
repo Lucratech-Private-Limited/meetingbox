@@ -41,8 +41,8 @@ class AudioCaptureService:
     self.redis_client = redis.Redis(host=REDIS_HOST, port=6379, decode_responses=True)
 
     storage_cfg = self.config.get("storage", {})
-    self.temp_dir = Path(storage_cfg.get("temp_dir", "/data/audio/temp"))
-    self.recordings_dir = Path(storage_cfg.get("recordings_dir", "/data/audio/recordings"))
+    self.temp_dir = Path(os.getenv("TEMP_SEGMENTS_DIR", storage_cfg.get("temp_dir", "/data/audio/temp")))
+    self.recordings_dir = Path(os.getenv("RECORDINGS_DIR", storage_cfg.get("recordings_dir", "/data/audio/recordings")))
 
     self.audio = pyaudio.PyAudio()
     self.stream: pyaudio.Stream | None = None

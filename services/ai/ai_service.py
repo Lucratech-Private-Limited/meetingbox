@@ -1,7 +1,6 @@
 import json
 import logging
 import os
-import uuid
 from datetime import datetime
 from typing import Any
 
@@ -102,74 +101,6 @@ class AIService:
       "topics": _ensure_str_list(data.get("topics")),
       "sentiment": str(data.get("sentiment", "")).strip(),
     }
-
-  def _extract_actions_from_summary(self, meeting_id: str, action_items: list[dict[str, Any]]) -> None:
-    if not action_items:
-      return
-
-    type_map = {
-      "email": "email_draft",
-      "email_draft": "email_draft",
-      "calendar": "calendar_invite",
-      "calendar_invite": "calendar_invite",
-      "task": "task_creation",
-      "task_creation": "task_creation",
-      "follow_up": "task_creation",
-      "followup": "task_creation",
-    }
-    integration_types = {"email_draft", "calendar_invite"}
-
-    conn = get_connection()
-    try:
-      cur = conn.cursor()
-      for item in action_items:
-        if not isinstance(item, dict):
-          continue
-
-        title = str(item.get("task") or item.get("title") or "").strip()
-        if not title:
-          continue
-
-        raw_type = str(item.get("type", "task")).strip().lower()
-        action_type = type_map.get(raw_type, "task_creation")
-        if action_type not in integration_types:
-          continue
-
-        cur.execute(
-          """
-          SELECT 1
-          FROM actions
-          WHERE meeting_id = ?
-            AND type = ?
-            AND lower(trim(title)) = lower(trim(?))
-            AND status IN ('pending', 'approved', 'draft_ready', 'executed')
-          LIMIT 1
-          """,
-          (meeting_id, action_type, title),
-        )
-        if cur.fetchone():
-          continue
-
-        draft = {k: v for k, v in item.items() if k not in ("task", "title", "assignee", "type")}
-        cur.execute(
-          """
-          INSERT INTO actions (id, meeting_id, type, title, assignee, confidence, draft, status, created_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)
-          """,
-          (
-            str(uuid.uuid4()),
-            meeting_id,
-            action_type,
-            title,
-            item.get("assignee"),
-            1.0,
-            json.dumps(draft),
-            datetime.utcnow().isoformat(),
-          ),
-        )
-      conn.commit()
-    finally:
-      conn.close()
 
   def _fetch_processing_state(self, meeting_id: str) -> dict[str, Any]:
     self._ensure_processing_state(meeting_id)
@@ -285,12 +216,10 @@ class AIService:
       "3. Decisions made\n"
       "4. Action items with assignees if available. Each action item MUST include a "
       '"type" field with one of these values:\n'
-      '   - "email_draft" — for items that require sending an email\n'
-      '   - "calendar_invite" — for items that require scheduling a meeting\n'
-      '   - "task" — for general to-do items\n'
-      '   IMPORTANT: Always include this item:\n'
-      '   {"task": "Send MOM of this meeting to all stakeholders", "assignee": null, '
-      '"due_date": null, "type": "email_draft"}\n'
+      '   - "email_draft" — for follow-ups that are naturally an email\n'
+      '   - "calendar_invite" — for next meetings or time-blocking commitments\n'
+      '   - "task" — for general human to-do items\n'
+      "   Only include action items that are explicitly grounded in the meeting.\n"
       "5. 3-5 topic hashtags\n"
       "6. Overall sentiment (single word or short phrase)\n\n"
       "Return **only** valid JSON with no additional text, in this exact shape:\n"
@@ -400,9 +329,6 @@ class AIService:
       conn.close()
 
     self._update_processing_state(meeting_id, last_summarized_segment=last_segment_num)
-    if is_final:
-      self._extract_actions_from_summary(meeting_id, summary.get("action_items", []))
-
   def _summarize_incrementally(self, meeting_id: str, finalize: bool) -> dict | None:
     self._ensure_processing_state(meeting_id)
     state = self._fetch_processing_state(meeting_id)

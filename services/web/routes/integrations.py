@@ -51,6 +51,21 @@ SCOPES_BY_PROVIDER = {
     ]),
 }
 
+INTEGRATION_CAPABILITIES = {
+    "gmail": {
+        "connector_target": "gmail",
+        "action_kinds": ["followup_email"],
+        "execution_modes": ["message_send"],
+        "description": "Send stakeholder recap and follow-up emails.",
+    },
+    "calendar": {
+        "connector_target": "calendar",
+        "action_kinds": ["schedule_followup"],
+        "execution_modes": ["event_create"],
+        "description": "Create follow-up meetings and focus blocks.",
+    },
+}
+
 
 def _check_google_configured():
     if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
@@ -97,6 +112,35 @@ def _get_integration(user_id: str, provider: str) -> dict | None:
         return cur.fetchone()
     finally:
         conn.close()
+
+
+def get_connected_providers(user_id: str) -> list[str]:
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT provider FROM integrations WHERE user_id = ?", (user_id,))
+        return [row[0] for row in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def get_action_capabilities(user_id: str | None) -> list[dict]:
+    capabilities = [
+        {
+            "connector_target": "internal",
+            "action_kinds": ["cost_analysis", "decision_brief", "risk_register", "task_digest"],
+            "execution_modes": ["artifact_create"],
+            "description": "Create and save internal MeetingBox artifacts.",
+        }
+    ]
+    if not user_id:
+        return capabilities
+
+    for provider in get_connected_providers(user_id):
+        meta = INTEGRATION_CAPABILITIES.get(provider)
+        if meta:
+            capabilities.append(meta)
+    return capabilities
 
 
 def _build_credentials(integration: dict):

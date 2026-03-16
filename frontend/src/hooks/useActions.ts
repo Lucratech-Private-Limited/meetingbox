@@ -4,7 +4,7 @@ import { useEffect } from 'react'
 import { useActionStore } from '../store/actionStore'
 
 export function useActions(meetingId: string | undefined) {
-  const { actions, loading, error, fetchActions, approveAction, dismissAction } =
+  const { actions, loading, error, fetchActions, dismissAction } =
     useActionStore()
 
   useEffect(() => {
@@ -13,5 +13,5 @@ export function useActions(meetingId: string | undefined) {
     }
   }, [meetingId, fetchActions])
 
-  return { actions, loading, error, approveAction, dismissAction }
+  return { actions, loading, error, dismissAction }
 }
