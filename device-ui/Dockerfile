@@ -1,6 +1,6 @@
 FROM python:3.11-slim
 
-# System dependencies for Kivy GUI on Raspberry Pi (X11 backend):
+# System dependencies for Kivy GUI on Linux (X11 backend):
 # SDL2, OpenGL, X11 client libs, GStreamer, touch input, build tools,
 # PortAudio for sounddevice (mic test)
 RUN apt-get update && apt-get install -y --no-install-recommends \

@@ -1,7 +1,7 @@
 """
 MeetingBox Device UI – Main Application
 
-Entry point for the 3.5" OLED touchscreen interface (Raspberry Pi 5).
+Entry point for the MeetingBox device interface.
 Implements the complete boot flow defined in the PRD:
   Splash → (first-boot? Welcome → WiFi → SetupProgress → AllSet →) Home
 """
@@ -31,8 +31,8 @@ from kivy.config import Config
 # Setting position/size/fullscreen after Window exists only partially works and
 # causes the window to render at the wrong position (top-left or bottom-left).
 _FULLSCREEN = os.getenv('FULLSCREEN', '0') == '1'
-_W = int(os.getenv('DISPLAY_WIDTH', '480'))
-_H = int(os.getenv('DISPLAY_HEIGHT', '320'))
+_W = int(os.getenv('DISPLAY_WIDTH', '1280'))
+_H = int(os.getenv('DISPLAY_HEIGHT', '720'))
 
 Config.set('graphics', 'window_state', 'visible')
 Config.set('graphics', 'position', 'custom')
@@ -127,7 +127,7 @@ from async_helper import run_async, get_async_loop
 
 class MeetingBoxApp(App):
     """
-    Main Kivy application for MeetingBox OLED UI.
+    Main Kivy application for the MeetingBox device UI.
 
     Manages:
     - Screen navigation with transitions

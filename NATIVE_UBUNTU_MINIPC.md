@@ -64,7 +64,7 @@ Set at minimum:
 - `GOOGLE_CLIENT_ID`
 - `GOOGLE_CLIENT_SECRET`
 - `LOCAL_LLM_MODEL` if you want a different Ollama model
-- display width and height if the touchscreen is not `480x320`
+- display width and height if you want to override the attached display defaults
 
 ## Seal it into appliance mode
 

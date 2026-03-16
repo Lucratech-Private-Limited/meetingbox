@@ -1,7 +1,7 @@
 """
 Device Management Routes
 
-Endpoints used by the OLED touchscreen device-ui.
+Endpoints used by the device-ui appliance interface.
 Manages: settings, WiFi, updates, system device info.
 """
 

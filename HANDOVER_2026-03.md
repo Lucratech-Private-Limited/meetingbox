@@ -272,12 +272,7 @@ These areas appear reusable on a Linux kiosk mini PC with little or no code chan
 These areas are currently coupled to Pi-style hardware or Pi deployment habits:
 
 #### 1. Screen brightness and screen power control
-`device-ui/src/hardware.py` is explicitly written for Raspberry Pi backlight sysfs paths:
-
-- `/sys/class/backlight/rpi_backlight/...`
-- `/sys/class/backlight/10-0045/...`
-
-It falls back to `xset`, but the implementation is still clearly Pi-first. On a mini PC with a built-in panel, these paths may not exist and brightness may need:
+`device-ui/src/hardware.py` now uses generic Linux backlight sysfs discovery and falls back to `xset` for display power control. On a mini PC with a built-in panel, brightness may still need:
 
 - a different sysfs path
 - DDC/CI
@@ -332,7 +327,6 @@ This made sense for an appliance without keyboard/mouse access. For a mini PC, t
 - `services/web/routes/device.py`
 - `services/audio/audio_capture.py`
 - `scripts/deploy_production.sh`
-- `scripts/setup_display.sh`
 - `scripts/hotspot.sh`
 - `docker-compose.yml`
 - `docker-compose.prod.yml`
@@ -417,7 +411,7 @@ Actions:
 2. Update `services/web/routes/device.py` so Wi-Fi and serial-number logic are not hardcoded to Pi-style assumptions.
 3. Update `services/audio/audio_capture.py` so mic selection can prefer the built-in mic when appropriate, ideally via explicit configuration instead of only name heuristics.
 4. Generalize `scripts/deploy_production.sh` so it reflects Linux kiosk deployment rather than Raspberry Pi-only deployment.
-5. Review whether `scripts/setup_display.sh` should be retired, replaced, or rewritten, since its forced Xorg config conflicts with lessons already recorded in `LEARNINGS.md`.
+5. Keep the Linux display path centered on host X11 auto-detection rather than reintroducing forced per-panel Xorg configs, since those conflicted with lessons already recorded in `LEARNINGS.md`.
 
 Expected outcome:
 

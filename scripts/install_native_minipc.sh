@@ -2,11 +2,11 @@
 set -euo pipefail
 
 # Native Ubuntu mini-PC installer for MeetingBox.
-# Replaces the Raspberry Pi + Docker boot flow with:
+# Replaces the old Raspberry Pi + Docker boot flow with:
 # - native Redis
 # - native Ollama
 # - native Python services under systemd
-# - native X server + Kivy touchscreen UI
+# - native X server + Kivy device UI
 
 if [ "${EUID}" -ne 0 ]; then
   echo "Run as root: sudo bash scripts/install_native_minipc.sh"
@@ -128,8 +128,8 @@ STATIC_DIR=$INSTALL_DIR/frontend/dist
 BACKEND_URL=http://localhost:8000
 BACKEND_WS_URL=ws://localhost:8000/ws
 DISPLAY=:0
-DISPLAY_WIDTH=480
-DISPLAY_HEIGHT=320
+DISPLAY_WIDTH=1280
+DISPLAY_HEIGHT=720
 FULLSCREEN=1
 LOG_TO_CONSOLE=0
 LOG_LEVEL=INFO
@@ -313,7 +313,7 @@ EOF
 
 cat > /etc/systemd/system/meetingbox-ui.service <<EOF
 [Unit]
-Description=MeetingBox Touchscreen UI
+Description=MeetingBox Device UI
 After=meetingbox-x.service meetingbox-web.service
 Requires=meetingbox-x.service meetingbox-web.service
 

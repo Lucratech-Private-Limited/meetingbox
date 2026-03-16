@@ -1,10 +1,10 @@
 # MeetingBox Device UI
 
-OLED touchscreen interface for MeetingBox hardware.
+Device UI for MeetingBox hardware.
 
 ## Features
 
-- Touch-first interface optimized for 3" OLED display
+- Touch-first interface for kiosk and appliance displays
 - Real-time recording status and live captions
 - Meeting history browser
 - Settings management (WiFi, integrations, system info)
@@ -12,9 +12,9 @@ OLED touchscreen interface for MeetingBox hardware.
 
 ## Hardware Requirements
 
-- Raspberry Pi 5 (8GB recommended)
-- 3" OLED Touchscreen (320x480 or 480x800 resolution)
-- Display connected via HDMI or DSI
+- Linux host capable of running X11
+- Display connected via HDMI, DisplayPort, or embedded panel
+- Optional touch input if the device UI is used interactively
 
 ## Installation
 

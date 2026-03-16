@@ -127,7 +127,7 @@ services:
       - meetingbox-net
 
   # ================================================================
-  # Device UI — Kivy touchscreen interface
+  # Device UI — Kivy appliance interface
   # ================================================================
   # Renders directly to the attached display via X11 passthrough.
   # Requires: X server running on the host (startx / lightdm).
@@ -172,8 +172,6 @@ services:
     # NOTE: For production with a touchscreen, uncomment:
     # devices:
     #   - /dev/input:/dev/input
-    # For GPU accel (requires dtoverlay=vc4-kms-v3d in /boot/config.txt):
-    #   - /dev/dri:/dev/dri
 
 volumes:
   redis-data:

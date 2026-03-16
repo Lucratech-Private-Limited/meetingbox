@@ -2,15 +2,15 @@
 # ============================================================
 # MeetingBox Production Deployment
 # ============================================================
-# Prepares a Raspberry Pi for autonomous, kiosk-style operation.
+# Prepares a Linux host for autonomous, kiosk-style operation.
 # After running this script and rebooting:
-#   - No Pi OS desktop or console is visible
+#   - No desktop or console is visible
 #   - All Docker services (including device-ui) start automatically
-#   - The OLED touchscreen shows the MeetingBox UI immediately
+#   - The attached display shows the MeetingBox UI immediately
 #   - No SSH or manual commands required
 #
 # Prerequisites:
-#   - Raspberry Pi OS Bookworm (Debian 12) Lite or Desktop
+#   - Debian/Ubuntu Linux with X11 support
 #   - A 'meetingbox' user exists (or $SUDO_USER will be used)
 #   - Internet connection for package and Docker image downloads
 #
@@ -184,7 +184,7 @@ echo ""
 echo "5/9  Configuring X11 display..."
 
 # Do not force custom Xorg Monitor/Screen config here.
-# On modern Pi OS (Bookworm/Trixie), forced Screen sections can cause:
+# Forced Screen sections can cause:
 #   AddScreen/ScreenInit failed for driver 0
 # Let Xorg auto-detect display/driver from the running kernel/KMS stack.
 mkdir -p /etc/X11/xorg.conf.d
@@ -263,8 +263,8 @@ echo "   Done"
 echo ""
 echo "6/9  Configuring silent boot..."
 
-# Kernel command line — Pi OS Bookworm uses /boot/firmware/cmdline.txt
-# Older Pi OS uses /boot/cmdline.txt
+# Kernel command line on Debian-family kiosk images may live in one of
+# these paths. If neither exists, boot quieting is skipped.
 CMDLINE=""
 for candidate in /boot/firmware/cmdline.txt /boot/cmdline.txt; do
     if [ -f "$candidate" ]; then
@@ -291,24 +291,6 @@ if [ -n "$CMDLINE" ]; then
     echo "   Updated $CMDLINE"
 else
     echo "   WARNING: Could not find cmdline.txt — skipping kernel quiet boot"
-fi
-
-# Disable the rainbow splash on Pi (shows a test pattern on HDMI at very early boot)
-BOOT_CONFIG=""
-for candidate in /boot/firmware/config.txt /boot/config.txt; do
-    if [ -f "$candidate" ]; then
-        BOOT_CONFIG="$candidate"
-        break
-    fi
-done
-
-if [ -n "$BOOT_CONFIG" ]; then
-    if ! grep -q "disable_splash" "$BOOT_CONFIG"; then
-        echo "" >> "$BOOT_CONFIG"
-        echo "# MeetingBox: disable rainbow splash" >> "$BOOT_CONFIG"
-        echo "disable_splash=1" >> "$BOOT_CONFIG"
-    fi
-    echo "   Disabled Pi rainbow splash in $BOOT_CONFIG"
 fi
 
 # Plymouth — simple black theme with text
@@ -471,7 +453,7 @@ echo "    1. Kernel boots silently (black screen)"
 echo "    2. Auto-login on tty1 as '$ACTUAL_USER'"
 echo "    3. X11 starts automatically (no desktop, just display server)"
 echo "    4. Docker Compose starts all services (including device-ui)"
-echo "    5. Device UI renders MeetingBox splash on the OLED"
+echo "    5. Device UI renders MeetingBox splash on the attached display"
 echo ""
 echo "  No SSH, no manual commands, no visible console."
 echo ""

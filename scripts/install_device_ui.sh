@@ -9,7 +9,7 @@
 #   cd /path/to/meetingbox-repo
 #   sudo bash scripts/install_device_ui.sh
 #
-# Tested on Raspberry Pi OS Bookworm (Debian 12)
+# Tested on Debian/Ubuntu Linux with X11
 # ============================================================
 
 set -e
@@ -128,14 +128,14 @@ echo "   Skipping auto-startx (dev mode — enable for production)"
 # fi
 
 # NOTE: .xinitrc and auto-login are disabled during development.
-# Run scripts/setup_display.sh when the physical screen is connected.
+# Use scripts/deploy_production.sh for kiosk-style production setup.
 echo "   Skipping .xinitrc creation (dev mode)"
 
 # -------------------------------------------------------
 # 4. Auto-login on tty1 (disabled during dev)
 # -------------------------------------------------------
 echo ""
-echo "4/7  Skipping auto-login on tty1 (dev mode — run setup_display.sh for production)"
+echo "4/7  Skipping auto-login on tty1 (dev mode — use deploy_production.sh for production)"
 
 # -------------------------------------------------------
 # 5. Systemd service for Docker Compose

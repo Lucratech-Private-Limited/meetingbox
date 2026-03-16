@@ -33,10 +33,9 @@ WS_MAX_RECONNECT_ATTEMPTS = 10
 # ============================================================================
 
 # Display resolution
-# 3.5" OLED touchscreen in landscape orientation
-# Native: 320x480, Landscape: 480x320
-DISPLAY_WIDTH = int(os.getenv('DISPLAY_WIDTH', '480'))
-DISPLAY_HEIGHT = int(os.getenv('DISPLAY_HEIGHT', '320'))
+# Override with env vars when targeting a specific panel or kiosk display.
+DISPLAY_WIDTH = int(os.getenv('DISPLAY_WIDTH', '1280'))
+DISPLAY_HEIGHT = int(os.getenv('DISPLAY_HEIGHT', '720'))
 
 # Display orientation
 DISPLAY_ORIENTATION = os.getenv('DISPLAY_ORIENTATION', 'landscape')
