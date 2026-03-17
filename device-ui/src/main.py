@@ -183,9 +183,9 @@ class MeetingBoxApp(App):
         # module load time (before Window was imported), so no runtime
         # Window.size / Window.fullscreen calls needed here.
 
-        # Hide cursor on production device
-        if not SHOW_FPS:
-            Window.show_cursor = False
+        # Show cursor in windowed mode (mouse/desktop).
+        # Hide it only in fullscreen kiosk mode (touchscreen, no mouse).
+        Window.show_cursor = (not FULLSCREEN) or SHOW_FPS
 
         # Screen manager – default to fade transition
         self.screen_manager = ScreenManager(
