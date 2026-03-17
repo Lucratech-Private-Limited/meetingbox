@@ -164,8 +164,10 @@ services:
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
       # Persistent device config (settings, setup marker)
       - ./data/config:/data/config
-      # Share Xauthority so the container can authenticate with X
-      - ${XAUTHORITY:-/home/meetingbox/.Xauthority}:/home/uiuser/.Xauthority:ro
+      # No Xauthority mount needed — the host .xinitrc runs
+      # 'xhost +local:' which allows all local socket connections
+      # without a magic cookie. Mounting the file caused failures
+      # when it didn't exist yet at container start time.
     networks:
       - meetingbox-net
     # NOTE: For production with a touchscreen, uncomment:

@@ -347,6 +347,8 @@ TTYPath=/dev/tty1
 StandardInput=tty
 StandardOutput=journal
 StandardError=journal
+# Remove stale X lock files before starting so reboots are always clean.
+ExecStartPre=/bin/bash -c 'rm -f /tmp/.X0-lock /tmp/.X11-unix/X0'
 ExecStart=/usr/bin/xinit $ACTUAL_HOME/.xinitrc -- :0 -nocursor vt1 -keeptty
 Restart=always
 RestartSec=2
