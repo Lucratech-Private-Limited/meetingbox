@@ -159,6 +159,10 @@ services:
       # Fullscreen mode (set to 0 for windowed dev mode)
       - FULLSCREEN=1
       - MOCK_BACKEND=0
+      # GPU rendering: allow Mesa to use the host DRI device.
+      # LIBGL_ALWAYS_SOFTWARE=1 is the fallback if DRI is still
+      # inaccessible (e.g. wrong render group GID on the host).
+      - LIBGL_ALWAYS_SOFTWARE=1
     volumes:
       # X11 socket — lets the container draw on the host display
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
@@ -168,6 +172,16 @@ services:
       # 'xhost +local:' which allows all local socket connections
       # without a magic cookie. Mounting the file caused failures
       # when it didn't exist yet at container start time.
+    devices:
+      # Pass the GPU into the container so Mesa can use hardware rendering.
+      # If this path does not exist on the host, remove this block.
+      - /dev/dri:/dev/dri
+    group_add:
+      # Give the container user access to DRI render nodes.
+      # GID 44  = video group on Ubuntu (card devices)
+      # GID 109 = render group on Ubuntu 24.04 (renderD* devices)
+      - "44"
+      - "109"
     networks:
       - meetingbox-net
     # NOTE: For production with a touchscreen, uncomment:
