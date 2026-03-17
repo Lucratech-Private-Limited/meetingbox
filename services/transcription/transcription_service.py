@@ -15,7 +15,9 @@ logger = logging.getLogger("meetingbox.transcription")
 
 REDIS_HOST = os.getenv("REDIS_HOST", "redis")
 TEMP_SEGMENTS_DIR = Path(os.getenv("TEMP_SEGMENTS_DIR", "/data/audio/temp"))
-DEFAULT_WHISPER_ROOT = Path(os.getenv("WHISPER_ROOT", "/opt/meetingbox/runtime/whisper.cpp"))
+# Docker image builds whisper.cpp under /app/whisper.cpp.
+# (Native mini-PC installs can still override WHISPER_ROOT via env.)
+DEFAULT_WHISPER_ROOT = Path(os.getenv("WHISPER_ROOT", "/app/whisper.cpp"))
 
 
 class TranscriptionService:
