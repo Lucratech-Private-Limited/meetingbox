@@ -13,11 +13,11 @@ echo "[ollama-init] Starting Ollama server..."
 ollama serve &
 SERVER_PID=$!
 
-# Wait for server to be ready
+# Wait for server to be ready using the ollama binary itself (no curl needed).
 echo "[ollama-init] Waiting for Ollama server to be ready..."
 MAX_RETRIES=30
 RETRY=0
-until curl -sf http://localhost:11434/api/tags >/dev/null 2>&1; do
+until ollama list >/dev/null 2>&1; do
     RETRY=$((RETRY + 1))
     if [ $RETRY -ge $MAX_RETRIES ]; then
         echo "[ollama-init] ERROR: Ollama server did not start in time"

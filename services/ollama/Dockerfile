@@ -1,8 +1,8 @@
 FROM ollama/ollama:latest
 
-# Install curl for health checks in the entrypoint
-RUN apt-get update && apt-get install -y --no-install-recommends curl \
-    && rm -rf /var/lib/apt/lists/*
+# No extra system packages needed — the entrypoint uses the ollama
+# binary directly for readiness checks, avoiding apt-get issues in
+# the ollama/ollama base image.
 
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
