@@ -312,9 +312,9 @@ echo "7/9  Installing systemd services..."
 cat > /etc/systemd/system/meetingbox.service << EOF
 [Unit]
 Description=MeetingBox (all services via Docker Compose)
-After=docker.service network-online.target meetingbox-x.service
+After=docker.service network-online.target
 Requires=docker.service
-Wants=network-online.target meetingbox-x.service
+Wants=network-online.target
 
 [Service]
 Type=oneshot
@@ -322,7 +322,6 @@ RemainAfterExit=yes
 User=$ACTUAL_USER
 WorkingDirectory=$INSTALL_DIR
 ExecStartPre=/bin/bash -c 'until docker info >/dev/null 2>&1; do sleep 2; done'
-ExecStartPre=/bin/bash -c 'for i in \$(seq 1 15); do [ -S /tmp/.X11-unix/X0 ] && break || sleep 2; done'
 ExecStart=/usr/bin/docker compose -f docker-compose.yml -f docker-compose.prod.yml --profile screen up -d
 ExecStop=/usr/bin/docker compose -f docker-compose.yml -f docker-compose.prod.yml --profile screen down
 TimeoutStartSec=300

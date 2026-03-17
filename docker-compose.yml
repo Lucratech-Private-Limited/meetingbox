@@ -156,8 +156,9 @@ services:
       # Kivy settings
       - KIVY_WINDOW=sdl2
       - KIVY_NO_CONSOLELOG=1
-      # Fullscreen mode (set to 0 for windowed dev mode)
-      - FULLSCREEN=1
+      # Fullscreen mode — set to 1 for dedicated kiosk display,
+      # 0 for windowed mode on a normal desktop.
+      - FULLSCREEN=0
       - MOCK_BACKEND=0
       # GPU rendering: allow Mesa to use the host DRI device.
       # LIBGL_ALWAYS_SOFTWARE=1 is the fallback if DRI is still
