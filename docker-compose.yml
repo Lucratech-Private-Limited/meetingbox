@@ -1,12 +1,11 @@
-version: "3.9"
-
 services:
   redis:
     image: redis:7-alpine
     container_name: meetingbox-redis
     restart: unless-stopped
-    ports:
-      - "6379:6379"
+    # No host port binding — Redis is only reachable inside the Docker
+    # network (meetingbox-net). Exposing port 6379 to the host is not
+    # needed and conflicts if a native redis-server is running.
     volumes:
       - redis-data:/data
     networks:
