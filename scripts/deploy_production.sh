@@ -356,16 +356,6 @@ RestartSec=2
 WantedBy=multi-user.target
 EOF
 
-# Mark setup as complete so the onboarding service never runs.
-# The hotspot/WiFi onboarding flow is not needed on a mini PC that
-# is already connected to the network via Ethernet or configured WiFi.
-mkdir -p "$INSTALL_DIR/data/config"
-touch "$INSTALL_DIR/data/config/.setup_complete"
-
-# Disable and mask the onboarding service so it cannot be started.
-systemctl disable meetingbox-onboard.service 2>/dev/null || true
-systemctl mask meetingbox-onboard.service 2>/dev/null || true
-
 systemctl daemon-reload
 systemctl enable meetingbox.service
 systemctl disable meetingbox-x.service 2>/dev/null || true

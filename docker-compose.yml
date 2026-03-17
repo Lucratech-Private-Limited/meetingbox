@@ -18,6 +18,7 @@ services:
     restart: unless-stopped
     depends_on:
       - redis
+    user: "1000:1000"            # Run as host meetingbox user so data volume writes succeed
     environment:
       - PYTHONUNBUFFERED=1
     volumes:
@@ -36,6 +37,7 @@ services:
     restart: unless-stopped
     depends_on:
       - redis
+    user: "1000:1000"            # Run as host meetingbox user so data volume writes succeed
     environment:
       - PYTHONUNBUFFERED=1
     volumes:
@@ -52,6 +54,7 @@ services:
     depends_on:
       - redis
       - ollama
+    user: "1000:1000"            # Run as host meetingbox user so data volume writes succeed
     environment:
       - PYTHONUNBUFFERED=1
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}

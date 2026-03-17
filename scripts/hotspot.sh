@@ -16,7 +16,17 @@ set -euo pipefail
 CON_NAME="MeetingBox-Hotspot"
 SSID_PREFIX="MeetingBox-"
 HOTSPOT_IP="192.168.4.1"
-WIFI_IFACE="${WIFI_IFACE:-wlan0}"
+
+# Auto-detect the WiFi interface if WIFI_IFACE is not set explicitly.
+# Picks the first wireless interface reported by the kernel (wlan0, wlp2s0, etc.)
+if [ -z "${WIFI_IFACE:-}" ]; then
+    WIFI_IFACE=$(ls /sys/class/net/ | grep -E "^wl" | head -1)
+    if [ -z "$WIFI_IFACE" ]; then
+        echo "[Hotspot] ERROR: No WiFi interface found. Plug in a USB WiFi adapter first."
+        exit 1
+    fi
+    echo "[Hotspot] Auto-detected WiFi interface: $WIFI_IFACE"
+fi
 
 get_suffix() {
     # Use last 4 chars of wlan0 MAC as suffix, or fallback
