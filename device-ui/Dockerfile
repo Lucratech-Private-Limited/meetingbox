@@ -1,8 +1,12 @@
 FROM python:3.11-slim
 
-# System dependencies for Kivy GUI on Linux (X11 backend):
-# SDL2, OpenGL, X11 client libs, GStreamer, touch input, build tools,
-# PortAudio for sounddevice (mic test)
+# System dependencies for Kivy GUI on Linux (X11/SDL2 backend):
+# SDL2, OpenGL/GLES, X11 client libs, touch input, build tools,
+# PortAudio for sounddevice (mic test).
+# Notes:
+#   libegl1-mesa-dev was removed in Debian Bookworm — EGL is now vendor-neutral.
+#   libmtdev1 was renamed to libmtdev1t64 in Bookworm's time_t transition.
+#   GStreamer dev libs and libinput-dev are not required for the SDL2 window backend.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libsdl2-dev \
     libsdl2-image-dev \
@@ -10,7 +14,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libsdl2-ttf-dev \
     libgl1-mesa-dev \
     libgles2-mesa-dev \
-    libegl1-mesa-dev \
     libx11-dev \
     libxext-dev \
     libxrender-dev \
@@ -18,10 +21,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxfixes-dev \
     libxi-dev \
     libxrandr-dev \
-    libgstreamer1.0-dev \
-    gstreamer1.0-plugins-base \
-    libmtdev1 \
-    libinput-dev \
+    libmtdev1t64 \
     libportaudio2 \
     build-essential \
     pkg-config \
