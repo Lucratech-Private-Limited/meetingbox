@@ -356,36 +356,19 @@ RestartSec=2
 WantedBy=multi-user.target
 EOF
 
-# Onboarding service (first-boot hotspot + setup portal)
-# Skip onboarding if setup is complete OR WiFi is already connected.
-cat > /etc/systemd/system/meetingbox-onboard.service << EOF
-[Unit]
-Description=MeetingBox First-Time Onboarding (Hotspot + Setup Portal)
-After=NetworkManager.service
-Before=meetingbox.service
-ConditionPathExists=!/opt/meetingbox/data/config/.setup_complete
+# Mark setup as complete so the onboarding service never runs.
+# The hotspot/WiFi onboarding flow is not needed on a mini PC that
+# is already connected to the network via Ethernet or configured WiFi.
+mkdir -p "$INSTALL_DIR/data/config"
+touch "$INSTALL_DIR/data/config/.setup_complete"
 
-[Service]
-Type=forking
-ExecCondition=/bin/bash -c '! nmcli -t -f TYPE,STATE dev | grep -q "^wifi:connected$"'
-ExecStartPre=/bin/bash /opt/meetingbox/scripts/hotspot.sh start
-ExecStart=/usr/bin/python3 /opt/meetingbox/scripts/onboard_server.py
-ExecStop=/bin/bash /opt/meetingbox/scripts/hotspot.sh stop
-Restart=on-failure
-RestartSec=5
-TimeoutStartSec=30
-
-[Install]
-WantedBy=multi-user.target
-EOF
-chmod +x "$INSTALL_DIR/scripts/hotspot.sh"
-chmod +x "$INSTALL_DIR/scripts/onboard_server.py" 2>/dev/null || true
+# Disable and mask the onboarding service so it cannot be started.
+systemctl disable meetingbox-onboard.service 2>/dev/null || true
+systemctl mask meetingbox-onboard.service 2>/dev/null || true
 
 systemctl daemon-reload
 systemctl enable meetingbox.service
-systemctl enable meetingbox-x.service
-systemctl enable meetingbox-onboard.service
-systemctl disable getty@tty1.service 2>/dev/null || true
+systemctl disable meetingbox-x.service 2>/dev/null || true
 
 # Enable mDNS
 systemctl enable avahi-daemon
