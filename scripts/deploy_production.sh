@@ -16,11 +16,30 @@
 #
 # Usage:
 #   cd /path/to/meetingbox-repo
-#   sudo bash scripts/deploy_production.sh
+#   sudo bash scripts/deploy_production.sh [--clean] [--clean-volumes]
 #
 # ============================================================
 
 set -e
+
+CLEAN_BUILD=0
+CLEAN_VOLUMES=0
+for arg in "$@"; do
+    case "$arg" in
+        --clean)
+            CLEAN_BUILD=1
+            ;;
+        --clean-volumes)
+            CLEAN_BUILD=1
+            CLEAN_VOLUMES=1
+            ;;
+        *)
+            echo "ERROR: Unknown argument: $arg"
+            echo "Usage: sudo bash scripts/deploy_production.sh [--clean] [--clean-volumes]"
+            exit 1
+            ;;
+    esac
+done
 
 echo "============================================"
 echo "  MeetingBox — Production Deployment"
@@ -57,6 +76,11 @@ echo "Repo:     $REPO_DIR"
 echo "Install:  $INSTALL_DIR"
 echo "User:     $ACTUAL_USER"
 echo "Home:     $ACTUAL_HOME"
+if [ "$CLEAN_BUILD" -eq 1 ]; then
+    echo "Mode:     clean rebuild"
+else
+    echo "Mode:     normal rebuild"
+fi
 echo ""
 
 # ==========================================================
@@ -129,6 +153,12 @@ if [ ! -f "$INSTALL_DIR/.env" ]; then
         echo "   Created .env from .env.example (edit API keys before use)"
     fi
 fi
+
+# Production deploys bypass onboarding by creating the setup marker.
+touch "$INSTALL_DIR/data/config/.setup_complete"
+chown "$ACTUAL_USER:$ACTUAL_USER" "$INSTALL_DIR/data/config/.setup_complete"
+echo "   Created onboarding bypass marker: $INSTALL_DIR/data/config/.setup_complete"
+
 echo "   Done"
 
 # ==========================================================
@@ -376,6 +406,16 @@ cd "$INSTALL_DIR"
 
 # Stop any existing containers
 docker compose -f docker-compose.yml -f docker-compose.prod.yml --profile screen down 2>/dev/null || true
+
+# Optional: clean MeetingBox images/volumes before rebuilding.
+if [ "$CLEAN_BUILD" -eq 1 ]; then
+    echo "   Performing clean Docker reset for MeetingBox..."
+    if [ "$CLEAN_VOLUMES" -eq 1 ]; then
+        docker compose -f docker-compose.yml -f docker-compose.prod.yml --profile screen down --rmi all -v 2>/dev/null || true
+    else
+        docker compose -f docker-compose.yml -f docker-compose.prod.yml --profile screen down --rmi all 2>/dev/null || true
+    fi
+fi
 
 # Build all images including device-ui
 docker compose -f docker-compose.yml -f docker-compose.prod.yml --profile screen build
