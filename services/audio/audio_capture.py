@@ -72,27 +72,106 @@ class AudioCaptureService:
     This way any USB mic -- ReSpeaker, Jabra, Samson, cheap USB dongle,
     etc. -- works automatically without code changes.
     """
+    def supports_rate(dev: dict, rate: int) -> bool:
+      try:
+        ok = self.audio.is_format_supported(
+          rate,
+          input_device=dev["index"],
+          input_channels=self.CHANNELS,
+          input_format=self.FORMAT,
+        )
+        return bool(ok)
+      except (ValueError, OSError):
+        return False
+
+    def configure_native_rate(dev: dict) -> bool:
+      native_rate = int(dev["info"].get("defaultSampleRate", 0))
+      if native_rate <= 0 or not supports_rate(dev, native_rate):
+        return False
+      self.RATE = native_rate
+      # Scale chunk size proportionally so each chunk covers the same time duration
+      self.CHUNK = int(self.config["audio"]["chunk_size"] * native_rate / self.TARGET_RATE)
+      return True
+
+    def is_generic_alias(name: str) -> bool:
+      low = name.lower()
+      return low in {"default", "sysdefault", "pulse"} or low.startswith(
+        ("default:", "sysdefault:", "pulse:", "dmix:", "dsnoop:", "front:", "surround", "iec958:")
+      )
+
+    def classify_device(name: str) -> tuple[int, int]:
+      low = name.lower()
+      usb_keywords = [
+        "usb", "uac", "respeaker", "jabra", "samson", "blue", "yeti",
+        "rode", "fifine", "tonor", "boya", "maono", "external", "webcam", "camera",
+      ]
+      builtin_keywords = ["hdmi", "built-in", "bcm", "broadcom", "headphone", "analog", "spdif", "iec958"]
+      if is_generic_alias(name):
+        return (2, 1)
+      if any(kw in low for kw in usb_keywords):
+        return (0, 0)
+      if "(hw:" in low:
+        return (0, 1)
+      if any(kw in low for kw in builtin_keywords):
+        return (1, 0)
+      return (1, 1)
+
+    def label_for(name: str) -> str:
+      category, subcategory = classify_device(name)
+      if category == 0:
+        return "USB/external" if subcategory == 0 else "hardware"
+      if category == 2:
+        return "generic alias"
+      return "built-in"
+
     # Explicit device index (e.g. AUDIO_INPUT_DEVICE_INDEX=1)
     idx_env = os.getenv("AUDIO_INPUT_DEVICE_INDEX")
     if idx_env is not None and idx_env.strip() != "":
       try:
         idx = int(idx_env.strip())
-        self.audio.get_device_info_by_index(idx)
-        logger.info("Using AUDIO_INPUT_DEVICE_INDEX=%d: %s", idx, self.audio.get_device_info_by_index(idx).get("name", ""))
-        return idx
+        info = self.audio.get_device_info_by_index(idx)
+        if info.get("maxInputChannels", 0) <= 0:
+          raise ValueError("device has no input channels")
+        dev = {"index": idx, "name": info.get("name", ""), "info": info}
+        if supports_rate(dev, self.TARGET_RATE):
+          logger.info("Using AUDIO_INPUT_DEVICE_INDEX=%d: %s (%dHz OK)", idx, dev["name"], self.TARGET_RATE)
+          return idx
+        if configure_native_rate(dev):
+          logger.info(
+            "Using AUDIO_INPUT_DEVICE_INDEX=%d: %s (native %dHz — will resample to %dHz)",
+            idx,
+            dev["name"],
+            self.RATE,
+            self.TARGET_RATE,
+          )
+          return idx
+        raise ValueError(f"device does not support {self.TARGET_RATE}Hz or its native rate")
       except (ValueError, OSError) as e:
-        logger.warning("AUDIO_INPUT_DEVICE_INDEX=%s invalid: %s — falling back to auto-detect", idx_env, e)
+        logger.warning("AUDIO_INPUT_DEVICE_INDEX=%s unusable: %s — falling back to auto-detect", idx_env, e)
 
     # Explicit device name substring (e.g. AUDIO_INPUT_DEVICE_NAME="USB PnP")
     name_pattern = os.getenv("AUDIO_INPUT_DEVICE_NAME", "").strip()
     if name_pattern:
       info = self.audio.get_host_api_info_by_index(0)
       for i in range(info.get("deviceCount", 0)):
-        dev = self.audio.get_device_info_by_host_api_device_index(0, i)
-        if dev.get("maxInputChannels", 0) <= 0:
+        device_info = self.audio.get_device_info_by_host_api_device_index(0, i)
+        if device_info.get("maxInputChannels", 0) <= 0:
           continue
-        if name_pattern.lower() in dev.get("name", "").lower():
-          logger.info("Using AUDIO_INPUT_DEVICE_NAME match: [%d] %s", i, dev.get("name"))
+        name = device_info.get("name", "")
+        if name_pattern.lower() not in name.lower():
+          continue
+        dev = {"index": i, "name": name, "info": device_info}
+        if supports_rate(dev, self.TARGET_RATE):
+          logger.info("Using AUDIO_INPUT_DEVICE_NAME match: [%d] %s (%dHz OK)", i, name, self.TARGET_RATE)
+          return i
+        if configure_native_rate(dev):
+          logger.info(
+            "Using AUDIO_INPUT_DEVICE_NAME match: [%d] %s (native %dHz — will resample to %dHz)",
+            i,
+            name,
+            self.RATE,
+            self.TARGET_RATE,
+          )
           return i
       logger.warning("No device matched AUDIO_INPUT_DEVICE_NAME=%r — falling back to auto-detect", name_pattern)
 
@@ -116,66 +195,23 @@ class AudioCaptureService:
     for c in candidates:
       logger.info("  [%d] %s  (rate=%s)", c['index'], c['name'], c['info'].get('defaultSampleRate'))
 
-    # Test which devices actually support our sample rate
-    def supports_sample_rate(dev: dict) -> bool:
-      try:
-        ok = self.audio.is_format_supported(
-          self.RATE,
-          input_device=dev["index"],
-          input_channels=self.CHANNELS,
-          input_format=self.FORMAT,
-        )
-        return bool(ok)
-      except (ValueError, OSError):
-        return False
-
-    # Classify into USB/external vs built-in
-    usb_keywords = ["usb", "uac", "respeaker", "jabra", "samson", "blue",
-                     "yeti", "rode", "fifine", "tonor", "boya", "maono",
-                     "external", "webcam", "camera"]
-    builtin_keywords = ["hdmi", "built-in", "bcm", "broadcom", "headphone",
-                         "analog", "spdif", "iec958"]
-
-    def is_likely_usb(name: str) -> bool:
-      low = name.lower()
-      if any(kw in low for kw in usb_keywords):
-        return True
-      if any(kw in low for kw in builtin_keywords):
-        return False
-      # Unknown device -- treat as external (better to try it than skip it)
-      return True
-
-    # Sort: USB/external first, then built-in
-    candidates.sort(key=lambda c: (0 if is_likely_usb(c["name"]) else 1))
+    # Sort: concrete USB/external first, built-ins next, generic aliases last.
+    # This avoids choosing wrappers like "sysdefault" over the actual USB device.
+    candidates.sort(key=lambda c: classify_device(c["name"]))
 
     # Pick the first candidate that supports our target sample rate
     for c in candidates:
-      if supports_sample_rate(c):
-        label = "USB/external" if is_likely_usb(c["name"]) else "built-in"
+      if supports_rate(c, self.TARGET_RATE):
+        label = label_for(c["name"])
         logger.info("Selected device %d: %s (%s, %dHz OK)", c['index'], c['name'], label, self.TARGET_RATE)
         return c["index"]
 
     logger.info("No device supports %dHz. Trying native rates...", self.TARGET_RATE)
     for c in candidates:
-      native_rate = int(c["info"].get("defaultSampleRate", 0))
-      if native_rate <= 0:
-        continue
-      try:
-        ok = self.audio.is_format_supported(
-          native_rate,
-          input_device=c["index"],
-          input_channels=self.CHANNELS,
-          input_format=self.FORMAT,
-        )
-        if ok:
-          label = "USB/external" if is_likely_usb(c["name"]) else "built-in"
-          logger.info("Selected device %d: %s (%s, native %dHz — will resample to %dHz)", c['index'], c['name'], label, native_rate, self.TARGET_RATE)
-          self.RATE = native_rate
-          # Scale chunk size proportionally so each chunk covers the same time duration
-          self.CHUNK = int(self.config["audio"]["chunk_size"] * native_rate / self.TARGET_RATE)
-          return c["index"]
-      except (ValueError, OSError):
-        continue
+      if configure_native_rate(c):
+        label = label_for(c["name"])
+        logger.info("Selected device %d: %s (%s, native %dHz — will resample to %dHz)", c['index'], c['name'], label, self.RATE, self.TARGET_RATE)
+        return c["index"]
 
     logger.warning("No usable input device found. Falling back to system default.")
     return None
