@@ -40,6 +40,9 @@ services:
     user: "1000:1000"            # Run as host meetingbox user so data volume writes succeed
     environment:
       - PYTHONUNBUFFERED=1
+      # Allow runtime tuning on mini-PC without rebuilding images.
+      - WHISPER_MODEL_PATH=${WHISPER_MODEL_PATH:-/app/whisper.cpp/models/ggml-medium.bin}
+      - WHISPER_THREADS=${WHISPER_THREADS:-4}
     volumes:
       - ./data/audio:/data/audio
       - ./data/transcripts:/data/transcripts
