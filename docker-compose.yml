@@ -21,6 +21,8 @@ services:
     user: "1000:1000"            # Run as host meetingbox user so data volume writes succeed
     environment:
       - PYTHONUNBUFFERED=1
+      - AUDIO_INPUT_DEVICE_INDEX=${AUDIO_INPUT_DEVICE_INDEX:-}
+      - AUDIO_INPUT_DEVICE_NAME=${AUDIO_INPUT_DEVICE_NAME:-}
     volumes:
       - ./data/audio:/data/audio
     devices:

@@ -61,15 +61,41 @@ class AudioCaptureService:
     Auto-detect the best available input device.
 
     Strategy (no hardcoded mic names):
-      1. Enumerate all input-capable devices.
-      2. Test each one to see if it actually supports our sample rate.
-      3. Prefer USB / external devices over built-in ones (they're almost
+      1. If AUDIO_INPUT_DEVICE_INDEX is set, use that index directly.
+      2. If AUDIO_INPUT_DEVICE_NAME is set, use first device whose name contains it.
+      3. Enumerate all input-capable devices.
+      4. Test each one to see if it actually supports our sample rate.
+      5. Prefer USB / external devices over built-in ones (they're almost
          always the meeting mic).
-      4. If nothing passes the sample-rate test, return None (system default).
+      6. If nothing passes the sample-rate test, return None (system default).
 
     This way any USB mic -- ReSpeaker, Jabra, Samson, cheap USB dongle,
     etc. -- works automatically without code changes.
     """
+    # Explicit device index (e.g. AUDIO_INPUT_DEVICE_INDEX=1)
+    idx_env = os.getenv("AUDIO_INPUT_DEVICE_INDEX")
+    if idx_env is not None and idx_env.strip() != "":
+      try:
+        idx = int(idx_env.strip())
+        self.audio.get_device_info_by_index(idx)
+        logger.info("Using AUDIO_INPUT_DEVICE_INDEX=%d: %s", idx, self.audio.get_device_info_by_index(idx).get("name", ""))
+        return idx
+      except (ValueError, OSError) as e:
+        logger.warning("AUDIO_INPUT_DEVICE_INDEX=%s invalid: %s — falling back to auto-detect", idx_env, e)
+
+    # Explicit device name substring (e.g. AUDIO_INPUT_DEVICE_NAME="USB PnP")
+    name_pattern = os.getenv("AUDIO_INPUT_DEVICE_NAME", "").strip()
+    if name_pattern:
+      info = self.audio.get_host_api_info_by_index(0)
+      for i in range(info.get("deviceCount", 0)):
+        dev = self.audio.get_device_info_by_host_api_device_index(0, i)
+        if dev.get("maxInputChannels", 0) <= 0:
+          continue
+        if name_pattern.lower() in dev.get("name", "").lower():
+          logger.info("Using AUDIO_INPUT_DEVICE_NAME match: [%d] %s", i, dev.get("name"))
+          return i
+      logger.warning("No device matched AUDIO_INPUT_DEVICE_NAME=%r — falling back to auto-detect", name_pattern)
+
     info = self.audio.get_host_api_info_by_index(0)
     num_devices = info.get("deviceCount", 0)
 
@@ -309,6 +335,21 @@ class AudioCaptureService:
     except Exception:
       return True  # Assume speech on VAD error
 
+  def _check_silent_audio(self, audio_bytes: bytes, segment_num: int) -> None:
+    """Warn if the captured audio appears to be silent (wrong device or muted mic)."""
+    if segment_num > 0:
+      return
+    samples = np.frombuffer(audio_bytes, dtype=np.int16)
+    peak = int(np.max(np.abs(samples))) if len(samples) > 0 else 0
+    # Typical speech peaks are 2000-20000; silence or wrong device is near 0
+    if peak < 200:
+      logger.warning(
+        "SILENT AUDIO DETECTED (peak=%d). Captured audio may be empty — transcription/summary will be blank. "
+        "Check: 1) AUDIO_INPUT_DEVICE_INDEX or AUDIO_INPUT_DEVICE_NAME in .env (see logs above for device list), "
+        "2) Mic volume and mute switch",
+        peak,
+      )
+
   def save_audio_segment(self, frames: list[bytes], segment_num: int) -> Path:
     assert self.current_session_id is not None
     session_dir = self.temp_dir / self.current_session_id
@@ -316,6 +357,8 @@ class AudioCaptureService:
 
     audio_bytes = b"".join(frames)
     segment_path.parent.mkdir(parents=True, exist_ok=True)
+
+    self._check_silent_audio(audio_bytes, segment_num)
 
     # Resample to target rate (16kHz) if recorded at a different rate
     if self.RATE != self.TARGET_RATE:

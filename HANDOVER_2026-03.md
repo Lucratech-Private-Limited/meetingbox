@@ -233,6 +233,22 @@ These are not blockers.
 
 The device UI has update screens but the backend endpoints don't do real update logic.
 
+### 9. Empty/silent audio — wrong mic selected (segments created but no speech)
+
+**Symptom:** Segments are created (1, 2, 3...) during recording, but when you play the audio file it's silent. Transcription outputs "blank" and summarization has no content. Progress may stick at 68%.
+
+**Root cause:** Segments are created by time (~15 s) and VAD (noise), not by actual speech. The audio container may be capturing the wrong ALSA device (HDMI, built-in mic, or default) instead of your USB mic. Inside Docker, ALSA device order can differ from the host.
+
+**Fix:**
+1. List devices: `./scripts/list_audio_devices.sh` (or `docker compose exec audio python -c "import pyaudio; p=pyaudio.PyAudio(); [print(i,p.get_device_info_by_index(i)['name']) for i in range(p.get_device_count()) if p.get_device_info_by_index(i).get('maxInputChannels')>0]"`)
+2. Add to `.env` to force your USB mic:
+   - By index: `AUDIO_INPUT_DEVICE_INDEX=1` (use the index from the list)
+   - By name: `AUDIO_INPUT_DEVICE_NAME=USB` (substring match, e.g. "Generic USB PnP Sound Device")
+3. Recreate the audio container: `docker compose ... up -d --force-recreate audio`
+4. Check mic volume and mute switch on the device.
+
+If the audio service logs `SILENT AUDIO DETECTED (peak=…)`, the wrong device is being used.
+
 ## How to Operate
 
 ### Start everything
