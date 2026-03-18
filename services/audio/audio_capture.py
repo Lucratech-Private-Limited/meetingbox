@@ -152,9 +152,8 @@ class AudioCaptureService:
     # Explicit device name substring (e.g. AUDIO_INPUT_DEVICE_NAME="USB PnP")
     name_pattern = os.getenv("AUDIO_INPUT_DEVICE_NAME", "").strip()
     if name_pattern:
-      info = self.audio.get_host_api_info_by_index(0)
-      for i in range(info.get("deviceCount", 0)):
-        device_info = self.audio.get_device_info_by_host_api_device_index(0, i)
+      for i in range(self.audio.get_device_count()):
+        device_info = self.audio.get_device_info_by_index(i)
         if device_info.get("maxInputChannels", 0) <= 0:
           continue
         name = device_info.get("name", "")
@@ -175,13 +174,12 @@ class AudioCaptureService:
           return i
       logger.warning("No device matched AUDIO_INPUT_DEVICE_NAME=%r — falling back to auto-detect", name_pattern)
 
-    info = self.audio.get_host_api_info_by_index(0)
-    num_devices = info.get("deviceCount", 0)
+    num_devices = self.audio.get_device_count()
 
     # Collect every input device with its metadata
     candidates: list[dict] = []
     for i in range(num_devices):
-      device_info = self.audio.get_device_info_by_host_api_device_index(0, i)
+      device_info = self.audio.get_device_info_by_index(i)
       if device_info.get("maxInputChannels", 0) <= 0:
         continue
       name = device_info.get("name", "")
