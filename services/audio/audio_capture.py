@@ -35,6 +35,10 @@ class AudioCaptureService:
     self.is_recording = False
     self.current_session_id: str | None = None
     self._recording_thread: object | None = None  # threading.Thread
+    self.recording_path: Path | None = None
+    self._recording_wave: wave.Wave_write | None = None
+    self._silent_probe = bytearray()
+    self._silent_probe_checked = False
 
     self.vad = webrtcvad.Vad(self.config["vad"]["aggressiveness"])
 
@@ -240,9 +244,10 @@ class AudioCaptureService:
 
     self.current_session_id = session_id
     self.is_recording = True
-
-    session_temp = self.temp_dir / session_id
-    session_temp.mkdir(parents=True, exist_ok=True)
+    self.recording_path = self.recordings_dir / f"{session_id}.wav"
+    self.recordings_dir.mkdir(parents=True, exist_ok=True)
+    self._silent_probe = bytearray()
+    self._silent_probe_checked = False
 
     mic_index = self.find_mic_device()
     self.stream = self.audio.open(
@@ -253,6 +258,10 @@ class AudioCaptureService:
       input_device_index=mic_index,
       frames_per_buffer=self.CHUNK,
     )
+    self._recording_wave = wave.open(str(self.recording_path), "wb")
+    self._recording_wave.setnchannels(self.CHANNELS)
+    self._recording_wave.setsampwidth(self.audio.get_sample_size(self.FORMAT))
+    self._recording_wave.setframerate(self.TARGET_RATE)
 
     self.redis_client.publish(
       "events",
@@ -316,7 +325,11 @@ class AudioCaptureService:
       self.stream.close()
       self.stream = None
 
-    final_path = self.combine_segments()
+    if self._recording_wave is not None:
+      self._recording_wave.close()
+      self._recording_wave = None
+
+    final_path = self.recording_path
 
     self.redis_client.publish(
       "events",
@@ -344,6 +357,7 @@ class AudioCaptureService:
 
     session_id = self.current_session_id
     self.current_session_id = None
+    self.recording_path = None
     return session_id
 
   # --- Segmentation helpers -------------------------------------------
@@ -420,51 +434,25 @@ class AudioCaptureService:
 
   def recording_loop(self) -> None:
     """
-    Blocking loop that reads from the input stream, applies VAD, and
-    saves segments when either:
-    - a maximum number of chunks is reached, or
-    - sufficient audio followed by a pause is detected.
+    Blocking loop that reads from the input stream and appends audio
+    directly to the final WAV file for the active session.
     """
-    segment_num = 0
-    current_frames: list[bytes] = []
-    silence_chunks = 0
-
-    MIN_SEGMENT_CHUNKS = 50
-    MAX_SEGMENT_CHUNKS = 500
-    SILENCE_THRESHOLD = 10
-
     try:
       while self.is_recording:
         assert self.stream is not None
+        assert self._recording_wave is not None
         chunk = self.stream.read(self.CHUNK, exception_on_overflow=False)
-        is_speech = self.process_audio_chunk(chunk)
+        audio_bytes = self._resample(chunk, self.RATE, self.TARGET_RATE) if self.RATE != self.TARGET_RATE else chunk
+        self._recording_wave.writeframes(audio_bytes)
 
-        current_frames.append(chunk)
-
-        if is_speech:
-          silence_chunks = 0
-        else:
-          silence_chunks += 1
-
-        should_save = False
-        if len(current_frames) >= MAX_SEGMENT_CHUNKS:
-          should_save = True
-        elif len(current_frames) >= MIN_SEGMENT_CHUNKS and silence_chunks >= SILENCE_THRESHOLD:
-          should_save = True
-
-        if should_save and current_frames:
-          self.save_audio_segment(current_frames, segment_num)
-          logger.info("Saved segment %d (%d chunks)", segment_num, len(current_frames))
-          segment_num += 1
-          current_frames = []
-          silence_chunks = 0
+        if not self._silent_probe_checked:
+          self._silent_probe.extend(audio_bytes)
+          if len(self._silent_probe) >= self.TARGET_RATE * self.CHANNELS * 2:
+            self._check_silent_audio(bytes(self._silent_probe), 0)
+            self._silent_probe_checked = True
 
     except Exception:
       logger.exception("Error in recording loop")
-
-    finally:
-      if current_frames:
-        self.save_audio_segment(current_frames, segment_num)
 
   def combine_segments(self) -> Path | None:
     """Merge all segment WAVs into a single recording file."""
