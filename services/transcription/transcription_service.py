@@ -418,10 +418,10 @@ class TranscriptionService:
   # --- Event loop ------------------------------------------------------
 
   def run(self) -> None:
-    logger.info("Service started, waiting for recording and segment events...")
+    logger.info("Service started, waiting for recording events...")
 
     pubsub = self.redis_client.pubsub()
-    pubsub.subscribe("events", "audio_segments")
+    pubsub.subscribe("events")
 
     for message in pubsub.listen():
       if message["type"] != "message":
@@ -432,14 +432,8 @@ class TranscriptionService:
       except json.JSONDecodeError:
         continue
 
-      channel = message.get("channel")
-
       def set_recording_idle() -> None:
         self.redis_client.set("recording_state", "idle")
-
-      if channel == "audio_segments":
-        self._handle_audio_segment(event)
-        continue
 
       event_type = event.get("type")
       if event_type == "recording_started":
@@ -462,10 +456,19 @@ class TranscriptionService:
       self._ensure_meeting_record(meeting_id, audio_path, status="finalizing")
       self._update_processing_state(meeting_id, recording_stopped=1)
 
-      if not self._finalize_incremental_transcription(meeting_id, audio_path):
+      if not audio_path:
+        logger.warning("recording_stopped missing audio path for %s", meeting_id)
         self._set_meeting_status(meeting_id, "transcription_failed")
         set_recording_idle()
         continue
+
+      transcription = self.transcribe_with_whisper(audio_path)
+      if not transcription:
+        self._set_meeting_status(meeting_id, "transcription_failed")
+        set_recording_idle()
+        continue
+
+      self._save_transcription(meeting_id, transcription)
 
       state = self._get_processing_state(meeting_id)
       self._set_meeting_status(meeting_id, "transcribed")
