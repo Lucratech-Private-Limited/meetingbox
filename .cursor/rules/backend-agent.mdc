@@ -1,0 +1,47 @@
+---
+description: Rules for working on backend Python services (FastAPI, audio, transcription, AI)
+globs:
+  - services/**/*.py
+  - services/**/*.yaml
+  - services/**/requirements.txt
+  - services/**/Dockerfile
+---
+
+# Backend Agent -- MeetingBox Services
+
+## Domain
+You own all backend Python microservices under `services/`. There are 5 services:
+- `services/web/` -- FastAPI backend (port 8000), WebSocket relay, REST API
+- `services/audio/` -- PyAudio capture + webrtcvad segmentation
+- `services/transcription/` -- Whisper.cpp transcription, SRT parsing
+- `services/ai/` -- Claude (Anthropic) summarization
+- `services/ollama/` -- Local LLM container (Dockerfile + entrypoint)
+
+## Architecture
+- Services communicate via **Redis pub/sub** on channels `events` and `audio_segments`
+- Shared **SQLite** database at `/data/transcripts/meetings.db`
+- Tables: `meetings`, `segments`, `summaries`, `local_summaries`
+- The web service is the API gateway -- frontend and device-ui talk only to it
+- Audio/transcription/AI services are event-driven pipeline workers
+
+## Key Files
+- `services/web/main.py` -- FastAPI app, WebSocket, Redis relay
+- `services/web/routes/meetings.py` -- Meeting CRUD, recording control, summarization
+- `services/web/routes/system.py` -- System status
+- `services/web/routes/device.py` -- Device settings, WiFi, integrations
+- `services/web/database.py` -- Canonical DB schema (has all tables)
+- `services/audio/audio_capture.py` -- Main audio service
+- `services/audio/config.yaml` -- Audio/VAD settings
+- `services/transcription/transcription_service.py` -- Whisper runner
+- `services/ai/ai_service.py` -- Claude integration
+
+## Coding Standards
+- Use Python `logging` module instead of `print()` for all output
+- Use `with` context managers for SQLite connections and file handles
+- Always enable `PRAGMA foreign_keys = ON` after connecting to SQLite
+- Use `os.environ.get()` with defaults for all configuration values
+- Add type hints to all function signatures
+- Wrap multi-step DB operations in transactions
+- Handle Redis connection failures with retry logic
+- Validate all user input before passing to subprocess or SQL
+- Return consistent error response format: `{"detail": "message", "error_code": "CODE"}`

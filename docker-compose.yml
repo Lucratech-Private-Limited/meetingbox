@@ -1,0 +1,207 @@
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: meetingbox-redis
+    restart: unless-stopped
+    # No host port binding — Redis is only reachable inside the Docker
+    # network (meetingbox-net). Exposing port 6379 to the host is not
+    # needed and conflicts if a native redis-server is running.
+    volumes:
+      - redis-data:/data
+    networks:
+      - meetingbox-net
+
+  audio:
+    build:
+      context: ./services/audio
+    container_name: meetingbox-audio
+    restart: unless-stopped
+    depends_on:
+      - redis
+    user: "1000:1000"            # Run as host meetingbox user so data volume writes succeed
+    environment:
+      - PYTHONUNBUFFERED=1
+      - AUDIO_INPUT_DEVICE_INDEX=${AUDIO_INPUT_DEVICE_INDEX:-}
+      - AUDIO_INPUT_DEVICE_NAME=${AUDIO_INPUT_DEVICE_NAME:-}
+    volumes:
+      - ./data/audio:/data/audio
+    devices:
+      - /dev/snd:/dev/snd       # Pass ALSA devices into the container (Linux only)
+    group_add:
+      - audio                    # Add container to host audio group (Linux only)
+    networks:
+      - meetingbox-net
+
+  transcription:
+    build:
+      context: ./services/transcription
+    container_name: meetingbox-transcription
+    restart: unless-stopped
+    depends_on:
+      - redis
+    user: "1000:1000"            # Run as host meetingbox user so data volume writes succeed
+    environment:
+      - PYTHONUNBUFFERED=1
+      # Allow runtime tuning on mini-PC without rebuilding images.
+      - WHISPER_MODEL_PATH=${WHISPER_MODEL_PATH:-/app/whisper.cpp/models/ggml-medium.bin}
+      - WHISPER_THREADS=${WHISPER_THREADS:-4}
+    volumes:
+      - ./data/audio:/data/audio
+      - ./data/transcripts:/data/transcripts
+    networks:
+      - meetingbox-net
+
+  ai:
+    build:
+      context: ./services/ai
+    container_name: meetingbox-ai
+    restart: unless-stopped
+    depends_on:
+      - redis
+      - ollama
+    user: "1000:1000"            # Run as host meetingbox user so data volume writes succeed
+    environment:
+      - PYTHONUNBUFFERED=1
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - OLLAMA_HOST=http://ollama:11434
+      - LOCAL_LLM_MODEL=${LOCAL_LLM_MODEL:-phi3:mini}
+      - USE_LOCAL_LLM=${USE_LOCAL_LLM:-true}
+    volumes:
+      - ./data/transcripts:/data/transcripts
+    networks:
+      - meetingbox-net
+
+  ollama:
+    build:
+      context: ./services/ollama
+    container_name: meetingbox-ollama
+    restart: unless-stopped
+    environment:
+      - LOCAL_LLM_MODEL=${LOCAL_LLM_MODEL:-phi3:mini}
+    volumes:
+      - ollama-data:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+    networks:
+      - meetingbox-net
+
+  web:
+    build:
+      context: ./services/web
+    container_name: meetingbox-web
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_started
+      ollama:
+        condition: service_healthy
+    environment:
+      - PYTHONUNBUFFERED=1
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - AI_MODEL=${AI_MODEL:-claude-sonnet-4-20250514}
+      - OLLAMA_HOST=http://ollama:11434
+      - LOCAL_LLM_MODEL=${LOCAL_LLM_MODEL:-phi3:mini}
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY}
+      - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:-}
+      - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET:-}
+      - APP_BASE_URL=${APP_BASE_URL:-http://localhost:8000}
+      - FRONTEND_BASE_URL=${FRONTEND_BASE_URL:-}
+    volumes:
+      - ./data/transcripts:/data/transcripts
+      - ./data/audio:/data/audio
+      - ./data/config:/data/config
+      - ./frontend/dist:/app/static
+    networks:
+      - meetingbox-net
+
+  nginx:
+    image: nginx:alpine
+    container_name: meetingbox-nginx
+    restart: unless-stopped
+    depends_on:
+      - web
+    ports:
+      - "80:80"
+      - "8000:8000"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./frontend/dist:/usr/share/nginx/html:ro
+    networks:
+      - meetingbox-net
+
+  # ================================================================
+  # Device UI — Kivy appliance interface
+  # ================================================================
+  # Renders directly to the attached display via X11 passthrough.
+  # Requires: X server running on the host (startx / lightdm).
+  #
+  # DEV MODE: profiles: ["screen"] means this container does NOT
+  # auto-start with 'docker compose up'. To start it manually:
+  #   docker compose --profile screen up -d device-ui
+  # Remove the profiles line for production.
+  # ================================================================
+  device-ui:
+    build:
+      context: ./device-ui
+    container_name: meetingbox-ui
+    profiles:
+      - screen
+    restart: unless-stopped
+    depends_on:
+      - web
+      - redis
+    environment:
+      - PYTHONUNBUFFERED=1
+      # Point to the web service inside the Docker network
+      - BACKEND_URL=http://web:8000
+      - BACKEND_WS_URL=ws://web:8000/ws
+      # Display: use the host X server
+      - DISPLAY=${DISPLAY:-:0}
+      # Kivy settings
+      - KIVY_WINDOW=sdl2
+      - KIVY_NO_CONSOLELOG=1
+      # Fullscreen mode — set to 1 for dedicated kiosk display,
+      # 0 for windowed mode on a normal desktop.
+      - FULLSCREEN=0
+      - MOCK_BACKEND=0
+      # GPU rendering: allow Mesa to use the host DRI device.
+      # LIBGL_ALWAYS_SOFTWARE=1 is the fallback if DRI is still
+      # inaccessible (e.g. wrong render group GID on the host).
+      - LIBGL_ALWAYS_SOFTWARE=1
+    volumes:
+      # X11 socket — lets the container draw on the host display
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      # Persistent device config (settings, setup marker)
+      - ./data/config:/data/config
+      # No Xauthority mount needed — the host .xinitrc runs
+      # 'xhost +local:' which allows all local socket connections
+      # without a magic cookie. Mounting the file caused failures
+      # when it didn't exist yet at container start time.
+    devices:
+      # Pass the GPU into the container so Mesa can use hardware rendering.
+      # If this path does not exist on the host, remove this block.
+      - /dev/dri:/dev/dri
+    group_add:
+      # Give the container user access to DRI render nodes.
+      # GID 44  = video group on Ubuntu (card devices)
+      # GID 109 = render group on Ubuntu 24.04 (renderD* devices)
+      - "44"
+      - "109"
+    networks:
+      - meetingbox-net
+    # NOTE: For production with a touchscreen, uncomment:
+    # devices:
+    #   - /dev/input:/dev/input
+
+volumes:
+  redis-data:
+  ollama-data:
+
+networks:
+  meetingbox-net:
+    driver: bridge
+

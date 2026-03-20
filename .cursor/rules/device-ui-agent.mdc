@@ -1,0 +1,49 @@
+---
+description: Rules for working on the Kivy touchscreen device UI
+globs:
+  - device-ui/**/*.py
+  - device-ui/requirements.txt
+  - device-ui/Dockerfile
+---
+
+# Device UI Agent -- MeetingBox Kivy Touchscreen
+
+## Domain
+You own the Kivy-based OLED touchscreen UI under `device-ui/src/`. This runs on a Raspberry Pi 5 with a 3.5" OLED display.
+
+## Architecture
+- **Kivy 2.3+** GUI framework with SDL2 backend
+- Connects to the web service backend via **httpx** (async HTTP) and **websockets**
+- Screen manager handles navigation between screens
+- Designed for 480x320 resolution touchscreen
+
+## Key Files
+- `main.py` -- Kivy app entry, screen manager, WebSocket listener
+- `config.py` -- Colors, fonts, sizes, backend URLs, display settings
+- `api_client.py` -- Async HTTP client for backend API
+- `mock_backend.py` -- Mock backend for development/testing
+- `screens/` -- All screen classes (home, recording, meetings, settings, WiFi, etc.)
+- `components/` -- Reusable widgets (button, card, status_bar, modal, etc.)
+
+## Screen Flow
+Splash -> Welcome -> WiFi Setup -> Setup Progress -> All Set -> Home
+Home -> Recording -> Processing -> Complete
+Home -> Meetings -> Meeting Detail
+Home -> Settings -> WiFi / System / Pickers
+
+## Backend API Dependency
+The device UI calls these backend endpoints:
+- `GET/POST /api/meetings/*` -- recording control, meeting list/detail
+- `GET/PATCH /api/device/settings` -- device settings
+- `GET /api/device/wifi/scan`, `POST /api/device/wifi/connect` -- WiFi
+- `GET /api/system/status` -- system info
+- `WS /ws` -- real-time events
+
+## Coding Standards
+- Always cancel Clock events and scheduled callbacks in `on_leave()` or cleanup methods
+- Use try/finally for resource cleanup
+- Reference colors from `config.COLORS` dict -- never hardcode hex values
+- Handle API errors gracefully with user-visible feedback
+- Use `self.app.screen_manager` for navigation, not `self.manager`
+- All async operations must handle connection errors and timeouts
+- Test with mock backend before testing against real backend

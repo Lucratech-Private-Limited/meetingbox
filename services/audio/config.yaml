@@ -1,0 +1,12 @@
+audio:
+  sample_rate: 16000
+  channels: 1
+  chunk_size: 480
+
+vad:
+  aggressiveness: 2
+
+storage:
+  temp_dir: /data/audio/temp
+  recordings_dir: /data/audio/recordings
+

@@ -1,0 +1,19 @@
+[Unit]
+Description=MeetingBox First-Time Onboarding (Hotspot + Setup Portal)
+After=NetworkManager.service
+Before=meetingbox.service
+ConditionPathExists=!/opt/meetingbox/data/config/.setup_complete
+
+[Service]
+Type=forking
+# If WiFi is already connected, skip onboarding/hotspot flow.
+ExecCondition=/bin/bash -c '! nmcli -t -f TYPE,STATE dev | grep -q "^wifi:connected$"'
+ExecStartPre=/bin/bash /opt/meetingbox/scripts/hotspot.sh start
+ExecStart=/usr/bin/python3 /opt/meetingbox/scripts/onboard_server.py
+ExecStop=/bin/bash /opt/meetingbox/scripts/hotspot.sh stop
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=30
+
+[Install]
+WantedBy=multi-user.target

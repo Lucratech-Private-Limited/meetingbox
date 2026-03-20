@@ -1,0 +1,46 @@
+---
+description: Rules for working on the React/TypeScript frontend dashboard
+globs:
+  - frontend/src/**/*.tsx
+  - frontend/src/**/*.ts
+  - frontend/src/**/*.css
+  - frontend/package.json
+  - frontend/vite.config.ts
+  - frontend/tailwind.config.js
+---
+
+# Frontend Agent -- MeetingBox Dashboard
+
+## Domain
+You own the React SPA under `frontend/src/`. The dashboard is served as static files by the FastAPI backend at port 8000.
+
+## Architecture
+- **React 18** + **TypeScript** + **Vite** build
+- **Zustand** for state management (3 stores: auth, meeting, action)
+- **Tailwind CSS** + **Headless UI** for styling
+- **Axios** for HTTP calls to `/api/*` endpoints
+- **WebSocket** at `/ws` for real-time events from Redis
+- **React Router v6** for client-side routing
+
+## Key Files
+- `App.tsx` -- Root component, routing, onboarding guard
+- `pages/` -- Dashboard, MeetingDetail, LiveRecording, Settings, SystemStatus, Onboarding
+- `api/client.ts` -- Axios instance with interceptors
+- `api/meetings.ts`, `api/actions.ts`, `api/settings.ts`, `api/integrations.ts` -- API modules
+- `store/authStore.ts`, `store/meetingStore.ts`, `store/actionStore.ts` -- Zustand stores
+- `hooks/useWebSocket.ts` -- Auto-reconnecting WebSocket hook
+- `components/ui/` -- Reusable UI primitives (Button, Card, Modal, Badge, etc.)
+- `types/` -- TypeScript type definitions
+
+## API Base URL
+All API calls go to the same origin (relative URLs). WebSocket connects to `ws://${window.location.host}/ws`.
+
+## Coding Standards
+- Never leave `console.log` / `console.warn` / `console.error` in production code
+- Every page must have loading, error, and empty states
+- Use proper TypeScript types -- avoid `any` and unchecked type assertions
+- Clean up all side effects (intervals, timeouts, WebSocket) in useEffect return
+- Use Tailwind utility classes, no inline styles
+- All lists should use stable unique keys (not array index)
+- Handle null/undefined defensively -- use optional chaining and nullish coalescing
+- Error boundaries should wrap route-level components

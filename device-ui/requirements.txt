@@ -1,0 +1,26 @@
+# UI Framework
+kivy>=2.3.1
+kivy-garden>=0.1.5
+
+# HTTP Client for Backend API
+httpx>=0.27.0
+websockets>=12.0
+
+# Async support
+aiofiles>=23.2.1
+
+# Image handling
+Pillow>=10.2.0
+
+# Audio capture (mic test)
+sounddevice>=0.4.6
+
+# QR Code generation
+qrcode>=7.4.2
+
+# Date/time formatting
+python-dateutil>=2.8.2
+
+# Testing
+pytest>=8.0.0
+pytest-asyncio>=0.23.5

@@ -1,0 +1,48 @@
+---
+description: Rules for working on Docker, deployment scripts, and infrastructure
+globs:
+  - docker-compose.yml
+  - .env.example
+  - scripts/**
+  - "**/Dockerfile"
+  - .gitignore
+  - "*.md"
+---
+
+# Infrastructure Agent -- MeetingBox DevOps
+
+## Domain
+You own Docker orchestration, deployment scripts, and infrastructure configuration.
+
+## Architecture
+- **Docker Compose** orchestrates 7 services: redis, audio, transcription, ai, ollama, web, device-ui
+- All services on `meetingbox-net` bridge network
+- Data persists in `./data/` (audio, transcripts/SQLite, config)
+- Frontend built separately, mounted as static files into web container
+- Device UI is optional (Docker profile: `screen`)
+
+## Key Files
+- `docker-compose.yml` -- Service definitions, volumes, networks
+- `.env.example` -- Environment variable template
+- `services/*/Dockerfile` -- Per-service container builds
+- `scripts/setup_vm.sh` -- Ubuntu VM setup (Docker, Node, ALSA, mDNS)
+- `scripts/setup_pi5.sh` -- Raspberry Pi 5 setup
+- `scripts/hotspot.sh` -- WiFi hotspot management
+- `scripts/onboard_server.py` -- First-boot WiFi configuration server
+- `scripts/install_device_ui.sh` -- Device UI installation
+- `scripts/dev_restart.sh` -- Development restart helper
+- `DEPLOY_LINUX.md` -- Full deployment guide
+
+## Deployment Targets
+- Primary: Raspberry Pi 5 (Ubuntu 24.04, 4GB RAM)
+- Secondary: Ubuntu VM in VirtualBox (for development)
+- Audio service requires `/dev/snd` passthrough on Linux
+
+## Coding Standards
+- Shell scripts must have error handling (`set -e` or explicit checks)
+- Check for command existence before using (`command -v`)
+- Use environment variables with defaults for all configurable values
+- Document all non-obvious Docker configuration with comments
+- Keep .gitignore comprehensive (no secrets, build artifacts, or IDE files)
+- Dockerfiles should use multi-stage builds where beneficial
+- Pin dependency versions in requirements.txt and Dockerfiles
