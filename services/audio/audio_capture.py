@@ -28,7 +28,9 @@ class AudioCaptureService:
       self.config = yaml.safe_load(f)
 
     self.TARGET_RATE = self.config["audio"]["sample_rate"]  # 16000 for Whisper
-    self.CHANNELS = self.config["audio"]["channels"]
+    self.TARGET_CHANNELS = self.config["audio"]["channels"]
+    self.CHANNELS = self.TARGET_CHANNELS
+    self.CAPTURE_CHANNELS = self.TARGET_CHANNELS
     self.FORMAT = pyaudio.paInt16
 
     self.is_recording = False
@@ -52,7 +54,7 @@ class AudioCaptureService:
     self.RATE = self.TARGET_RATE
     self.CHUNK = self.config["audio"]["chunk_size"]
 
-    logger.info("Initialized - target %dHz, %dch", self.TARGET_RATE, self.CHANNELS)
+    logger.info("Initialized - target %dHz, %dch", self.TARGET_RATE, self.TARGET_CHANNELS)
 
   # --- Device handling -------------------------------------------------
 
@@ -72,23 +74,37 @@ class AudioCaptureService:
     This way any USB mic -- ReSpeaker, Jabra, Samson, cheap USB dongle,
     etc. -- works automatically without code changes.
     """
-    def supports_rate(dev: dict, rate: int) -> bool:
+    self.CAPTURE_CHANNELS = self.TARGET_CHANNELS
+
+    def supports_rate(dev: dict, rate: int, channels: int) -> bool:
       try:
         ok = self.audio.is_format_supported(
           rate,
           input_device=dev["index"],
-          input_channels=self.CHANNELS,
+          input_channels=channels,
           input_format=self.FORMAT,
         )
         return bool(ok)
       except (ValueError, OSError):
         return False
 
+    def pick_capture_channels(dev: dict, rate: int) -> int | None:
+      preferred_channels = [self.TARGET_CHANNELS]
+      max_input_channels = int(dev["info"].get("maxInputChannels", 0) or 0)
+      if self.TARGET_CHANNELS == 1 and max_input_channels >= 2:
+        preferred_channels.append(2)
+      for channels in preferred_channels:
+        if supports_rate(dev, rate, channels):
+          return channels
+      return None
+
     def configure_native_rate(dev: dict) -> bool:
       native_rate = int(dev["info"].get("defaultSampleRate", 0))
-      if native_rate <= 0 or not supports_rate(dev, native_rate):
+      capture_channels = pick_capture_channels(dev, native_rate)
+      if native_rate <= 0 or capture_channels is None:
         return False
       self.RATE = native_rate
+      self.CAPTURE_CHANNELS = capture_channels
       # Scale chunk size proportionally so each chunk covers the same time duration
       self.CHUNK = int(self.config["audio"]["chunk_size"] * native_rate / self.TARGET_RATE)
       return True
@@ -133,15 +149,24 @@ class AudioCaptureService:
         if info.get("maxInputChannels", 0) <= 0:
           raise ValueError("device has no input channels")
         dev = {"index": idx, "name": info.get("name", ""), "info": info}
-        if supports_rate(dev, self.TARGET_RATE):
-          logger.info("Using AUDIO_INPUT_DEVICE_INDEX=%d: %s (%dHz OK)", idx, dev["name"], self.TARGET_RATE)
+        capture_channels = pick_capture_channels(dev, self.TARGET_RATE)
+        if capture_channels is not None:
+          self.CAPTURE_CHANNELS = capture_channels
+          logger.info(
+            "Using AUDIO_INPUT_DEVICE_INDEX=%d: %s (%dHz OK, capture=%dch)",
+            idx,
+            dev["name"],
+            self.TARGET_RATE,
+            self.CAPTURE_CHANNELS,
+          )
           return idx
         if configure_native_rate(dev):
           logger.info(
-            "Using AUDIO_INPUT_DEVICE_INDEX=%d: %s (native %dHz — will resample to %dHz)",
+            "Using AUDIO_INPUT_DEVICE_INDEX=%d: %s (native %dHz, capture=%dch — will resample to %dHz)",
             idx,
             dev["name"],
             self.RATE,
+            self.CAPTURE_CHANNELS,
             self.TARGET_RATE,
           )
           return idx
@@ -160,15 +185,24 @@ class AudioCaptureService:
         if name_pattern.lower() not in name.lower():
           continue
         dev = {"index": i, "name": name, "info": device_info}
-        if supports_rate(dev, self.TARGET_RATE):
-          logger.info("Using AUDIO_INPUT_DEVICE_NAME match: [%d] %s (%dHz OK)", i, name, self.TARGET_RATE)
+        capture_channels = pick_capture_channels(dev, self.TARGET_RATE)
+        if capture_channels is not None:
+          self.CAPTURE_CHANNELS = capture_channels
+          logger.info(
+            "Using AUDIO_INPUT_DEVICE_NAME match: [%d] %s (%dHz OK, capture=%dch)",
+            i,
+            name,
+            self.TARGET_RATE,
+            self.CAPTURE_CHANNELS,
+          )
           return i
         if configure_native_rate(dev):
           logger.info(
-            "Using AUDIO_INPUT_DEVICE_NAME match: [%d] %s (native %dHz — will resample to %dHz)",
+            "Using AUDIO_INPUT_DEVICE_NAME match: [%d] %s (native %dHz, capture=%dch — will resample to %dHz)",
             i,
             name,
             self.RATE,
+            self.CAPTURE_CHANNELS,
             self.TARGET_RATE,
           )
           return i
@@ -202,13 +236,30 @@ class AudioCaptureService:
     # of generic aliases like "sysdefault", even when the USB device needs
     # resampling to 16kHz.
     for c in candidates:
-      if supports_rate(c, self.TARGET_RATE):
+      capture_channels = pick_capture_channels(c, self.TARGET_RATE)
+      if capture_channels is not None:
+        self.CAPTURE_CHANNELS = capture_channels
         label = label_for(c["name"])
-        logger.info("Selected device %d: %s (%s, %dHz OK)", c['index'], c['name'], label, self.TARGET_RATE)
+        logger.info(
+          "Selected device %d: %s (%s, %dHz OK, capture=%dch)",
+          c['index'],
+          c['name'],
+          label,
+          self.TARGET_RATE,
+          self.CAPTURE_CHANNELS,
+        )
         return c["index"]
       if configure_native_rate(c):
         label = label_for(c["name"])
-        logger.info("Selected device %d: %s (%s, native %dHz — will resample to %dHz)", c['index'], c['name'], label, self.RATE, self.TARGET_RATE)
+        logger.info(
+          "Selected device %d: %s (%s, native %dHz, capture=%dch — will resample to %dHz)",
+          c['index'],
+          c['name'],
+          label,
+          self.RATE,
+          self.CAPTURE_CHANNELS,
+          self.TARGET_RATE,
+        )
         return c["index"]
 
     logger.warning("No usable input device found. Falling back to system default.")
@@ -227,6 +278,21 @@ class AudioCaptureService:
     indices = np.linspace(0, len(samples) - 1, num_out)
     resampled = np.interp(indices, np.arange(len(samples)), samples)
     return resampled.astype(np.int16).tobytes()
+
+  def _prepare_audio_bytes(self, chunk: bytes) -> bytes:
+    """Convert captured PCM into the mono target format used for storage."""
+    audio_bytes = chunk
+    if self.CAPTURE_CHANNELS != self.TARGET_CHANNELS:
+      if self.TARGET_CHANNELS != 1 or self.CAPTURE_CHANNELS < 2:
+        raise ValueError(
+          f"Unsupported channel conversion: capture={self.CAPTURE_CHANNELS}, target={self.TARGET_CHANNELS}"
+        )
+      samples = np.frombuffer(audio_bytes, dtype=np.int16)
+      frames = samples.reshape(-1, self.CAPTURE_CHANNELS)
+      audio_bytes = frames.mean(axis=1).astype(np.int16).tobytes()
+    if self.RATE != self.TARGET_RATE:
+      audio_bytes = self._resample(audio_bytes, self.RATE, self.TARGET_RATE)
+    return audio_bytes
 
   # --- Recording lifecycle ---------------------------------------------
 
@@ -247,7 +313,7 @@ class AudioCaptureService:
     mic_index = self.find_mic_device()
     self.stream = self.audio.open(
       format=self.FORMAT,
-      channels=self.CHANNELS,
+      channels=self.CAPTURE_CHANNELS,
       rate=self.RATE,
       input=True,
       input_device_index=mic_index,
@@ -257,7 +323,7 @@ class AudioCaptureService:
     output_path = self.recordings_dir / f"{session_id}.wav"
     output_path.parent.mkdir(parents=True, exist_ok=True)
     wav_writer = wave.open(str(output_path), "wb")
-    wav_writer.setnchannels(self.CHANNELS)
+    wav_writer.setnchannels(self.TARGET_CHANNELS)
     wav_writer.setsampwidth(self.audio.get_sample_size(self.FORMAT))
     wav_writer.setframerate(self.TARGET_RATE)
     self._output_path = output_path
@@ -445,7 +511,7 @@ class AudioCaptureService:
       while self.is_recording:
         assert self.stream is not None
         chunk = self.stream.read(self.CHUNK, exception_on_overflow=False)
-        audio_bytes = self._resample(chunk, self.RATE, self.TARGET_RATE) if self.RATE != self.TARGET_RATE else chunk
+        audio_bytes = self._prepare_audio_bytes(chunk)
 
         if not checked_audio:
           self._check_silent_audio(audio_bytes, 0)
