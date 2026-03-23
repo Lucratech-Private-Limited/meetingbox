@@ -197,15 +197,15 @@ class AudioCaptureService:
     # This avoids choosing wrappers like "sysdefault" over the actual USB device.
     candidates.sort(key=lambda c: classify_device(c["name"]))
 
-    # Pick the first candidate that supports our target sample rate
+    # Pick the first preferred candidate that supports either our target
+    # sample rate or its native rate. This keeps concrete USB devices ahead
+    # of generic aliases like "sysdefault", even when the USB device needs
+    # resampling to 16kHz.
     for c in candidates:
       if supports_rate(c, self.TARGET_RATE):
         label = label_for(c["name"])
         logger.info("Selected device %d: %s (%s, %dHz OK)", c['index'], c['name'], label, self.TARGET_RATE)
         return c["index"]
-
-    logger.info("No device supports %dHz. Trying native rates...", self.TARGET_RATE)
-    for c in candidates:
       if configure_native_rate(c):
         label = label_for(c["name"])
         logger.info("Selected device %d: %s (%s, native %dHz — will resample to %dHz)", c['index'], c['name'], label, self.RATE, self.TARGET_RATE)
