@@ -22,7 +22,7 @@ DEFAULT_WHISPER_ROOT = Path(os.getenv("WHISPER_ROOT", "/app/whisper.cpp"))
 
 class TranscriptionService:
   """
-  Consume completed recordings, run Whisper.cpp (medium model) on them,
+  Consume completed recordings, run Whisper.cpp (tiny model) on them,
   and persist structured transcript segments into SQLite.
   """
 
@@ -37,7 +37,7 @@ class TranscriptionService:
     )
     self.model_path = os.getenv(
       "WHISPER_MODEL_PATH",
-      str(DEFAULT_WHISPER_ROOT / "models" / "ggml-medium.bin"),
+      str(DEFAULT_WHISPER_ROOT / "models" / "ggml-tiny.bin"),
     )
 
     logger.info("Service initialized, model=%s, DB=%s", self.model_path, DB_PATH)

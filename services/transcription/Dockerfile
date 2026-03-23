@@ -16,10 +16,10 @@ RUN git clone https://github.com/ggerganov/whisper.cpp.git && \
   cmake -B build && \
   cmake --build build --config Release
 
-# Download medium model (~1.5GB) — used for all transcription (Telugu/multilingual)
+# Download tiny model — fast default for on-device transcription
 RUN cd /app/whisper.cpp/models && \
-  bash -c 'wget -q --show-progress -O ggml-medium.bin https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.bin' && \
-  test -f ggml-medium.bin
+  bash -c 'wget -q --show-progress -O ggml-tiny.bin https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin' && \
+  test -f ggml-tiny.bin
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt

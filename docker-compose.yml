@@ -43,7 +43,7 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
       # Allow runtime tuning on mini-PC without rebuilding images.
-      - WHISPER_MODEL_PATH=${WHISPER_MODEL_PATH:-/app/whisper.cpp/models/ggml-medium.bin}
+      - WHISPER_MODEL_PATH=${WHISPER_MODEL_PATH:-/app/whisper.cpp/models/ggml-tiny.bin}
       - WHISPER_THREADS=${WHISPER_THREADS:-4}
     volumes:
       - ./data/audio:/data/audio
