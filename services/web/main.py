@@ -249,7 +249,9 @@ if STATIC_DIR.exists():
       return FileResponse(str(requested))
     return FileResponse(str(STATIC_DIR / "index.html"))
 
-  app.add_api_route(
+  # FastAPI.add_api_route() does not accept route_class_override (0.109+); the
+  # router method does — required so GET /{path} does not steal POST /api/*.
+  app.router.add_api_route(
       "/{full_path:path}",
       serve_spa,
       methods=["GET"],
