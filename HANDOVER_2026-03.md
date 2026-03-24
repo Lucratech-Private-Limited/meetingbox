@@ -1,6 +1,6 @@
 # MeetingBox Handover
 
-Last updated: 2026-03-17
+Last updated: 2026-03-20
 
 ## Purpose
 
@@ -13,6 +13,23 @@ MeetingBox is an on-prem AI meeting appliance. It captures room audio, transcrib
 The project was originally built for a Raspberry Pi 5 with a 3.5-inch OLED touchscreen. It has now been migrated to run on a **Linux mini PC with Ubuntu Desktop and a standard monitor** connected via HDMI.
 
 **Current production target:** Intel mini PC, Ubuntu 24.04 Desktop, standard HDMI monitor, USB headset microphone, mouse/keyboard input, Docker Compose runtime.
+
+## Delta Update (2026-03-20)
+
+This section is the latest validated state and overrides older details below when there is a conflict.
+
+- Audio capture now writes directly to one file per meeting: /data/audio/recordings/<meeting_id>.wav while recording.
+- The old VAD segment fan-out path is no longer the primary transcription input path.
+- Transcription now runs once after recording_stopped (single Whisper pass on full meeting WAV), then stores transcript segments in SQLite and emits transcription_complete.
+- services/transcription/Dockerfile currently downloads ggml-tiny.bin by default; compose default is WHISPER_MODEL_PATH=/app/whisper.cpp/models/ggml-tiny.bin unless overridden.
+- To switch Whisper size, change model file in services/transcription/Dockerfile and WHISPER_MODEL_PATH, then rebuild only transcription: docker compose build --no-cache transcription && docker compose up -d transcription.
+- Actions tab behavior: action generation and Execute in services/web/services/action_engine.py call Anthropic (_call_claude_json) when ANTHROPIC_API_KEY is set. This path is not using Ollama.
+- services/ai/ai_service.py summarization prompt usage: _build_prompt is used for first/full summary; _build_update_prompt is only used when an existing local summary is incrementally updated.
+- Known ops gotchas seen recently:
+  - Compose working directory mismatch causes data to appear in different host paths.
+  - SQLite readonly database occurs when data/transcripts ownership/permissions do not match UID 1000 container user.
+  - If model env points to a file not present in image, rebuild transcription with --no-cache.
+  - For device UI over local display, ensure DISPLAY=:0 and X access is available.
 
 ## Current Production Hardware
 
@@ -38,8 +55,8 @@ docker compose -f docker-compose.yml -f docker-compose.prod.yml --profile screen
 | Container | Image | Purpose |
 |---|---|---|
 | `meetingbox-redis` | `redis:7-alpine` | Event bus (pub/sub) and state store |
-| `meetingbox-audio` | `meetingbox-audio` | Mic capture, VAD segmentation, Redis publishing |
-| `meetingbox-transcription` | `meetingbox-transcription` | Whisper.cpp transcription of audio segments |
+| `meetingbox-audio` | `meetingbox-audio` | Mic capture and direct session WAV recording |
+| `meetingbox-transcription` | `meetingbox-transcription` | Whisper.cpp transcription after recording stops |
 | `meetingbox-ai` | `meetingbox-ai` | Summary generation via Ollama (local) or Claude (cloud) |
 | `meetingbox-ollama` | `meetingbox-ollama` | Local LLM runtime (phi3:mini) |
 | `meetingbox-web` | `meetingbox-web` | FastAPI backend, REST API, WebSocket relay |
@@ -49,7 +66,7 @@ docker compose -f docker-compose.yml -f docker-compose.prod.yml --profile screen
 ### Data Flow
 
 ```
-USB Mic → audio (VAD segments) → Redis → transcription (Whisper.cpp) → SQLite
+USB Mic → audio (single meeting WAV) → Redis event (recording_stopped) → transcription (Whisper.cpp once) → SQLite
                                                      ↓
                                                ai (Ollama/Claude) → SQLite
                                                      ↓
@@ -62,7 +79,6 @@ All data lives under `./data/` relative to the compose working directory. On the
 
 | Host Path | Container Mount | Contents |
 |---|---|---|
-| `data/audio/temp/` | `/data/audio/temp` | Per-session segment WAV files (temporary) |
 | `data/audio/recordings/` | `/data/audio/recordings` | Final combined WAV recordings |
 | `data/transcripts/` | `/data/transcripts` | `meetings.db` (SQLite), optional model files |
 | `data/config/` | `/data/config` | `device_settings.json`, `.setup_complete` marker |
@@ -74,9 +90,9 @@ All data lives under `./data/` relative to the compose working directory. On the
 | `docker-compose.yml` | Service definitions, volumes, networks |
 | `docker-compose.prod.yml` | Production overrides (adds `/dev/input` to device-ui) |
 | `.env` / `.env.example` | Environment variables (API keys, model config, JWT secret) |
-| `services/audio/audio_capture.py` | Mic detection, recording loop, VAD segmentation |
+| `services/audio/audio_capture.py` | Mic detection, recording loop, direct WAV writer |
 | `services/audio/config.yaml` | Audio sample rate, VAD aggressiveness, storage paths |
-| `services/transcription/transcription_service.py` | Whisper.cpp runner, SQLite persistence, Redis events |
+| `services/transcription/transcription_service.py` | Post-stop Whisper runner, SQLite persistence, Redis events |
 | `services/ai/ai_service.py` | Ollama/Claude summary generation |
 | `services/web/main.py` | FastAPI app, WebSocket relay, Redis listener |
 | `services/web/routes/meetings.py` | Recording control, meeting CRUD, summarization endpoints |

@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import subprocess
+import time
 import wave
 from datetime import datetime
 from pathlib import Path
@@ -18,6 +19,25 @@ TEMP_SEGMENTS_DIR = Path(os.getenv("TEMP_SEGMENTS_DIR", "/data/audio/temp"))
 # Docker image builds whisper.cpp under /app/whisper.cpp.
 # (Native mini-PC installs can still override WHISPER_ROOT via env.)
 DEFAULT_WHISPER_ROOT = Path(os.getenv("WHISPER_ROOT", "/app/whisper.cpp"))
+DEBUG_LOG_PATH = Path("/data/transcripts/debug-5f8641.log")
+
+
+def _debug_log(location: str, message: str, data: dict, hypothesis_id: str, run_id: str = "initial") -> None:
+  payload = {
+    "sessionId": "5f8641",
+    "runId": run_id,
+    "hypothesisId": hypothesis_id,
+    "location": location,
+    "message": message,
+    "data": data,
+    "timestamp": int(time.time() * 1000),
+  }
+  try:
+    DEBUG_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with DEBUG_LOG_PATH.open("a", encoding="utf-8") as fh:
+      fh.write(json.dumps(payload, ensure_ascii=True) + "\n")
+  except Exception:
+    pass
 
 
 class TranscriptionService:
@@ -40,6 +60,28 @@ class TranscriptionService:
       str(DEFAULT_WHISPER_ROOT / "models" / "ggml-tiny.bin"),
     )
 
+    # region agent log
+    model_file = Path(self.model_path)
+    models_dir = model_file.parent
+    try:
+      models_sample = sorted(p.name for p in models_dir.glob("ggml-*.bin"))
+    except Exception:
+      models_sample = []
+    _debug_log(
+      "services/transcription/transcription_service.py:44",
+      "transcription startup model check",
+      {
+        "model_path": self.model_path,
+        "model_exists": model_file.exists(),
+        "model_readable": os.access(model_file, os.R_OK),
+        "models_dir_exists": models_dir.exists(),
+        "models_sample": models_sample[:10],
+        "cwd": os.getcwd(),
+      },
+      hypothesis_id="H1",
+    )
+    # endregion
+
     logger.info("Service initialized, model=%s, DB=%s", self.model_path, DB_PATH)
 
   # --- Whisper wrapper -------------------------------------------------
@@ -52,6 +94,25 @@ class TranscriptionService:
       *extra_args,
       "--threads", os.getenv("WHISPER_THREADS", "4"),
     ]
+
+    # region agent log
+    model_file = Path(self.model_path)
+    audio_file = Path(audio_path)
+    _debug_log(
+      "services/transcription/transcription_service.py:66",
+      "pre-whisper file check",
+      {
+        "model_path": self.model_path,
+        "model_exists": model_file.exists(),
+        "model_readable": os.access(model_file, os.R_OK),
+        "audio_path": audio_path,
+        "audio_exists": audio_file.exists(),
+        "audio_size": audio_file.stat().st_size if audio_file.exists() else None,
+        "cmd": cmd,
+      },
+      hypothesis_id="H2",
+    )
+    # endregion
 
     logger.info("Running: %s", " ".join(cmd))
     try:
@@ -71,6 +132,18 @@ class TranscriptionService:
     if result.stderr:
       for line in result.stderr.strip().splitlines()[-10:]:
         logger.debug("whisper stderr: %s", line)
+    # region agent log
+    _debug_log(
+      "services/transcription/transcription_service.py:96",
+      "whisper result",
+      {
+        "returncode": result.returncode,
+        "stdout_tail": result.stdout.strip().splitlines()[-3:] if result.stdout else [],
+        "stderr_tail": result.stderr.strip().splitlines()[-3:] if result.stderr else [],
+      },
+      hypothesis_id="H3",
+    )
+    # endregion
     logger.info("whisper exit code: %d", result.returncode)
     return result
 
