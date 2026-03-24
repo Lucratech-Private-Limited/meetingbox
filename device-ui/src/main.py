@@ -76,6 +76,7 @@ from config import (
     SHOW_FPS,
     TRANSITION_DURATION,
     DEFAULT_PRIVACY_MODE,
+    SETUP_COMPLETE_MARKER_PATHS,
 )
 
 from api_client import BackendClient
@@ -277,12 +278,8 @@ class MeetingBoxApp(App):
             return False
         # Check shared config volume (mounted at /data/config in Docker,
         # falls back to /opt/meetingbox for bare-metal installs)
-        for marker_path in [
-            '/data/config/.setup_complete',
-            '/opt/meetingbox/data/config/.setup_complete',
-            '/opt/meetingbox/.setup_complete',
-        ]:
-            if Path(marker_path).exists():
+        for marker_path in SETUP_COMPLETE_MARKER_PATHS:
+            if marker_path.exists():
                 return False
         return True
 

@@ -226,20 +226,23 @@ async def update_settings(body: SettingsUpdate, current_user: Optional[dict] = D
 
 
 class SetupCompleteBody(BaseModel):
-    """Metadata written to .setup_complete when onboarding finishes."""
+    """
+    Payload for finishing first-boot after the device joins a Wi‑Fi LAN.
+
+    All fields are optional; defaults are fine if SSID is unknown.
+    - wifi_ssid: connected network name (informational)
+    - onboarding_flow: fixed tag for analytics / support (default wifi_on_device_v1)
+    """
 
     wifi_ssid: str = ""
     onboarding_flow: str = "wifi_on_device_v1"
 
 
-@router.post("/setup-complete")
-async def post_setup_complete(
-    body: SetupCompleteBody,
-    current_user: Optional[dict] = Depends(get_optional_user),
-):
+def finalize_first_boot_setup(body: SetupCompleteBody) -> dict:
     """
-    Mark first-boot setup finished. Writes JSON metadata next to device_settings.json.
-    Device UI calls this after successful WiFi, then navigates home.
+    Write `.setup_complete` next to `device_settings.json`.
+    Registered as POST /api/device/setup-complete on the main FastAPI app so the
+    SPA GET catch‑all cannot cause 405 on this path.
     """
     settings = _load_settings()
     meta = {

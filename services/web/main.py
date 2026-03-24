@@ -7,7 +7,9 @@ import threading
 import time
 from pathlib import Path
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from typing import Optional
+
+from fastapi import Depends, FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.routing import APIRoute
@@ -22,6 +24,8 @@ from routes.device import router as device_router
 from routes.auth import router as auth_router
 from routes.actions import router as actions_router
 from routes.integrations import router as integrations_router
+from auth import get_optional_user
+from routes.device import SetupCompleteBody, finalize_first_boot_setup
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
 logger = logging.getLogger("meetingbox.web")
@@ -182,6 +186,18 @@ app.include_router(system_router, prefix="/api/system", tags=["system"])
 app.include_router(device_router, prefix="/api/device", tags=["device"])
 app.include_router(actions_router, prefix="/api", tags=["actions"])
 app.include_router(integrations_router, prefix="/api", tags=["integrations"])
+
+
+@app.post("/api/device/setup-complete", tags=["device"])
+async def post_setup_complete_root(
+    body: SetupCompleteBody,
+    _current_user: Optional[dict] = Depends(get_optional_user),
+):
+    """
+    Finish first-boot after Wi‑Fi is on a real LAN. Must stay on the app root
+    (before SPA static routes) so POST is never confused with GET /*.
+    """
+    return finalize_first_boot_setup(body)
 
 
 @app.websocket("/ws")

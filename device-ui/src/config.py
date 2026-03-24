@@ -203,6 +203,7 @@ DEFAULT_AUTO_DELETE = 'never'       # never, 30, 60, 90
 # ============================================================================
 
 DEVICE_MODEL = 'MeetingBox v1.0'
+# Legacy hotspot onboarding (unused in current Wi‑Fi-to-LAN flow; kept for old scripts)
 HOTSPOT_SSID_PREFIX = 'MeetingBox-'
 HOTSPOT_IP = '192.168.4.1'
 SETUP_URL = f'http://{HOTSPOT_IP}'
@@ -224,6 +225,14 @@ BASE_DIR = Path(__file__).parent.parent.resolve()
 ASSETS_DIR = BASE_DIR / 'assets'
 FONTS_DIR = ASSETS_DIR / 'fonts'
 ICONS_DIR = ASSETS_DIR / 'icons'
+
+# First-boot complete markers (keep in sync with MeetingBoxApp.needs_setup).
+SETUP_COMPLETE_MARKER_PATHS = (
+    Path('/data/config/.setup_complete'),
+    Path('/opt/meetingbox/data/config/.setup_complete'),
+    Path('/opt/meetingbox/.setup_complete'),
+    BASE_DIR / 'data' / 'config' / '.setup_complete',
+)
 
 try:
     ASSETS_DIR.mkdir(exist_ok=True)
