@@ -265,20 +265,44 @@ async def wifi_scan(current_user: Optional[dict] = Depends(get_optional_user)):
     networks = []
     try:
         result = subprocess.run(
-            ["nmcli", "-t", "-f", "SSID,SIGNAL,SECURITY,ACTIVE", "dev", "wifi", "list"],
+            ["nmcli", "-m", "multiline", "-f", "SSID,SIGNAL,SECURITY,IN-USE", "dev", "wifi", "list"],
             capture_output=True, text=True, timeout=15,
         )
-        for line in result.stdout.strip().splitlines():
-            parts = line.split(":")
-            if len(parts) >= 4 and parts[0]:
-                networks.append({
-                    "ssid": parts[0],
-                    "signal_strength": int(parts[1]) if parts[1].isdigit() else 0,
-                    "security": parts[2] or "open",
-                    "connected": parts[3] == "yes",
-                })
+        if result.returncode == 0:
+            cur: dict[str, str] = {}
+            for line in result.stdout.splitlines() + [""]:
+                if not line.strip():
+                    ssid = (cur.get("SSID") or "").strip()
+                    if ssid:
+                        signal_raw = (cur.get("SIGNAL") or "0").strip()
+                        sec_raw = (cur.get("SECURITY") or "").strip()
+                        in_use = (cur.get("IN-USE") or "").strip()
+                        try:
+                            signal = int(signal_raw) if signal_raw else 0
+                        except ValueError:
+                            signal = 0
+                        networks.append({
+                            "ssid": ssid,
+                            "signal_strength": signal,
+                            "security": sec_raw or "open",
+                            "connected": in_use == "*",
+                        })
+                    cur = {}
+                    continue
+                if ":" in line:
+                    k, v = line.split(":", 1)
+                    cur[k.strip()] = v.strip()
     except Exception as e:
         # Fallback: return current connection only
+        wifi = _get_wifi_info()
+        if wifi["ssid"]:
+            networks.append({
+                "ssid": wifi["ssid"],
+                "signal_strength": wifi["signal"],
+                "security": "wpa2",
+                "connected": True,
+            })
+    if not networks:
         wifi = _get_wifi_info()
         if wifi["ssid"]:
             networks.append({

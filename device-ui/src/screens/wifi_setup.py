@@ -10,11 +10,13 @@ Design ref: UI_Ref_for_cursor/Wifi_Setup_screen/WIFI_Setup_screen.png
 """
 
 import logging
+import shutil
+import subprocess
 from pathlib import Path
 from typing import Optional
 
 from kivy.clock import Clock
-from kivy.graphics import Color, Rectangle, RoundedRectangle
+from kivy.graphics import Color, Line, Rectangle, RoundedRectangle
 from kivy.uix.behaviors import ButtonBehavior
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.floatlayout import FloatLayout
@@ -68,19 +70,22 @@ class _WiFiRow(ButtonBehavior, BoxLayout):
 
         kwargs.setdefault('orientation', 'horizontal')
         kwargs.setdefault('size_hint_y', None)
-        kwargs.setdefault('height', 64)
+        kwargs.setdefault('height', 68)
         kwargs.setdefault('padding', [12, 8])
         kwargs.setdefault('spacing', 10)
         super().__init__(**kwargs)
 
         with self.canvas.before:
-            Color(*COLORS['surface'])
-            self._bg = RoundedRectangle(
-                pos=self.pos, size=self.size, radius=[BORDER_RADIUS])
+            Color(*COLORS['surface_light'])
+            self._bg = Rectangle(pos=self.pos, size=self.size)
+        with self.canvas.after:
+            Color(*COLORS['gray_800'])
+            self._sep = Line(points=[self.x, self.y, self.x + self.width, self.y], width=1)
         self.bind(
             pos=lambda w, *_: setattr(self._bg, 'pos', w.pos),
             size=lambda w, *_: setattr(self._bg, 'size', w.size),
         )
+        self.bind(pos=self._update_sep, size=self._update_sep)
 
         # Signal / status icon (left)
         if busy:
@@ -154,6 +159,9 @@ class _WiFiRow(ButtonBehavior, BoxLayout):
                 width=28,
             )
             self.add_widget(right)
+
+    def _update_sep(self, *_args):
+        self._sep.points = [self.x, self.y, self.x + self.width, self.y]
 
 
 class WiFiSetupScreen(BaseScreen):
@@ -238,7 +246,7 @@ class WiFiSetupScreen(BaseScreen):
         )
 
         scroll = ScrollView(do_scroll_x=False, size_hint=(1, 1))
-        self._list = GridLayout(cols=1, spacing=8, size_hint_y=None, padding=[8, 8])
+        self._list = GridLayout(cols=1, spacing=0, size_hint_y=None, padding=[8, 8, 8, 0])
         self._list.bind(minimum_height=self._list.setter('height'))
         scroll.add_widget(self._list)
         card.add_widget(scroll)
@@ -267,7 +275,7 @@ class WiFiSetupScreen(BaseScreen):
             size_hint=(0.45, 1),
             font_size=FONT_SIZES['small'],
         )
-        rescan.bind(on_press=lambda *_: self._load_networks())
+        rescan.bind(on_press=lambda *_: self._load_networks(rescan=True))
         actions.add_widget(rescan)
         card.add_widget(actions)
 
@@ -300,7 +308,7 @@ class WiFiSetupScreen(BaseScreen):
         self._ready_for_next = False
         self._connected_ssid = ''
         self._sync_next_button()
-        self._load_networks()
+        self._load_networks(rescan=True)
 
     def on_leave(self):
         self._connecting_ssid = None
@@ -314,20 +322,25 @@ class WiFiSetupScreen(BaseScreen):
         self._connected_ssid = ssid or ''
         self._sync_next_button()
 
-    def _load_networks(self):
+    def _load_networks(self, rescan: bool = False):
         async def _load():
             try:
-                nets = await self.backend.get_wifi_networks()
+                nets = self._scan_local_wifi(rescan=rescan)
                 Clock.schedule_once(lambda *_: self._apply_networks(nets), 0)
             except Exception as e:
-                logger.warning('WiFi scan failed: %s', e)
-                Clock.schedule_once(
-                    lambda *_: self.add_widget(ModalDialog(
-                        title='Scan failed',
-                        message='Could not scan networks. Check WiFi hardware and try Rescan.',
-                        confirm_text='OK',
-                        cancel_text='',
-                    )), 0)
+                logger.warning('Local WiFi scan failed, trying backend: %s', e)
+                try:
+                    nets = await self.backend.get_wifi_networks()
+                    Clock.schedule_once(lambda *_: self._apply_networks(nets), 0)
+                except Exception as be:
+                    logger.warning('Backend WiFi scan failed: %s', be)
+                    Clock.schedule_once(
+                        lambda *_: self.add_widget(ModalDialog(
+                            title='Scan failed',
+                            message='Could not scan networks. Check WiFi adapter and NetworkManager.',
+                            confirm_text='OK',
+                            cancel_text='',
+                        )), 0)
 
         run_async(_load())
 
@@ -351,6 +364,18 @@ class WiFiSetupScreen(BaseScreen):
             row = _WiFiRow(net, self._connecting_ssid or '')
             row.bind(on_press=lambda inst, n=net: self._on_row_pressed(n))
             self._list.add_widget(row)
+        if not self._list.children:
+            empty = Label(
+                text='No networks found. Tap Rescan.',
+                font_size=FONT_SIZES['small'],
+                color=COLORS['gray_500'],
+                size_hint=(1, None),
+                height=44,
+                halign='left',
+                valign='middle',
+            )
+            empty.bind(size=empty.setter('text_size'))
+            self._list.add_widget(empty)
 
     def _on_row_pressed(self, net: dict):
         if self._connecting_ssid:
@@ -577,7 +602,10 @@ class WiFiSetupScreen(BaseScreen):
 
         async def _run():
             try:
-                result = await self.backend.connect_wifi(ssid, password=password)
+                if self._has_local_nmcli():
+                    result = self._connect_local_wifi(ssid, password=password)
+                else:
+                    result = await self.backend.connect_wifi(ssid, password=password)
                 ok = result.get('status') == 'connected'
                 msg = result.get('message', '')
 
@@ -585,7 +613,7 @@ class WiFiSetupScreen(BaseScreen):
                     self._connecting_ssid = None
                     if ok:
                         self._set_ready(ssid)
-                        self._load_networks()
+                        self._load_networks(rescan=False)
                     else:
                         self._populate_list()
                         self.add_widget(ModalDialog(
@@ -612,6 +640,84 @@ class WiFiSetupScreen(BaseScreen):
                 Clock.schedule_once(_fail, 0)
 
         run_async(_run())
+
+    # ------------------------------------------------------------------
+    # Local WiFi control (native UI path)
+    # ------------------------------------------------------------------
+
+    def _has_local_nmcli(self) -> bool:
+        return shutil.which('nmcli') is not None
+
+    def _detect_wifi_iface(self) -> Optional[str]:
+        if not self._has_local_nmcli():
+            return None
+        try:
+            res = subprocess.run(
+                ['nmcli', '-t', '-f', 'DEVICE,TYPE,STATE', 'device', 'status'],
+                capture_output=True, text=True, timeout=6,
+            )
+            for line in res.stdout.splitlines():
+                parts = line.split(':')
+                if len(parts) >= 3 and parts[1] == 'wifi':
+                    return parts[0]
+        except Exception:
+            return None
+        return None
+
+    def _scan_local_wifi(self, rescan: bool = False) -> list[dict]:
+        if not self._has_local_nmcli():
+            raise RuntimeError('nmcli not available')
+        if rescan:
+            try:
+                subprocess.run(
+                    ['nmcli', 'device', 'wifi', 'rescan'],
+                    capture_output=True, text=True, timeout=10,
+                )
+            except Exception:
+                pass
+
+        res = subprocess.run(
+            ['nmcli', '-m', 'multiline', '-f', 'SSID,SIGNAL,SECURITY,IN-USE', 'device', 'wifi', 'list'],
+            capture_output=True, text=True, timeout=15,
+        )
+        nets: list[dict] = []
+        cur: dict[str, str] = {}
+        for line in res.stdout.splitlines() + ['']:
+            if not line.strip():
+                ssid = (cur.get('SSID') or '').strip()
+                if ssid:
+                    signal_raw = (cur.get('SIGNAL') or '0').strip()
+                    sec_raw = (cur.get('SECURITY') or '').strip()
+                    in_use = (cur.get('IN-USE') or '').strip()
+                    try:
+                        signal = int(signal_raw) if signal_raw else 0
+                    except ValueError:
+                        signal = 0
+                    nets.append({
+                        'ssid': ssid,
+                        'signal_strength': signal,
+                        'security': sec_raw or 'open',
+                        'connected': in_use == '*',
+                    })
+                cur = {}
+                continue
+            if ':' in line:
+                k, v = line.split(':', 1)
+                cur[k.strip()] = v.strip()
+        return nets
+
+    def _connect_local_wifi(self, ssid: str, password: Optional[str]) -> dict:
+        iface = self._detect_wifi_iface()
+        cmd = ['nmcli', 'device', 'wifi', 'connect', ssid]
+        if password:
+            cmd += ['password', password]
+        if iface:
+            cmd += ['ifname', iface]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if res.returncode == 0:
+            return {'status': 'connected', 'message': f'Connected to {ssid}'}
+        msg = (res.stderr or '').strip() or (res.stdout or '').strip() or 'Connection failed'
+        return {'status': 'failed', 'message': msg}
 
     def _on_back(self, _inst):
         self.go_back()
