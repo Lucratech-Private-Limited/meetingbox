@@ -10,6 +10,9 @@ from pathlib import Path
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from fastapi.routing import APIRoute
+from starlette.routing import Match, get_route_path
+from starlette.types import Scope
 import redis
 
 from database import init_database, get_connection
@@ -201,18 +204,43 @@ async def health() -> dict:
   return {"status": "healthy", "service": "meetingbox-web"}
 
 
+class _SpaFallbackAPIRoute(APIRoute):
+  """
+  The SPA GET catch-all must not partially-match /api/*. Otherwise Starlette
+  treats POST /api/... as "wrong method" on that GET route and returns
+  405 Allow: GET — masking a missing API handler and breaking setup-complete.
+  """
+
+  def matches(self, scope: Scope) -> tuple[Match, Scope]:
+    if scope.get("type") == "http":
+      path = get_route_path(scope)
+      if path == "/api" or path.startswith("/api/"):
+        return Match.NONE, {}
+    match, child_scope = super().matches(scope)
+    if match != Match.NONE:
+      child_scope["route"] = self
+    return match, child_scope
+
+
 if STATIC_DIR.exists():
   @app.get("/")
   async def serve_index() -> FileResponse:
     return FileResponse(str(STATIC_DIR / "index.html"))
 
-
-  @app.get("/{full_path:path}")
   async def serve_spa(full_path: str) -> FileResponse:
     requested = STATIC_DIR / full_path
     if requested.is_file():
       return FileResponse(str(requested))
     return FileResponse(str(STATIC_DIR / "index.html"))
+
+  app.add_api_route(
+      "/{full_path:path}",
+      serve_spa,
+      methods=["GET"],
+      response_class=FileResponse,
+      route_class_override=_SpaFallbackAPIRoute,
+      include_in_schema=False,
+  )
 
 
 if __name__ == "__main__":
