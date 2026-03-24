@@ -2,92 +2,179 @@
 Welcome Screen – First-time setup introduction
 
 Trigger : Follows splash on first boot
-Content : Logo, welcome text, CONTINUE button
-Action  : Tap CONTINUE → WiFi Setup Screen
+Content : Logo, welcome text, CTA button, security footer
+Action  : Tap button → WiFi Setup Screen
+
+Design ref: UI_Ref_for_cursor/Welcome_Screen/Frame 1.png
 """
 
+from pathlib import Path
+
 from kivy.uix.boxlayout import BoxLayout
+from kivy.uix.floatlayout import FloatLayout
+from kivy.uix.anchorlayout import AnchorLayout
 from kivy.uix.label import Label
 from kivy.uix.widget import Widget
+from kivy.uix.image import Image
+from kivy.uix.behaviors import ButtonBehavior
 from kivy.graphics import Color, Rectangle
 
 from screens.base_screen import BaseScreen
-from components.button import PrimaryButton
-from config import COLORS, FONT_SIZES, SPACING
+from config import COLORS, FONT_SIZES, SPACING, ASSETS_DIR
+
+# Welcome screen assets
+WELCOME_DIR = ASSETS_DIR / 'welcome'
+LOGO_PATH = str(WELCOME_DIR / 'LOGO.png')
+BUTTON_PATH = str(WELCOME_DIR / 'Button.png')
+SHIELD_PATH = str(WELCOME_DIR / 'shield.png')
+ELLIPSE_PATHS = [
+    str(WELCOME_DIR / 'Ellipse 1.png'),
+    str(WELCOME_DIR / 'Ellipse 2.png'),
+    str(WELCOME_DIR / 'Ellipse 3.png'),
+]
+
+# Design colors (from ref: #0B0D11 bg, #4A90E2 button, #9CA3AF secondary)
+WELCOME_BG = (0.043, 0.051, 0.067, 1)  # #0B0D11
+
+
+class _ImageButton(ButtonBehavior, Image):
+    """Tappable image button (for CTA using Button.png asset)."""
+    pass
 
 
 class WelcomeScreen(BaseScreen):
-    """Welcome / first-boot screen."""
+    """Welcome / first-boot screen – MeetingBox AI intro with gradient overlays."""
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self._build_ui()
 
     def _build_ui(self):
-        root = BoxLayout(orientation='vertical', padding=[SPACING['screen_padding'], 0])
-        self.make_dark_bg(root)
+        root = FloatLayout()
+        # Dark base background
+        with root.canvas.before:
+            Color(*WELCOME_BG)
+            self._bg_rect = Rectangle(pos=root.pos, size=root.size)
+        root.bind(pos=self._update_bg, size=self._update_bg)
+
+        # Ellipse gradient overlays (layered for ambient effect)
+        for path in ELLIPSE_PATHS:
+            if Path(path).exists():
+                img = Image(
+                    source=path,
+                    allow_stretch=True,
+                    keep_ratio=False,
+                    size_hint=(1, 1),
+                    pos_hint={'x': 0, 'y': 0},
+                    opacity=0.35,
+                )
+                root.add_widget(img)
+
+        # Content layout
+        content = BoxLayout(orientation='vertical', padding=[SPACING['screen_padding'], 0])
+
+        # Header: logo + "MeetingBox" (top-left)
+        header = BoxLayout(
+            orientation='horizontal',
+            size_hint=(1, None),
+            height=56,
+            spacing=12,
+            padding=[0, 8],
+        )
+        logo_img = Image(
+            source=LOGO_PATH,
+            size_hint=(None, 1),
+            width=40,
+            allow_stretch=True,
+            keep_ratio=True,
+        )
+        header.add_widget(logo_img)
+        brand = Label(
+            text='MeetingBox',
+            font_size=FONT_SIZES['title'],
+            bold=True,
+            color=COLORS['white'],
+            halign='left',
+            valign='middle',
+            size_hint_x=0.6,
+        )
+        brand.bind(size=brand.setter('text_size'))
+        header.add_widget(brand)
+        content.add_widget(header)
 
         # Top spacer
-        root.add_widget(Widget(size_hint=(1, 0.1)))
+        content.add_widget(Widget(size_hint=(1, 0.12)))
 
-        # Logo
-        logo = Label(
-            text='MeetingBox',
-            font_size=28,
+        # Hero: title + subtitle (centered)
+        title = Label(
+            text='MeetingBox AI',
+            font_size=FONT_SIZES['huge'],
             bold=True,
             color=COLORS['white'],
             size_hint=(1, None),
-            height=80,
+            height=48,
             halign='center',
             valign='middle',
         )
-        root.add_widget(logo)
-
-        # Title
-        title = Label(
-            text='Welcome to MeetingBox AI!',
-            font_size=FONT_SIZES['large'],
-            bold=True,
-            color=COLORS['white'],
-            size_hint=(1, None),
-            height=36,
-            halign='center',
-        )
         title.bind(size=title.setter('text_size'))
-        root.add_widget(title)
+        content.add_widget(title)
 
-        # Subtitle
         subtitle = Label(
-            text="First, let's connect to your WiFi",
+            text="Your meeting room that remembers everything.",
             font_size=FONT_SIZES['body'],
-            color=COLORS['gray_500'],
+            color=COLORS['gray_400'],
             size_hint=(1, None),
-            height=28,
+            height=32,
             halign='center',
+            valign='middle',
         )
         subtitle.bind(size=subtitle.setter('text_size'))
-        root.add_widget(subtitle)
+        content.add_widget(subtitle)
 
         # Spacer
-        root.add_widget(Widget(size_hint=(1, 0.15)))
+        content.add_widget(Widget(size_hint=(1, 0.15)))
 
-        # CONTINUE button
-        btn_row = BoxLayout(
-            size_hint=(1, None), height=60,
-            padding=[80, 0],
+        # CTA button (uses Button.png asset with "Start Your First Meeting")
+        btn_wrap = BoxLayout(size_hint=(1, None), height=70, padding=[80, 0])
+        cta_btn = _ImageButton(
+            source=BUTTON_PATH,
+            allow_stretch=True,
+            keep_ratio=True,
         )
-        continue_btn = PrimaryButton(
-            text='CONTINUE  →',
-            font_size=FONT_SIZES['large'],
+        cta_btn.bind(on_press=self._on_continue)
+        btn_wrap.add_widget(cta_btn)
+        content.add_widget(btn_wrap)
+
+        # Spacer
+        content.add_widget(Widget(size_hint=(1, 0.1)))
+
+        # Footer: shield + "Enterprise-grade security included" (centered)
+        footer_wrap = AnchorLayout(
+            anchor_x='center',
+            anchor_y='center',
+            size_hint=(1, None),
+            height=40,
         )
-        continue_btn.bind(on_press=self._on_continue)
-        btn_row.add_widget(continue_btn)
-        root.add_widget(btn_row)
+        shield_img = Image(
+            source=SHIELD_PATH,
+            allow_stretch=True,
+            keep_ratio=True,
+            size_hint=(None, None),
+            size=(280, 32),
+        )
+        footer_wrap.add_widget(shield_img)
+        content.add_widget(footer_wrap)
 
         # Bottom spacer
-        root.add_widget(Widget(size_hint=(1, 0.15)))
+        content.add_widget(Widget(size_hint=(1, 0.05)))
 
+        root.add_widget(content)
         self.add_widget(root)
+
+    def _update_bg(self, widget, value):
+        if hasattr(self, '_bg_rect') and widget:
+            self._bg_rect.pos = widget.pos
+            self._bg_rect.size = widget.size
 
     def _on_continue(self, _inst):
         self.goto('wifi_setup', transition='slide_left')
