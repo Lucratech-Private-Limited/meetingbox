@@ -28,6 +28,7 @@ router = APIRouter()
 SETTINGS_FILE = Path(os.getenv("DEVICE_SETTINGS_PATH", "/data/config/device_settings.json"))
 SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
 SETUP_COMPLETE_FILE = SETTINGS_FILE.parent / ".setup_complete"
+PROFILES_FILE = SETTINGS_FILE.parent / "device_profiles.json"
 
 # NetworkManager WiFi interface (override if not wlan0, e.g. wlp2s0)
 WIFI_IFACE = os.getenv("WIFI_INTERFACE", "wlan0")
@@ -206,9 +207,10 @@ async def update_settings(body: SettingsUpdate, current_user: Optional[dict] = D
         return {"status": "restarting"}
 
     if action == "factory_reset":
-        # Delete settings and setup marker, then reboot
+        # Delete settings, profiles, setup marker, then reboot
         try:
             SETTINGS_FILE.unlink(missing_ok=True)
+            PROFILES_FILE.unlink(missing_ok=True)
             # Remove setup marker from shared config volume
             SETUP_COMPLETE_FILE.unlink(missing_ok=True)
             for p in ["/data/config/.setup_complete",

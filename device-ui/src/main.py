@@ -82,6 +82,7 @@ from config import (
 from api_client import BackendClient
 from mock_backend import MockBackendClient
 from hardware import set_brightness, screen_off, screen_on
+from profile_store import get_active_profile
 
 # Boot-flow screens
 from screens.splash import SplashScreen
@@ -89,6 +90,8 @@ from screens.welcome import WelcomeScreen
 from screens.room_name import RoomNameScreen
 from screens.wifi_setup import WiFiSetupScreen
 from screens.wifi_connected import WiFiConnectedScreen
+from screens.create_profile import CreateProfileScreen
+from screens.meetingbox_ready import MeetingBoxReadyScreen
 from screens.setup_progress import SetupProgressScreen
 from screens.all_set import AllSetScreen
 
@@ -179,6 +182,10 @@ class MeetingBoxApp(App):
         self.privacy_mode = DEFAULT_PRIVACY_MODE
         self.device_name = 'MeetingBox'
         self.auto_record = False
+        self.setup_language = 'English (US)'
+        self.current_user_id = None
+        self.current_display_name = None
+        self.connected_wifi_ssid = ''
 
         # Screen manager & nav stack
         self.screen_manager = None
@@ -218,6 +225,8 @@ class MeetingBoxApp(App):
         self.screen_manager.add_widget(RoomNameScreen(name='room_name'))
         self.screen_manager.add_widget(WiFiSetupScreen(name='wifi_setup'))
         self.screen_manager.add_widget(WiFiConnectedScreen(name='wifi_connected'))
+        self.screen_manager.add_widget(CreateProfileScreen(name='create_profile'))
+        self.screen_manager.add_widget(MeetingBoxReadyScreen(name='meetingbox_ready'))
         self.screen_manager.add_widget(SetupProgressScreen(name='setup_progress'))
         self.screen_manager.add_widget(AllSetScreen(name='all_set'))
 
@@ -301,12 +310,14 @@ class MeetingBoxApp(App):
             if self._setup_poll:
                 self._setup_poll.cancel()
                 self._setup_poll = None
-            # Do not include wifi_setup: marker is written there; user must tap
-            # Next → home. Auto-jumping to all_set would race with that flow.
-            onboarding_screens = {'welcome', 'room_name', 'setup_progress'}
+            # If setup completed elsewhere (e.g. marker synced), leave onboarding.
+            onboarding_screens = {
+                'welcome', 'room_name', 'setup_progress', 'wifi_setup',
+                'wifi_connected', 'create_profile', 'meetingbox_ready', 'all_set',
+            }
             current = self.screen_manager.current
             if current in onboarding_screens:
-                self.goto_screen('all_set', 'fade')
+                self.goto_screen('home', 'fade')
 
     def on_stop(self):
         logger.info("MeetingBox UI stopping")
@@ -338,6 +349,13 @@ class MeetingBoxApp(App):
                 self.auto_record = auto_record
             except Exception as e:
                 logger.warning("Could not load settings: %s", e)
+            try:
+                prof = get_active_profile()
+                if prof:
+                    self.current_user_id = prof.get('user_id')
+                    self.current_display_name = prof.get('display_name')
+            except Exception as e:
+                logger.debug("Active profile load skipped: %s", e)
         run_async(_health())
 
     # ==================================================================
@@ -373,7 +391,10 @@ class MeetingBoxApp(App):
         if self._nav_stack:
             target = self._nav_stack.pop()
             # Skip non-core screens in stack when going back
-            skip = {'splash', 'welcome', 'wifi_setup', 'wifi_connected', 'setup_progress', 'all_set'}
+            skip = {
+                'splash', 'welcome', 'wifi_setup', 'wifi_connected',
+                'setup_progress', 'all_set', 'create_profile', 'meetingbox_ready',
+            }
             while target in skip and self._nav_stack:
                 target = self._nav_stack.pop()
             self._set_transition('slide_right')

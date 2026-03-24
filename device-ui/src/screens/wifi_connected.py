@@ -2,12 +2,10 @@
 WiFi Connected confirmation screen (Frame 12 reference).
 
 Shown after WiFi connection succeeds. Displays local IP + access URL and
-continues onboarding when the user taps "Continue setup".
+continues to Create profile when the user taps "Continue setup".
 """
 
-import json
 import logging
-from datetime import datetime, timezone
 
 from kivy.clock import Clock
 from kivy.graphics import Color, Ellipse, Line, RoundedRectangle
@@ -18,14 +16,12 @@ from kivy.uix.widget import Widget
 
 from async_helper import run_async
 from components.button import PrimaryButton
-from components.modal_dialog import ModalDialog
 from config import (
     ASSETS_DIR,
     BORDER_RADIUS,
     COLORS,
     DASHBOARD_URL,
     FONT_SIZES,
-    SETUP_COMPLETE_MARKER_PATHS,
 )
 from screens.base_screen import BaseScreen
 
@@ -36,33 +32,8 @@ LOGO_PATH = str(WELCOME_DIR / "LOGO.png")
 WIFI_BG = (0.043, 0.051, 0.067, 1)
 
 
-def _write_local_setup_complete_marker(
-    wifi_ssid: str,
-    device_name: str,
-    onboarding_flow: str,
-) -> bool:
-    """Mirror server .setup_complete JSON on paths the UI checks (API fallback)."""
-    meta = {
-        "version": 1,
-        "completed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "device_name": (device_name or "MeetingBox").strip(),
-        "wifi_ssid": (wifi_ssid or "").strip(),
-        "onboarding_flow": (onboarding_flow or "wifi_on_device_v1").strip(),
-    }
-    text = json.dumps(meta, indent=2)
-    any_ok = False
-    for path in SETUP_COMPLETE_MARKER_PATHS:
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(text, encoding="utf-8")
-            any_ok = True
-        except OSError as e:
-            logger.debug("Local setup marker skip %s: %s", path, e)
-    return any_ok
-
-
 class WiFiConnectedScreen(BaseScreen):
-    """Success screen shown between WiFi setup and Home."""
+    """Success screen shown after WiFi connects; leads to Create profile."""
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -279,55 +250,4 @@ class WiFiConnectedScreen(BaseScreen):
         run_async(_run())
 
     def _on_continue(self, _inst):
-        if self._continue_btn is not None:
-            self._continue_btn.disabled = True
-
-        async def _finish():
-            flow = "wifi_on_device_v1"
-            try:
-                await self.backend.post_setup_complete(
-                    wifi_ssid=self._wifi_ssid,
-                    onboarding_flow=flow,
-                )
-                api_ok = True
-            except Exception as e:
-                logger.error("post_setup_complete failed on WiFi success page: %s", e)
-                api_ok = False
-
-            name = getattr(self.app, "device_name", "MeetingBox") or "MeetingBox"
-            local_ok = False
-            if not api_ok:
-                local_ok = _write_local_setup_complete_marker(
-                    self._wifi_ssid, name, flow,
-                )
-                if local_ok:
-                    logger.info(
-                        "Wrote .setup_complete locally (API failed); onboarding can finish",
-                    )
-
-            def _go(*_a):
-                if self._continue_btn is not None:
-                    self._continue_btn.disabled = False
-                self.goto("home", transition="fade")
-
-            def _err(*_a):
-                if self._continue_btn is not None:
-                    self._continue_btn.disabled = False
-                self.add_widget(
-                    ModalDialog(
-                        title="Could not finish setup",
-                        message=(
-                            "WiFi is connected, but the setup marker could not be saved. "
-                            "Check the web service, then tap Continue again."
-                        ),
-                        confirm_text="OK",
-                        cancel_text="",
-                    )
-                )
-
-            if api_ok or local_ok:
-                Clock.schedule_once(_go, 0)
-            else:
-                Clock.schedule_once(_err, 0)
-
-        run_async(_finish())
+        self.goto("create_profile", transition="slide_left")
