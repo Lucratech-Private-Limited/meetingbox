@@ -270,28 +270,37 @@ async def wifi_scan(current_user: Optional[dict] = Depends(get_optional_user)):
         )
         if result.returncode == 0:
             cur: dict[str, str] = {}
-            for line in result.stdout.splitlines() + [""]:
-                if not line.strip():
-                    ssid = (cur.get("SSID") or "").strip()
-                    if ssid:
-                        signal_raw = (cur.get("SIGNAL") or "0").strip()
-                        sec_raw = (cur.get("SECURITY") or "").strip()
-                        in_use = (cur.get("IN-USE") or "").strip()
-                        try:
-                            signal = int(signal_raw) if signal_raw else 0
-                        except ValueError:
-                            signal = 0
-                        networks.append({
-                            "ssid": ssid,
-                            "signal_strength": signal,
-                            "security": sec_raw or "open",
-                            "connected": in_use == "*",
-                        })
-                    cur = {}
+
+            def flush_current():
+                ssid = (cur.get("SSID") or "").strip()
+                if not ssid:
+                    return
+                signal_raw = (cur.get("SIGNAL") or "0").strip()
+                sec_raw = (cur.get("SECURITY") or "").strip()
+                in_use = (cur.get("IN-USE") or "").strip()
+                try:
+                    signal = int(signal_raw) if signal_raw else 0
+                except ValueError:
+                    signal = 0
+                networks.append({
+                    "ssid": ssid,
+                    "signal_strength": signal,
+                    "security": sec_raw or "open",
+                    "connected": in_use == "*",
+                })
+
+            for line in result.stdout.splitlines():
+                if ":" not in line:
                     continue
-                if ":" in line:
-                    k, v = line.split(":", 1)
-                    cur[k.strip()] = v.strip()
+                k, v = line.split(":", 1)
+                key = k.strip()
+                val = v.strip()
+                if key == "SSID" and "SSID" in cur:
+                    flush_current()
+                    cur = {}
+                cur[key] = val
+
+            flush_current()
     except Exception as e:
         # Fallback: return current connection only
         wifi = _get_wifi_info()

@@ -682,28 +682,41 @@ class WiFiSetupScreen(BaseScreen):
         )
         nets: list[dict] = []
         cur: dict[str, str] = {}
-        for line in res.stdout.splitlines() + ['']:
-            if not line.strip():
-                ssid = (cur.get('SSID') or '').strip()
-                if ssid:
-                    signal_raw = (cur.get('SIGNAL') or '0').strip()
-                    sec_raw = (cur.get('SECURITY') or '').strip()
-                    in_use = (cur.get('IN-USE') or '').strip()
-                    try:
-                        signal = int(signal_raw) if signal_raw else 0
-                    except ValueError:
-                        signal = 0
-                    nets.append({
-                        'ssid': ssid,
-                        'signal_strength': signal,
-                        'security': sec_raw or 'open',
-                        'connected': in_use == '*',
-                    })
-                cur = {}
+
+        def flush_current():
+            ssid = (cur.get('SSID') or '').strip()
+            if not ssid:
+                return
+            signal_raw = (cur.get('SIGNAL') or '0').strip()
+            sec_raw = (cur.get('SECURITY') or '').strip()
+            in_use = (cur.get('IN-USE') or '').strip()
+            try:
+                signal = int(signal_raw) if signal_raw else 0
+            except ValueError:
+                signal = 0
+            nets.append({
+                'ssid': ssid,
+                'signal_strength': signal,
+                'security': sec_raw or 'open',
+                'connected': in_use == '*',
+            })
+
+        for line in res.stdout.splitlines():
+            if ':' not in line:
                 continue
-            if ':' in line:
-                k, v = line.split(':', 1)
-                cur[k.strip()] = v.strip()
+            k, v = line.split(':', 1)
+            key = k.strip()
+            val = v.strip()
+
+            # nmcli multiline output is not always separated by blank lines.
+            # If a key repeats for the next AP, flush the current record first.
+            if key == 'SSID' and 'SSID' in cur:
+                flush_current()
+                cur = {}
+
+            cur[key] = val
+
+        flush_current()
         return nets
 
     def _connect_local_wifi(self, ssid: str, password: Optional[str]) -> dict:
