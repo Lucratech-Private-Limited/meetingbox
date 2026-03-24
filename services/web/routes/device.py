@@ -56,12 +56,30 @@ def _nmcli_run(args: list, timeout: float = 30) -> subprocess.CompletedProcess:
         )
     )
     if res.returncode != 0 and priv and shutil.which("sudo"):
-        return subprocess.run(
+        res2 = subprocess.run(
             ["sudo", "-n", "nmcli", *args],
             capture_output=True,
             text=True,
             timeout=timeout,
         )
+        sudo_msg = ((res2.stderr or "") + (res2.stdout or "")).lower()
+        # If sudo itself failed because it cannot prompt, keep original
+        # NetworkManager permission error for clearer UI messaging.
+        if (
+            res2.returncode != 0
+            and any(
+                s in sudo_msg
+                for s in (
+                    "a password is required",
+                    "password is required",
+                    "terminal is required",
+                    "no tty present",
+                    "sudo: a password",
+                )
+            )
+        ):
+            return res
+        return res2
     return res
 
 

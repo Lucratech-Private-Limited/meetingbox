@@ -19,6 +19,10 @@ _src_dir = Path(__file__).resolve().parent
 if str(_src_dir) not in sys.path:
     sys.path.insert(0, str(_src_dir))
 
+# Before importing Kivy: stable clipboard provider on Linux (see kivy_options).
+if sys.platform.startswith("linux"):
+    os.environ.setdefault("KIVY_CLIPBOARD", "sdl2")
+
 from kivy.app import App
 from kivy.uix.screenmanager import (
     ScreenManager, FadeTransition, SlideTransition, NoTransition

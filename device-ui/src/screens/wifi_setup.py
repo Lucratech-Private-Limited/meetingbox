@@ -671,6 +671,22 @@ class WiFiSetupScreen(BaseScreen):
                 ['sudo', '-n', 'nmcli'] + args,
                 capture_output=True, text=True, timeout=timeout,
             )
+            sudo_msg = ((res2.stderr or '') + (res2.stdout or '')).lower()
+            # If sudo itself failed because it cannot prompt, keep original
+            # NetworkManager error so users don't confuse sudo password with WiFi password.
+            if (
+                res2.returncode != 0 and
+                any(
+                    s in sudo_msg for s in (
+                        'a password is required',
+                        'password is required',
+                        'terminal is required',
+                        'no tty present',
+                        'sudo: a password',
+                    )
+                )
+            ):
+                return res
             return res2
         return res
 
