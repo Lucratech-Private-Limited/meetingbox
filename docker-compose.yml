@@ -148,6 +148,8 @@ services:
     build:
       context: ./device-ui
     container_name: meetingbox-ui
+    # Match web/audio/transcription (UID 1000) so ./data/config is writable.
+    user: "1000:1000"
     profiles:
       - screen
     restart: unless-stopped

@@ -7,7 +7,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from config import SETUP_COMPLETE_MARKER_PATHS
+from config import setup_complete_marker_paths_for_write
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +30,7 @@ def write_local_setup_complete_marker(
         meta.update(extra)
     text = json.dumps(meta, indent=2)
     any_ok = False
-    for path in SETUP_COMPLETE_MARKER_PATHS:
+    for path in setup_complete_marker_paths_for_write():
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(text, encoding="utf-8")

@@ -16,11 +16,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from config import BASE_DIR
+from config import BASE_DIR, resolve_device_config_dir
 
 logger = logging.getLogger(__name__)
-
-_DEFAULT_REL = Path("data") / "config" / "device_profiles.json"
 
 
 def profiles_file_path() -> Path:
@@ -32,17 +30,7 @@ def profiles_file_path() -> Path:
         except OSError as e:
             logger.warning("DEVICE_PROFILES_PATH mkdir failed %s: %s", p, e)
         return p
-    for p in (
-        Path("/data/config/device_profiles.json"),
-        Path("/opt/meetingbox/data/config/device_profiles.json"),
-        BASE_DIR / _DEFAULT_REL,
-    ):
-        try:
-            p.parent.mkdir(parents=True, exist_ok=True)
-            return p
-        except OSError as e:
-            logger.debug("profiles path skip %s: %s", p, e)
-    return BASE_DIR / _DEFAULT_REL
+    return resolve_device_config_dir() / "device_profiles.json"
 
 
 def _hash_password(password: str) -> str:

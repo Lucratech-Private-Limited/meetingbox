@@ -41,7 +41,7 @@ COPY . .
 # Create non-root user with host-matching groups for device access
 RUN groupadd -g 44 video 2>/dev/null || true \
     && groupadd -g 105 input 2>/dev/null || true \
-    && useradd -m -s /bin/bash -G video,input uiuser \
+    && useradd -m -u 1000 -s /bin/bash -G video,input uiuser \
     && chown -R uiuser:uiuser /app
 
 # Kivy config: use SDL2 window provider, disable console log

@@ -226,13 +226,105 @@ ASSETS_DIR = BASE_DIR / 'assets'
 FONTS_DIR = ASSETS_DIR / 'fonts'
 ICONS_DIR = ASSETS_DIR / 'icons'
 
-# First-boot complete markers (keep in sync with MeetingBoxApp.needs_setup).
-SETUP_COMPLETE_MARKER_PATHS = (
+# Legacy marker locations (older builds / server may have written here).
+_SETUP_COMPLETE_LEGACY_MARKERS = (
     Path('/data/config/.setup_complete'),
     Path('/opt/meetingbox/data/config/.setup_complete'),
     Path('/opt/meetingbox/.setup_complete'),
     BASE_DIR / 'data' / 'config' / '.setup_complete',
 )
+
+
+def resolve_device_config_dir() -> Path:
+    """
+    Writable directory for device_profiles.json and local .setup_complete.
+
+    Prefers /data/config when the compose volume is writable. If /data/config
+    is root-owned or missing, falls back to BASE_DIR/data/config (ephemeral
+    inside Docker — see warning).
+    """
+    candidates = (
+        Path('/data/config'),
+        Path('/opt/meetingbox/data/config'),
+        BASE_DIR / 'data' / 'config',
+    )
+    for d in candidates:
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            logger.debug('device config dir skip %s: %s', d, e)
+            continue
+        try:
+            if os.access(d, os.W_OK):
+                return d
+        except OSError:
+            continue
+    # Should not reach: BASE_DIR path usually mkdir+writable
+    fb = BASE_DIR / 'data' / 'config'
+    try:
+        fb.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    if Path('/.dockerenv').exists():
+        try:
+            vol = Path('/data/config')
+            vol_ok = vol.exists() and os.access(vol, os.W_OK)
+        except OSError:
+            vol_ok = False
+        if not vol_ok:
+            logger.warning(
+                'Cannot persist to /data/config (not writable). Using %s — '
+                'setup and profiles are LOST on container restart. Fix on host: '
+                'sudo chown -R 1000:1000 ./data/config',
+                fb,
+            )
+    return fb
+
+
+def setup_complete_marker_paths_for_read() -> tuple[Path, ...]:
+    """If any path exists, first boot is done (keep in sync with needs_setup)."""
+    seen: set[str] = set()
+    out: list[Path] = []
+    primary = resolve_device_config_dir() / '.setup_complete'
+    for p in (primary, *_SETUP_COMPLETE_LEGACY_MARKERS):
+        try:
+            key = str(p.resolve())
+        except OSError:
+            key = str(p)
+        if key not in seen:
+            seen.add(key)
+            out.append(p)
+    return tuple(out)
+
+
+def setup_complete_marker_paths_for_write() -> tuple[Path, ...]:
+    """Write .setup_complete to every distinct writable config root."""
+    dirs: list[Path] = []
+    primary = resolve_device_config_dir()
+    dirs.append(primary)
+    for d in (Path('/data/config'), Path('/opt/meetingbox/data/config')):
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            continue
+        try:
+            if os.access(d, os.W_OK):
+                dirs.append(d)
+        except OSError:
+            continue
+    seen: set[str] = set()
+    uniq: list[Path] = []
+    for d in dirs:
+        try:
+            k = str(d.resolve())
+        except OSError:
+            k = str(d)
+        if k not in seen:
+            seen.add(k)
+            uniq.append(d)
+    return tuple(d / '.setup_complete' for d in uniq)
+
+
 
 try:
     ASSETS_DIR.mkdir(exist_ok=True)
