@@ -30,6 +30,10 @@ sudo ./scripts/install_device_ui.sh
 # Navigate to device-ui directory
 cd device-ui/
 
+# Create and activate a virtual environment (recommended for local dev)
+python3 -m venv .venv
+source .venv/bin/activate
+
 # Install Python dependencies
 pip3 install -r requirements.txt
 
@@ -59,6 +63,14 @@ sudo systemctl enable meetingbox-ui  # Auto-start on boot
 
 ### Manual Run (Development)
 ```bash
+# Run locally without Docker (recommended during UI iteration)
+cd device-ui
+source .venv/bin/activate
+
+# Match Figma canvas scale
+export DISPLAY_WIDTH=1024
+export DISPLAY_HEIGHT=600
+
 # With real backend
 python3 src/main.py
 

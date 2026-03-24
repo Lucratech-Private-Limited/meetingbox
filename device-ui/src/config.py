@@ -33,9 +33,9 @@ WS_MAX_RECONNECT_ATTEMPTS = 10
 # ============================================================================
 
 # Display resolution
-# Override with env vars when targeting a specific panel or kiosk display.
-DISPLAY_WIDTH = int(os.getenv('DISPLAY_WIDTH', '1280'))
-DISPLAY_HEIGHT = int(os.getenv('DISPLAY_HEIGHT', '720'))
+# Figma-aligned default is 1024x600; override via env vars as needed.
+DISPLAY_WIDTH = int(os.getenv('DISPLAY_WIDTH', '1024'))
+DISPLAY_HEIGHT = int(os.getenv('DISPLAY_HEIGHT', '600'))
 
 # Display orientation
 DISPLAY_ORIENTATION = os.getenv('DISPLAY_ORIENTATION', 'landscape')

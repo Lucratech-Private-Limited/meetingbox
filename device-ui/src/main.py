@@ -31,8 +31,8 @@ from kivy.config import Config
 # Setting position/size/fullscreen after Window exists only partially works and
 # causes the window to render at the wrong position (top-left or bottom-left).
 _FULLSCREEN = os.getenv('FULLSCREEN', '0') == '1'
-_W = int(os.getenv('DISPLAY_WIDTH', '1280'))
-_H = int(os.getenv('DISPLAY_HEIGHT', '720'))
+_W = int(os.getenv('DISPLAY_WIDTH', '1024'))
+_H = int(os.getenv('DISPLAY_HEIGHT', '600'))
 
 Config.set('graphics', 'window_state', 'visible')
 Config.set('graphics', 'position', 'custom')
