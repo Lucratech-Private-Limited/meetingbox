@@ -29,6 +29,20 @@ source "$ACTIVATE"
 export DISPLAY_WIDTH="${DISPLAY_WIDTH:-1024}"
 export DISPLAY_HEIGHT="${DISPLAY_HEIGHT:-600}"
 
+# If you launched this from SSH, DISPLAY is often localhost:10.0 (forwarded X).
+# MoTTY / missing xauth then shows no window on the real monitor. Prefer local :0
+# when the console X socket exists. Opt out: MEETINGBOX_KEEP_SSH_X=1
+if [[ "$(uname -s)" == "Linux" ]] && [[ "${MEETINGBOX_KEEP_SSH_X:-0}" != "1" ]]; then
+  if [[ -n "${DISPLAY:-}" && "${DISPLAY}" == localhost:* ]] && [[ -S /tmp/.X11-unix/X0 ]]; then
+    echo "[MeetingBox] DISPLAY was ${DISPLAY}; switching to :0 for local monitor (set MEETINGBOX_KEEP_SSH_X=1 to keep SSH X11)." >&2
+    export DISPLAY=:0
+  fi
+fi
+# Explicit override: MEETINGBOX_USE_LOCAL_X=1 forces :0 when available.
+if [[ "$(uname -s)" == "Linux" ]] && [[ "${MEETINGBOX_USE_LOCAL_X:-0}" == "1" ]] && [[ -S /tmp/.X11-unix/X0 ]]; then
+  export DISPLAY=:0
+fi
+
 # Kivy on Linux: SDL2 clipboard still loads an X11 "cutbuffer" helper; without
 # xclip/xsel it logs CRITICAL (see kivy/core/clipboard/__init__.py).
 if [[ "$(uname -s)" == "Linux" ]] && ! command -v xclip >/dev/null 2>&1 && ! command -v xsel >/dev/null 2>&1; then

@@ -24,6 +24,17 @@ if str(_src_dir) not in sys.path:
 if sys.platform.startswith("linux"):
     os.environ.setdefault("KIVY_CLIPBOARD", "sdl2")
 
+# SSH sessions often set DISPLAY=localhost:10.0; MoTTY then shows no window on
+# the built-in monitor. Use local :0 if that socket exists (opt out:
+# MEETINGBOX_KEEP_SSH_X=1). Must run before kivy.core.window is imported.
+if (
+    sys.platform.startswith("linux")
+    and os.environ.get("MEETINGBOX_KEEP_SSH_X") != "1"
+):
+    _disp = os.environ.get("DISPLAY", "")
+    if _disp.startswith("localhost:") and Path("/tmp/.X11-unix/X0").exists():
+        os.environ["DISPLAY"] = ":0"
+
 from kivy.app import App
 from kivy.uix.screenmanager import (
     ScreenManager, FadeTransition, SlideTransition, NoTransition
@@ -238,8 +249,22 @@ class MeetingBoxApp(App):
 
         Window.bind(on_touch_down=self._reset_idle_timer)
 
+        # Ensure the SDL window is mapped and on top (some WMs / SSH DISPLAY
+        # combinations leave it hidden until raised).
+        Clock.schedule_once(lambda *_: self._ensure_window_visible(), 0)
+        Clock.schedule_once(lambda *_: self._ensure_window_visible(), 0.3)
+
         logger.info("UI built – starting on splash screen")
         return self.screen_manager
+
+    def _ensure_window_visible(self):
+        try:
+            if hasattr(Window, 'show'):
+                Window.show()
+            if hasattr(Window, 'raise_window'):
+                Window.raise_window()
+        except Exception as e:
+            logger.debug('ensure_window_visible: %s', e)
 
     # ==================================================================
     # SETUP CHECK

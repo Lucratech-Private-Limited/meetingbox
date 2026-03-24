@@ -6,12 +6,21 @@ falls back to X11 DPMS commands for screen power control.
 """
 
 import logging
+import os
 import subprocess
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 BACKLIGHT_ROOT = Path("/sys/class/backlight")
+
+
+def _x11_env() -> dict:
+    """Env for xset: same DISPLAY as the running app, not hard-coded :0."""
+    env = os.environ.copy()
+    if not env.get("DISPLAY"):
+        env["DISPLAY"] = ":0"
+    return env
 
 BRIGHTNESS_MAP = {
     "low": 0.30,
@@ -87,7 +96,7 @@ def screen_off() -> None:
         subprocess.run(
             ["xset", "dpms", "force", "off"],
             capture_output=True, timeout=5,
-            env={"DISPLAY": ":0"},
+            env=_x11_env(),
         )
     except Exception as e:
         logger.debug("screen_off fallback failed: %s", e)
@@ -114,7 +123,7 @@ def screen_on(level: str = "high") -> None:
             subprocess.run(
                 ["xset", "dpms", "force", "on"],
                 capture_output=True, timeout=5,
-                env={"DISPLAY": ":0"},
+                env=_x11_env(),
             )
         except Exception:
             pass
