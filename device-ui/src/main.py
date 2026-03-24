@@ -43,6 +43,8 @@ Config.set('graphics', 'height', str(_H))
 Config.set('graphics', 'borderless', '1' if _FULLSCREEN else '0')
 Config.set('graphics', 'fullscreen', 'auto' if _FULLSCREEN else '0')
 Config.set('input', 'mouse', 'mouse,multitouch_on_demand')
+# On-screen keyboard for TextInput when no system keyboard (touch / kiosk).
+Config.set('kivy', 'keyboard_mode', 'systemanddock')
 
 from kivy.core.window import Window  # noqa: E402 — must import after Config
 
@@ -270,8 +272,9 @@ class MeetingBoxApp(App):
             if self._setup_poll:
                 self._setup_poll.cancel()
                 self._setup_poll = None
-            onboarding_screens = {
-                'welcome', 'room_name', 'wifi_setup', 'setup_progress'}
+            # Do not include wifi_setup: marker is written there; user must tap
+            # Next → home. Auto-jumping to all_set would race with that flow.
+            onboarding_screens = {'welcome', 'room_name', 'setup_progress'}
             current = self.screen_manager.current
             if current in onboarding_screens:
                 self.goto_screen('all_set', 'fade')
@@ -499,8 +502,7 @@ class MeetingBoxApp(App):
     def on_setup_complete(self, data):
         """Handle setup_complete event globally -- works from any onboarding screen."""
         logger.info("Setup complete event received")
-        onboarding_screens = {
-            'welcome', 'room_name', 'wifi_setup', 'setup_progress'}
+        onboarding_screens = {'welcome', 'room_name', 'setup_progress'}
         current = self.screen_manager.current
 
         def _advance(_dt):

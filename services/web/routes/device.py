@@ -10,6 +10,7 @@ import os
 import platform
 import subprocess
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -25,6 +26,10 @@ router = APIRouter()
 # Persistent settings file on disk
 SETTINGS_FILE = Path(os.getenv("DEVICE_SETTINGS_PATH", "/data/config/device_settings.json"))
 SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+SETUP_COMPLETE_FILE = SETTINGS_FILE.parent / ".setup_complete"
+
+# NetworkManager WiFi interface (override if not wlan0, e.g. wlp2s0)
+WIFI_IFACE = os.getenv("WIFI_INTERFACE", "wlan0")
 
 FIRMWARE_VERSION = os.getenv("FIRMWARE_VERSION", "1.0.0")
 DEVICE_MODEL = "MeetingBox v1.0"
@@ -160,7 +165,9 @@ async def update_settings(body: SettingsUpdate, current_user: Optional[dict] = D
         try:
             SETTINGS_FILE.unlink(missing_ok=True)
             # Remove setup marker from shared config volume
+            SETUP_COMPLETE_FILE.unlink(missing_ok=True)
             for p in ["/data/config/.setup_complete",
+                      "/opt/meetingbox/data/config/.setup_complete",
                       "/opt/meetingbox/.setup_complete"]:
                 Path(p).unlink(missing_ok=True)
             subprocess.Popen(["sudo", "reboot"], close_fds=True)
@@ -171,6 +178,39 @@ async def update_settings(body: SettingsUpdate, current_user: Optional[dict] = D
     current.update(updates)
     _save_settings(current)
     return current
+
+
+class SetupCompleteBody(BaseModel):
+    """Metadata written to .setup_complete when onboarding finishes."""
+
+    wifi_ssid: str = ""
+    onboarding_flow: str = "wifi_on_device_v1"
+
+
+@router.post("/setup-complete")
+async def post_setup_complete(
+    body: SetupCompleteBody,
+    current_user: Optional[dict] = Depends(get_optional_user),
+):
+    """
+    Mark first-boot setup finished. Writes JSON metadata next to device_settings.json.
+    Device UI calls this after successful WiFi, then navigates home.
+    """
+    settings = _load_settings()
+    meta = {
+        "version": 1,
+        "completed_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "device_name": settings.get("device_name", "MeetingBox"),
+        "wifi_ssid": (body.wifi_ssid or "").strip(),
+        "onboarding_flow": body.onboarding_flow or "wifi_on_device_v1",
+    }
+    try:
+        SETUP_COMPLETE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(SETUP_COMPLETE_FILE, "w", encoding="utf-8") as f:
+            json.dump(meta, f, indent=2)
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"Could not write setup marker: {e}")
+    return {"status": "ok", "metadata": meta}
 
 
 # ======================================================================
@@ -270,7 +310,7 @@ async def wifi_connect(body: WiFiConnect, current_user: Optional[dict] = Depends
             subprocess.run(
                 ["nmcli", "connection", "add",
                  "type", "wifi",
-                 "ifname", "wlan0",
+                 "ifname", WIFI_IFACE,
                  "con-name", body.ssid,
                  "ssid", body.ssid,
                  "--",
@@ -305,7 +345,7 @@ async def wifi_disconnect(current_user: Optional[dict] = Depends(get_optional_us
     """Disconnect from current WiFi."""
     try:
         subprocess.run(
-            ["nmcli", "dev", "disconnect", "wlan0"],
+            ["nmcli", "dev", "disconnect", WIFI_IFACE],
             capture_output=True, text=True, timeout=10,
         )
         return {"status": "disconnected"}

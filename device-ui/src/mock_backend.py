@@ -182,6 +182,21 @@ class MockBackendClient:
         logger.info(f"[MOCK] Updated settings: {settings}")
         return self._settings
 
+    async def post_setup_complete(
+            self,
+            wifi_ssid: str = "",
+            onboarding_flow: str = "wifi_on_device_v1") -> Dict:
+        await asyncio.sleep(0.2)
+        meta = {
+            "version": 1,
+            "completed_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "device_name": self._settings.get("device_name", "MeetingBox"),
+            "wifi_ssid": wifi_ssid or "",
+            "onboarding_flow": onboarding_flow,
+        }
+        logger.info("[MOCK] Setup complete: %s", meta)
+        return {"status": "ok", "metadata": meta}
+
     # ==================================================================
     # INTEGRATIONS
     # ==================================================================

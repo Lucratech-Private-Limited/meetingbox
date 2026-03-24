@@ -1,232 +1,647 @@
 """
-WiFi Setup Screen – Two-column layout
+WiFi Setup – on-device scan, connect, and finish onboarding.
 
-Left  : Step-by-step instructions + waiting indicator
-Right : QR code pointing to http://192.168.4.1
+Design ref: UI_Ref_for_cursor/Wifi_Setup_screen/WIFI_Setup_screen.png
 
-The actual WiFi hotspot is managed by the host-side onboard service
-(scripts/hotspot.sh + scripts/onboard_server.py). This screen reads the
-SSID from the hotspot status file or falls back to a generated name.
-
-Auto-advances to 'all_set' when the .setup_complete marker appears
-(handled by the global _global_setup_check in main.py).
+- Lists networks from GET /api/device/wifi/scan
+- Rescan, add network manually (security type + SSID + password)
+- Next enabled only after successful WiFi connection; then POST
+  /api/device/setup-complete and navigate to Home.
 """
 
-import subprocess
+import logging
 from pathlib import Path
+from typing import Optional
 
-from kivy.uix.boxlayout import BoxLayout
-from kivy.uix.label import Label
-from kivy.uix.image import Image
-from kivy.uix.widget import Widget
-from kivy.graphics import Color, Rectangle
 from kivy.clock import Clock
+from kivy.graphics import Color, Rectangle, RoundedRectangle
+from kivy.uix.behaviors import ButtonBehavior
+from kivy.uix.boxlayout import BoxLayout
+from kivy.uix.floatlayout import FloatLayout
+from kivy.uix.gridlayout import GridLayout
+from kivy.uix.image import Image
+from kivy.uix.label import Label
+from kivy.uix.scrollview import ScrollView
+from kivy.uix.spinner import Spinner
+from kivy.uix.textinput import TextInput
+from kivy.uix.widget import Widget
 
 from screens.base_screen import BaseScreen
-from config import (COLORS, FONT_SIZES, SPACING,
-                    HOTSPOT_SSID_PREFIX, HOTSPOT_IP, SETUP_URL)
+from components.button import PrimaryButton, SecondaryButton
+from components.modal_dialog import ModalDialog
+from config import COLORS, FONT_SIZES, ASSETS_DIR, BORDER_RADIUS
+from async_helper import run_async
 
-try:
-    import qrcode
-    from io import BytesIO
-    from kivy.core.image import Image as CoreImage
-    HAS_QRCODE = True
-except ImportError:
-    HAS_QRCODE = False
+logger = logging.getLogger(__name__)
+
+WELCOME_DIR = ASSETS_DIR / 'welcome'
+LOGO_PATH = str(WELCOME_DIR / 'LOGO.png')
+WIFI_BG = (0.043, 0.051, 0.067, 1)
 
 
-def _get_hotspot_ssid() -> str:
-    """Read the active hotspot SSID from the system."""
-    # Try multiple possible locations for the hotspot script
-    for script_path in ["/opt/meetingbox/scripts/hotspot.sh",
-                        "/home/meetingbox/meetingbox/scripts/hotspot.sh"]:
-        try:
-            result = subprocess.run(
-                ["bash", script_path, "status"],
-                capture_output=True, text=True, timeout=5,
+def _format_security(sec: str) -> str:
+    s = (sec or '').strip()
+    if not s or s == '--':
+        return 'OPEN'
+    return s.upper().replace('_', ' ')
+
+
+def _is_open_network(security: str) -> bool:
+    s = (security or '').lower()
+    return not s or s in ('open', '--', 'none', '')
+
+
+class _AddNetworkLink(ButtonBehavior, Label):
+    """Tappable '+ Add Network Manually' label."""
+    pass
+
+
+class _WiFiRow(ButtonBehavior, BoxLayout):
+    """One network row in the setup list."""
+
+    def __init__(self, net: dict, connecting_ssid: str, **kwargs):
+        self.net = net
+        ssid = net.get('ssid') or ''
+        sec = net.get('security') or ''
+        connected = bool(net.get('connected'))
+        busy = connecting_ssid == ssid
+
+        kwargs.setdefault('orientation', 'horizontal')
+        kwargs.setdefault('size_hint_y', None)
+        kwargs.setdefault('height', 64)
+        kwargs.setdefault('padding', [12, 8])
+        kwargs.setdefault('spacing', 10)
+        super().__init__(**kwargs)
+
+        with self.canvas.before:
+            Color(*COLORS['surface'])
+            self._bg = RoundedRectangle(
+                pos=self.pos, size=self.size, radius=[BORDER_RADIUS])
+        self.bind(
+            pos=lambda w, *_: setattr(self._bg, 'pos', w.pos),
+            size=lambda w, *_: setattr(self._bg, 'size', w.size),
+        )
+
+        # Signal / status icon (left)
+        if busy:
+            icon_txt = '⟳'
+            icon_color = COLORS['blue']
+        elif connected:
+            icon_txt = '◉'
+            icon_color = COLORS['blue']
+        else:
+            sig = int(net.get('signal_strength') or 0)
+            if sig >= 70:
+                icon_txt = '▂▄▆'
+            elif sig >= 40:
+                icon_txt = '▂▄'
+            else:
+                icon_txt = '▂'
+            icon_color = COLORS['gray_500']
+
+        icon = Label(
+            text=icon_txt,
+            font_size=FONT_SIZES['medium'],
+            color=icon_color,
+            size_hint=(None, 1),
+            width=36,
+            halign='center',
+        )
+        self.add_widget(icon)
+
+        mid = BoxLayout(orientation='vertical', spacing=2, size_hint=(1, 1))
+        title = Label(
+            text=ssid,
+            font_size=FONT_SIZES['medium'],
+            bold=True,
+            color=COLORS['white'],
+            halign='left',
+            valign='middle',
+            size_hint=(1, None),
+            height=22,
+        )
+        title.bind(size=title.setter('text_size'))
+        mid.add_widget(title)
+
+        if busy:
+            sub = 'Connecting…'
+            sub_color = COLORS['blue']
+        else:
+            sub = _format_security(sec)
+            sub_color = COLORS['gray_500']
+        sub_l = Label(
+            text=sub,
+            font_size=FONT_SIZES['small'],
+            color=sub_color,
+            halign='left',
+            size_hint=(1, None),
+            height=18,
+        )
+        sub_l.bind(size=sub_l.setter('text_size'))
+        mid.add_widget(sub_l)
+        self.add_widget(mid)
+
+        if not busy:
+            if _is_open_network(sec):
+                right_txt = '○'
+            else:
+                right_txt = '🔒'
+            right = Label(
+                text=right_txt,
+                font_size=FONT_SIZES['small'],
+                color=COLORS['gray_400'],
+                size_hint=(None, 1),
+                width=28,
             )
-            parts = result.stdout.strip().split("|")
-            if parts[0] == "active" and len(parts) >= 2:
-                return parts[1]
-        except Exception:
-            continue
-
-    # Fallback: derive from MAC address
-    for iface in ["wlan0", "wlp1s0", "wlp2s0"]:
-        try:
-            mac = Path(f"/sys/class/net/{iface}/address").read_text().strip()
-            suffix = mac.replace(":", "")[-4:].upper()
-            return f"{HOTSPOT_SSID_PREFIX}{suffix}"
-        except Exception:
-            continue
-
-    return f"{HOTSPOT_SSID_PREFIX}Setup"
+            self.add_widget(right)
 
 
 class WiFiSetupScreen(BaseScreen):
-    """WiFi setup screen shown during first-time configuration."""
+    """First-boot WiFi: scan, connect, then mark setup complete and go Home."""
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.ssid_label = None
-        self._dot_index = 0
-        self._dot_event = None
+        self.networks = []
+        self._connecting_ssid = None
+        self._ready_for_next = False
+        self._connected_ssid = ''
         self._build_ui()
 
     def _build_ui(self):
-        root = BoxLayout(
-            orientation='horizontal',
-            padding=SPACING['screen_padding'],
-            spacing=SPACING['section_spacing'],
-        )
-        self.make_dark_bg(root)
-
-        # --- LEFT column ---
-        left = BoxLayout(
-            orientation='vertical',
-            size_hint=(0.55, 1),
-            spacing=8,
+        root = BoxLayout(orientation='vertical', padding=[20, 10, 20, 14], spacing=0)
+        root.canvas.before.clear()
+        with root.canvas.before:
+            Color(*WIFI_BG)
+            self._root_bg = RoundedRectangle(pos=root.pos, size=root.size)
+        root.bind(
+            pos=lambda w, *_: setattr(self._root_bg, 'pos', w.pos),
+            size=lambda w, *_: setattr(self._root_bg, 'size', w.size),
         )
 
-        s1h = Label(
-            text='1. Connect to WiFi:',
-            font_size=FONT_SIZES['body'],
-            color=COLORS['white'],
-            halign='left', valign='bottom',
-            size_hint=(1, None), height=24,
-        )
-        s1h.bind(size=s1h.setter('text_size'))
-        left.add_widget(s1h)
-
-        ssid = _get_hotspot_ssid()
-        self.ssid_label = Label(
-            text=f'   {ssid}',
-            font_size=FONT_SIZES['medium'],
+        # Header
+        header = BoxLayout(
+            orientation='horizontal', size_hint=(1, None), height=52, spacing=12)
+        if Path(LOGO_PATH).exists():
+            header.add_widget(Image(
+                source=LOGO_PATH, size_hint=(None, 1), width=40, fit_mode='contain'))
+        else:
+            header.add_widget(Widget(size_hint=(None, 1), width=8))
+        brand = Label(
+            text='MeetingBox',
+            font_size=FONT_SIZES['title'],
             bold=True,
             color=COLORS['white'],
-            halign='left', valign='top',
-            size_hint=(1, None), height=22,
-        )
-        self.ssid_label.bind(size=self.ssid_label.setter('text_size'))
-        left.add_widget(self.ssid_label)
-
-        hint = Label(
-            text='   (on your phone or laptop)',
-            font_size=FONT_SIZES['small'],
-            color=COLORS['gray_500'],
             halign='left',
-            size_hint=(1, None), height=18,
+            valign='middle',
+            size_hint_x=1,
         )
-        hint.bind(size=hint.setter('text_size'))
-        left.add_widget(hint)
+        brand.bind(size=brand.setter('text_size'))
+        header.add_widget(brand)
+        root.add_widget(header)
 
-        left.add_widget(Widget(size_hint=(1, None), height=8))
+        root.add_widget(Widget(size_hint=(1, None), height=6))
 
-        s2h = Label(
-            text='2. Open in browser:',
-            font_size=FONT_SIZES['body'],
-            color=COLORS['white'],
-            halign='left', valign='bottom',
-            size_hint=(1, None), height=24,
-        )
-        s2h.bind(size=s2h.setter('text_size'))
-        left.add_widget(s2h)
-
-        url_label = Label(
-            text=f'   {SETUP_URL}',
-            font_size=FONT_SIZES['medium'],
+        title = Label(
+            text='Connect to WiFi',
+            font_size=FONT_SIZES['huge'],
             bold=True,
+            color=COLORS['white'],
+            halign='left',
+            size_hint=(1, None),
+            height=40,
+        )
+        title.bind(size=title.setter('text_size'))
+        root.add_widget(title)
+
+        sub = Label(
+            text='Required for calendar sync and email delivery.',
+            font_size=FONT_SIZES['body'],
+            color=COLORS['gray_400'],
+            halign='left',
+            size_hint=(1, None),
+            height=28,
+        )
+        sub.bind(size=sub.setter('text_size'))
+        root.add_widget(sub)
+
+        root.add_widget(Widget(size_hint=(1, None), height=10))
+
+        # List card
+        card = BoxLayout(orientation='vertical', size_hint=(1, 1), spacing=0)
+        with card.canvas.before:
+            Color(*COLORS['surface'])
+            self._card_bg = RoundedRectangle(
+                pos=card.pos, size=card.size, radius=[BORDER_RADIUS])
+        card.bind(
+            pos=lambda w, *_: setattr(self._card_bg, 'pos', w.pos),
+            size=lambda w, *_: setattr(self._card_bg, 'size', w.size),
+        )
+
+        scroll = ScrollView(do_scroll_x=False, size_hint=(1, 1))
+        self._list = GridLayout(cols=1, spacing=8, size_hint_y=None, padding=[8, 8])
+        self._list.bind(minimum_height=self._list.setter('height'))
+        scroll.add_widget(self._list)
+        card.add_widget(scroll)
+
+        actions = BoxLayout(
+            orientation='horizontal',
+            size_hint=(1, None),
+            height=40,
+            padding=[8, 4],
+            spacing=16,
+        )
+        add_link = _AddNetworkLink(
+            text='+ Add Network Manually',
+            font_size=FONT_SIZES['small'],
             color=COLORS['blue'],
             halign='left',
-            size_hint=(1, None), height=22,
+            valign='middle',
+            size_hint=(0.55, 1),
         )
-        url_label.bind(size=url_label.setter('text_size'))
-        left.add_widget(url_label)
+        add_link.bind(size=add_link.setter('text_size'))
+        add_link.bind(on_press=lambda *_: self._show_manual_dialog())
+        actions.add_widget(add_link)
 
-        s3h = Label(
-            text='3. Select your WiFi network',
-            font_size=FONT_SIZES['body'],
-            color=COLORS['white'],
-            halign='left', valign='bottom',
-            size_hint=(1, None), height=24,
-        )
-        s3h.bind(size=s3h.setter('text_size'))
-        left.add_widget(s3h)
-
-        left.add_widget(Widget(size_hint=(1, 0.3)))
-
-        # Waiting indicator (replaces the old "I'M CONNECTED" button)
-        self.waiting_label = Label(
-            text='Waiting for WiFi configuration...',
-            font_size=FONT_SIZES['small'],
-            color=COLORS['gray_500'],
-            halign='left',
-            size_hint=(1, None), height=20,
-        )
-        self.waiting_label.bind(size=self.waiting_label.setter('text_size'))
-        left.add_widget(self.waiting_label)
-
-        self.dots_label = Label(
-            text='',
-            font_size=FONT_SIZES['small'],
-            color=COLORS['gray_500'],
-            halign='left',
-            size_hint=(1, None), height=16,
-        )
-        self.dots_label.bind(size=self.dots_label.setter('text_size'))
-        left.add_widget(self.dots_label)
-
-        left.add_widget(Widget(size_hint=(1, None), height=8))
-
-        root.add_widget(left)
-
-        # --- RIGHT column: QR code ---
-        right = BoxLayout(
-            orientation='vertical',
+        rescan = SecondaryButton(
+            text='↻  Rescan',
             size_hint=(0.45, 1),
+            font_size=FONT_SIZES['small'],
         )
+        rescan.bind(on_press=lambda *_: self._load_networks())
+        actions.add_widget(rescan)
+        card.add_widget(actions)
 
-        qr_widget = self._generate_qr(SETUP_URL)
-        right.add_widget(qr_widget)
-        root.add_widget(right)
+        root.add_widget(card)
+
+        root.add_widget(Widget(size_hint=(1, None), height=10))
+
+        foot = BoxLayout(orientation='horizontal', size_hint=(1, None), height=52, spacing=12)
+        back_btn = SecondaryButton(
+            text='Back', size_hint=(None, 1), width=100,
+            font_size=FONT_SIZES['medium'])
+        back_btn.bind(on_press=self._on_back)
+        foot.add_widget(back_btn)
+        foot.add_widget(Widget(size_hint=(1, 1)))
+        self._next_btn = PrimaryButton(
+            text='Next',
+            size_hint=(None, 1), width=120,
+            font_size=FONT_SIZES['medium'],
+        )
+        self._next_btn.bind(on_press=self._on_next)
+        self._next_btn.disabled = True
+        self._next_btn.opacity = 0.45
+        foot.add_widget(self._next_btn)
+        root.add_widget(foot)
 
         self.add_widget(root)
 
     def on_enter(self):
-        ssid = _get_hotspot_ssid()
-        if self.ssid_label:
-            self.ssid_label.text = f'   {ssid}'
-        self._dot_index = 0
-        self._dot_event = Clock.schedule_interval(self._animate_dots, 0.6)
+        self._connecting_ssid = None
+        self._ready_for_next = False
+        self._connected_ssid = ''
+        self._sync_next_button()
+        self._load_networks()
 
     def on_leave(self):
-        if self._dot_event:
-            self._dot_event.cancel()
-            self._dot_event = None
+        self._connecting_ssid = None
 
-    def _animate_dots(self, _dt):
-        self._dot_index = (self._dot_index + 1) % 4
-        dots = '.' * self._dot_index
-        self.dots_label.text = f'   {dots}'
+    def _sync_next_button(self):
+        self._next_btn.disabled = not self._ready_for_next
+        self._next_btn.opacity = 1.0 if self._ready_for_next else 0.45
 
-    def _generate_qr(self, url: str):
-        """Generate QR code image widget."""
-        if HAS_QRCODE:
+    def _set_ready(self, ssid: str):
+        self._ready_for_next = True
+        self._connected_ssid = ssid or ''
+        self._sync_next_button()
+
+    def _load_networks(self):
+        async def _load():
             try:
-                qr = qrcode.QRCode(version=1, box_size=6, border=1)
-                qr.add_data(url)
-                qr.make(fit=True)
-                img = qr.make_image(fill_color='white', back_color='black')
-                buf = BytesIO()
-                img.save(buf, format='PNG')
-                buf.seek(0)
-                core_img = CoreImage(buf, ext='png')
-                return Image(texture=core_img.texture, size_hint=(1, 1))
-            except Exception:
-                pass
-        lbl = Label(
-            text='[QR CODE]',
-            font_size=FONT_SIZES['large'],
-            color=COLORS['gray_500'],
+                nets = await self.backend.get_wifi_networks()
+                Clock.schedule_once(lambda *_: self._apply_networks(nets), 0)
+            except Exception as e:
+                logger.warning('WiFi scan failed: %s', e)
+                Clock.schedule_once(
+                    lambda *_: self.add_widget(ModalDialog(
+                        title='Scan failed',
+                        message='Could not scan networks. Check WiFi hardware and try Rescan.',
+                        confirm_text='OK',
+                        cancel_text='',
+                    )), 0)
+
+        run_async(_load())
+
+    def _apply_networks(self, nets):
+        self.networks = nets or []
+        for n in self.networks:
+            if n.get('connected') and n.get('ssid'):
+                self._set_ready(n['ssid'])
+                break
+        self._populate_list()
+
+    def _populate_list(self):
+        self._list.clear_widgets()
+        # Connected / stronger signals first
+        def sort_key(x):
+            return (0 if x.get('connected') else 1, -(x.get('signal_strength') or 0))
+
+        for net in sorted(self.networks, key=sort_key):
+            if not net.get('ssid'):
+                continue
+            row = _WiFiRow(net, self._connecting_ssid or '')
+            row.bind(on_press=lambda inst, n=net: self._on_row_pressed(n))
+            self._list.add_widget(row)
+
+    def _on_row_pressed(self, net: dict):
+        if self._connecting_ssid:
+            return
+        ssid = net.get('ssid')
+        if not ssid:
+            return
+        if net.get('connected'):
+            self._set_ready(ssid)
+            self._populate_list()
+            return
+        sec = net.get('security') or ''
+        if _is_open_network(sec):
+            self._connect(ssid, None)
+        else:
+            self._show_password_dialog(ssid)
+
+    def _show_password_dialog(self, ssid: str):
+        overlay = FloatLayout()
+
+        with overlay.canvas.before:
+            Color(*COLORS['overlay'])
+            ov = Rectangle(pos=overlay.pos, size=overlay.size)
+        overlay.bind(
+            pos=lambda w, *_: setattr(ov, 'pos', w.pos),
+            size=lambda w, *_: setattr(ov, 'size', w.size),
         )
-        return lbl
+
+        card = BoxLayout(
+            orientation='vertical',
+            size_hint=(None, None),
+            size=(400, 230),
+            pos_hint={'center_x': 0.5, 'center_y': 0.5},
+            padding=16,
+            spacing=10,
+        )
+        with card.canvas.before:
+            Color(*COLORS['surface'])
+            cbg = RoundedRectangle(
+                pos=card.pos, size=card.size, radius=[BORDER_RADIUS])
+        card.bind(
+            pos=lambda w, *_: setattr(cbg, 'pos', w.pos),
+            size=lambda w, *_: setattr(cbg, 'size', w.size),
+        )
+
+        title = Label(
+            text=f'Connect to {ssid}',
+            font_size=FONT_SIZES['title'],
+            bold=True,
+            color=COLORS['white'],
+            halign='left',
+            size_hint=(1, None),
+            height=28,
+        )
+        title.bind(size=title.setter('text_size'))
+        card.add_widget(title)
+
+        pwd = TextInput(
+            hint_text='Password',
+            password=True,
+            multiline=False,
+            font_size=FONT_SIZES['body'],
+            size_hint=(1, None),
+            height=44,
+            background_color=COLORS['surface_light'],
+            foreground_color=COLORS['white'],
+            hint_text_color=COLORS['gray_600'],
+            cursor_color=COLORS['white'],
+        )
+        card.add_widget(pwd)
+
+        row = BoxLayout(size_hint=(1, None), height=48, spacing=10)
+        cancel = SecondaryButton(text='Cancel', size_hint=(0.5, 1))
+        go = PrimaryButton(text='Connect', size_hint=(0.5, 1))
+
+        def dismiss(*_a):
+            if overlay.parent:
+                overlay.parent.remove_widget(overlay)
+
+        def do_connect(*_a):
+            pw = pwd.text.strip()
+            if not pw:
+                self.add_widget(ModalDialog(
+                    title='Password required',
+                    message='Enter the WiFi password.',
+                    confirm_text='OK',
+                    cancel_text='',
+                ))
+                return
+            dismiss()
+            self._connect(ssid, pw)
+
+        cancel.bind(on_press=dismiss)
+        go.bind(on_press=do_connect)
+        row.add_widget(cancel)
+        row.add_widget(go)
+        card.add_widget(row)
+
+        overlay.add_widget(card)
+        self.add_widget(overlay)
+
+    def _show_manual_dialog(self):
+        overlay = FloatLayout()
+        with overlay.canvas.before:
+            Color(*COLORS['overlay'])
+            ov = Rectangle(pos=overlay.pos, size=overlay.size)
+        overlay.bind(
+            pos=lambda w, *_: setattr(ov, 'pos', w.pos),
+            size=lambda w, *_: setattr(ov, 'size', w.size),
+        )
+
+        card = BoxLayout(
+            orientation='vertical',
+            size_hint=(None, None),
+            size=(420, 300),
+            pos_hint={'center_x': 0.5, 'center_y': 0.5},
+            padding=16,
+            spacing=8,
+        )
+        with card.canvas.before:
+            Color(*COLORS['surface'])
+            cbg = RoundedRectangle(
+                pos=card.pos, size=card.size, radius=[BORDER_RADIUS])
+        card.bind(
+            pos=lambda w, *_: setattr(cbg, 'pos', w.pos),
+            size=lambda w, *_: setattr(cbg, 'size', w.size),
+        )
+
+        card.add_widget(Label(
+            text='Add network',
+            font_size=FONT_SIZES['title'],
+            bold=True,
+            color=COLORS['white'],
+            halign='left',
+            size_hint=(1, None),
+            height=26,
+        ))
+
+        ssid_in = TextInput(
+            hint_text='Network name (SSID)',
+            multiline=False,
+            font_size=FONT_SIZES['body'],
+            size_hint=(1, None),
+            height=40,
+            background_color=COLORS['surface_light'],
+            foreground_color=COLORS['white'],
+            hint_text_color=COLORS['gray_600'],
+            cursor_color=COLORS['white'],
+        )
+        card.add_widget(ssid_in)
+
+        spin = Spinner(
+            text='WPA2 Personal',
+            values=('Open', 'WPA2 Personal', 'WPA3 Personal'),
+            size_hint=(1, None),
+            height=40,
+            background_color=COLORS['gray_800'],
+            color=COLORS['white'],
+        )
+        card.add_widget(spin)
+
+        pwd_in = TextInput(
+            hint_text='Password (if required)',
+            password=True,
+            multiline=False,
+            font_size=FONT_SIZES['body'],
+            size_hint=(1, None),
+            height=40,
+            background_color=COLORS['surface_light'],
+            foreground_color=COLORS['white'],
+            hint_text_color=COLORS['gray_600'],
+            cursor_color=COLORS['white'],
+        )
+        card.add_widget(pwd_in)
+
+        def on_sec(spinner, txt):
+            pwd_in.disabled = txt == 'Open'
+            pwd_in.opacity = 0.5 if pwd_in.disabled else 1.0
+
+        spin.bind(text=on_sec)
+        on_sec(spin, spin.text)
+
+        row = BoxLayout(size_hint=(1, None), height=48, spacing=10)
+
+        def dismiss(*_a):
+            if overlay.parent:
+                overlay.parent.remove_widget(overlay)
+
+        def do_add(*_a):
+            name = ssid_in.text.strip()
+            if not name:
+                return
+            sec = spin.text
+            if sec != 'Open':
+                pw = pwd_in.text.strip()
+                if not pw:
+                    self.add_widget(ModalDialog(
+                        title='Password required',
+                        message='Enter the network password or choose Open.',
+                        confirm_text='OK',
+                        cancel_text='',
+                    ))
+                    return
+            dismiss()
+            if sec == 'Open':
+                self._connect(name, None)
+            else:
+                self._connect(name, pwd_in.text.strip())
+
+        cancel = SecondaryButton(text='Cancel', size_hint=(0.5, 1))
+        go = PrimaryButton(text='Connect', size_hint=(0.5, 1))
+        cancel.bind(on_press=dismiss)
+        go.bind(on_press=do_add)
+        row.add_widget(cancel)
+        row.add_widget(go)
+        card.add_widget(row)
+
+        overlay.add_widget(card)
+        self.add_widget(overlay)
+
+    def _connect(self, ssid: str, password: Optional[str]):
+        self._connecting_ssid = ssid
+        self._populate_list()
+
+        async def _run():
+            try:
+                result = await self.backend.connect_wifi(ssid, password=password)
+                ok = result.get('status') == 'connected'
+                msg = result.get('message', '')
+
+                def _done(*_a):
+                    self._connecting_ssid = None
+                    if ok:
+                        self._set_ready(ssid)
+                        self._load_networks()
+                    else:
+                        self._populate_list()
+                        self.add_widget(ModalDialog(
+                            title='Could not connect',
+                            message=msg or 'Check the password and try again.',
+                            confirm_text='OK',
+                            cancel_text='',
+                        ))
+
+                Clock.schedule_once(_done, 0)
+            except Exception as e:
+                logger.warning('connect_wifi error: %s', e)
+
+                def _fail(*_a):
+                    self._connecting_ssid = None
+                    self._populate_list()
+                    self.add_widget(ModalDialog(
+                        title='Connection error',
+                        message=str(e)[:200],
+                        confirm_text='OK',
+                        cancel_text='',
+                    ))
+
+                Clock.schedule_once(_fail, 0)
+
+        run_async(_run())
+
+    def _on_back(self, _inst):
+        self.go_back()
+
+    def _on_next(self, _inst):
+        if not self._ready_for_next:
+            return
+
+        async def _finish():
+            try:
+                await self.backend.post_setup_complete(
+                    wifi_ssid=self._connected_ssid,
+                    onboarding_flow='wifi_on_device_v1',
+                )
+
+                def _go(*_a):
+                    self.goto('home', transition='fade')
+
+                Clock.schedule_once(_go, 0)
+            except Exception as e:
+                logger.error('post_setup_complete failed: %s', e)
+
+                def _err(*_a):
+                    self.add_widget(ModalDialog(
+                        title='Could not finish setup',
+                        message='Saved WiFi but setup marker failed. Try again.',
+                        confirm_text='OK',
+                        cancel_text='',
+                    ))
+
+                Clock.schedule_once(_err, 0)
+
+        run_async(_finish())

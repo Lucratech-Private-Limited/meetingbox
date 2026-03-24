@@ -295,6 +295,25 @@ class BackendClient:
             logger.error(f"Failed to update settings: {e}")
             raise
 
+    async def post_setup_complete(
+            self,
+            wifi_ssid: str = "",
+            onboarding_flow: str = "wifi_on_device_v1") -> Dict:
+        """POST /api/device/setup-complete — writes .setup_complete JSON on server."""
+        try:
+            resp = await self.client.post(
+                f"{self.base_url}/api/device/setup-complete",
+                json={
+                    "wifi_ssid": wifi_ssid or "",
+                    "onboarding_flow": onboarding_flow,
+                },
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.error(f"Failed to mark setup complete: {e}")
+            raise
+
     # ==================================================================
     # INTEGRATIONS API
     # ==================================================================
