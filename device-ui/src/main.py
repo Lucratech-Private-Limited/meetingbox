@@ -87,6 +87,7 @@ from screens.splash import SplashScreen
 from screens.welcome import WelcomeScreen
 from screens.room_name import RoomNameScreen
 from screens.wifi_setup import WiFiSetupScreen
+from screens.wifi_connected import WiFiConnectedScreen
 from screens.setup_progress import SetupProgressScreen
 from screens.all_set import AllSetScreen
 
@@ -215,6 +216,7 @@ class MeetingBoxApp(App):
         self.screen_manager.add_widget(WelcomeScreen(name='welcome'))
         self.screen_manager.add_widget(RoomNameScreen(name='room_name'))
         self.screen_manager.add_widget(WiFiSetupScreen(name='wifi_setup'))
+        self.screen_manager.add_widget(WiFiConnectedScreen(name='wifi_connected'))
         self.screen_manager.add_widget(SetupProgressScreen(name='setup_progress'))
         self.screen_manager.add_widget(AllSetScreen(name='all_set'))
 
@@ -374,7 +376,7 @@ class MeetingBoxApp(App):
         if self._nav_stack:
             target = self._nav_stack.pop()
             # Skip non-core screens in stack when going back
-            skip = {'splash', 'welcome', 'wifi_setup', 'setup_progress', 'all_set'}
+            skip = {'splash', 'welcome', 'wifi_setup', 'wifi_connected', 'setup_progress', 'all_set'}
             while target in skip and self._nav_stack:
                 target = self._nav_stack.pop()
             self._set_transition('slide_right')

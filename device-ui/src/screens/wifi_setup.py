@@ -5,8 +5,8 @@ Design ref: UI_Ref_for_cursor/Wifi_Setup_screen/WIFI_Setup_screen.png
 
 - Lists networks from GET /api/device/wifi/scan
 - Rescan, add network manually (security type + SSID + password)
-- Next enabled only after successful WiFi connection; then POST
-  /api/device/setup-complete and navigate to Home.
+- Next enabled only after successful WiFi connection; then navigate
+  to a WiFi success confirmation screen.
 """
 
 import logging
@@ -165,7 +165,7 @@ class _WiFiRow(ButtonBehavior, BoxLayout):
 
 
 class WiFiSetupScreen(BaseScreen):
-    """First-boot WiFi: scan, connect, then mark setup complete and go Home."""
+    """First-boot WiFi: scan, connect, then continue to success page."""
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -788,29 +788,5 @@ class WiFiSetupScreen(BaseScreen):
     def _on_next(self, _inst):
         if not self._ready_for_next:
             return
-
-        async def _finish():
-            try:
-                await self.backend.post_setup_complete(
-                    wifi_ssid=self._connected_ssid,
-                    onboarding_flow='wifi_on_device_v1',
-                )
-
-                def _go(*_a):
-                    self.goto('home', transition='fade')
-
-                Clock.schedule_once(_go, 0)
-            except Exception as e:
-                logger.error('post_setup_complete failed: %s', e)
-
-                def _err(*_a):
-                    self.add_widget(ModalDialog(
-                        title='Could not finish setup',
-                        message='Saved WiFi but setup marker failed. Try again.',
-                        confirm_text='OK',
-                        cancel_text='',
-                    ))
-
-                Clock.schedule_once(_err, 0)
-
-        run_async(_finish())
+        self.app.connected_wifi_ssid = self._connected_ssid or ''
+        self.goto('wifi_connected', transition='fade')
