@@ -168,10 +168,10 @@ services:
       # 0 for windowed mode on a normal desktop.
       - FULLSCREEN=0
       - MOCK_BACKEND=0
-      # GPU rendering: allow Mesa to use the host DRI device.
-      # LIBGL_ALWAYS_SOFTWARE=1 is the fallback if DRI is still
-      # inaccessible (e.g. wrong render group GID on the host).
-      - LIBGL_ALWAYS_SOFTWARE=1
+      # GPU rendering: Mesa uses host DRI device (/dev/dri) for hardware
+      # acceleration. Remove the devices block and uncomment below if
+      # hardware fails (e.g. black screen):
+      # - LIBGL_ALWAYS_SOFTWARE=1
     volumes:
       # X11 socket — lets the container draw on the host display
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
