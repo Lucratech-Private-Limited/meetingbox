@@ -9,6 +9,7 @@ Implements the complete boot flow defined in the PRD:
 import asyncio
 import logging
 import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -708,10 +709,27 @@ class MeetingBoxApp(App):
 
 def main():
     print(f"[MeetingBox] Starting Device UI", flush=True)
-    print(f"[MeetingBox] DISPLAY={os.environ.get('DISPLAY', '(not set)')}", flush=True)
+    disp = os.environ.get('DISPLAY', '(not set)')
+    print(f"[MeetingBox] DISPLAY={disp}", flush=True)
     print(f"[MeetingBox] FULLSCREEN={os.environ.get('FULLSCREEN', '(not set)')}", flush=True)
     print(f"[MeetingBox] BACKEND_URL={os.environ.get('BACKEND_URL', '(not set)')}", flush=True)
     print(f"[MeetingBox] MOCK_BACKEND={os.environ.get('MOCK_BACKEND', '(not set)')}", flush=True)
+
+    if sys.platform.startswith('linux'):
+        if not shutil.which('xclip') and not shutil.which('xsel'):
+            print(
+                '[MeetingBox] Tip: sudo apt install xclip  '
+                '(stops Kivy Cutbuffer CRITICAL on Linux)',
+                flush=True,
+            )
+        if isinstance(disp, str) and (
+            disp.startswith('localhost:') or ':10.' in disp
+        ):
+            print(
+                '[MeetingBox] Tip: DISPLAY looks like SSH X11; for kiosk use '
+                'local session e.g. DISPLAY=:0',
+                flush=True,
+            )
 
     import subprocess
     try:
