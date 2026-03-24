@@ -648,13 +648,39 @@ class WiFiSetupScreen(BaseScreen):
     def _has_local_nmcli(self) -> bool:
         return shutil.which('nmcli') is not None
 
+    def _nmcli_run(self, args: list, timeout: float = 30):
+        """
+        Run nmcli. If NetworkManager denies the action (PolicyKit), retry with
+        `sudo -n nmcli` so a passwordless sudo rule can allow WiFi on kiosk users.
+        """
+        cmd = ['nmcli'] + args
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        combined = ((res.stderr or '') + (res.stdout or '')).lower()
+        priv = any(
+            s in combined
+            for s in (
+                'insufficient privileges',
+                'not authorized',
+                'permission denied',
+                'not allowed to',
+                'polkit',
+            )
+        )
+        if res.returncode != 0 and priv and shutil.which('sudo'):
+            res2 = subprocess.run(
+                ['sudo', '-n', 'nmcli'] + args,
+                capture_output=True, text=True, timeout=timeout,
+            )
+            return res2
+        return res
+
     def _detect_wifi_iface(self) -> Optional[str]:
         if not self._has_local_nmcli():
             return None
         try:
-            res = subprocess.run(
-                ['nmcli', '-t', '-f', 'DEVICE,TYPE,STATE', 'device', 'status'],
-                capture_output=True, text=True, timeout=6,
+            res = self._nmcli_run(
+                ['-t', '-f', 'DEVICE,TYPE,STATE', 'device', 'status'],
+                timeout=6,
             )
             for line in res.stdout.splitlines():
                 parts = line.split(':')
@@ -669,16 +695,14 @@ class WiFiSetupScreen(BaseScreen):
             raise RuntimeError('nmcli not available')
         if rescan:
             try:
-                subprocess.run(
-                    ['nmcli', 'device', 'wifi', 'rescan'],
-                    capture_output=True, text=True, timeout=10,
-                )
+                self._nmcli_run(['device', 'wifi', 'rescan'], timeout=10)
             except Exception:
                 pass
 
-        res = subprocess.run(
-            ['nmcli', '-m', 'multiline', '-f', 'SSID,SIGNAL,SECURITY,IN-USE', 'device', 'wifi', 'list'],
-            capture_output=True, text=True, timeout=15,
+        res = self._nmcli_run(
+            ['-m', 'multiline', '-f', 'SSID,SIGNAL,SECURITY,IN-USE',
+             'device', 'wifi', 'list'],
+            timeout=15,
         )
         nets: list[dict] = []
         cur: dict[str, str] = {}
@@ -721,15 +745,25 @@ class WiFiSetupScreen(BaseScreen):
 
     def _connect_local_wifi(self, ssid: str, password: Optional[str]) -> dict:
         iface = self._detect_wifi_iface()
-        cmd = ['nmcli', 'device', 'wifi', 'connect', ssid]
+        args = ['device', 'wifi', 'connect', ssid]
         if password:
-            cmd += ['password', password]
+            args += ['password', password]
         if iface:
-            cmd += ['ifname', iface]
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            args += ['ifname', iface]
+        res = self._nmcli_run(args, timeout=30)
         if res.returncode == 0:
             return {'status': 'connected', 'message': f'Connected to {ssid}'}
         msg = (res.stderr or '').strip() or (res.stdout or '').strip() or 'Connection failed'
+        ml = msg.lower()
+        if 'password' not in ml and '802' not in ml:
+            if any(
+                s in ml
+                for s in ('sudo', 'privileges', 'not authorized', 'polkit')
+            ):
+                msg += (
+                    '\n\nWiFi needs NetworkManager permission on this device. '
+                    'See scripts/sudoers.meetingbox-nmcli.example or scripts/polkit/'
+                )
         return {'status': 'failed', 'message': msg}
 
     def _on_back(self, _inst):

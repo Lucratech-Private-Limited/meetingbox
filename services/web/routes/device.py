@@ -8,6 +8,7 @@ Manages: settings, WiFi, updates, system device info.
 import json
 import os
 import platform
+import shutil
 import subprocess
 import time
 from datetime import datetime, timezone
@@ -36,6 +37,32 @@ DEVICE_MODEL = "MeetingBox v1.0"
 
 # Boot time for uptime calculation
 _BOOT_TIME = time.time()
+
+
+def _nmcli_run(args: list, timeout: float = 30) -> subprocess.CompletedProcess:
+    """Run nmcli; on PolicyKit denial retry with sudo -n (see scripts/sudoers / polkit)."""
+    res = subprocess.run(
+        ["nmcli", *args], capture_output=True, text=True, timeout=timeout
+    )
+    combined = ((res.stderr or "") + (res.stdout or "")).lower()
+    priv = any(
+        s in combined
+        for s in (
+            "insufficient privileges",
+            "not authorized",
+            "permission denied",
+            "not allowed to",
+            "polkit",
+        )
+    )
+    if res.returncode != 0 and priv and shutil.which("sudo"):
+        return subprocess.run(
+            ["sudo", "-n", "nmcli", *args],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    return res
 
 
 # ======================================================================
@@ -264,9 +291,17 @@ async def wifi_scan(current_user: Optional[dict] = Depends(get_optional_user)):
     """Scan for available WiFi networks."""
     networks = []
     try:
-        result = subprocess.run(
-            ["nmcli", "-m", "multiline", "-f", "SSID,SIGNAL,SECURITY,IN-USE", "dev", "wifi", "list"],
-            capture_output=True, text=True, timeout=15,
+        result = _nmcli_run(
+            [
+                "-m",
+                "multiline",
+                "-f",
+                "SSID,SIGNAL,SECURITY,IN-USE",
+                "dev",
+                "wifi",
+                "list",
+            ],
+            timeout=15,
         )
         if result.returncode == 0:
             cur: dict[str, str] = {}
@@ -333,41 +368,38 @@ async def wifi_connect(body: WiFiConnect, current_user: Optional[dict] = Depends
     """Connect to a WiFi network using NetworkManager."""
     try:
         # Remove any stale connection profile first
-        subprocess.run(
-            ["nmcli", "connection", "delete", body.ssid],
-            capture_output=True, text=True, timeout=10,
-        )
+        _nmcli_run(["connection", "delete", body.ssid], timeout=10)
 
         if body.password:
             # Explicit creation with security type to avoid key-mgmt bug
-            subprocess.run(
-                ["nmcli", "connection", "add",
-                 "type", "wifi",
-                 "ifname", WIFI_IFACE,
-                 "con-name", body.ssid,
-                 "ssid", body.ssid,
-                 "--",
-                 "wifi-sec.key-mgmt", "wpa-psk",
-                 "wifi-sec.psk", body.password],
-                capture_output=True, text=True, timeout=15,
+            _nmcli_run(
+                [
+                    "connection",
+                    "add",
+                    "type",
+                    "wifi",
+                    "ifname",
+                    WIFI_IFACE,
+                    "con-name",
+                    body.ssid,
+                    "ssid",
+                    body.ssid,
+                    "--",
+                    "wifi-sec.key-mgmt",
+                    "wpa-psk",
+                    "wifi-sec.psk",
+                    body.password,
+                ],
+                timeout=15,
             )
-            result = subprocess.run(
-                ["nmcli", "connection", "up", body.ssid],
-                capture_output=True, text=True, timeout=30,
-            )
+            result = _nmcli_run(["connection", "up", body.ssid], timeout=30)
         else:
-            result = subprocess.run(
-                ["nmcli", "dev", "wifi", "connect", body.ssid],
-                capture_output=True, text=True, timeout=30,
-            )
+            result = _nmcli_run(["dev", "wifi", "connect", body.ssid], timeout=30)
 
         if result.returncode == 0:
             return {"status": "connected", "message": f"Connected to {body.ssid}"}
         else:
-            subprocess.run(
-                ["nmcli", "connection", "delete", body.ssid],
-                capture_output=True, text=True, timeout=10,
-            )
+            _nmcli_run(["connection", "delete", body.ssid], timeout=10)
             return {"status": "failed", "message": result.stderr.strip() or result.stdout.strip()}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -377,10 +409,7 @@ async def wifi_connect(body: WiFiConnect, current_user: Optional[dict] = Depends
 async def wifi_disconnect(current_user: Optional[dict] = Depends(get_optional_user)):
     """Disconnect from current WiFi."""
     try:
-        subprocess.run(
-            ["nmcli", "dev", "disconnect", WIFI_IFACE],
-            capture_output=True, text=True, timeout=10,
-        )
+        _nmcli_run(["dev", "disconnect", WIFI_IFACE], timeout=10)
         return {"status": "disconnected"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

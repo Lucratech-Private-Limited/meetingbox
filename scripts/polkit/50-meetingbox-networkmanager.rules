@@ -1,0 +1,13 @@
+// Allow the logged-in local user to use NetworkManager (WiFi scan/connect from MeetingBox UI).
+// Install:
+//   sudo cp scripts/polkit/50-meetingbox-networkmanager.rules /etc/polkit-1/rules.d/
+//   sudo systemctl restart polkit
+//
+// Adjust polkit path if your distro uses /usr/share/polkit-1/rules.d/ instead.
+
+polkit.addRule(function (action, subject) {
+    if (action.id.indexOf("org.freedesktop.NetworkManager.") === 0 &&
+        subject.local && subject.active && subject.user !== null) {
+        return polkit.Result.YES;
+    }
+});

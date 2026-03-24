@@ -1,0 +1,10 @@
+# Example: allow passwordless nmcli for the kiosk user (MeetingBox device UI).
+#
+# Install:
+#   sudo cp scripts/sudoers.meetingbox-nmcli.example /etc/sudoers.d/meetingbox-nmcli
+#   sudo chmod 440 /etc/sudoers.d/meetingbox-nmcli
+#   sudo visudo -cf /etc/sudoers.d/meetingbox-nmcli
+#
+# Replace "meetingbox" with your login name if different.
+
+meetingbox ALL=(ALL) NOPASSWD: /usr/bin/nmcli
