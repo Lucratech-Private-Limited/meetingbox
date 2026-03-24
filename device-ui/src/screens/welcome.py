@@ -3,7 +3,7 @@ Welcome Screen – First-time setup introduction
 
 Trigger : Follows splash on first boot
 Content : Logo, welcome text, CTA button, security footer
-Action  : Tap button → WiFi Setup Screen
+Action  : Tap button → Name room → WiFi Setup
 
 Design ref: UI_Ref_for_cursor/Welcome_Screen/Frame 1.png
 """
@@ -177,4 +177,4 @@ class WelcomeScreen(BaseScreen):
             self._bg_rect.size = widget.size
 
     def _on_continue(self, _inst):
-        self.goto('wifi_setup', transition='slide_left')
+        self.goto('room_name', transition='slide_left')

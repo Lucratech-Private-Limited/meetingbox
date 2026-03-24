@@ -67,6 +67,7 @@ from hardware import set_brightness, screen_off, screen_on
 # Boot-flow screens
 from screens.splash import SplashScreen
 from screens.welcome import WelcomeScreen
+from screens.room_name import RoomNameScreen
 from screens.wifi_setup import WiFiSetupScreen
 from screens.setup_progress import SetupProgressScreen
 from screens.all_set import AllSetScreen
@@ -194,6 +195,7 @@ class MeetingBoxApp(App):
         # Register ALL screens
         self.screen_manager.add_widget(SplashScreen(name='splash'))
         self.screen_manager.add_widget(WelcomeScreen(name='welcome'))
+        self.screen_manager.add_widget(RoomNameScreen(name='room_name'))
         self.screen_manager.add_widget(WiFiSetupScreen(name='wifi_setup'))
         self.screen_manager.add_widget(SetupProgressScreen(name='setup_progress'))
         self.screen_manager.add_widget(AllSetScreen(name='all_set'))
@@ -268,7 +270,8 @@ class MeetingBoxApp(App):
             if self._setup_poll:
                 self._setup_poll.cancel()
                 self._setup_poll = None
-            onboarding_screens = {'welcome', 'wifi_setup', 'setup_progress'}
+            onboarding_screens = {
+                'welcome', 'room_name', 'wifi_setup', 'setup_progress'}
             current = self.screen_manager.current
             if current in onboarding_screens:
                 self.goto_screen('all_set', 'fade')
@@ -496,7 +499,8 @@ class MeetingBoxApp(App):
     def on_setup_complete(self, data):
         """Handle setup_complete event globally -- works from any onboarding screen."""
         logger.info("Setup complete event received")
-        onboarding_screens = {'welcome', 'wifi_setup', 'setup_progress'}
+        onboarding_screens = {
+            'welcome', 'room_name', 'wifi_setup', 'setup_progress'}
         current = self.screen_manager.current
 
         def _advance(_dt):
