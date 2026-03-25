@@ -7,13 +7,11 @@ Two visual states driven by self._is_paused:
 
 import logging
 import random
-from collections import deque
 from datetime import datetime
-from pathlib import Path
 
 from kivy.animation import Animation
 from kivy.clock import Clock
-from kivy.graphics import Color, Ellipse, Line, Rectangle, RoundedRectangle
+from kivy.graphics import Color, Ellipse, Rectangle, RoundedRectangle
 from kivy.uix.behaviors import ButtonBehavior
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.floatlayout import FloatLayout
@@ -21,18 +19,10 @@ from kivy.uix.image import Image
 from kivy.uix.label import Label
 from kivy.uix.widget import Widget
 
-from async_helper import run_async
 from config import ASSETS_DIR, COLORS, FONT_SIZES, SPACING
 from screens.base_screen import BaseScreen
 
 logger = logging.getLogger(__name__)
-
-try:
-    import sounddevice as sd
-    _HAS_AUDIO = True
-except (ImportError, OSError) as e:
-    _HAS_AUDIO = False
-    logger.warning("sounddevice unavailable – waveform will simulate: %s", e)
 
 _REC_ASSETS = ASSETS_DIR / "recording"
 
@@ -100,9 +90,6 @@ class _Waveform(Widget):
 # ---------------------------------------------------------------------------
 
 class RecordingScreen(BaseScreen):
-    SAMPLE_RATE = 16000
-    BLOCK_SIZE = 1600
-
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.elapsed_seconds = 0
@@ -110,10 +97,6 @@ class RecordingScreen(BaseScreen):
         self.waveform_event = None
         self._is_paused = False
         self._paused_at_text = ""
-        self._stream = None
-        self._rms_history = deque(maxlen=_Waveform.NUM_BARS)
-        for _ in range(_Waveform.NUM_BARS):
-            self._rms_history.append(0.0)
         self._build_ui()
 
     # ==================================================================
@@ -154,11 +137,13 @@ class RecordingScreen(BaseScreen):
         timer_col = BoxLayout(orientation="vertical", size_hint=(None, 1), width=200)
         self.timer_label = Label(
             text="00:00",
-            font_size=48,
+            font_size=42,
             bold=True,
             color=COLORS["white"],
             halign="center",
-            valign="bottom",
+            valign="middle",
+            size_hint=(1, None),
+            height=44,
         )
         self.timer_label.bind(size=self.timer_label.setter("text_size"))
         timer_col.add_widget(self.timer_label)
@@ -410,7 +395,6 @@ class RecordingScreen(BaseScreen):
         ov_content.add_widget(Widget(size_hint=(1, None), height=12))
 
         self.paused_overlay.add_widget(ov_content)
-        self.root_layout.add_widget(self.paused_overlay)
 
         self.add_widget(self.root_layout)
 
@@ -429,16 +413,11 @@ class RecordingScreen(BaseScreen):
         self.timer_label.text = "00:00"
         self.elapsed_sub.text = "ELAPSED TIME"
         self.waveform.set_active(True)
-        self.paused_overlay.opacity = 0
-        self.paused_overlay.disabled = True
+        if self.paused_overlay.parent is self.root_layout:
+            self.root_layout.remove_widget(self.paused_overlay)
 
         self.timer_event = Clock.schedule_interval(self._tick_timer, 1.0)
-
-        if _HAS_AUDIO:
-            self._start_audio_stream()
-            self.waveform_event = Clock.schedule_interval(self._tick_waveform_real, 0.08)
-        else:
-            self.waveform_event = Clock.schedule_interval(lambda _: self.waveform.update_random(), 0.1)
+        self.waveform_event = Clock.schedule_interval(lambda _: self.waveform.update_random(), 0.1)
 
     def on_leave(self):
         if self.timer_event:
@@ -447,44 +426,6 @@ class RecordingScreen(BaseScreen):
         if self.waveform_event:
             self.waveform_event.cancel()
             self.waveform_event = None
-        self._stop_audio_stream()
-
-    # ==================================================================
-    # AUDIO STREAM (real mic levels)
-    # ==================================================================
-
-    def _start_audio_stream(self):
-        try:
-            self._stream = sd.InputStream(
-                samplerate=self.SAMPLE_RATE,
-                channels=1,
-                dtype="int16",
-                blocksize=self.BLOCK_SIZE,
-                callback=self._audio_callback,
-            )
-            self._stream.start()
-        except Exception as e:
-            logger.warning("Recording waveform: could not open audio: %s", e)
-            self._stream = None
-
-    def _stop_audio_stream(self):
-        if self._stream:
-            try:
-                self._stream.stop()
-                self._stream.close()
-            except Exception:
-                pass
-            self._stream = None
-
-    def _audio_callback(self, indata, frames, time_info, status):
-        samples = indata[:, 0]
-        rms = (sum(int(s) ** 2 for s in samples) / len(samples)) ** 0.5
-        normalised = min(1.0, rms / 5000.0)
-        self._rms_history.append(normalised)
-
-    def _tick_waveform_real(self, _dt):
-        levels = [max(2, int(v * _Waveform.MAX_H)) for v in self._rms_history]
-        self.waveform.set_levels(levels)
 
     # ==================================================================
     # TIMER
@@ -514,6 +455,8 @@ class RecordingScreen(BaseScreen):
             self.app.pause_recording()
 
     def on_paused(self):
+        if self._is_paused:
+            return
         self._is_paused = True
 
         if self.timer_event:
@@ -522,7 +465,6 @@ class RecordingScreen(BaseScreen):
         if self.waveform_event:
             self.waveform_event.cancel()
             self.waveform_event = None
-        self._stop_audio_stream()
 
         self.waveform.set_active(False)
         self.waveform.set_levels([2] * _Waveform.NUM_BARS)
@@ -533,23 +475,30 @@ class RecordingScreen(BaseScreen):
         self.paused_duration.text = f"Meeting duration: {self._fmt_time(self.elapsed_seconds)}"
         self.ov_room_label.text = getattr(self.app, "device_name", "MeetingBox")
 
-        self.paused_overlay.disabled = False
+        if self.paused_overlay.parent is not self.root_layout:
+            self.root_layout.add_widget(self.paused_overlay)
+        self.paused_overlay.opacity = 0
         Animation(opacity=1, duration=0.25).start(self.paused_overlay)
 
     def on_resumed(self):
+        if not self._is_paused:
+            return
         self._is_paused = False
 
         Animation(opacity=0, duration=0.2).start(self.paused_overlay)
-        Clock.schedule_once(lambda _: setattr(self.paused_overlay, "disabled", True), 0.25)
+        Clock.schedule_once(self._hide_paused_overlay, 0.25)
 
         self.waveform.set_active(True)
+        if self.timer_event:
+            self.timer_event.cancel()
+        if self.waveform_event:
+            self.waveform_event.cancel()
         self.timer_event = Clock.schedule_interval(self._tick_timer, 1.0)
+        self.waveform_event = Clock.schedule_interval(lambda _: self.waveform.update_random(), 0.1)
 
-        if _HAS_AUDIO:
-            self._start_audio_stream()
-            self.waveform_event = Clock.schedule_interval(self._tick_waveform_real, 0.08)
-        else:
-            self.waveform_event = Clock.schedule_interval(lambda _: self.waveform.update_random(), 0.1)
+    def _hide_paused_overlay(self, _dt):
+        if self.paused_overlay.parent is self.root_layout:
+            self.root_layout.remove_widget(self.paused_overlay)
 
     # ==================================================================
     # STOP

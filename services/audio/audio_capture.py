@@ -34,6 +34,7 @@ class AudioCaptureService:
     self.FORMAT = pyaudio.paInt16
 
     self.is_recording = False
+    self.is_paused = False
     self.current_session_id: str | None = None
     self._recording_thread: object | None = None  # threading.Thread
     self._output_path: Path | None = None
@@ -306,6 +307,7 @@ class AudioCaptureService:
 
     self.current_session_id = session_id
     self.is_recording = True
+    self.is_paused = False
 
     session_temp = self.temp_dir / session_id
     session_temp.mkdir(parents=True, exist_ok=True)
@@ -375,6 +377,7 @@ class AudioCaptureService:
 
     logger.info("Stopping recording - session %s", self.current_session_id)
     self.is_recording = False
+    self.is_paused = False
 
     # Wait for the recording thread to finish reading before closing the stream.
     # Without this, stream.close() races with stream.read() in the thread,
@@ -511,6 +514,8 @@ class AudioCaptureService:
       while self.is_recording:
         assert self.stream is not None
         chunk = self.stream.read(self.CHUNK, exception_on_overflow=False)
+        if self.is_paused:
+          continue
         audio_bytes = self._prepare_audio_bytes(chunk)
 
         if not checked_audio:
@@ -523,6 +528,46 @@ class AudioCaptureService:
 
     except Exception:
       logger.exception("Error in recording loop")
+
+  def pause_recording(self) -> bool:
+    if not self.is_recording:
+      logger.warning("Pause requested while not recording")
+      return False
+    if self.is_paused:
+      return True
+    self.is_paused = True
+    self.redis_client.publish(
+      "events",
+      json.dumps(
+        {
+          "type": "recording_paused",
+          "session_id": self.current_session_id,
+          "timestamp": datetime.now().isoformat(),
+        }
+      ),
+    )
+    logger.info("Recording paused - session %s", self.current_session_id)
+    return True
+
+  def resume_recording(self) -> bool:
+    if not self.is_recording:
+      logger.warning("Resume requested while not recording")
+      return False
+    if not self.is_paused:
+      return True
+    self.is_paused = False
+    self.redis_client.publish(
+      "events",
+      json.dumps(
+        {
+          "type": "recording_resumed",
+          "session_id": self.current_session_id,
+          "timestamp": datetime.now().isoformat(),
+        }
+      ),
+    )
+    logger.info("Recording resumed - session %s", self.current_session_id)
+    return True
 
   def combine_segments(self) -> Path | None:
     """Merge all segment WAVs into a single recording file."""
@@ -578,6 +623,10 @@ class AudioCaptureService:
           self._recording_thread = thread
       elif action == "stop_recording":
         self.stop_recording(session_id_from_command=command.get("session_id"))
+      elif action == "pause_recording":
+        self.pause_recording()
+      elif action == "resume_recording":
+        self.resume_recording()
 
 
 if __name__ == "__main__":

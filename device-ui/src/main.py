@@ -689,25 +689,31 @@ class MeetingBoxApp(App):
         run_async(_stop())
 
     def pause_recording(self):
-        if not self.current_session_id:
-            return
         async def _pause():
             try:
                 await self.backend.pause_recording(self.current_session_id)
                 self.recording_state['paused'] = True
+                screen = self.screen_manager.get_screen('recording')
+                if hasattr(screen, 'on_paused'):
+                    Clock.schedule_once(lambda _: screen.on_paused(), 0)
             except Exception as e:
                 logger.error(f"Failed to pause: {e}")
+                Clock.schedule_once(
+                    lambda _: self.show_error_screen('Pause Failed', str(e)), 0)
         run_async(_pause())
 
     def resume_recording(self):
-        if not self.current_session_id:
-            return
         async def _resume():
             try:
                 await self.backend.resume_recording(self.current_session_id)
                 self.recording_state['paused'] = False
+                screen = self.screen_manager.get_screen('recording')
+                if hasattr(screen, 'on_resumed'):
+                    Clock.schedule_once(lambda _: screen.on_resumed(), 0)
             except Exception as e:
                 logger.error(f"Failed to resume: {e}")
+                Clock.schedule_once(
+                    lambda _: self.show_error_screen('Resume Failed', str(e)), 0)
         run_async(_resume())
 
     # ==================================================================

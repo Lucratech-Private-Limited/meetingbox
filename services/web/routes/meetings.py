@@ -218,22 +218,32 @@ async def reset_recording_state(current_user: Optional[dict] = Depends(get_optio
 
 @router.post("/pause")
 async def pause_meeting(current_user: Optional[dict] = Depends(get_optional_user)):
-  """Pause the current recording (stub -- audio service does not yet support pause)."""
+  """Pause the current recording."""
   state = _get_redis().get("recording_state") or "idle"
   if state != "recording":
     raise HTTPException(status_code=400, detail="No active recording to pause")
+  session_id = _get_redis().get("current_meeting_id")
+  _get_redis().publish(
+    "commands",
+    json.dumps({"action": "pause_recording", "session_id": session_id}),
+  )
   _get_redis().set("recording_state", "paused")
-  return {"status": "paused"}
+  return {"status": "paused", "session_id": session_id}
 
 
 @router.post("/resume")
 async def resume_meeting(current_user: Optional[dict] = Depends(get_optional_user)):
-  """Resume a paused recording (stub -- audio service does not yet support resume)."""
+  """Resume a paused recording."""
   state = _get_redis().get("recording_state") or "idle"
   if state != "paused":
     raise HTTPException(status_code=400, detail="No paused recording to resume")
+  session_id = _get_redis().get("current_meeting_id")
+  _get_redis().publish(
+    "commands",
+    json.dumps({"action": "resume_recording", "session_id": session_id}),
+  )
   _get_redis().set("recording_state", "recording")
-  return {"status": "recording"}
+  return {"status": "recording", "session_id": session_id}
 
 
 class MeetingUpdateRequest(BaseModel):
