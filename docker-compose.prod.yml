@@ -1,5 +1,7 @@
 # Production overrides for MeetingBox
 #
+# Audio capture: run on the host (see services/audio/run_audio_capture.sh), not in Docker.
+#
 # Usage (systemd service applies this automatically):
 #   docker compose -f docker-compose.yml -f docker-compose.prod.yml --profile screen up -d
 #

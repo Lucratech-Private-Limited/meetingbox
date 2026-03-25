@@ -3,15 +3,26 @@ services:
     image: redis:7-alpine
     container_name: meetingbox-redis
     restart: unless-stopped
-    # No host port binding — Redis is only reachable inside the Docker
-    # network (meetingbox-net). Exposing port 6379 to the host is not
-    # needed and conflicts if a native redis-server is running.
+    # Localhost only: native `services/audio/run_audio_capture.sh` uses REDIS_HOST=127.0.0.1.
+    # Remove this mapping if you run another Redis on the host on 6379.
+    ports:
+      - "127.0.0.1:6379:6379"
     volumes:
       - redis-data:/data
     networks:
       - meetingbox-net
 
+  # ================================================================
+  # Audio capture in Docker (optional — not recommended on mini-PC)
+  # ================================================================
+  # Default stack uses **host** capture: run from repo:
+  #   services/audio/run_audio_capture.sh
+  # To use the containerized capture instead:
+  #   docker compose --profile docker-audio up -d
+  # ================================================================
   audio:
+    profiles:
+      - docker-audio
     build:
       context: ./services/audio
     container_name: meetingbox-audio
