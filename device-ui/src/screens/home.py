@@ -4,9 +4,10 @@ from datetime import datetime
 from pathlib import Path
 
 from kivy.clock import Clock
-from kivy.graphics import Color, Rectangle, RoundedRectangle
+from kivy.graphics import Color, Ellipse, Rectangle, RoundedRectangle
 from kivy.uix.behaviors import ButtonBehavior
 from kivy.uix.boxlayout import BoxLayout
+from kivy.uix.floatlayout import FloatLayout
 from kivy.uix.image import Image
 from kivy.uix.label import Label
 from kivy.uix.widget import Widget
@@ -15,6 +16,9 @@ from async_helper import run_async
 from components.button import PrimaryButton
 from config import ASSETS_DIR, COLORS, FONT_SIZES, SPACING
 from screens.base_screen import BaseScreen
+
+_CHIP_SIZE = 34
+_ICON_SIZE = 16
 
 
 class _LabelButton(ButtonBehavior, Label):
@@ -25,35 +29,36 @@ class _ImageButton(ButtonBehavior, Image):
     """Simple tappable image widget."""
 
 
-class _IconChip(ButtonBehavior, BoxLayout):
-    """Circular background chip + tintable icon."""
+class _IconChip(ButtonBehavior, FloatLayout):
+    """Fixed-size circle chip with a centered tintable icon."""
 
-    def __init__(self, bg_source: Path, icon_source: Path, **kwargs):
-        kwargs.setdefault("orientation", "vertical")
+    def __init__(self, icon_source: Path, **kwargs):
         kwargs.setdefault("size_hint", (None, None))
-        kwargs.setdefault("size", (34, 34))
+        kwargs.setdefault("size", (_CHIP_SIZE, _CHIP_SIZE))
         super().__init__(**kwargs)
 
-        self.bg_img = Image(
-            source=str(bg_source),
-            allow_stretch=True,
-            keep_ratio=False,
-        )
+        with self.canvas.before:
+            self._bg_color = Color(*COLORS["gray_800"])
+            self._bg_circle = Ellipse(pos=self.pos, size=self.size)
+        self.bind(pos=self._sync_bg, size=self._sync_bg)
+
         self.icon_img = Image(
             source=str(icon_source),
             color=COLORS["white"],
             size_hint=(None, None),
-            size=(15, 15),
+            size=(_ICON_SIZE, _ICON_SIZE),
+            allow_stretch=True,
+            keep_ratio=True,
         )
-
-        self.add_widget(self.bg_img)
         self.add_widget(self.icon_img)
-        self.bind(pos=self._layout, size=self._layout)
-        self._layout()
+        self.bind(pos=self._center_icon, size=self._center_icon)
+        Clock.schedule_once(lambda _: self._center_icon(), 0)
 
-    def _layout(self, *_args):
-        self.bg_img.pos = self.pos
-        self.bg_img.size = self.size
+    def _sync_bg(self, *_args):
+        self._bg_circle.pos = self.pos
+        self._bg_circle.size = self.size
+
+    def _center_icon(self, *_args):
         self.icon_img.center_x = self.center_x
         self.icon_img.center_y = self.center_y
 
@@ -139,11 +144,11 @@ class HomeScreen(BaseScreen):
         )
         right.add_widget(self.top_time_label)
 
-        self.wifi_chip = _IconChip(self._chip_bg, self._wifi_icon)
+        self.wifi_chip = _IconChip(self._wifi_icon)
         self.wifi_chip.bind(on_press=lambda *_: self.goto("wifi", transition="slide_left"))
         right.add_widget(self.wifi_chip)
 
-        self.mic_chip = _IconChip(self._chip_bg, self._mic_icon)
+        self.mic_chip = _IconChip(self._mic_icon)
         self.mic_chip.bind(on_press=lambda *_: self.goto("mic_test", transition="slide_left"))
         right.add_widget(self.mic_chip)
 
@@ -248,33 +253,37 @@ class HomeScreen(BaseScreen):
 
         root.add_widget(Widget())
 
-        root.add_widget(self.build_footer())
-        root.add_widget(Widget(size_hint=(1, None), height=8))
-
-        btn_wrap = BoxLayout(
-            orientation="vertical",
+        btn_row = BoxLayout(
+            orientation="horizontal",
             size_hint=(1, None),
-            height=94,
-            padding=[180, 10],
+            height=60,
         )
+        btn_row.add_widget(Widget())
         if self._start_button_asset.exists():
             self.start_btn = _ImageButton(
                 source=str(self._start_button_asset),
                 allow_stretch=True,
-                keep_ratio=False,
-                size_hint=(1, None),
-                height=62,
+                keep_ratio=True,
+                size_hint=(None, None),
+                height=56,
+                width=320,
             )
         else:
             self.start_btn = PrimaryButton(
                 text="Start Meeting",
                 font_size=FONT_SIZES["large"],
                 halign="center",
+                size_hint=(None, None),
+                height=56,
+                width=320,
             )
         self.start_btn.bind(on_press=self._on_start_recording)
-        btn_wrap.add_widget(self.start_btn)
-        root.add_widget(btn_wrap)
-        root.add_widget(Widget(size_hint=(1, None), height=8))
+        btn_row.add_widget(self.start_btn)
+        btn_row.add_widget(Widget())
+        root.add_widget(btn_row)
+
+        root.add_widget(Widget(size_hint=(1, None), height=10))
+        root.add_widget(self.build_footer())
 
         self.add_widget(root)
 
