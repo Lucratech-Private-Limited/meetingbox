@@ -18,11 +18,21 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 import psutil
+import redis
 
 from auth import get_optional_user
 from database import get_connection
 
 router = APIRouter()
+REDIS_HOST = os.getenv("REDIS_HOST", "redis")
+_redis_client = None
+
+
+def _get_redis() -> redis.Redis:
+    global _redis_client
+    if _redis_client is None:
+        _redis_client = redis.Redis(host=REDIS_HOST, port=6379, decode_responses=True)
+    return _redis_client
 
 # Persistent settings file on disk
 SETTINGS_FILE = Path(os.getenv("DEVICE_SETTINGS_PATH", "/data/config/device_settings.json"))
@@ -176,6 +186,20 @@ def _get_serial() -> str:
 async def get_settings(current_user: Optional[dict] = Depends(get_optional_user)):
     """Return current device settings."""
     return _load_settings()
+
+
+@router.post("/mic-test/start")
+async def start_mic_test(current_user: Optional[dict] = Depends(get_optional_user)):
+    """Start live microphone level stream for device UI test screen."""
+    _get_redis().publish("commands", json.dumps({"action": "start_mic_test"}))
+    return {"status": "mic_test_started"}
+
+
+@router.post("/mic-test/stop")
+async def stop_mic_test(current_user: Optional[dict] = Depends(get_optional_user)):
+    """Stop live microphone level stream for device UI test screen."""
+    _get_redis().publish("commands", json.dumps({"action": "stop_mic_test"}))
+    return {"status": "mic_test_stopped"}
 
 
 class SettingsUpdate(BaseModel):

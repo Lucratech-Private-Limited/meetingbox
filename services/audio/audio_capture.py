@@ -36,8 +36,10 @@ class AudioCaptureService:
 
     self.is_recording = False
     self.is_paused = False
+    self.is_mic_test = False
     self.current_session_id: str | None = None
     self._recording_thread: object | None = None  # threading.Thread
+    self._mic_test_thread: object | None = None  # threading.Thread
     self._output_path: Path | None = None
     self._wav_writer: wave.Wave_write | None = None
     self._last_level_emit_at = 0.0
@@ -303,6 +305,8 @@ class AudioCaptureService:
     if self.is_recording:
       logger.warning("Already recording")
       return False
+    if self.is_mic_test:
+      self.stop_mic_test()
 
     if session_id is None:
       session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -432,6 +436,75 @@ class AudioCaptureService:
     session_id = self.current_session_id
     self.current_session_id = None
     return session_id
+
+  def start_mic_test(self) -> bool:
+    if self.is_recording:
+      logger.warning("Mic test requested while recording is active")
+      return False
+    if self.is_mic_test:
+      return True
+
+    mic_index = self.find_mic_device()
+    self.stream = self.audio.open(
+      format=self.FORMAT,
+      channels=self.CAPTURE_CHANNELS,
+      rate=self.RATE,
+      input=True,
+      input_device_index=mic_index,
+      frames_per_buffer=self.CHUNK,
+    )
+    self.is_mic_test = True
+    logger.info("Mic test started")
+    return True
+
+  def stop_mic_test(self) -> None:
+    if not self.is_mic_test:
+      return
+    self.is_mic_test = False
+
+    if self._mic_test_thread is not None:
+      import threading
+      if isinstance(self._mic_test_thread, threading.Thread) and self._mic_test_thread.is_alive():
+        self._mic_test_thread.join(timeout=2.0)
+      self._mic_test_thread = None
+
+    if self.stream:
+      try:
+        self.stream.stop_stream()
+        self.stream.close()
+      except Exception:
+        pass
+      self.stream = None
+    logger.info("Mic test stopped")
+
+  def mic_test_loop(self) -> None:
+    try:
+      while self.is_mic_test and not self.is_recording:
+        assert self.stream is not None
+        chunk = self.stream.read(self.CHUNK, exception_on_overflow=False)
+        audio_bytes = self._prepare_audio_bytes(chunk)
+
+        now = time.monotonic()
+        if now - self._last_level_emit_at >= 0.08:
+          samples = np.frombuffer(audio_bytes, dtype=np.int16)
+          if len(samples) > 0:
+            rms = float(np.sqrt(np.mean(np.square(samples.astype(np.float64)))))
+            level = min(1.0, rms / 5000.0)
+          else:
+            level = 0.0
+          self.redis_client.publish(
+            "events",
+            json.dumps(
+              {
+                "type": "mic_test_level",
+                "level": level,
+                "timestamp": datetime.now().isoformat(),
+              }
+            ),
+          )
+          self._last_level_emit_at = now
+    except Exception:
+      logger.exception("Error in mic test loop")
 
   # --- Segmentation helpers -------------------------------------------
 
@@ -662,6 +735,14 @@ class AudioCaptureService:
         self.pause_recording()
       elif action == "resume_recording":
         self.resume_recording()
+      elif action == "start_mic_test":
+        if self.start_mic_test():
+          import threading
+          thread = threading.Thread(target=self.mic_test_loop, daemon=True)
+          thread.start()
+          self._mic_test_thread = thread
+      elif action == "stop_mic_test":
+        self.stop_mic_test()
 
 
 if __name__ == "__main__":

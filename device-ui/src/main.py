@@ -473,6 +473,7 @@ class MeetingBoxApp(App):
                     'recording_paused': self.on_recording_paused,
                     'recording_resumed': self.on_recording_resumed,
                     'audio_level': self.on_audio_level,
+                    'mic_test_level': self.on_mic_test_level,
                     'transcription_complete': self.on_transcription_complete,
                     'audio_segment': self.on_audio_segment,
                     'processing_started': self.on_processing_started,
@@ -539,6 +540,13 @@ class MeetingBoxApp(App):
         screen = self.screen_manager.get_screen('recording')
         if hasattr(screen, 'on_audio_level'):
             Clock.schedule_once(lambda _: screen.on_audio_level(level), 0)
+
+    def on_mic_test_level(self, data):
+        level_data = data if 'level' in data else data.get('data', {})
+        level = float(level_data.get('level', 0.0) or 0.0)
+        screen = self.screen_manager.get_screen('mic_test')
+        if hasattr(screen, 'on_mic_test_level'):
+            Clock.schedule_once(lambda _: screen.on_mic_test_level(level), 0)
 
     def on_processing_started(self, data):
         screen = self.screen_manager.get_screen('processing')

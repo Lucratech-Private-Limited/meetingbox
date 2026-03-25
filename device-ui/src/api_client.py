@@ -448,6 +448,26 @@ class BackendClient:
             logger.error(f"Failed to disconnect WiFi: {e}")
             raise
 
+    async def start_mic_test(self) -> Dict:
+        """POST /api/device/mic-test/start"""
+        try:
+            resp = await self.client.post(f"{self.base_url}/api/device/mic-test/start")
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.error(f"Failed to start mic test: {e}")
+            raise
+
+    async def stop_mic_test(self) -> Dict:
+        """POST /api/device/mic-test/stop"""
+        try:
+            resp = await self.client.post(f"{self.base_url}/api/device/mic-test/stop")
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.error(f"Failed to stop mic test: {e}")
+            raise
+
     # ==================================================================
     # WEBSOCKET (Real-time events)
     # ==================================================================
