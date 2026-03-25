@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import time
 import wave
 from datetime import datetime
 from pathlib import Path
@@ -39,6 +40,7 @@ class AudioCaptureService:
     self._recording_thread: object | None = None  # threading.Thread
     self._output_path: Path | None = None
     self._wav_writer: wave.Wave_write | None = None
+    self._last_level_emit_at = 0.0
     self.vad = webrtcvad.Vad(self.config["vad"]["aggressiveness"])
 
     self.redis_client = redis.Redis(host=REDIS_HOST, port=6379, decode_responses=True)
@@ -518,6 +520,28 @@ class AudioCaptureService:
           continue
         audio_bytes = self._prepare_audio_bytes(chunk)
 
+        # Emit near-real-time audio level for UI waveform (throttled).
+        now = time.monotonic()
+        if now - self._last_level_emit_at >= 0.08:
+          samples = np.frombuffer(audio_bytes, dtype=np.int16)
+          if len(samples) > 0:
+            rms = float(np.sqrt(np.mean(np.square(samples.astype(np.float64)))))
+            level = min(1.0, rms / 5000.0)
+          else:
+            level = 0.0
+          self.redis_client.publish(
+            "events",
+            json.dumps(
+              {
+                "type": "audio_level",
+                "session_id": self.current_session_id,
+                "level": level,
+                "timestamp": datetime.now().isoformat(),
+              }
+            ),
+          )
+          self._last_level_emit_at = now
+
         if not checked_audio:
           self._check_silent_audio(audio_bytes, 0)
           checked_audio = True
@@ -542,6 +566,17 @@ class AudioCaptureService:
         {
           "type": "recording_paused",
           "session_id": self.current_session_id,
+          "timestamp": datetime.now().isoformat(),
+        }
+      ),
+    )
+    self.redis_client.publish(
+      "events",
+      json.dumps(
+        {
+          "type": "audio_level",
+          "session_id": self.current_session_id,
+          "level": 0.0,
           "timestamp": datetime.now().isoformat(),
         }
       ),

@@ -7,6 +7,7 @@ Two visual states driven by self._is_paused:
 
 import logging
 import random
+from collections import deque
 from datetime import datetime
 
 from kivy.animation import Animation
@@ -97,6 +98,8 @@ class RecordingScreen(BaseScreen):
         self.waveform_event = None
         self._is_paused = False
         self._paused_at_text = ""
+        self._level_history = deque([0.0] * _Waveform.NUM_BARS, maxlen=_Waveform.NUM_BARS)
+        self._last_audio_level_ts = 0.0
         self._build_ui()
 
     # ==================================================================
@@ -413,11 +416,13 @@ class RecordingScreen(BaseScreen):
         self.timer_label.text = "00:00"
         self.elapsed_sub.text = "ELAPSED TIME"
         self.waveform.set_active(True)
+        self._level_history = deque([0.0] * _Waveform.NUM_BARS, maxlen=_Waveform.NUM_BARS)
+        self._last_audio_level_ts = 0.0
         if self.paused_overlay.parent is self.root_layout:
             self.root_layout.remove_widget(self.paused_overlay)
 
         self.timer_event = Clock.schedule_interval(self._tick_timer, 1.0)
-        self.waveform_event = Clock.schedule_interval(lambda _: self.waveform.update_random(), 0.1)
+        self.waveform_event = Clock.schedule_interval(self._tick_waveform, 0.08)
 
     def on_leave(self):
         if self.timer_event:
@@ -494,11 +499,28 @@ class RecordingScreen(BaseScreen):
         if self.waveform_event:
             self.waveform_event.cancel()
         self.timer_event = Clock.schedule_interval(self._tick_timer, 1.0)
-        self.waveform_event = Clock.schedule_interval(lambda _: self.waveform.update_random(), 0.1)
+        self.waveform_event = Clock.schedule_interval(self._tick_waveform, 0.08)
 
     def _hide_paused_overlay(self, _dt):
         if self.paused_overlay.parent is self.root_layout:
             self.root_layout.remove_widget(self.paused_overlay)
+
+    def on_audio_level(self, level: float):
+        if self._is_paused:
+            return
+        # Noise gate so bars remain still in quiet rooms.
+        gated = 0.0 if level < 0.015 else min(1.0, level)
+        self._level_history.append(gated)
+        self._last_audio_level_ts = datetime.now().timestamp()
+
+    def _tick_waveform(self, _dt):
+        if self._is_paused:
+            return
+        now_ts = datetime.now().timestamp()
+        if now_ts - self._last_audio_level_ts > 0.25:
+            self._level_history = deque([v * 0.82 for v in self._level_history], maxlen=_Waveform.NUM_BARS)
+        levels = [max(2, int(v * _Waveform.MAX_H)) for v in self._level_history]
+        self.waveform.set_levels(levels)
 
     # ==================================================================
     # STOP
