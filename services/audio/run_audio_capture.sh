@@ -35,6 +35,12 @@ fi
 # shellcheck source=/dev/null
 source "$ACTIVATE"
 
+# webrtcvad imports pkg_resources — that module ships with setuptools, not PyPI "pkg_resources".
+if ! python3 -c "import pkg_resources" 2>/dev/null; then
+  echo "[MeetingBox audio] Installing setuptools (required by webrtcvad). Run: pip install -r requirements.txt" >&2
+  pip install "setuptools>=69.0.0"
+fi
+
 export REDIS_HOST="${REDIS_HOST:-127.0.0.1}"
 export TEMP_SEGMENTS_DIR="${TEMP_SEGMENTS_DIR:-$REPO_ROOT/data/audio/temp}"
 export RECORDINGS_DIR="${RECORDINGS_DIR:-$REPO_ROOT/data/audio/recordings}"
