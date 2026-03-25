@@ -27,7 +27,15 @@ cd "$SCRIPT_DIR"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 VENV_DIR="${VENV_DIR:-.venv}"
 ACTIVATE="$VENV_DIR/bin/activate"
-PYTHON_CMD="${PYTHON:-python3}"
+# Use an absolute interpreter for non-venv mode so a previously-activated
+# venv in PATH cannot hijack execution.
+if [[ -n "${PYTHON:-}" ]]; then
+  PYTHON_CMD="$PYTHON"
+elif [[ "${MEETINGBOX_USE_VENV:-1}" == "0" ]] && [[ -x "/usr/bin/python3" ]]; then
+  PYTHON_CMD="/usr/bin/python3"
+else
+  PYTHON_CMD="python3"
+fi
 
 if [[ "${MEETINGBOX_USE_VENV:-1}" != "0" ]] && [[ -f "$ACTIVATE" ]]; then
   # shellcheck source=/dev/null
