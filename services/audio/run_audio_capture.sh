@@ -14,6 +14,8 @@
 #
 # Usage:
 #   ./run_audio_capture.sh
+#   MEETINGBOX_USE_VENV=0 ./run_audio_capture.sh
+#   PYTHON=/usr/bin/python3.12 ./run_audio_capture.sh
 #   REDIS_HOST=127.0.0.1 ./run_audio_capture.sh
 #   AUDIO_INPUT_DEVICE_INDEX=2 ./run_audio_capture.sh
 
@@ -25,20 +27,33 @@ cd "$SCRIPT_DIR"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 VENV_DIR="${VENV_DIR:-.venv}"
 ACTIVATE="$VENV_DIR/bin/activate"
+PYTHON_CMD="${PYTHON:-python3}"
 
-if [[ ! -f "$ACTIVATE" ]]; then
-  echo "Missing venv: $SCRIPT_DIR/$VENV_DIR" >&2
-  echo "Create it with: python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt" >&2
-  exit 1
+if [[ "${MEETINGBOX_USE_VENV:-1}" != "0" ]] && [[ -f "$ACTIVATE" ]]; then
+  # shellcheck source=/dev/null
+  source "$ACTIVATE"
+  PYTHON_CMD="python3"
+  echo "[MeetingBox audio] Using venv: $SCRIPT_DIR/$VENV_DIR" >&2
+elif [[ "${MEETINGBOX_USE_VENV:-1}" != "0" ]] && [[ ! -f "$ACTIVATE" ]]; then
+  echo "[MeetingBox audio] No venv at $SCRIPT_DIR/$VENV_DIR — using system $PYTHON_CMD" >&2
+  echo "[MeetingBox audio] Tip: python3 -m venv .venv && . .venv/bin/activate && pip install -r requirements.txt" >&2
+else
+  echo "[MeetingBox audio] MEETINGBOX_USE_VENV=0 — using system $PYTHON_CMD" >&2
 fi
 
-# shellcheck source=/dev/null
-source "$ACTIVATE"
+# webrtcvad imports pkg_resources — that module ships with setuptools.
+if ! "$PYTHON_CMD" -c "import pkg_resources" >/dev/null 2>&1; then
+  echo "[MeetingBox audio] pkg_resources missing; installing setuptools..." >&2
+  if ! "$PYTHON_CMD" -m pip --version >/dev/null 2>&1; then
+    "$PYTHON_CMD" -m ensurepip --upgrade >/dev/null 2>&1 || true
+  fi
+  "$PYTHON_CMD" -m pip install --upgrade "setuptools>=69.0.0"
+fi
 
-# webrtcvad imports pkg_resources — that module ships with setuptools, not PyPI "pkg_resources".
-if ! python3 -c "import pkg_resources" 2>/dev/null; then
-  echo "[MeetingBox audio] Installing setuptools (required by webrtcvad). Run: pip install -r requirements.txt" >&2
-  pip install "setuptools>=69.0.0"
+if ! "$PYTHON_CMD" -c "import pkg_resources" >/dev/null 2>&1; then
+  echo "[MeetingBox audio] ERROR: pkg_resources still missing." >&2
+  echo "[MeetingBox audio] Try: $PYTHON_CMD -m pip install -r requirements.txt" >&2
+  exit 1
 fi
 
 export REDIS_HOST="${REDIS_HOST:-127.0.0.1}"
@@ -52,5 +67,6 @@ mkdir -p "$TEMP_SEGMENTS_DIR" "$RECORDINGS_DIR"
 echo "[MeetingBox audio] REDIS_HOST=$REDIS_HOST" >&2
 echo "[MeetingBox audio] TEMP_SEGMENTS_DIR=$TEMP_SEGMENTS_DIR" >&2
 echo "[MeetingBox audio] RECORDINGS_DIR=$RECORDINGS_DIR" >&2
+echo "[MeetingBox audio] PYTHON=$("$PYTHON_CMD" -c 'import sys; print(sys.executable)')" >&2
 
-exec python3 audio_capture.py "$@"
+exec "$PYTHON_CMD" audio_capture.py "$@"
