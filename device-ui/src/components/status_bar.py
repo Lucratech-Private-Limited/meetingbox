@@ -8,6 +8,7 @@ Top bar (44 px) with:
 """
 
 from kivy.uix.boxlayout import BoxLayout
+from kivy.uix.image import Image
 from kivy.uix.label import Label
 from kivy.uix.behaviors import ButtonBehavior
 from kivy.uix.widget import Widget
@@ -15,11 +16,18 @@ from kivy.graphics import Color, Rectangle, Line
 from kivy.animation import Animation
 from kivy.app import App
 
-from config import COLORS, FONT_SIZES, STATUS_BAR_HEIGHT
+from config import ASSETS_DIR, COLORS, FONT_SIZES, STATUS_BAR_HEIGHT
+
+_GEAR_ICON = ASSETS_DIR / "recording" / "setteing gear icon.png"
 
 
 class _GearButton(ButtonBehavior, Label):
-    """Tappable gear icon."""
+    """Tappable gear icon (text fallback)."""
+    pass
+
+
+class _GearImageButton(ButtonBehavior, Image):
+    """Tappable gear icon (image asset)."""
     pass
 
 
@@ -159,12 +167,21 @@ class StatusBar(BoxLayout):
     # -- helpers --------------------------------------------------------
 
     def _make_gear(self):
-        gear = _GearButton(
-            text='⚙',
-            font_size=FONT_SIZES['title'],
-            color=COLORS['gray_500'],
-            size_hint=(0.15, 1),
-        )
+        if _GEAR_ICON.exists():
+            gear = _GearImageButton(
+                source=str(_GEAR_ICON),
+                size_hint=(None, None),
+                size=(28, 28),
+                allow_stretch=True,
+                keep_ratio=True,
+            )
+        else:
+            gear = _GearButton(
+                text='⚙',
+                font_size=FONT_SIZES['title'],
+                color=COLORS['gray_500'],
+                size_hint=(0.15, 1),
+            )
         gear.bind(on_press=self._on_gear_pressed)
         return gear
 

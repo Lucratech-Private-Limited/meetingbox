@@ -152,16 +152,26 @@ class HomeScreen(BaseScreen):
         self.mic_chip.bind(on_press=lambda *_: self.goto("mic_test", transition="slide_left"))
         right.add_widget(self.mic_chip)
 
-        self.settings_btn = _LabelButton(
-            text="⚙",
-            font_size=FONT_SIZES["title"],
-            color=COLORS["gray_400"],
-            size_hint=(None, 1),
-            width=28,
-            halign="center",
-            valign="middle",
-        )
-        self.settings_btn.bind(size=self.settings_btn.setter("text_size"))
+        gear_path = ASSETS_DIR / "recording" / "setteing gear icon.png"
+        if gear_path.exists():
+            self.settings_btn = _ImageButton(
+                source=str(gear_path),
+                size_hint=(None, None),
+                size=(28, 28),
+                allow_stretch=True,
+                keep_ratio=True,
+            )
+        else:
+            self.settings_btn = _LabelButton(
+                text="⚙",
+                font_size=FONT_SIZES["title"],
+                color=COLORS["gray_400"],
+                size_hint=(None, 1),
+                width=28,
+                halign="center",
+                valign="middle",
+            )
+            self.settings_btn.bind(size=self.settings_btn.setter("text_size"))
         self.settings_btn.bind(on_press=lambda *_: self.goto("settings", transition="slide_left"))
         right.add_widget(self.settings_btn)
         top.add_widget(right)
