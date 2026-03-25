@@ -5,8 +5,13 @@
 # `docker compose up` does not start audio in a container.
 #
 # One-time setup (Debian/Ubuntu):
-#   sudo apt install -y portaudio19-dev libasound2-dev python3-dev build-essential
-#   cd services/audio && python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt
+#   sudo apt install -y portaudio19-dev libasound2-dev python3-dev build-essential python3-venv
+#   cd services/audio && python3 -m venv .venv
+#   .venv/bin/python3 -m pip install -U pip setuptools
+#   .venv/bin/python3 -m pip install -r requirements.txt
+#
+# If you see "No module named 'pkg_resources'" (webrtcvad needs setuptools):
+#   cd services/audio && .venv/bin/python3 -m pip install -U "setuptools>=69"
 #
 # Prerequisites:
 #   - Redis reachable from the host. Compose publishes Redis on 127.0.0.1:6379.
@@ -40,7 +45,8 @@ fi
 if [[ "${MEETINGBOX_USE_VENV:-1}" != "0" ]] && [[ -f "$ACTIVATE" ]]; then
   # shellcheck source=/dev/null
   source "$ACTIVATE"
-  PYTHON_CMD="python3"
+  # Absolute venv python — avoids a stale/wrong `python3` on PATH (e.g. another venv).
+  PYTHON_CMD="$SCRIPT_DIR/$VENV_DIR/bin/python3"
   echo "[MeetingBox audio] Using venv: $SCRIPT_DIR/$VENV_DIR" >&2
 elif [[ "${MEETINGBOX_USE_VENV:-1}" != "0" ]] && [[ ! -f "$ACTIVATE" ]]; then
   echo "[MeetingBox audio] No venv at $SCRIPT_DIR/$VENV_DIR — using system $PYTHON_CMD" >&2
