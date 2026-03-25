@@ -5,6 +5,7 @@ Configure display, backend connection, and UI preferences.
 Based on PRD v1.0 – Apple-inspired premium dark theme.
 """
 
+import functools
 import logging
 import os
 from pathlib import Path
@@ -235,49 +236,61 @@ _SETUP_COMPLETE_LEGACY_MARKERS = (
 )
 
 
+def _system_config_dir_usable(d: Path) -> bool:
+    """
+    Use /data/config or /opt/... without mkdir(parents=True), which would try
+    to create /data at filesystem root and fail with EACCES for normal users
+    when /data does not exist (typical when running the UI outside Docker).
+    """
+    try:
+        if d.is_dir():
+            return bool(os.access(d, os.W_OK))
+        parent = d.parent
+        if not parent.is_dir() or not os.access(parent, os.W_OK):
+            return False
+        d.mkdir(exist_ok=True)
+        return d.is_dir() and bool(os.access(d, os.W_OK))
+    except OSError:
+        return False
+
+
+@functools.lru_cache(maxsize=1)
 def resolve_device_config_dir() -> Path:
     """
     Writable directory for device_profiles.json and local .setup_complete.
 
-    Prefers /data/config when the compose volume is writable. If /data/config
-    is root-owned or missing, falls back to BASE_DIR/data/config (ephemeral
-    inside Docker — see warning).
+    Prefers /data/config when the compose volume exists and is writable.
+    Otherwise uses BASE_DIR/data/config (under the app tree).
     """
-    candidates = (
-        Path('/data/config'),
-        Path('/opt/meetingbox/data/config'),
-        BASE_DIR / 'data' / 'config',
-    )
-    for d in candidates:
-        try:
-            d.mkdir(parents=True, exist_ok=True)
-        except OSError as e:
-            logger.debug('device config dir skip %s: %s', d, e)
-            continue
-        try:
-            if os.access(d, os.W_OK):
-                return d
-        except OSError:
-            continue
-    # Should not reach: BASE_DIR path usually mkdir+writable
+    for d in (Path('/data/config'), Path('/opt/meetingbox/data/config')):
+        if _system_config_dir_usable(d):
+            return d
+
     fb = BASE_DIR / 'data' / 'config'
     try:
         fb.mkdir(parents=True, exist_ok=True)
     except OSError:
         pass
+
     if Path('/.dockerenv').exists():
         try:
             vol = Path('/data/config')
-            vol_ok = vol.exists() and os.access(vol, os.W_OK)
+            vol_ok = vol.is_dir() and os.access(vol, os.W_OK)
         except OSError:
             vol_ok = False
         if not vol_ok:
             logger.warning(
-                'Cannot persist to /data/config (not writable). Using %s — '
+                'Cannot persist to /data/config (not writable or missing). Using %s — '
                 'setup and profiles are LOST on container restart. Fix on host: '
                 'sudo chown -R 1000:1000 ./data/config',
                 fb,
             )
+    else:
+        logger.debug(
+            'Using application data dir %s (no writable /data/config on this host)',
+            fb,
+        )
+
     return fb
 
 
@@ -303,15 +316,8 @@ def setup_complete_marker_paths_for_write() -> tuple[Path, ...]:
     primary = resolve_device_config_dir()
     dirs.append(primary)
     for d in (Path('/data/config'), Path('/opt/meetingbox/data/config')):
-        try:
-            d.mkdir(parents=True, exist_ok=True)
-        except OSError:
-            continue
-        try:
-            if os.access(d, os.W_OK):
-                dirs.append(d)
-        except OSError:
-            continue
+        if _system_config_dir_usable(d):
+            dirs.append(d)
     seen: set[str] = set()
     uniq: list[Path] = []
     for d in dirs:
