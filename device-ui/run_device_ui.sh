@@ -43,6 +43,13 @@ if [[ "$(uname -s)" == "Linux" ]] && [[ "${MEETINGBOX_USE_LOCAL_X:-0}" == "1" ]]
   export DISPLAY=:0
 fi
 
+# Console/kiosk: DISPLAY often unset when launching from systemd or tty; SDL
+# then may not map a visible window. Use local :0 when the socket exists.
+if [[ "$(uname -s)" == "Linux" ]] && [[ -z "${DISPLAY:-}" ]] && [[ -S /tmp/.X11-unix/X0 ]]; then
+  export DISPLAY=:0
+  echo "[MeetingBox] DISPLAY was unset; set to :0 for local X11 (socket X0 present)." >&2
+fi
+
 # Kivy on Linux: SDL2 clipboard still loads an X11 "cutbuffer" helper; without
 # xclip/xsel it logs CRITICAL (see kivy/core/clipboard/__init__.py).
 if [[ "$(uname -s)" == "Linux" ]] && ! command -v xclip >/dev/null 2>&1 && ! command -v xsel >/dev/null 2>&1; then

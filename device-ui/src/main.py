@@ -7,10 +7,12 @@ Implements the complete boot flow defined in the PRD:
 """
 
 import asyncio
+import json
 import logging
 import os
 import shutil
 import sys
+import time
 from pathlib import Path
 
 # Ensure the directory containing this file (src) is on sys.path so that
@@ -265,6 +267,30 @@ class MeetingBoxApp(App):
         # combinations leave it hidden until raised).
         Clock.schedule_once(lambda *_: self._ensure_window_visible(), 0)
         Clock.schedule_once(lambda *_: self._ensure_window_visible(), 0.3)
+
+        # region agent log
+        def _dbg_window(_dt):
+            try:
+                _debug_ndjson(
+                    "H2",
+                    "main.py:MeetingBoxApp.build",
+                    "window_after_build",
+                    {
+                        "size": [float(Window.size[0]), float(Window.size[1])],
+                        "pos": [float(Window.pos[0]), float(Window.pos[1])],
+                        "fullscreen": bool(Window.fullscreen),
+                    },
+                )
+            except Exception as ex:
+                _debug_ndjson(
+                    "H2",
+                    "main.py:MeetingBoxApp.build",
+                    "window_probe_failed",
+                    {"error": str(ex)},
+                )
+
+        Clock.schedule_once(_dbg_window, 0.5)
+        # endregion
 
         logger.info("UI built – starting on splash screen")
         return self.screen_manager
@@ -752,6 +778,27 @@ class MeetingBoxApp(App):
 # ENTRY POINT
 # ==================================================================
 
+# region agent log
+_DEBUG_LOG_PATH = Path(__file__).resolve().parent.parent.parent / "debug-422319.log"
+
+
+def _debug_ndjson(hypothesis_id: str, location: str, message: str, data=None):
+    try:
+        rec = {
+            "sessionId": "422319",
+            "hypothesisId": hypothesis_id,
+            "location": location,
+            "message": message,
+            "data": data or {},
+            "timestamp": int(time.time() * 1000),
+        }
+        with open(_DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, default=str) + "\n")
+    except Exception:
+        pass
+# endregion
+
+
 def main():
     print(f"[MeetingBox] Starting Device UI", flush=True)
     disp = os.environ.get('DISPLAY', '(not set)')
@@ -784,6 +831,20 @@ def main():
         print(f"[MeetingBox] X11 socket dir: {result.stdout.strip()}", flush=True)
     except Exception as e:
         print(f"[MeetingBox] X11 socket check failed: {e}", flush=True)
+
+    # region agent log
+    _debug_ndjson(
+        "H1",
+        "main.py:main",
+        "startup_env",
+        {
+            "DISPLAY": os.environ.get("DISPLAY"),
+            "WAYLAND_DISPLAY": os.environ.get("WAYLAND_DISPLAY"),
+            "XDG_SESSION_TYPE": os.environ.get("XDG_SESSION_TYPE"),
+            "X0_exists": Path("/tmp/.X11-unix/X0").exists(),
+        },
+    )
+    # endregion
 
     logger.info("Starting MeetingBox Device UI")
     try:
