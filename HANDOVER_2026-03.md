@@ -1,6 +1,6 @@
 # MeetingBox Handover
 
-Last updated: 2026-03-20
+Last updated: 2026-03-25
 
 ## Purpose
 
@@ -14,7 +14,7 @@ The project was originally built for a Raspberry Pi 5 with a 3.5-inch OLED touch
 
 **Current production target:** Intel mini PC, Ubuntu 24.04 Desktop, standard HDMI monitor, USB headset microphone, mouse/keyboard input, Docker Compose runtime.
 
-## Delta Update (2026-03-20)
+## Delta Update (2026-03-25)
 
 This section is the latest validated state and overrides older details below when there is a conflict.
 
@@ -25,6 +25,17 @@ This section is the latest validated state and overrides older details below whe
 - To switch Whisper size, change model file in services/transcription/Dockerfile and WHISPER_MODEL_PATH, then rebuild only transcription: docker compose build --no-cache transcription && docker compose up -d transcription.
 - Actions tab behavior: action generation and Execute in services/web/services/action_engine.py call Anthropic (_call_claude_json) when ANTHROPIC_API_KEY is set. This path is not using Ollama.
 - services/ai/ai_service.py summarization prompt usage: _build_prompt is used for first/full summary; _build_update_prompt is only used when an existing local summary is incrementally updated.
+- Audio capture is no longer part of the default Docker stack. The `audio` service is now behind profile `docker-audio`.
+- Default audio operation on the mini PC is host-side capture via `services/audio/run_audio_capture.sh`.
+- Redis is published on localhost for host audio capture: `127.0.0.1:6379:6379`.
+- If `webrtcvad` fails with `ModuleNotFoundError: pkg_resources`, install `setuptools` in the exact interpreter/venv running `audio_capture.py`.
+- Device onboarding now includes:
+  - WiFi connected -> Create profile (Frame 13)
+  - MeetingBox ready summary (Frame 14)
+  - finalize setup -> Home
+- Local device user profiles are stored in `device_profiles.json` with hashed passwords and `active_user_id`.
+- Factory reset now removes the profile store along with settings and `.setup_complete`.
+- Setup marker path resolution was updated to handle writable vs non-writable config roots more safely on Docker and native host runs.
 - Known ops gotchas seen recently:
   - Compose working directory mismatch causes data to appear in different host paths.
   - SQLite readonly database occurs when data/transcripts ownership/permissions do not match UID 1000 container user.
@@ -45,7 +56,7 @@ This section is the latest validated state and overrides older details below whe
 
 ### Service Stack (Docker Compose)
 
-All services run in Docker via a single compose file. The production command is:
+Most services run in Docker via a single compose file. The default production command is:
 
 ```bash
 cd /home/meetingbox/meetingbox
@@ -55,13 +66,27 @@ docker compose -f docker-compose.yml -f docker-compose.prod.yml --profile screen
 | Container | Image | Purpose |
 |---|---|---|
 | `meetingbox-redis` | `redis:7-alpine` | Event bus (pub/sub) and state store |
-| `meetingbox-audio` | `meetingbox-audio` | Mic capture and direct session WAV recording |
+| `meetingbox-audio` | `meetingbox-audio` | Optional Docker mic capture (`--profile docker-audio`) |
 | `meetingbox-transcription` | `meetingbox-transcription` | Whisper.cpp transcription after recording stops |
 | `meetingbox-ai` | `meetingbox-ai` | Summary generation via Ollama (local) or Claude (cloud) |
 | `meetingbox-ollama` | `meetingbox-ollama` | Local LLM runtime (phi3:mini) |
 | `meetingbox-web` | `meetingbox-web` | FastAPI backend, REST API, WebSocket relay |
 | `meetingbox-nginx` | `nginx:alpine` | Reverse proxy, static frontend serving (ports 80, 8000) |
 | `meetingbox-ui` | `meetingbox-device-ui` | Kivy windowed UI on the desktop (profile: `screen`) |
+
+Default audio capture on the mini PC is host-side:
+
+```bash
+cd /home/meetingbox/meetingbox/services/audio
+bash run_audio_capture.sh
+```
+
+Use Docker audio only when explicitly needed:
+
+```bash
+cd /home/meetingbox/meetingbox
+docker compose --profile docker-audio up -d audio
+```
 
 ### Data Flow
 
@@ -81,17 +106,18 @@ All data lives under `./data/` relative to the compose working directory. On the
 |---|---|---|
 | `data/audio/recordings/` | `/data/audio/recordings` | Final combined WAV recordings |
 | `data/transcripts/` | `/data/transcripts` | `meetings.db` (SQLite), optional model files |
-| `data/config/` | `/data/config` | `device_settings.json`, `.setup_complete` marker |
+| `data/config/` | `/data/config` | `device_settings.json`, `.setup_complete`, `device_profiles.json` |
 
 ### Key Files
 
 | File | What It Does |
 |---|---|
-| `docker-compose.yml` | Service definitions, volumes, networks |
+| `docker-compose.yml` | Service definitions, volumes, networks, localhost Redis publish, optional `docker-audio` profile |
 | `docker-compose.prod.yml` | Production overrides (adds `/dev/input` to device-ui) |
 | `.env` / `.env.example` | Environment variables (API keys, model config, JWT secret) |
 | `services/audio/audio_capture.py` | Mic detection, recording loop, direct WAV writer |
 | `services/audio/config.yaml` | Audio sample rate, VAD aggressiveness, storage paths |
+| `services/audio/run_audio_capture.sh` | Host-side audio capture runner (preferred on mini PC) |
 | `services/transcription/transcription_service.py` | Post-stop Whisper runner, SQLite persistence, Redis events |
 | `services/ai/ai_service.py` | Ollama/Claude summary generation |
 | `services/web/main.py` | FastAPI app, WebSocket relay, Redis listener |
@@ -124,7 +150,7 @@ All data lives under `./data/` relative to the compose working directory. On the
 - Pi rainbow splash disable from `deploy_production.sh`
 - `libegl1-mesa-dev` and `libmtdev1` from device-ui Dockerfile (renamed/removed in Debian Bookworm)
 - `curl` installation from Ollama Dockerfile (broken packages in `ollama/ollama:latest`)
-- Redis host port binding (port 6379 conflicted with native redis-server)
+- Default always-on Docker audio capture
 - Xauthority file mount from device-ui (fragile, unnecessary with `xhost +local:`)
 - `version: "3.9"` from docker-compose.yml (obsolete in modern Docker Compose)
 
@@ -139,7 +165,7 @@ All data lives under `./data/` relative to the compose working directory. On the
 | `services/ollama/Dockerfile` | Removed `apt-get install curl`; health checks use `ollama list` |
 | `services/ollama/entrypoint.sh` | Readiness check: `curl` → `ollama list` |
 | `services/transcription/transcription_service.py` | Default Whisper path: `/opt/meetingbox/runtime/whisper.cpp` → `/app/whisper.cpp` |
-| `docker-compose.yml` | Redis port removed; `user: "1000:1000"` on audio/transcription/ai; Ollama healthcheck uses `ollama list`; device-ui gets `/dev/dri`, `LIBGL_ALWAYS_SOFTWARE=1`, `FULLSCREEN=0`; Whisper model/threads configurable via env |
+| `docker-compose.yml` | Redis published on `127.0.0.1:6379`; `audio` moved behind `docker-audio` profile; `user: "1000:1000"` on audio/transcription/ai; Ollama healthcheck uses `ollama list`; device-ui gets `/dev/dri`, `LIBGL_ALWAYS_SOFTWARE=1`, `FULLSCREEN=0`; Whisper model/threads configurable via env |
 | `scripts/deploy_production.sh` | Generalized from Pi to Linux; removed Pi boot config; disabled onboarding; disabled `meetingbox-x.service` |
 | `scripts/hotspot.sh` | Auto-detects WiFi interface name instead of hardcoding `wlan0` |
 | `scripts/install_native_minipc.sh` | Default display: 480x320 → 1280x720 |
@@ -149,6 +175,8 @@ All data lives under `./data/` relative to the compose working directory. On the
 - GDM3 auto-login config (`/etc/gdm3/custom.conf`)
 - Desktop autostart entry (`~/.config/autostart/meetingbox-ui.desktop`) that runs `xhost +local:` and restarts device-ui on login
 - `.setup_complete` marker created by deploy script to bypass onboarding
+- Profile creation + final ready screens in device onboarding
+- `device_profiles.json` local profile storage
 - `WHISPER_MODEL_PATH` and `WHISPER_THREADS` env vars in compose for runtime tuning
 
 ## Current Boot Sequence (After Reboot)
@@ -156,10 +184,11 @@ All data lives under `./data/` relative to the compose working directory. On the
 1. Ubuntu boots → `graphical.target` → GDM3 starts
 2. GDM3 auto-logs in as `meetingbox` (configured in `/etc/gdm3/custom.conf`)
 3. Ubuntu desktop appears on monitor
-4. `meetingbox.service` (systemd) starts Docker Compose with all 8 containers
+4. `meetingbox.service` (systemd) starts Docker Compose for the default stack (audio is not started unless `docker-audio` profile is requested)
 5. Autostart desktop entry (`meetingbox-ui.desktop`) runs `xhost +local:` then restarts `meetingbox-ui`
 6. MeetingBox device UI window appears on desktop
-7. Web dashboard available at `http://localhost` or `http://meetingbox.local`
+7. If using host audio, run `services/audio/run_audio_capture.sh`
+8. Web dashboard available at `http://localhost` or `http://meetingbox.local`
 
 ## Systemd Services
 
@@ -267,10 +296,22 @@ If the audio service logs `SILENT AUDIO DETECTED (peak=…)`, the wrong device i
 
 ## How to Operate
 
-### Start everything
+### Start default stack
 ```bash
 cd /home/meetingbox/meetingbox
 docker compose -f docker-compose.yml -f docker-compose.prod.yml --profile screen up -d
+```
+
+### Start host audio capture
+```bash
+cd /home/meetingbox/meetingbox/services/audio
+bash run_audio_capture.sh
+```
+
+### Start Docker audio capture instead
+```bash
+cd /home/meetingbox/meetingbox
+docker compose -f docker-compose.yml -f docker-compose.prod.yml --profile screen --profile docker-audio up -d audio
 ```
 
 ### Stop everything
@@ -289,6 +330,8 @@ docker logs meetingbox-transcription -f
 docker logs meetingbox-ai -f
 docker logs meetingbox-ui -f
 ```
+
+If using host audio instead of Docker audio, watch the host process terminal or redirect logs from `services/audio/run_audio_capture.sh`.
 
 ### Rebuild after code changes
 ```bash
