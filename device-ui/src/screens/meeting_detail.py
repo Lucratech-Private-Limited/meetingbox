@@ -1,7 +1,7 @@
 """
 Meeting Detail Screen – Dark themed (480 × 320)
 
-Scrollable detail view with summary, action items, decisions.
+Scrollable detail view with report, action items, decisions.
 """
 
 from datetime import datetime
@@ -135,16 +135,21 @@ class MeetingDetailScreen(BaseScreen):
 
     def _populate_summary(self, summary):
         self.summary_container.clear_widgets()
-        h = Label(text='Summary', font_size=FONT_SIZES['medium'],
+        h = Label(text='Report', font_size=FONT_SIZES['medium'],
                   size_hint_y=None, height=20, color=COLORS['white'],
                   bold=True, halign='left')
         h.bind(size=h.setter('text_size'))
         self.summary_container.add_widget(h)
-        t = Label(text=summary.get('summary', 'No summary'),
-                  font_size=FONT_SIZES['small'], size_hint_y=None,
+        t = Label(text=summary.get('summary', 'No report yet.'),
+                  font_size=FONT_SIZES['body'], size_hint_y=None,
                   color=COLORS['gray_400'], halign='left', valign='top')
-        t.bind(texture_size=t.setter('size'))
-        t.bind(size=t.setter('text_size'))
+        t.bind(width=lambda w, val: setattr(w, 'text_size', (val, None)))
+
+        def _report_tex_size(inst, ts):
+            inst.height = ts[1] + 8
+            self.summary_container.height = 20 + inst.height + SPACING['button_spacing']
+
+        t.bind(texture_size=_report_tex_size)
         self.summary_container.add_widget(t)
         self.summary_container.height = 20 + t.height + SPACING['button_spacing']
 

@@ -1,5 +1,5 @@
 """
-Processing Screen – transcription / summary (no fake progress bar).
+Processing Screen – transcription / meeting report (no fake progress bar).
 
 Shows a loading indicator and status text. Optional ETA line only when the
 backend sends a positive `eta` on `processing_progress` WebSocket events.
@@ -67,7 +67,7 @@ class ProcessingScreen(BaseScreen):
         col.add_widget(self.spinner_label)
 
         self.status_label = Label(
-            text="Generating transcript and summary…",
+            text="Transcribing and building your meeting report…",
             font_size=FONT_SIZES["medium"],
             color=COLORS["white"],
             halign="center",

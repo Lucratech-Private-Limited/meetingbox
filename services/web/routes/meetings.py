@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 import redis
 import shutil
 import httpx
@@ -79,7 +79,7 @@ def _generate_session_id() -> str:
 
 
 def _derive_title(summary: str, topics: list) -> str:
-    """Derive a short human-readable meeting title from the summary or topics."""
+    """Derive a short human-readable meeting title from report text or topics."""
     if topics:
       clean = [t.strip().lstrip("#") for t in topics[:3] if isinstance(t, str) and t.strip()]
       if clean:
@@ -92,6 +92,32 @@ def _derive_title(summary: str, topics: list) -> str:
       if first:
         return first
     return ""
+
+
+def _coerce_str_list(raw: object) -> list[str]:
+  out: list[str] = []
+  for item in (raw if isinstance(raw, list) else []) or []:
+    if isinstance(item, str):
+      out.append(item)
+    elif isinstance(item, dict):
+      out.append(str(item.get("text") or item.get("point") or item.get("question") or item))
+    else:
+      out.append(str(item))
+  return out
+
+
+def _compose_stored_report_body(data: dict) -> str:
+  """Single text stored in summaries.summary for API + device-ui (full report body)."""
+  main = (data.get("full_report") or data.get("summary") or "").strip()
+  parts: list[str] = [main] if main else []
+  oq = data.get("open_questions") or []
+  if oq:
+    parts.append("\n\n---\nOPEN QUESTIONS\n" + "\n".join(f"• {x}" for x in oq))
+  rc = data.get("risks_or_concerns") or []
+  if rc:
+    parts.append("\n\n---\nRISKS / CONCERNS\n" + "\n".join(f"• {x}" for x in rc))
+  return "".join(parts).strip()
+
 
 # Accepted upload extensions; non-WAV are converted with ffmpeg to 16kHz mono WAV
 UPLOAD_AUDIO_EXTENSIONS = {".wav", ".webm", ".ogg", ".mp4", ".m4a"}
@@ -125,6 +151,8 @@ class MeetingSummary(BaseModel):
 
 
 class LocalSummary(BaseModel):
+  model_config = ConfigDict(protected_namespaces=())
+
   summary: str
   action_items: list[dict]
   decisions: list
@@ -178,6 +206,9 @@ def _normalize_summary_data(data: dict) -> dict:
   sentiment = data.get("sentiment", "")
   if not isinstance(sentiment, str):
     data["sentiment"] = str(sentiment)
+
+  data["open_questions"] = _coerce_str_list(data.get("open_questions"))
+  data["risks_or_concerns"] = _coerce_str_list(data.get("risks_or_concerns"))
 
   return data
 
@@ -372,6 +403,7 @@ def _transcribe_audio_with_openai(audio_path: Path) -> str:
   if not client:
     raise HTTPException(status_code=400, detail="OPENAI_API_KEY is not configured on the server.")
   model = os.getenv("OPENAI_TRANSCRIBE_MODEL", "whisper-1")
+  logger.info("Transcribing %s with OpenAI (%s)", audio_path.name, model)
   try:
     with open(audio_path, "rb") as audio_fp:
       tr = client.audio.transcriptions.create(
@@ -571,7 +603,7 @@ async def list_meetings(limit: int = 50, offset: int = 0, status: Optional[str] 
 
 @router.post("/{meeting_id}/summarize")
 async def summarize_meeting(meeting_id: str, current_user: Optional[dict] = Depends(get_optional_user)):
-  """Generate an AI summary for a transcribed meeting using Claude."""
+  """Generate a detailed meeting report from the transcript using Claude (stored in summaries.summary)."""
   client = _get_anthropic_client()
   if not client:
     raise HTTPException(status_code=400, detail="ANTHROPIC_API_KEY is not configured on the server.")
@@ -620,32 +652,43 @@ async def summarize_meeting(meeting_id: str, current_user: Optional[dict] = Depe
   transcript = "\n\n".join(parts)
 
   prompt = (
-    "You are analyzing a meeting transcript. Please provide:\n\n"
-    "1. Summary (2-3 sentences)\n"
-    "2. Key discussion points (3-5 bullets)\n"
-    "3. Decisions made\n"
-    "4. Action items with assignees if available. Each action item MUST include a "
-    '"type" field with one of these values:\n'
-    '   - "email_draft" — for follow-ups that are naturally an email\n'
-    '   - "calendar_invite" — for next meetings or time-blocking commitments\n'
-    '   - "task" — for general human to-do items that don\'t involve email or calendar\n'
-    "   Only include action items that are explicitly grounded in the meeting.\n"
-    "5. 3-5 topic hashtags\n"
-    "6. Overall sentiment (single word or short phrase)\n\n"
-    "Return **only** valid JSON in this shape:\n"
-    '{\n'
-    '  "summary": "...",\n'
-    '  "discussion_points": ["...", "..."],\n'
-    '  "decisions": ["...", "..."],\n'
-    '  "action_items": [{"task": "...", "assignee": "...", "due_date": "...", "type": "email_draft | calendar_invite | task"}],\n'
-    '  "topics": ["#topic1", "#topic2"],\n'
-    '  "sentiment": "Productive"\n'
+    "You are producing a **detailed meeting REPORT** from the transcript below. This is NOT a short summary.\n\n"
+    "Rules:\n"
+    "- Ground every section in what was actually said. Paraphrase faithfully; do not invent facts, names, dates, or commitments.\n"
+    "- When the transcript includes [MM:SS] timestamps, refer to them where helpful (e.g. ‘around 04:12’).\n"
+    "- Write for someone who was not in the room. Be specific: who said what (when names/roles appear), what was proposed, what was agreed or rejected.\n"
+    "- Use clear structure inside `full_report` with headings and bullet lists as appropriate. Aim for depth and clarity, not brevity.\n"
+    "  Suggested sections (adapt to the content):\n"
+    "  - Context / purpose of the meeting\n"
+    "  - Discussion by theme or chronology (whichever fits the transcript)\n"
+    "  - Agreements, disagreements, and rationale (if stated)\n"
+    "  - Follow-ups already stated in the conversation\n"
+    "- If something is unclear or missing from the audio, say so explicitly in `open_questions` rather than guessing.\n\n"
+    "Also extract structured fields for downstream use:\n"
+    "- `decisions`: concrete decisions or conclusions reached (strings). Empty list if none.\n"
+    "- `action_items`: only items explicitly assigned or committed in the meeting. Each object MUST include "
+    '"type": one of "email_draft" | "calendar_invite" | "task".\n'
+    "- `topics`: 3–8 short hashtags (strings).\n"
+    "- `sentiment`: one word or short phrase characterizing the overall tone.\n"
+    "- `open_questions`: unresolved questions or ambiguities visible in the transcript.\n"
+    "- `risks_or_concerns`: risks, blockers, or worries stated in the meeting.\n\n"
+    "Return **only** valid JSON with this shape (no markdown fences outside the JSON):\n"
+    "{\n"
+    '  "report_title": "Short title for the meeting (max ~80 chars)",\n'
+    '  "full_report": "Long multi-section report as plain text (headings and bullets allowed). '
+    'Avoid generic filler unless the meeting actually said it.",\n'
+    '  "decisions": ["..."],\n'
+    '  "action_items": [{"task": "...", "assignee": "...", "due_date": "", "type": "task"}],\n'
+    '  "topics": ["#topic"],\n'
+    '  "sentiment": "...",\n'
+    '  "open_questions": ["..."],\n'
+    '  "risks_or_concerns": ["..."]\n'
     "}\n\n"
     f"Transcript:\n\n{transcript}"
   )
 
   model = os.getenv("AI_MODEL", "claude-sonnet-4-20250514")
-  max_tokens = int(os.getenv("AI_MAX_TOKENS", "2000"))
+  max_tokens = int(os.getenv("AI_REPORT_MAX_TOKENS", os.getenv("AI_MAX_TOKENS", "8192")))
 
   try:
     resp = client.messages.create(
@@ -673,6 +716,10 @@ async def summarize_meeting(meeting_id: str, current_user: Optional[dict] = Depe
   # Normalize LLM output (decisions/topics may be objects instead of strings)
   data = _normalize_summary_data(data)
 
+  report_body = _compose_stored_report_body(data)
+  if not report_body:
+    raise HTTPException(status_code=500, detail="Model returned an empty report (full_report).")
+
   conn = get_connection()
   conn.execute("PRAGMA foreign_keys = ON")
   try:
@@ -685,7 +732,7 @@ async def summarize_meeting(meeting_id: str, current_user: Optional[dict] = Depe
       """,
       (
         meeting_id,
-        data.get("summary", ""),
+        report_body,
         json.dumps(data.get("action_items", [])),
         json.dumps(data.get("decisions", [])),
         json.dumps(data.get("topics", [])),
@@ -693,7 +740,8 @@ async def summarize_meeting(meeting_id: str, current_user: Optional[dict] = Depe
         datetime.now().isoformat(),
       ),
     )
-    auto_title = _derive_title(data.get("summary", ""), data.get("topics", []))
+    rt = (data.get("report_title") or "").strip()
+    auto_title = (rt[:80] if rt else "") or _derive_title(report_body, data.get("topics", []))
     if auto_title and (meeting.get("title", "").startswith("Meeting ") or not meeting.get("title")):
       cur.execute("UPDATE meetings SET status = 'completed', end_time = ?, title = ? WHERE id = ?", (datetime.now().isoformat(), auto_title, meeting_id))
     else:
@@ -712,11 +760,14 @@ async def summarize_meeting(meeting_id: str, current_user: Optional[dict] = Depe
 
   return {
     "status": "generated",
-    "summary": data.get("summary", ""),
+    "summary": report_body,
     "action_items": data.get("action_items", []),
     "decisions": data.get("decisions", []),
     "topics": data.get("topics", []),
     "sentiment": data.get("sentiment", ""),
+    "report_title": (data.get("report_title") or "").strip(),
+    "open_questions": data.get("open_questions", []),
+    "risks_or_concerns": data.get("risks_or_concerns", []),
   }
 
 

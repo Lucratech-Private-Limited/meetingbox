@@ -1,9 +1,9 @@
 """
-Summary Review Screen -- Post-recording summary & actions (480 x 320)
+Report Review Screen -- Post-recording detailed report & actions
 
-Two tabs: Summary | Actions
-- Summary tab: shows the AI-generated summary text, decisions, topics
-- Actions tab: shows action items with checkboxes and Execute Selected button
+Two tabs: Report | Actions
+- Report tab: full meeting report from transcript (detailed, not a short summary)
+- Actions tab: action items with checkboxes and Execute Selected button
 """
 
 import logging
@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 
 class SummaryReviewScreen(BaseScreen):
-    """Post-recording screen with Summary and Actions tabs."""
+    """Post-recording screen with Report and Actions tabs."""
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -45,7 +45,7 @@ class SummaryReviewScreen(BaseScreen):
         self.make_dark_bg(self.root_layout)
 
         self.status_bar = StatusBar(
-            status_text='SUMMARY',
+            status_text='MEETING REPORT',
             status_color=COLORS['green'],
             device_name='MeetingBox AI',
             show_settings=False,
@@ -62,7 +62,7 @@ class SummaryReviewScreen(BaseScreen):
         )
 
         self.summary_tab_btn = SecondaryButton(
-            text='Summary',
+            text='Report',
             font_size=FONT_SIZES['body'],
             size_hint=(0.5, 1),
         )
@@ -162,10 +162,10 @@ class SummaryReviewScreen(BaseScreen):
         )
         content.bind(minimum_height=content.setter('height'))
 
-        summary_text = self._summary_data.get('summary', 'No summary available.')
+        summary_text = self._summary_data.get('summary', 'No report available.')
         lbl = Label(
             text=summary_text,
-            font_size=FONT_SIZES['small'] + 1,
+            font_size=FONT_SIZES['body'],
             color=COLORS['white'],
             halign='left',
             valign='top',

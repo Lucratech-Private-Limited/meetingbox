@@ -124,7 +124,7 @@ class CompleteScreen(BaseScreen):
                         stats_parts.append(f'• {ac} action item{"s" if ac != 1 else ""}')
                     if dc:
                         stats_parts.append(f'• {dc} decision{"s" if dc != 1 else ""} made')
-                    stats_parts.append('• Summary ready')
+                    stats_parts.append('• Meeting report ready')
                     stats = '\n'.join(stats_parts)
 
                 def _update(_dt):

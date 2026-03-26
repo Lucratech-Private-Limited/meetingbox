@@ -569,7 +569,7 @@ class MeetingBoxApp(App):
         def _update_status(_dt):
             screen = self.screen_manager.get_screen('processing')
             if hasattr(screen, 'set_processing_status'):
-                screen.set_processing_status('Transcription done. Generating summary…')
+                screen.set_processing_status('Transcription done. Building meeting report…')
 
         Clock.schedule_once(_update_status, 0)
 
@@ -577,7 +577,7 @@ class MeetingBoxApp(App):
         def _update_status(_dt):
             screen = self.screen_manager.get_screen('processing')
             if hasattr(screen, 'set_processing_status'):
-                screen.set_processing_status('Updating local summary…')
+                screen.set_processing_status('Updating report…')
 
         Clock.schedule_once(_update_status, 0)
 
@@ -587,7 +587,7 @@ class MeetingBoxApp(App):
         def _update_status(_dt):
             screen = self.screen_manager.get_screen('processing')
             if hasattr(screen, 'set_processing_status'):
-                screen.set_processing_status('Generating summary…')
+                screen.set_processing_status('Building meeting report…')
 
         Clock.schedule_once(_update_status, 0)
         self._auto_summarize(meeting_id)
