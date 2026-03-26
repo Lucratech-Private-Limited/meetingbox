@@ -5,7 +5,6 @@ import random
 import string
 import subprocess
 import tempfile
-import base64
 import wave
 from datetime import datetime
 from pathlib import Path
@@ -363,26 +362,55 @@ def _extract_anthropic_text(resp) -> str:
   return "\n".join(text_parts).strip()
 
 
+def _anthropic_error_message(exc: BaseException) -> str:
+  """Surface API error.message when present (helps debug 400s in logs and HTTP detail)."""
+  try:
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+      err = body.get("error")
+      if isinstance(err, dict) and err.get("message"):
+        return str(err["message"])
+      if isinstance(err, str):
+        return err
+  except Exception:
+    pass
+  return str(exc)
+
+
+FILES_API_BETA = "files-api-2025-04-14"
+
+
 def _transcribe_audio_with_anthropic(audio_path: Path) -> str:
+  """
+  Transcribe via Anthropic Files API + Messages (beta): inline input_audio is not supported
+  on the stable messages endpoint and returns 400.
+  """
   client = _get_anthropic_client()
   if not client:
     raise HTTPException(status_code=400, detail="ANTHROPIC_API_KEY is not configured on the server.")
+  file_id: str | None = None
   try:
-    audio_b64 = base64.b64encode(audio_path.read_bytes()).decode("utf-8")
-    resp = client.messages.create(
+    with open(audio_path, "rb") as audio_fp:
+      uploaded = client.beta.files.upload(
+        file=(audio_path.name, audio_fp, "audio/wav"),
+        timeout=600.0,
+      )
+    file_id = uploaded.id
+
+    resp = client.beta.messages.create(
       model=AI_TRANSCRIBE_MODEL,
       max_tokens=4096,
+      betas=[FILES_API_BETA],
       messages=[
         {
           "role": "user",
           "content": [
             {"type": "text", "text": "Transcribe this meeting audio accurately. Return only plain transcript text with no markdown and no commentary."},
             {
-              "type": "input_audio",
+              "type": "document",
               "source": {
-                "type": "base64",
-                "media_type": "audio/wav",
-                "data": audio_b64,
+                "type": "file",
+                "file_id": file_id,
               },
             },
           ],
@@ -396,7 +424,15 @@ def _transcribe_audio_with_anthropic(audio_path: Path) -> str:
   except HTTPException:
     raise
   except Exception as exc:
-    raise HTTPException(status_code=500, detail=f"Anthropic transcription failed: {exc}")
+    detail = _anthropic_error_message(exc)
+    logger.exception("Anthropic transcription failed: %s", detail)
+    raise HTTPException(status_code=502, detail=f"Anthropic transcription failed: {detail}")
+  finally:
+    if file_id:
+      try:
+        client.beta.files.delete(file_id)
+      except Exception:
+        logger.warning("Could not delete ephemeral Anthropic file %s", file_id, exc_info=True)
 
 
 @router.post("/upload-audio")
