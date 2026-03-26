@@ -558,11 +558,9 @@ class MeetingBoxApp(App):
         status = data.get('status', '')
         eta = data.get('eta', 0)
         screen = self.screen_manager.get_screen('processing')
-        if hasattr(screen, 'on_progress_update'):
+        if hasattr(screen, 'on_backend_progress'):
             Clock.schedule_once(
-                lambda _: screen.on_progress_update(progress, status), 0)
-        if eta and hasattr(screen, 'set_eta'):
-            screen.set_eta(eta)
+                lambda _: screen.on_backend_progress(progress, status, eta), 0)
 
     def on_transcription_complete(self, data):
         meeting_id = data.get('meeting_id')
@@ -570,16 +568,16 @@ class MeetingBoxApp(App):
 
         def _update_status(_dt):
             screen = self.screen_manager.get_screen('processing')
-            if hasattr(screen, 'on_progress_update'):
-                screen.on_progress_update(80, 'Transcription done. Generating summary…')
+            if hasattr(screen, 'set_processing_status'):
+                screen.set_processing_status('Transcription done. Generating summary…')
 
         Clock.schedule_once(_update_status, 0)
 
     def on_summary_progress(self, data):
         def _update_status(_dt):
             screen = self.screen_manager.get_screen('processing')
-            if hasattr(screen, 'on_progress_update'):
-                screen.on_progress_update(90, 'Updating local summary…')
+            if hasattr(screen, 'set_processing_status'):
+                screen.set_processing_status('Updating local summary…')
 
         Clock.schedule_once(_update_status, 0)
 
@@ -588,8 +586,8 @@ class MeetingBoxApp(App):
 
         def _update_status(_dt):
             screen = self.screen_manager.get_screen('processing')
-            if hasattr(screen, 'on_progress_update'):
-                screen.on_progress_update(100, 'Generating summary…')
+            if hasattr(screen, 'set_processing_status'):
+                screen.set_processing_status('Generating summary…')
 
         Clock.schedule_once(_update_status, 0)
         self._auto_summarize(meeting_id)

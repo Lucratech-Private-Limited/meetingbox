@@ -7,6 +7,7 @@ Two visual states driven by self._is_paused:
 
 import logging
 import random
+import time
 from collections import deque
 from datetime import datetime
 
@@ -14,6 +15,7 @@ from kivy.animation import Animation
 from kivy.clock import Clock
 from kivy.graphics import Color, Ellipse, Rectangle, RoundedRectangle
 from kivy.uix.behaviors import ButtonBehavior
+from kivy.uix.anchorlayout import AnchorLayout
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.floatlayout import FloatLayout
 from kivy.uix.image import Image
@@ -100,6 +102,8 @@ class RecordingScreen(BaseScreen):
         self._paused_at_text = ""
         self._level_history = deque([0.0] * _Waveform.NUM_BARS, maxlen=_Waveform.NUM_BARS)
         self._last_audio_level_ts = 0.0
+        self._rec_base_elapsed = 0.0
+        self._rec_active_start = None
         self._build_ui()
 
     # ==================================================================
@@ -118,12 +122,14 @@ class RecordingScreen(BaseScreen):
 
         content = BoxLayout(orientation="vertical", size_hint=(1, 1))
 
-        # --- top bar ---
-        top = BoxLayout(
+        # --- top: badge row + centered timer (below, full width) ---
+        top_block = BoxLayout(orientation="vertical", size_hint=(1, None), height=128)
+
+        top_row = BoxLayout(
             orientation="horizontal",
             size_hint=(1, None),
-            height=62,
-            padding=[SPACING["screen_padding"], 12],
+            height=48,
+            padding=[SPACING["screen_padding"], 8, SPACING["screen_padding"], 4],
             spacing=10,
         )
 
@@ -134,10 +140,29 @@ class RecordingScreen(BaseScreen):
             allow_stretch=True,
             keep_ratio=True,
         )
-        top.add_widget(self.rec_badge)
-        top.add_widget(Widget())
+        top_row.add_widget(self.rec_badge)
+        top_row.add_widget(Widget())
 
-        timer_col = BoxLayout(orientation="vertical", size_hint=(None, 1), width=200)
+        gear_path = _REC_ASSETS / "setteing gear icon.png"
+        self.gear_btn = _ImageButton(
+            source=str(gear_path),
+            size_hint=(None, None),
+            size=(32, 32),
+            allow_stretch=True,
+            keep_ratio=True,
+        )
+        self.gear_btn.bind(on_press=lambda *_: self.goto("settings", transition="slide_left"))
+        top_row.add_widget(self.gear_btn)
+        top_block.add_widget(top_row)
+
+        timer_anchor = AnchorLayout(
+            anchor_x="center",
+            anchor_y="center",
+            size_hint=(1, None),
+            height=72,
+            padding=[0, 4, 0, 0],
+        )
+        timer_col = BoxLayout(orientation="vertical", size_hint=(None, None), width=220, height=66)
         self.timer_label = Label(
             text="00:00",
             font_size=42,
@@ -158,25 +183,14 @@ class RecordingScreen(BaseScreen):
             halign="center",
             valign="top",
             size_hint=(1, None),
-            height=16,
+            height=18,
         )
         self.elapsed_sub.bind(size=self.elapsed_sub.setter("text_size"))
         timer_col.add_widget(self.elapsed_sub)
-        top.add_widget(timer_col)
+        timer_anchor.add_widget(timer_col)
+        top_block.add_widget(timer_anchor)
 
-        top.add_widget(Widget())
-
-        gear_path = _REC_ASSETS / "setteing gear icon.png"
-        self.gear_btn = _ImageButton(
-            source=str(gear_path),
-            size_hint=(None, None),
-            size=(32, 32),
-            allow_stretch=True,
-            keep_ratio=True,
-        )
-        self.gear_btn.bind(on_press=lambda *_: self.goto("settings", transition="slide_left"))
-        top.add_widget(self.gear_btn)
-        content.add_widget(top)
+        content.add_widget(top_block)
 
         # --- center waveform ---
         content.add_widget(Widget())
@@ -411,8 +425,17 @@ class RecordingScreen(BaseScreen):
     # ==================================================================
 
     def on_enter(self):
+        if self.timer_event:
+            self.timer_event.cancel()
+            self.timer_event = None
+        if self.waveform_event:
+            self.waveform_event.cancel()
+            self.waveform_event = None
+
         self._is_paused = False
         self.elapsed_seconds = 0
+        self._rec_base_elapsed = 0.0
+        self._rec_active_start = time.monotonic()
         self.timer_label.text = "00:00"
         self.elapsed_sub.text = "ELAPSED TIME"
         self.waveform.set_active(True)
@@ -421,7 +444,7 @@ class RecordingScreen(BaseScreen):
         if self.paused_overlay.parent is self.root_layout:
             self.root_layout.remove_widget(self.paused_overlay)
 
-        self.timer_event = Clock.schedule_interval(self._tick_timer, 1.0)
+        self.timer_event = Clock.schedule_interval(self._tick_timer, 0.5)
         self.waveform_event = Clock.schedule_interval(self._tick_waveform, 0.08)
 
     def on_leave(self):
@@ -436,8 +459,13 @@ class RecordingScreen(BaseScreen):
     # TIMER
     # ==================================================================
 
+    def _elapsed_from_monotonic(self) -> int:
+        if self._is_paused or self._rec_active_start is None:
+            return int(self._rec_base_elapsed)
+        return int(self._rec_base_elapsed + (time.monotonic() - self._rec_active_start))
+
     def _tick_timer(self, _dt):
-        self.elapsed_seconds += 1
+        self.elapsed_seconds = self._elapsed_from_monotonic()
         self.timer_label.text = self._fmt_time(self.elapsed_seconds)
 
     @staticmethod
@@ -463,6 +491,9 @@ class RecordingScreen(BaseScreen):
         if self._is_paused:
             return
         self._is_paused = True
+        if self._rec_active_start is not None:
+            self._rec_base_elapsed += time.monotonic() - self._rec_active_start
+            self._rec_active_start = None
 
         if self.timer_event:
             self.timer_event.cancel()
@@ -489,6 +520,7 @@ class RecordingScreen(BaseScreen):
         if not self._is_paused:
             return
         self._is_paused = False
+        self._rec_active_start = time.monotonic()
 
         Animation(opacity=0, duration=0.2).start(self.paused_overlay)
         Clock.schedule_once(self._hide_paused_overlay, 0.25)
