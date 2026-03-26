@@ -1,6 +1,9 @@
 # Production overrides for MeetingBox
 #
-# Audio capture: run on the host (see services/audio/run_audio_capture.sh), not in Docker.
+# Audio: either host script (services/audio/run_audio_capture.sh) or Docker:
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml --profile docker-audio --profile screen up -d
+#
+# Default stack has no local Ollama/Whisper workers (--profile local-workers to enable).
 #
 # Usage (systemd service applies this automatically):
 #   docker compose -f docker-compose.yml -f docker-compose.prod.yml --profile screen up -d

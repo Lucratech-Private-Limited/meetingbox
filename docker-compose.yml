@@ -12,6 +12,12 @@ services:
     networks:
       - meetingbox-net
 
+  # Default stack (`docker compose up -d`): redis, web, nginx — cloud transcription (OpenAI)
+  # + summarization (Anthropic) inside web. Optional profiles:
+  #   docker-audio      → container mic capture + upload to web
+  #   screen            → Kivy device-ui
+  #   local-workers     → legacy local Whisper + Ollama + ai worker (not needed for API-only)
+
   # ================================================================
   # Audio capture in Docker (optional — not recommended on mini-PC)
   # ================================================================
@@ -47,6 +53,8 @@ services:
       - meetingbox-net
 
   transcription:
+    profiles:
+      - local-workers
     build:
       context: ./services/transcription
     container_name: meetingbox-transcription
@@ -66,6 +74,8 @@ services:
       - meetingbox-net
 
   ai:
+    profiles:
+      - local-workers
     build:
       context: ./services/ai
     container_name: meetingbox-ai
@@ -86,6 +96,8 @@ services:
       - meetingbox-net
 
   ollama:
+    profiles:
+      - local-workers
     build:
       context: ./services/ollama
     container_name: meetingbox-ollama
@@ -111,14 +123,13 @@ services:
     depends_on:
       redis:
         condition: service_started
-      ollama:
-        condition: service_healthy
     environment:
       - PYTHONUNBUFFERED=1
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - OPENAI_TRANSCRIBE_MODEL=${OPENAI_TRANSCRIBE_MODEL:-whisper-1}
       - AI_MODEL=${AI_MODEL:-claude-sonnet-4-20250514}
+      - USE_LOCAL_LLM=${USE_LOCAL_LLM:-false}
       - OLLAMA_HOST=http://ollama:11434
       - LOCAL_LLM_MODEL=${LOCAL_LLM_MODEL:-phi3:mini}
       - JWT_SECRET_KEY=${JWT_SECRET_KEY}
