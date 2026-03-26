@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 import redis
 import shutil
@@ -370,7 +370,11 @@ def _ensure_16k_mono_wav(source: Path, dest: Path) -> None:
 
 
 @router.post("/upload-audio")
-async def upload_audio(file: UploadFile = File(...), current_user: dict = Depends(get_current_user)):
+async def upload_audio(
+  file: UploadFile = File(...),
+  session_id: Optional[str] = Form(default=None),
+  _current_user: Optional[dict] = Depends(get_optional_user),
+):
   """
   Upload audio from your computer (e.g. browser recording). Accepts WAV, WebM, OGG, MP4.
   Converts to 16kHz mono WAV and runs the same pipeline (transcription → summary).
@@ -380,7 +384,7 @@ async def upload_audio(file: UploadFile = File(...), current_user: dict = Depend
   ext = Path(fn).suffix or ".webm"
   if ext not in UPLOAD_AUDIO_EXTENSIONS:
     ext = ".webm"
-  session_id = _generate_session_id()
+  session_id = session_id or _generate_session_id()
   dest_wav = RECORDINGS_DIR / f"{session_id}.wav"
 
   with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:

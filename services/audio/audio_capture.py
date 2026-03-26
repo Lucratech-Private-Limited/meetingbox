@@ -2,9 +2,12 @@ import json
 import logging
 import os
 import time
+import uuid
 import wave
 from datetime import datetime
 from pathlib import Path
+from urllib import error as urlerror
+from urllib import request as urlrequest
 
 import numpy as np
 import pyaudio
@@ -50,6 +53,8 @@ class AudioCaptureService:
     storage_cfg = self.config.get("storage", {})
     self.temp_dir = Path(os.getenv("TEMP_SEGMENTS_DIR", storage_cfg.get("temp_dir", "/data/audio/temp")))
     self.recordings_dir = Path(os.getenv("RECORDINGS_DIR", storage_cfg.get("recordings_dir", "/data/audio/recordings")))
+    self.upload_on_stop = os.getenv("UPLOAD_AUDIO_ON_STOP", "1").lower() not in ("0", "false", "no")
+    self.upload_audio_api_url = os.getenv("UPLOAD_AUDIO_API_URL", "http://127.0.0.1:8000/api/meetings/upload-audio")
 
     self.audio = pyaudio.PyAudio()
     self.stream: pyaudio.Stream | None = None
@@ -363,6 +368,56 @@ class AudioCaptureService:
     logger.info("Recording started - session %s", session_id)
     return True
 
+  def _build_multipart_payload(self, wav_path: Path, session_id: str) -> tuple[str, bytes]:
+    boundary = f"----MeetingBoxBoundary{uuid.uuid4().hex}"
+    crlf = b"\r\n"
+    chunks: list[bytes] = []
+
+    chunks.append(f"--{boundary}".encode("utf-8"))
+    chunks.append(b'Content-Disposition: form-data; name="session_id"')
+    chunks.append(b"")
+    chunks.append(session_id.encode("utf-8"))
+
+    chunks.append(f"--{boundary}".encode("utf-8"))
+    chunks.append(
+      f'Content-Disposition: form-data; name="file"; filename="{wav_path.name}"'.encode("utf-8")
+    )
+    chunks.append(b"Content-Type: audio/wav")
+    chunks.append(b"")
+    chunks.append(wav_path.read_bytes())
+
+    chunks.append(f"--{boundary}--".encode("utf-8"))
+    body = crlf.join(chunks) + crlf
+    return boundary, body
+
+  def _upload_recording_via_api(self, wav_path: Path, session_id: str) -> bool:
+    if not wav_path.exists():
+      logger.error("Upload skipped: WAV file does not exist (%s)", wav_path)
+      return False
+
+    try:
+      boundary, body = self._build_multipart_payload(wav_path, session_id)
+      req = urlrequest.Request(
+        self.upload_audio_api_url,
+        data=body,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        method="POST",
+      )
+      with urlrequest.urlopen(req, timeout=180) as resp:
+        status = getattr(resp, "status", 200)
+        raw = resp.read().decode("utf-8", errors="ignore")
+        if status < 200 or status >= 300:
+          logger.error("Upload failed for %s: HTTP %s %s", session_id, status, raw[:200])
+          return False
+        logger.info("Uploaded recording via API for %s", session_id)
+        return True
+    except urlerror.HTTPError as e:
+      detail = e.read().decode("utf-8", errors="ignore")
+      logger.error("Upload HTTP error for %s: %s %s", session_id, e.code, detail[:200])
+    except Exception as e:
+      logger.error("Upload failed for %s: %s", session_id, e)
+    return False
+
   def stop_recording(self, session_id_from_command: str | None = None) -> str | None:
     if not self.is_recording:
       logger.warning("Not recording")
@@ -409,17 +464,23 @@ class AudioCaptureService:
       logger.warning("Final recording file missing for session %s", self.current_session_id)
     self._output_path = None
 
-    self.redis_client.publish(
-      "events",
-      json.dumps(
-        {
-          "type": "recording_stopped",
-          "session_id": self.current_session_id,
-          "path": str(final_path) if final_path else None,
-          "timestamp": datetime.now().isoformat(),
-        }
-      ),
-    )
+    session_id = self.current_session_id
+    uploaded = False
+    if self.upload_on_stop and final_path and session_id:
+      uploaded = self._upload_recording_via_api(final_path, session_id)
+
+    if not uploaded:
+      self.redis_client.publish(
+        "events",
+        json.dumps(
+          {
+            "type": "recording_stopped",
+            "session_id": session_id,
+            "path": str(final_path) if final_path else None,
+            "timestamp": datetime.now().isoformat(),
+          }
+        ),
+      )
 
     # update hardware state
     self.redis_client.publish(
@@ -428,12 +489,11 @@ class AudioCaptureService:
         {
           "action": "update_display",
           "state": "processing",
-          "session_id": self.current_session_id,
+          "session_id": session_id,
         }
       ),
     )
 
-    session_id = self.current_session_id
     self.current_session_id = None
     return session_id
 
