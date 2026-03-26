@@ -38,7 +38,21 @@ def _get_anthropic_client():
 # Ollama configuration for local summarization
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://ollama:11434")
 LOCAL_LLM_MODEL = os.getenv("LOCAL_LLM_MODEL", "phi3:mini")
-AI_TRANSCRIBE_MODEL = os.getenv("AI_TRANSCRIBE_MODEL", os.getenv("AI_MODEL", "claude-sonnet-4-20250514"))
+
+# OpenAI (Whisper) transcription for upload-audio pipeline
+_openai_client = None
+
+
+def _get_openai_client():
+  global _openai_client
+  if _openai_client is None:
+    api_key = os.getenv("OPENAI_API_KEY", "")
+    if not api_key:
+      return None
+    from openai import OpenAI
+
+    _openai_client = OpenAI(api_key=api_key)
+  return _openai_client
 
 router = APIRouter()
 REDIS_HOST = os.getenv("REDIS_HOST", "redis")
@@ -352,87 +366,25 @@ def _ensure_16k_mono_wav(source: Path, dest: Path) -> None:
   )
 
 
-def _extract_anthropic_text(resp) -> str:
-  text_parts: list[str] = []
-  for block in getattr(resp, "content", []) or []:
-    if getattr(block, "type", "") == "text":
-      text = getattr(block, "text", "")
-      if text:
-        text_parts.append(text)
-  return "\n".join(text_parts).strip()
-
-
-def _anthropic_error_message(exc: BaseException) -> str:
-  """Surface API error.message when present (helps debug 400s in logs and HTTP detail)."""
-  try:
-    body = getattr(exc, "body", None)
-    if isinstance(body, dict):
-      err = body.get("error")
-      if isinstance(err, dict) and err.get("message"):
-        return str(err["message"])
-      if isinstance(err, str):
-        return err
-  except Exception:
-    pass
-  return str(exc)
-
-
-FILES_API_BETA = "files-api-2025-04-14"
-
-
-def _transcribe_audio_with_anthropic(audio_path: Path) -> str:
-  """
-  Transcribe via Anthropic Files API + Messages (beta): inline input_audio is not supported
-  on the stable messages endpoint and returns 400.
-  """
-  client = _get_anthropic_client()
+def _transcribe_audio_with_openai(audio_path: Path) -> str:
+  """Transcribe meeting WAV via OpenAI Audio API (e.g. whisper-1). Anthropic is used only for summarization."""
+  client = _get_openai_client()
   if not client:
-    raise HTTPException(status_code=400, detail="ANTHROPIC_API_KEY is not configured on the server.")
-  file_id: str | None = None
+    raise HTTPException(status_code=400, detail="OPENAI_API_KEY is not configured on the server.")
+  model = os.getenv("OPENAI_TRANSCRIBE_MODEL", "whisper-1")
   try:
     with open(audio_path, "rb") as audio_fp:
-      uploaded = client.beta.files.upload(
+      tr = client.audio.transcriptions.create(
+        model=model,
         file=(audio_path.name, audio_fp, "audio/wav"),
-        timeout=600.0,
       )
-    file_id = uploaded.id
-
-    resp = client.beta.messages.create(
-      model=AI_TRANSCRIBE_MODEL,
-      max_tokens=4096,
-      betas=[FILES_API_BETA],
-      messages=[
-        {
-          "role": "user",
-          "content": [
-            {"type": "text", "text": "Transcribe this meeting audio accurately. Return only plain transcript text with no markdown and no commentary."},
-            {
-              "type": "document",
-              "source": {
-                "type": "file",
-                "file_id": file_id,
-              },
-            },
-          ],
-        }
-      ],
-    )
-    transcript = _extract_anthropic_text(resp)
-    if not transcript:
-      raise HTTPException(status_code=500, detail="Anthropic transcription returned empty text.")
-    return transcript
-  except HTTPException:
-    raise
   except Exception as exc:
-    detail = _anthropic_error_message(exc)
-    logger.exception("Anthropic transcription failed: %s", detail)
-    raise HTTPException(status_code=502, detail=f"Anthropic transcription failed: {detail}")
-  finally:
-    if file_id:
-      try:
-        client.beta.files.delete(file_id)
-      except Exception:
-        logger.warning("Could not delete ephemeral Anthropic file %s", file_id, exc_info=True)
+    logger.exception("OpenAI transcription failed: %s", exc)
+    raise HTTPException(status_code=502, detail=f"OpenAI transcription failed: {exc}") from exc
+  transcript = (getattr(tr, "text", None) or "").strip()
+  if not transcript:
+    raise HTTPException(status_code=500, detail="OpenAI transcription returned empty text.")
+  return transcript
 
 
 @router.post("/upload-audio")
@@ -443,7 +395,7 @@ async def upload_audio(
 ):
   """
   Upload audio from your computer (e.g. browser recording). Accepts WAV, WebM, OGG, MP4.
-  Converts to 16kHz mono WAV and runs the same pipeline (transcription → summary).
+  Converts to 16kHz mono WAV, transcribes with OpenAI (Whisper), summarizes with Anthropic.
   Use this to record with your PC mic: record in the browser, then upload.
   """
   fn = (file.filename or "").lower()
@@ -518,7 +470,7 @@ async def upload_audio(
     conn.close()
 
   try:
-    transcript = _transcribe_audio_with_anthropic(dest_wav)
+    transcript = _transcribe_audio_with_openai(dest_wav)
 
     conn = get_connection()
     conn.execute("PRAGMA foreign_keys = ON")
@@ -547,7 +499,7 @@ async def upload_audio(
         "type": "transcription_complete",
         "meeting_id": session_id,
         "last_segment_num": 0,
-        "source": "anthropic_cloud",
+        "source": "openai_whisper",
         "timestamp": datetime.now().isoformat(),
       }),
     )

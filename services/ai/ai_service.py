@@ -484,7 +484,7 @@ class AIService:
         )
         continue
 
-      if event.get("source") == "anthropic_cloud":
+      if event.get("source") in ("anthropic_cloud", "openai_whisper"):
         logger.info("Skipping local summary for cloud transcription %s", meeting_id)
         continue
 
