@@ -601,6 +601,17 @@ async def list_meetings(limit: int = 50, offset: int = 0, status: Optional[str] 
   return rows
 
 
+def _anthropic_message_text(resp) -> str:
+  """Concatenate all text blocks (some models split long replies across blocks)."""
+  parts: list[str] = []
+  for block in getattr(resp, "content", None) or []:
+    if getattr(block, "type", None) == "text":
+      t = getattr(block, "text", None) or ""
+      if t:
+        parts.append(t)
+  return "\n".join(parts).strip()
+
+
 @router.post("/{meeting_id}/summarize")
 async def summarize_meeting(meeting_id: str, current_user: Optional[dict] = Depends(get_optional_user)):
   """Generate a detailed meeting report from the transcript using Claude (stored in summaries.summary)."""
@@ -652,18 +663,21 @@ async def summarize_meeting(meeting_id: str, current_user: Optional[dict] = Depe
   transcript = "\n\n".join(parts)
 
   prompt = (
-    "You are producing a **detailed meeting REPORT** from the transcript below. This is NOT a short summary.\n\n"
+    "You are producing a **FULL MEETING REPORT** from the transcript. Output must read like a substantive written record, "
+    "**not** an executive summary, **not** a handful of bullets, and **not** one short page.\n\n"
+    "LENGTH & DEPTH (critical):\n"
+    "- Scale `full_report` with transcript size: short meetings → still multiple solid paragraphs; long meetings → very long report with many sections.\n"
+    "- Target **at least** several hundred words whenever the transcript has more than ~300 words. For long transcripts, aim for **thousands of words** "
+    "until you hit your output limit—prioritize completeness of the narrative over brevity.\n"
+    "- Use **dense prose paragraphs** for the main story. Bullets are only for lists (action-like lists, explicit enumerations from the call). "
+    "Do **not** replace the narrative with bullet-only outlines.\n"
+    "- Include a **DETAILED ACCOUNT** subsection (heading in plain text) that walks through what happened in **order** (or by topic with clear transitions), "
+    "quoting or paraphrasing concrete details: numbers, dates, product names, objections, examples, who advocated for what.\n\n"
     "Rules:\n"
-    "- Ground every section in what was actually said. Paraphrase faithfully; do not invent facts, names, dates, or commitments.\n"
-    "- When the transcript includes [MM:SS] timestamps, refer to them where helpful (e.g. ‘around 04:12’).\n"
-    "- Write for someone who was not in the room. Be specific: who said what (when names/roles appear), what was proposed, what was agreed or rejected.\n"
-    "- Use clear structure inside `full_report` with headings and bullet lists as appropriate. Aim for depth and clarity, not brevity.\n"
-    "  Suggested sections (adapt to the content):\n"
-    "  - Context / purpose of the meeting\n"
-    "  - Discussion by theme or chronology (whichever fits the transcript)\n"
-    "  - Agreements, disagreements, and rationale (if stated)\n"
-    "  - Follow-ups already stated in the conversation\n"
-    "- If something is unclear or missing from the audio, say so explicitly in `open_questions` rather than guessing.\n\n"
+    "- Ground every claim in the transcript. Do not invent facts, people, or commitments.\n"
+    "- When lines include [MM:SS] timestamps, cite them when anchoring events.\n"
+    "- Write for someone who missed the meeting; include *who said what* when the transcript supports it.\n"
+    "- If audio/transcript is thin, say so in the report—do not pad with fiction.\n\n"
     "Also extract structured fields for downstream use:\n"
     "- `decisions`: concrete decisions or conclusions reached (strings). Empty list if none.\n"
     "- `action_items`: only items explicitly assigned or committed in the meeting. Each object MUST include "
@@ -675,8 +689,7 @@ async def summarize_meeting(meeting_id: str, current_user: Optional[dict] = Depe
     "Return **only** valid JSON with this shape (no markdown fences outside the JSON):\n"
     "{\n"
     '  "report_title": "Short title for the meeting (max ~80 chars)",\n'
-    '  "full_report": "Long multi-section report as plain text (headings and bullets allowed). '
-    'Avoid generic filler unless the meeting actually said it.",\n'
+    '  "full_report": "(long string) multi-section narrative with a DETAILED ACCOUNT; use single quotes for quoted speech where possible so JSON stays valid",\n'
     '  "decisions": ["..."],\n'
     '  "action_items": [{"task": "...", "assignee": "...", "due_date": "", "type": "task"}],\n'
     '  "topics": ["#topic"],\n'
@@ -688,7 +701,7 @@ async def summarize_meeting(meeting_id: str, current_user: Optional[dict] = Depe
   )
 
   model = os.getenv("AI_MODEL", "claude-sonnet-4-20250514")
-  max_tokens = int(os.getenv("AI_REPORT_MAX_TOKENS", os.getenv("AI_MAX_TOKENS", "8192")))
+  max_tokens = int(os.getenv("AI_REPORT_MAX_TOKENS", os.getenv("AI_MAX_TOKENS", "16384")))
 
   try:
     resp = client.messages.create(
@@ -696,9 +709,19 @@ async def summarize_meeting(meeting_id: str, current_user: Optional[dict] = Depe
       max_tokens=max_tokens,
       messages=[{"role": "user", "content": prompt}],
     )
-    text = resp.content[0].text
+    stop_reason = getattr(resp, "stop_reason", None)
+    if stop_reason == "max_tokens":
+      logger.warning(
+        "Meeting report hit max_tokens (%s); raise AI_REPORT_MAX_TOKENS for longer output.",
+        max_tokens,
+      )
+    text = _anthropic_message_text(resp)
+    if not text:
+      raise HTTPException(status_code=500, detail="Claude returned an empty message.")
+  except HTTPException:
+    raise
   except Exception as exc:
-    raise HTTPException(status_code=500, detail=f"Claude API error: {exc}")
+    raise HTTPException(status_code=500, detail=f"Claude API error: {exc}") from exc
 
   # Parse JSON from response
   if "```json" in text:
