@@ -36,6 +36,7 @@ services:
       - AUDIO_INPUT_DEVICE_NAME=${AUDIO_INPUT_DEVICE_NAME:-}
       - UPLOAD_AUDIO_ON_STOP=${UPLOAD_AUDIO_ON_STOP:-1}
       - UPLOAD_AUDIO_API_URL=${UPLOAD_AUDIO_API_URL:-http://web:8000/api/meetings/upload-audio}
+      - UPLOAD_AUDIO_TIMEOUT_SECONDS=${UPLOAD_AUDIO_TIMEOUT_SECONDS:-1200}
     volumes:
       - ./data/audio:/data/audio
     devices:

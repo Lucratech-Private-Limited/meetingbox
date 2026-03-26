@@ -77,6 +77,7 @@ export AUDIO_INPUT_DEVICE_INDEX="${AUDIO_INPUT_DEVICE_INDEX:-}"
 export AUDIO_INPUT_DEVICE_NAME="${AUDIO_INPUT_DEVICE_NAME:-}"
 export UPLOAD_AUDIO_ON_STOP="${UPLOAD_AUDIO_ON_STOP:-1}"
 export UPLOAD_AUDIO_API_URL="${UPLOAD_AUDIO_API_URL:-http://127.0.0.1:8000/api/meetings/upload-audio}"
+export UPLOAD_AUDIO_TIMEOUT_SECONDS="${UPLOAD_AUDIO_TIMEOUT_SECONDS:-1200}"
 
 mkdir -p "$TEMP_SEGMENTS_DIR" "$RECORDINGS_DIR"
 
@@ -85,6 +86,7 @@ echo "[MeetingBox audio] TEMP_SEGMENTS_DIR=$TEMP_SEGMENTS_DIR" >&2
 echo "[MeetingBox audio] RECORDINGS_DIR=$RECORDINGS_DIR" >&2
 echo "[MeetingBox audio] UPLOAD_AUDIO_ON_STOP=$UPLOAD_AUDIO_ON_STOP" >&2
 echo "[MeetingBox audio] UPLOAD_AUDIO_API_URL=$UPLOAD_AUDIO_API_URL" >&2
+echo "[MeetingBox audio] UPLOAD_AUDIO_TIMEOUT_SECONDS=$UPLOAD_AUDIO_TIMEOUT_SECONDS" >&2
 echo "[MeetingBox audio] PYTHON=$("$PYTHON_CMD" -c 'import sys; print(sys.executable)')" >&2
 
 exec "$PYTHON_CMD" audio_capture.py "$@"

@@ -55,6 +55,11 @@ class AudioCaptureService:
     self.recordings_dir = Path(os.getenv("RECORDINGS_DIR", storage_cfg.get("recordings_dir", "/data/audio/recordings")))
     self.upload_on_stop = os.getenv("UPLOAD_AUDIO_ON_STOP", "1").lower() not in ("0", "false", "no")
     self.upload_audio_api_url = os.getenv("UPLOAD_AUDIO_API_URL", "http://127.0.0.1:8000/api/meetings/upload-audio")
+    # upload-audio runs transcription + summarization before HTTP response; keep above client/nginx limits.
+    try:
+      self.upload_audio_timeout_seconds = max(60, int(os.getenv("UPLOAD_AUDIO_TIMEOUT_SECONDS", "1200")))
+    except ValueError:
+      self.upload_audio_timeout_seconds = 1200
 
     self.audio = pyaudio.PyAudio()
     self.stream: pyaudio.Stream | None = None
@@ -403,7 +408,7 @@ class AudioCaptureService:
         headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
         method="POST",
       )
-      with urlrequest.urlopen(req, timeout=180) as resp:
+      with urlrequest.urlopen(req, timeout=self.upload_audio_timeout_seconds) as resp:
         status = getattr(resp, "status", 200)
         raw = resp.read().decode("utf-8", errors="ignore")
         if status < 200 or status >= 300:
