@@ -484,6 +484,10 @@ class AIService:
         )
         continue
 
+      if event.get("source") == "anthropic_cloud":
+        logger.info("Skipping local summary for cloud transcription %s", meeting_id)
+        continue
+
       logger.info("Finalizing summary for %s", meeting_id)
 
       if USE_LOCAL_LLM or not self._claude_client:

@@ -5,6 +5,8 @@ import random
 import string
 import subprocess
 import tempfile
+import base64
+import wave
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
@@ -37,6 +39,7 @@ def _get_anthropic_client():
 # Ollama configuration for local summarization
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://ollama:11434")
 LOCAL_LLM_MODEL = os.getenv("LOCAL_LLM_MODEL", "phi3:mini")
+AI_TRANSCRIBE_MODEL = os.getenv("AI_TRANSCRIBE_MODEL", os.getenv("AI_MODEL", "claude-sonnet-4-20250514"))
 
 router = APIRouter()
 REDIS_HOST = os.getenv("REDIS_HOST", "redis")
@@ -321,30 +324,11 @@ async def delete_meeting(meeting_id: str, current_user: Optional[dict] = Depends
 @router.post("/test/ingest-wav")
 async def ingest_test_wav(file: UploadFile = File(...), current_user: dict | None = Depends(get_optional_user)):
   """
-  Upload a WAV file to run through the full pipeline (transcription → summary).
-  Use this to test without a microphone. Session ID is derived from filename or timestamp.
+  Upload a WAV file to run through the cloud-only Anthropic pipeline.
   """
   if not file.filename or not file.filename.lower().endswith(".wav"):
     raise HTTPException(status_code=400, detail="Upload must be a .wav file")
-  session_id = _generate_session_id()
-  dest = RECORDINGS_DIR / f"{session_id}.wav"
-  try:
-    with dest.open("wb") as f:
-      shutil.copyfileobj(file.file, f)
-  except Exception as e:
-    raise HTTPException(status_code=500, detail=str(e))
-
-  # Emit the same event the audio service would: transcription service will pick it up
-  _get_redis().publish(
-    "events",
-    json.dumps({
-      "type": "recording_stopped",
-      "session_id": session_id,
-      "path": str(dest),
-      "timestamp": datetime.now().isoformat(),
-    }),
-  )
-  return {"session_id": session_id, "path": str(dest), "status": "ingested"}
+  return await upload_audio(file=file, session_id=_generate_session_id(), _current_user=current_user)
 
 
 def _ensure_16k_mono_wav(source: Path, dest: Path) -> None:
@@ -367,6 +351,52 @@ def _ensure_16k_mono_wav(source: Path, dest: Path) -> None:
     capture_output=True,
     timeout=300,
   )
+
+
+def _extract_anthropic_text(resp) -> str:
+  text_parts: list[str] = []
+  for block in getattr(resp, "content", []) or []:
+    if getattr(block, "type", "") == "text":
+      text = getattr(block, "text", "")
+      if text:
+        text_parts.append(text)
+  return "\n".join(text_parts).strip()
+
+
+def _transcribe_audio_with_anthropic(audio_path: Path) -> str:
+  client = _get_anthropic_client()
+  if not client:
+    raise HTTPException(status_code=400, detail="ANTHROPIC_API_KEY is not configured on the server.")
+  try:
+    audio_b64 = base64.b64encode(audio_path.read_bytes()).decode("utf-8")
+    resp = client.messages.create(
+      model=AI_TRANSCRIBE_MODEL,
+      max_tokens=4096,
+      messages=[
+        {
+          "role": "user",
+          "content": [
+            {"type": "text", "text": "Transcribe this meeting audio accurately. Return only plain transcript text with no markdown and no commentary."},
+            {
+              "type": "input_audio",
+              "source": {
+                "type": "base64",
+                "media_type": "audio/wav",
+                "data": audio_b64,
+              },
+            },
+          ],
+        }
+      ],
+    )
+    transcript = _extract_anthropic_text(resp)
+    if not transcript:
+      raise HTTPException(status_code=500, detail="Anthropic transcription returned empty text.")
+    return transcript
+  except HTTPException:
+    raise
+  except Exception as exc:
+    raise HTTPException(status_code=500, detail=f"Anthropic transcription failed: {exc}")
 
 
 @router.post("/upload-audio")
@@ -405,16 +435,115 @@ async def upload_audio(
 
   _get_redis().set("recording_state", "processing")
   _get_redis().set("current_meeting_id", session_id)
+  now_iso = datetime.now().isoformat()
+
+  duration_seconds = 0
+  try:
+    with wave.open(str(dest_wav), "rb") as wf:
+      frames = wf.getnframes()
+      rate = wf.getframerate() or 16000
+      duration_seconds = int(frames / float(rate))
+  except Exception:
+    duration_seconds = 0
+
   _get_redis().publish(
     "events",
     json.dumps({
-      "type": "recording_stopped",
-      "session_id": session_id,
-      "path": str(dest_wav),
-      "timestamp": datetime.now().isoformat(),
+      "type": "processing_started",
+      "meeting_id": session_id,
+      "title": f"Meeting {session_id}",
+      "duration": duration_seconds,
+      "timestamp": now_iso,
     }),
   )
-  return {"session_id": session_id, "path": str(dest_wav), "status": "ingested"}
+
+  conn = get_connection()
+  conn.execute("PRAGMA foreign_keys = ON")
+  conn.row_factory = lambda cursor, row: {col[0]: row[idx] for idx, col in enumerate(cursor.description)}
+  try:
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM meetings WHERE id = ?", (session_id,))
+    exists = cur.fetchone()
+    if not exists:
+      cur.execute(
+        """
+        INSERT INTO meetings (id, title, start_time, end_time, duration, audio_path, status, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (session_id, f"Meeting {session_id}", now_iso, None, None, str(dest_wav), "transcribing", now_iso),
+      )
+    else:
+      cur.execute(
+        "UPDATE meetings SET audio_path = ?, status = ?, start_time = COALESCE(start_time, ?) WHERE id = ?",
+        (str(dest_wav), "transcribing", now_iso, session_id),
+      )
+    conn.commit()
+  finally:
+    conn.close()
+
+  try:
+    transcript = _transcribe_audio_with_anthropic(dest_wav)
+
+    conn = get_connection()
+    conn.execute("PRAGMA foreign_keys = ON")
+    try:
+      cur = conn.cursor()
+      cur.execute("DELETE FROM segments WHERE meeting_id = ?", (session_id,))
+      cur.execute(
+        """
+        INSERT INTO segments
+          (meeting_id, segment_num, start_time, end_time, text, speaker_id, confidence)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (session_id, 0, 0.0, float(duration_seconds), transcript, None, 1.0),
+      )
+      cur.execute(
+        "UPDATE meetings SET status = ?, duration = ? WHERE id = ?",
+        ("transcribed", duration_seconds, session_id),
+      )
+      conn.commit()
+    finally:
+      conn.close()
+
+    _get_redis().publish(
+      "events",
+      json.dumps({
+        "type": "transcription_complete",
+        "meeting_id": session_id,
+        "last_segment_num": 0,
+        "source": "anthropic_cloud",
+        "timestamp": datetime.now().isoformat(),
+      }),
+    )
+
+    summary_result = await summarize_meeting(session_id, _current_user)
+    _get_redis().publish(
+      "events",
+      json.dumps({
+        "type": "summary_complete",
+        "meeting_id": session_id,
+        "summary": summary_result,
+        "timestamp": datetime.now().isoformat(),
+      }),
+    )
+
+    _get_redis().set("recording_state", "idle")
+    _get_redis().delete("current_meeting_id")
+    return {"session_id": session_id, "path": str(dest_wav), "status": "completed"}
+  except HTTPException as exc:
+    _get_redis().set("recording_state", "idle")
+    _get_redis().delete("current_meeting_id")
+    _get_redis().publish(
+      "events",
+      json.dumps({
+        "type": "error",
+        "error_type": "Processing Failed",
+        "message": exc.detail,
+        "meeting_id": session_id,
+        "timestamp": datetime.now().isoformat(),
+      }),
+    )
+    raise
 
 
 @router.get("/")
@@ -605,64 +734,8 @@ async def summarize_meeting(meeting_id: str, current_user: Optional[dict] = Depe
 
 @router.post("/{meeting_id}/summarize-local")
 async def summarize_meeting_local(meeting_id: str, current_user: Optional[dict] = Depends(get_optional_user)):
-  """Queue a backend-owned local summary generation request."""
-  conn = get_connection()
-  conn.execute("PRAGMA foreign_keys = ON")
-  conn.row_factory = lambda cursor, row: {col[0]: row[idx] for idx, col in enumerate(cursor.description)}
-  try:
-    cur = conn.cursor()
-
-    cur.execute("SELECT * FROM meetings WHERE id = ?", (meeting_id,))
-    meeting = cur.fetchone()
-    if not meeting:
-      raise HTTPException(status_code=404, detail="Meeting not found")
-
-    cur.execute("SELECT * FROM local_summaries WHERE meeting_id = ?", (meeting_id,))
-    existing = cur.fetchone()
-    if existing:
-      result = _normalize_summary_data({
-        "summary": existing["summary"],
-        "discussion_points": json.loads(existing.get("discussion_points") or "[]"),
-        "action_items": json.loads(existing["action_items"] or "[]"),
-        "decisions": json.loads(existing["decisions"] or "[]"),
-        "topics": json.loads(existing["topics"] or "[]"),
-        "sentiment": existing["sentiment"],
-      })
-      result["status"] = "already_exists" if int(existing.get("is_final", 0) or 0) else "in_progress"
-      result["model_name"] = existing.get("model_name", LOCAL_LLM_MODEL)
-      return result
-
-    cur.execute(
-      """
-      INSERT OR IGNORE INTO processing_state
-        (meeting_id, updated_at)
-      VALUES (?, ?)
-      """,
-      (meeting_id, datetime.now().isoformat()),
-    )
-    cur.execute("UPDATE meetings SET status = 'summarizing' WHERE id = ?", (meeting_id,))
-    conn.commit()
-  finally:
-    conn.close()
-
-  _get_redis().publish(
-    "events",
-    json.dumps(
-      {
-        "type": "summary_requested",
-        "meeting_id": meeting_id,
-        "timestamp": datetime.now().isoformat(),
-      }
-    ),
-  )
-  if current_user:
-    try:
-      generate_actions_for_meeting(meeting_id, current_user["id"])
-    except HTTPException:
-      pass
-    except Exception:
-      logger.exception("Agentic action generation request failed for %s", meeting_id)
-  return {"status": "queued", "meeting_id": meeting_id}
+  """Compatibility route: force Anthropic summary instead of local LLM."""
+  return await summarize_meeting(meeting_id, current_user)
 
 
 class EmailRequest(BaseModel):

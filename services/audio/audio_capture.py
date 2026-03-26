@@ -474,9 +474,10 @@ class AudioCaptureService:
         "events",
         json.dumps(
           {
-            "type": "recording_stopped",
+            "type": "error",
+            "error_type": "Upload Failed",
+            "message": "Could not upload audio for cloud transcription/summarization.",
             "session_id": session_id,
-            "path": str(final_path) if final_path else None,
             "timestamp": datetime.now().isoformat(),
           }
         ),
