@@ -18,6 +18,7 @@ import httpx
 
 from auth import get_current_user, get_optional_user
 from database import get_connection
+from meeting_agent import run_meeting_agent_pipeline
 from services.action_engine import generate_actions_for_meeting
 
 logger = logging.getLogger(__name__)
@@ -502,49 +503,12 @@ async def upload_audio(
     conn.close()
 
   try:
-    transcript = _transcribe_audio_with_openai(dest_wav)
-
-    conn = get_connection()
-    conn.execute("PRAGMA foreign_keys = ON")
-    try:
-      cur = conn.cursor()
-      cur.execute("DELETE FROM segments WHERE meeting_id = ?", (session_id,))
-      cur.execute(
-        """
-        INSERT INTO segments
-          (meeting_id, segment_num, start_time, end_time, text, speaker_id, confidence)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
-        (session_id, 0, 0.0, float(duration_seconds), transcript, None, 1.0),
-      )
-      cur.execute(
-        "UPDATE meetings SET status = ?, duration = ? WHERE id = ?",
-        ("transcribed", duration_seconds, session_id),
-      )
-      conn.commit()
-    finally:
-      conn.close()
-
-    _get_redis().publish(
-      "events",
-      json.dumps({
-        "type": "transcription_complete",
-        "meeting_id": session_id,
-        "last_segment_num": 0,
-        "source": "openai_whisper",
-        "timestamp": datetime.now().isoformat(),
-      }),
-    )
-
-    summary_result = await summarize_meeting(session_id, _current_user)
-    _get_redis().publish(
-      "events",
-      json.dumps({
-        "type": "summary_complete",
-        "meeting_id": session_id,
-        "summary": summary_result,
-        "timestamp": datetime.now().isoformat(),
-      }),
+    await run_meeting_agent_pipeline(
+      _get_redis(),
+      session_id,
+      dest_wav,
+      duration_seconds,
+      _current_user,
     )
 
     _get_redis().set("recording_state", "idle")

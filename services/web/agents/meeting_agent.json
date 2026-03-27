@@ -1,0 +1,13 @@
+{
+  "id": "meeting_agent",
+  "name": "Meeting Agent",
+  "description": "Runs after a meeting ends: transcribe audio, generate meeting report, persist to SQLite, emit device events. Triggered only by the system (upload-audio / MEETING_ENDED pipeline), not by voice.",
+  "triggers": [],
+  "system_prompt": "Not used directly — pipeline is implemented in meeting_agent.py and routes/meetings.py (Whisper + Claude report).",
+  "tools": ["meeting_transcribe", "meeting_report", "meeting_persist"],
+  "requires_approval": false,
+  "background": false,
+  "priority": 10,
+  "memory_context": false,
+  "max_tool_calls": 0
+}
