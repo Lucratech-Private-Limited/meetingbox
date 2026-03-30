@@ -5,6 +5,8 @@ export interface AssistantIntentResponse {
   assistant_message: string
   routed_agent_id?: string | null
   routing_method?: string
+  routing_rationale?: string
+  requires_approval?: boolean
   pending_actions?: Array<{ id: string; tool_name: string; status: string }>
   tool_results?: unknown[]
 }

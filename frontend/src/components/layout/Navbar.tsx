@@ -6,6 +6,7 @@ import { useAuthStore } from '../../store/authStore'
 
 const navigation = [
   { name: 'Dashboard', href: '/dashboard' },
+  { name: 'Assistant', href: '/assistant' },
   { name: 'Settings', href: '/settings' },
   { name: 'System', href: '/system' },
 ]

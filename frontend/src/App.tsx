@@ -13,6 +13,7 @@ import MeetingDetail from './pages/MeetingDetail'
 import LiveRecording from './pages/LiveRecording'
 import Settings from './pages/Settings'
 import SystemStatus from './pages/SystemStatus'
+import AssistantChat from './pages/AssistantChat'
 
 function AuthGate({ children }: { children: React.ReactNode }) {
   const token = useAuthStore((s) => s.token)
@@ -130,6 +131,7 @@ export default function App() {
             <Route path="live" element={<LiveRecording />} />
             <Route path="settings" element={<Settings />} />
             <Route path="system" element={<SystemStatus />} />
+            <Route path="assistant" element={<AssistantChat />} />
           </Route>
 
           {/* Catch-all */}

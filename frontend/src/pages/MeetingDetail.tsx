@@ -1,7 +1,7 @@
 // Meeting detail page — summary, transcript, actions tabs, export, summarize buttons
 
 import { useState, useEffect, useCallback } from 'react'
-import { useParams, useNavigate } from 'react-router-dom'
+import { useParams, useNavigate, Link } from 'react-router-dom'
 import { format } from 'date-fns'
 import { meetingsApi } from '../api/meetings'
 import { parseUTC } from '../utils/formatters'
@@ -281,6 +281,12 @@ export default function MeetingDetailPage() {
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
+          <Link
+            to={`/assistant?meeting=${encodeURIComponent(id || '')}`}
+            className="px-4 py-2 text-sm font-medium text-primary-800 bg-primary-50 border border-primary-200 rounded-lg hover:bg-primary-100"
+          >
+            Assistant
+          </Link>
           <button
             onClick={() => handleExport('pdf')}
             className="px-4 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-lg hover:bg-gray-50"

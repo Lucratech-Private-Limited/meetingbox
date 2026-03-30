@@ -19,6 +19,7 @@ from orchestrator import RouteResult, route_intent
 from tools.base_tool import ToolError
 from tools.calendar_tool import calendar_create_from_payload, calendar_list_upcoming
 from tools.gmail_tool import gmail_list_recent, gmail_send_from_payload
+from tools.memory_tool import memory_fetch_meeting, memory_search_meetings
 
 logger = logging.getLogger("meetingbox.assistant")
 
@@ -26,6 +27,8 @@ TOOL_CAL_LIST = "calendar_list_upcoming"
 TOOL_CAL_CREATE = "calendar_create_event"
 TOOL_GMAIL_LIST = "gmail_list_recent"
 TOOL_GMAIL_SEND = "gmail_send_email"
+TOOL_MEMORY_SEARCH = "memory_search_meetings"
+TOOL_MEMORY_FETCH = "memory_fetch_meeting"
 WRITE_TOOLS = frozenset({TOOL_CAL_CREATE, TOOL_GMAIL_SEND})
 
 _anthropic_client = None
@@ -244,6 +247,176 @@ def plan_communication_steps(message: str) -> list[dict[str, Any]]:
   return _llm_communication_plan(message) or _heuristic_communication_plan(message)
 
 
+def _llm_memory_plan(message: str) -> list[dict[str, Any]] | None:
+  client = _get_anthropic()
+  if not client:
+    return None
+  import os
+
+  prompt = (
+    "Plan meeting-memory tools for the user message. Return **only** valid JSON: "
+    "{\"steps\": [ {\"tool\": \"memory_search_meetings\"|\"memory_fetch_meeting\", "
+    "\"args\": object, \"is_write\": false } ] }.\n"
+    "Rules:\n"
+    "- memory_search_meetings: find past meetings. Args: query (keywords or empty for recent), "
+    "max_results (int, default 12).\n"
+    "- memory_fetch_meeting: load summary + transcript excerpt for one meeting. Args: meeting_id (string).\n"
+    "- Start with search unless the user already gave a specific meeting_id.\n"
+    "- You may add a fetch step for one meeting_id after search when they ask for detail.\n"
+    f"User message:\n{message.strip()[:4000]}\n"
+  )
+  model = os.getenv("AI_MODEL", "claude-sonnet-4-20250514")
+  try:
+    resp = client.messages.create(
+      model=model,
+      max_tokens=900,
+      messages=[{"role": "user", "content": prompt}],
+    )
+  except Exception:
+    logger.exception("memory plan LLM failed")
+    return None
+  text = getattr(resp.content[0], "text", "") or ""
+  try:
+    data = _parse_json_loose(text)
+  except json.JSONDecodeError:
+    logger.warning("memory plan not JSON: %s", text[:200])
+    return None
+  steps = data.get("steps") if isinstance(data, dict) else None
+  if not isinstance(steps, list) or not steps:
+    return None
+  normalized: list[dict[str, Any]] = []
+  for step in steps:
+    if not isinstance(step, dict):
+      continue
+    tool = str(step.get("tool") or "").strip()
+    if tool not in (TOOL_MEMORY_SEARCH, TOOL_MEMORY_FETCH):
+      continue
+    args = step.get("args") if isinstance(step.get("args"), dict) else {}
+    normalized.append({"tool": tool, "args": args, "is_write": False})
+  return normalized or None
+
+
+def _heuristic_memory_plan(message: str) -> list[dict[str, Any]]:
+  stripped = message.strip()
+  if not stripped:
+    return [{"tool": TOOL_MEMORY_SEARCH, "args": {"query": "", "max_results": 12}, "is_write": False}]
+  return [{
+    "tool": TOOL_MEMORY_SEARCH,
+    "args": {"query": stripped[:500], "max_results": 12},
+    "is_write": False,
+  }]
+
+
+def plan_memory_steps(message: str) -> list[dict[str, Any]]:
+  return _llm_memory_plan(message) or _heuristic_memory_plan(message)
+
+
+def _memory_tools_blob(tool_results: list[dict[str, Any]]) -> str:
+  lines: list[str] = []
+  for t in tool_results:
+    tool = t.get("tool")
+    if t.get("error"):
+      lines.append(f"{tool} error: {t.get('error')}")
+      continue
+    r = t.get("result")
+    if not isinstance(r, dict):
+      continue
+    if tool == TOOL_MEMORY_SEARCH:
+      meetings = r.get("meetings") or []
+      lines.append(f"Search found {len(meetings)} meeting(s).")
+      for m in meetings[:10]:
+        tid = m.get("id", "")
+        title = m.get("title", "")
+        when = m.get("created_at") or m.get("start_time") or ""
+        lines.append(f"  - id={tid} title={title} when={when}")
+    elif tool == TOOL_MEMORY_FETCH:
+      if r.get("error"):
+        lines.append(f"Fetch: {r.get('error')}")
+        continue
+      title = r.get("title", "")
+      lines.append(f"Meeting: {title}")
+      summ = (r.get("summary") or "").strip()
+      if summ:
+        lines.append(f"Summary:\n{summ[:6000]}")
+      excerpt = (r.get("transcript_excerpt") or "").strip()
+      if excerpt:
+        lines.append(f"Transcript excerpt:\n{excerpt[:8000]}")
+      dec = r.get("decisions")
+      if isinstance(dec, list) and dec:
+        lines.append(f"Decisions: {dec[:20]}")
+      ai = r.get("action_items")
+      if isinstance(ai, list) and ai:
+        lines.append(f"Action items: {json.dumps(ai, default=str)[:4000]}")
+  return "\n".join(lines).strip()[:24000]
+
+
+def _synthesize_memory_reply(question: str, tool_results: list[dict[str, Any]]) -> str | None:
+  client = _get_anthropic()
+  if not client:
+    return None
+  import os
+
+  blobbed = _memory_tools_blob(tool_results)
+  if not blobbed:
+    return None
+  model = os.getenv("AI_MODEL", "claude-sonnet-4-20250514")
+  try:
+    resp = client.messages.create(
+      model=model,
+      max_tokens=1200,
+      messages=[{
+        "role": "user",
+        "content": (
+          "You are MeetingBox memory assistant. Using ONLY the retrieved data below, "
+          "answer the user's question. If data is missing, say so. Be concise and clear. "
+          "Cite meeting titles/dates when relevant. Do not invent facts.\n\n"
+          f"User question:\n{question.strip()[:2000]}\n\nRetrieved data:\n{blobbed}"
+        ),
+      }],
+    )
+  except Exception:
+    logger.exception("memory synthesis failed")
+    return None
+  return (getattr(resp.content[0], "text", "") or "").strip() or None
+
+
+def _memory_fallback_reply(tool_results: list[dict[str, Any]]) -> str:
+  parts: list[str] = []
+  for t in tool_results:
+    tool = t.get("tool")
+    if t.get("error"):
+      parts.append(f"{tool}: {t.get('error')}")
+      continue
+    r = t.get("result")
+    if not isinstance(r, dict):
+      continue
+    if tool == TOOL_MEMORY_SEARCH:
+      ms = r.get("meetings") or []
+      if not ms:
+        parts.append("No meetings matched that search.")
+      else:
+        lines = [f"Found {len(ms)} meeting(s):"]
+        for m in ms[:10]:
+          lines.append(
+            f"• {m.get('title', '')} — "
+            f"{m.get('created_at') or m.get('start_time') or ''} (id: {m.get('id', '')})"
+          )
+        parts.append("\n".join(lines))
+    elif tool == TOOL_MEMORY_FETCH:
+      if r.get("error"):
+        parts.append(str(r["error"]))
+        continue
+      head = f"**{r.get('title', 'Meeting')}**"
+      summ = (r.get("summary") or "").strip()
+      if summ:
+        snip = summ[:1200] + ("…" if len(summ) > 1200 else "")
+        parts.append(f"{head}\n\n{snip}")
+      ex = (r.get("transcript_excerpt") or "").strip()
+      if ex and len((summ or "")) < 100:
+        parts.append((ex[:2000] + "…") if len(ex) > 2000 else ex)
+  return "\n\n".join(parts) if parts else "No meeting data was found."
+
+
 def _row_factory(cursor, row):
   return {col[0]: row[idx] for idx, col in enumerate(cursor.description)}
 
@@ -341,8 +514,9 @@ def process_assistant_intent(
 
   if not route.agent_id:
     msg = (
-      "I could not route that to a specialist. Try phrases about your **calendar** "
-      "or **email** / **inbox**, or connect Gmail/Calendar in Settings."
+      "I could not route that to a specialist. Try asking about your **calendar**, "
+      "**email** / **inbox**, or **past meetings** (e.g. what did we discuss, search meetings). "
+      "Connect Gmail/Calendar in Settings for Google features."
     )
     payload = {
       "assistant_message": msg,
@@ -485,6 +659,75 @@ def process_assistant_intent(
       assistant_lines.append(f"Here are recent messages ({n} shown). See tool_results for details.")
     if not assistant_lines:
       assistant_lines.append("Communication request processed. See tool_results for details.")
+
+  elif agent_id == "memory_agent":
+    steps = plan_memory_steps(text)
+    fetched_ids: set[str] = set()
+    for step in steps:
+      tool = step["tool"]
+      args = dict(step.get("args") or {})
+      if tool == TOOL_MEMORY_SEARCH:
+        q = str(args.get("query", "") if args.get("query") is not None else text)
+        try:
+          res = memory_search_meetings(
+            user_id,
+            q,
+            max_results=int(args.get("max_results", 12)),
+          )
+          tool_results.append({"tool": tool, "result": res})
+        except Exception as e:
+          logger.exception("memory search failed")
+          tool_results.append({"tool": tool, "error": str(e)})
+      elif tool == TOOL_MEMORY_FETCH:
+        mid = str(args.get("meeting_id") or "").strip()
+        if not mid:
+          tool_results.append({"tool": tool, "error": "meeting_id is required"})
+          continue
+        fetched_ids.add(mid)
+        try:
+          res = memory_fetch_meeting(
+            user_id,
+            mid,
+            max_segments=int(args.get("max_segments", 80)),
+            max_total_chars=int(args.get("max_total_chars", 20000)),
+          )
+          tool_results.append({"tool": tool, "result": res})
+        except Exception as e:
+          logger.exception("memory fetch failed")
+          tool_results.append({"tool": tool, "error": str(e)})
+      else:
+        tool_results.append({"tool": str(tool), "error": "Unknown memory tool"})
+
+    search_hit = next(
+      (
+        t for t in reversed(tool_results)
+        if t.get("tool") == TOOL_MEMORY_SEARCH
+        and isinstance(t.get("result"), dict)
+        and not t.get("error")
+      ),
+      None,
+    )
+    if search_hit:
+      meetings = search_hit["result"].get("meetings") or []
+      for m in meetings[:2]:
+        mid = str(m.get("id") or "").strip()
+        if mid and mid not in fetched_ids:
+          fetched_ids.add(mid)
+          try:
+            res = memory_fetch_meeting(user_id, mid, max_segments=60, max_total_chars=16000)
+            tool_results.append({
+              "tool": TOOL_MEMORY_FETCH,
+              "result": res,
+              "note": "auto-enriched from top search hits",
+            })
+          except Exception as e:
+            tool_results.append({"tool": TOOL_MEMORY_FETCH, "error": str(e)})
+
+    syn = _synthesize_memory_reply(text, tool_results)
+    if syn:
+      assistant_lines.append(syn)
+    else:
+      assistant_lines.append(_memory_fallback_reply(tool_results))
 
   else:
     assistant_lines.append(

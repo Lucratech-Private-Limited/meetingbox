@@ -1,0 +1,32 @@
+{
+  "id": "memory_agent",
+  "name": "Memory Agent",
+  "description": "Searches past meetings, summaries, and transcripts stored locally — recalls what was discussed. Read-only.",
+  "triggers": [
+    "what did we",
+    "what we discussed",
+    "last meeting",
+    "previous meeting",
+    "past meeting",
+    "our meeting about",
+    "in the meeting",
+    "search meetings",
+    "meeting history",
+    "transcript",
+    "summaries",
+    "action items from",
+    "did we talk about",
+    "when did we discuss",
+    "recall what",
+    "look up meeting",
+    "find meeting",
+    "which meeting"
+  ],
+  "system_prompt": "assistant_service: memory_search_meetings and memory_fetch_meeting over SQLite.",
+  "tools": ["memory_search_meetings", "memory_fetch_meeting"],
+  "requires_approval": false,
+  "background": false,
+  "priority": 6,
+  "memory_context": false,
+  "max_tool_calls": 8
+}
