@@ -36,9 +36,10 @@ export default function SummaryCard({ summary, meetingId }: SummaryCardProps) {
       const res = await postAssistantIntent(message, meetingId)
       toast.success(res.assistant_message || 'Calendar request sent.')
       if (res.pending_actions && res.pending_actions.length > 0) {
-        toast('Open the dashboard and approve the pending calendar action (Settings → integrations).', {
-          duration: 5000,
-        })
+        toast(
+          'Open Settings → Integrations and use Assistant queue → Approve to create the calendar event.',
+          { duration: 6000 },
+        )
       }
     } catch (err: unknown) {
       const msg =
