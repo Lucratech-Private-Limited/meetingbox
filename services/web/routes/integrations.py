@@ -9,7 +9,11 @@ an authorization code that is exchanged for tokens.
 Env vars required:
   GOOGLE_CLIENT_ID      -- from Google Cloud Console (Web application type)
   GOOGLE_CLIENT_SECRET  -- from Google Cloud Console
-  APP_BASE_URL          -- base URL of the web backend (e.g. http://localhost:8000)
+  APP_BASE_URL          -- fallback base URL if Host cannot be determined (e.g. http://localhost:8000)
+
+OAuth redirect_uri is derived from the incoming request (X-Forwarded-Proto + Host) when
+possible so Google Console can match the same origin you use in the browser (LAN IP,
+meetingbox.local, etc.) without changing .env each time.
 """
 
 import json
@@ -20,7 +24,7 @@ from datetime import datetime
 from urllib.parse import urlencode, quote_plus
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import RedirectResponse
 
 from auth import get_current_user, SECRET_KEY
@@ -33,7 +37,6 @@ router = APIRouter()
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
 APP_BASE_URL = os.getenv("APP_BASE_URL", "http://localhost:8000").rstrip("/")
-FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", APP_BASE_URL).rstrip("/")
 
 GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 TOKEN_URL = "https://oauth2.googleapis.com/token"
@@ -77,6 +80,43 @@ def _check_google_configured():
 
 def _get_redirect_uri(provider: str) -> str:
     return f"{APP_BASE_URL}/api/integrations/{provider}/callback"
+
+
+def infer_public_base_url(request: Request) -> str:
+    """
+    Public origin (scheme + host [+ port]) for OAuth redirect_uri and return redirects.
+    Uses proxy headers from nginx, then Host, then APP_BASE_URL.
+    """
+    raw_host = (request.headers.get("x-forwarded-host") or request.headers.get("host") or "").strip()
+    if raw_host:
+        host = raw_host.split(",")[0].strip()
+    else:
+        host = ""
+
+    if host:
+        proto_raw = (request.headers.get("x-forwarded-proto") or "").strip().lower()
+        proto = proto_raw.split(",")[0].strip() if proto_raw else ""
+        if proto not in ("http", "https"):
+            proto = request.url.scheme or "http"
+        hostname_only = host.split(":")[0].lower()
+        if hostname_only in ("web", "meetingbox-web"):
+            logger.warning(
+                "OAuth infer_public_base_url: internal Host %r — using APP_BASE_URL", host
+            )
+            return APP_BASE_URL.rstrip("/")
+        return f"{proto}://{host}".rstrip("/")
+
+    # No Host (e.g. odd clients): fall back
+    return APP_BASE_URL.rstrip("/")
+
+
+def _redirect_uri_for_request(request: Request, provider: str) -> str:
+    return f"{infer_public_base_url(request)}/api/integrations/{provider}/callback"
+
+
+def _post_oauth_browser_base(request: Request) -> str:
+    """Same public origin as redirect_uri so /settings opens on the host you used to connect."""
+    return infer_public_base_url(request)
 
 
 def _create_state_token(user_id: str, provider: str) -> str:
@@ -276,7 +316,11 @@ async def list_integrations(current_user: dict = Depends(get_current_user)):
 # ======================================================================
 
 @router.get("/integrations/{provider}/auth-url")
-async def get_auth_url(provider: str, current_user: dict = Depends(get_current_user)):
+async def get_auth_url(
+    provider: str,
+    request: Request,
+    current_user: dict = Depends(get_current_user),
+):
     """
     Return the Google OAuth authorization URL for the given provider.
     The frontend should redirect the browser to this URL.
@@ -287,10 +331,12 @@ async def get_auth_url(provider: str, current_user: dict = Depends(get_current_u
         raise HTTPException(status_code=400, detail=f"Unknown provider: {provider}")
 
     state = _create_state_token(current_user["id"], provider)
+    redirect_uri = _redirect_uri_for_request(request, provider)
+    logger.info("OAuth auth-url provider=%s redirect_uri=%s", provider, redirect_uri)
 
     params = {
         "client_id": GOOGLE_CLIENT_ID,
-        "redirect_uri": _get_redirect_uri(provider),
+        "redirect_uri": redirect_uri,
         "response_type": "code",
         "scope": SCOPES_BY_PROVIDER[provider],
         "access_type": "offline",
@@ -308,6 +354,7 @@ async def get_auth_url(provider: str, current_user: dict = Depends(get_current_u
 
 @router.get("/integrations/{provider}/callback")
 async def oauth_callback(
+    request: Request,
     provider: str,
     code: str = Query(default=""),
     state: str = Query(default=""),
@@ -318,7 +365,9 @@ async def oauth_callback(
     This endpoint exchanges the code for tokens, saves them, and redirects
     the browser back to the Settings page.
     """
-    frontend_base = FRONTEND_BASE_URL
+    frontend_base = _post_oauth_browser_base(request)
+    redirect_uri = _redirect_uri_for_request(request, provider)
+    logger.info("OAuth callback provider=%s redirect_uri=%s", provider, redirect_uri)
 
     if error:
         logger.warning("OAuth callback error for %s: %s", provider, error)
@@ -339,7 +388,6 @@ async def oauth_callback(
             url=f"{frontend_base}/settings?integration=error&reason=provider_mismatch",
         )
 
-    redirect_uri = _get_redirect_uri(provider)
     scopes = SCOPES_BY_PROVIDER.get(provider, "")
 
     try:
