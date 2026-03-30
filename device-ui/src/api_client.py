@@ -177,7 +177,22 @@ class BackendClient:
             # Flatten: merge meeting fields + summary into a single dict
             meeting = data.get('meeting', {})
             segments = data.get('segments', [])
-            summary = data.get('summary') or data.get('local_summary') or {}
+            summary_raw = data.get('summary')
+            local_raw = data.get('local_summary')
+            if summary_raw and isinstance(summary_raw, dict):
+                summary = dict(summary_raw)
+                if (
+                    not (summary.get('action_items') or [])
+                    and local_raw
+                    and isinstance(local_raw, dict)
+                ):
+                    la = local_raw.get('action_items') or []
+                    if la:
+                        summary['action_items'] = la
+            elif local_raw and isinstance(local_raw, dict):
+                summary = local_raw
+            else:
+                summary = {}
 
             result = {
                 **meeting,

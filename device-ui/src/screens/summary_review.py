@@ -137,6 +137,31 @@ class SummaryReviewScreen(BaseScreen):
 
         run_async(_fetch())
 
+    @staticmethod
+    def _coerce_summary_action_items(raw):
+        out = []
+        for a in raw or []:
+            if isinstance(a, dict):
+                task = (a.get("task") or a.get("description") or "").strip()
+                if not task:
+                    task = str(a)
+                out.append({
+                    "task": task,
+                    "assignee": a.get("assignee"),
+                    "due_date": a.get("due_date"),
+                    "completed": bool(a.get("completed", False)),
+                })
+            else:
+                s = str(a).strip()
+                if s:
+                    out.append({
+                        "task": s,
+                        "assignee": None,
+                        "due_date": None,
+                        "completed": False,
+                    })
+        return out
+
     def _switch_tab(self, tab: str):
         self._current_tab = tab
         self._render_tab()
@@ -149,8 +174,6 @@ class SummaryReviewScreen(BaseScreen):
             self.execute_btn.disabled = True
         else:
             self._render_actions_tab()
-            self.execute_btn.opacity = 1
-            self.execute_btn.disabled = False
 
     def _render_summary_tab(self):
         scroll = ScrollView(size_hint=(1, 1))
@@ -230,18 +253,28 @@ class SummaryReviewScreen(BaseScreen):
         )
         content.bind(minimum_height=content.setter('height'))
 
-        if not self._actions_data:
-            empty = Label(
-                text='No action items found.',
-                font_size=FONT_SIZES['body'],
-                color=COLORS['gray_500'],
-                halign='center',
+        self.execute_btn.opacity = 1
+
+        agentic = list(self._actions_data or [])
+        summary_items = self._coerce_summary_action_items(
+            (self._summary_data or {}).get("action_items", []),
+        )
+
+        if agentic:
+            hdr = Label(
+                text='AI actions (select, then Execute)',
+                font_size=FONT_SIZES['small'],
+                bold=True,
+                color=COLORS['blue'],
+                halign='left',
+                valign='middle',
                 size_hint_y=None,
-                height=40,
+                height=22,
             )
-            content.add_widget(empty)
-        else:
-            for action in self._actions_data:
+            hdr.bind(width=lambda w, val: setattr(w, 'text_size', (val, None)))
+            content.add_widget(hdr)
+
+            for action in agentic:
                 row = BoxLayout(
                     orientation='horizontal',
                     size_hint_y=None,
@@ -280,6 +313,76 @@ class SummaryReviewScreen(BaseScreen):
                 row.add_widget(al)
 
                 content.add_widget(row)
+
+            self.execute_btn.disabled = False
+            self.execute_btn.opacity = 1
+
+        elif summary_items:
+            hdr = Label(
+                text='Action items from report',
+                font_size=FONT_SIZES['body'],
+                bold=True,
+                color=COLORS['blue'],
+                halign='left',
+                valign='middle',
+                size_hint_y=None,
+                height=24,
+            )
+            hdr.bind(width=lambda w, val: setattr(w, 'text_size', (val, None)))
+            content.add_widget(hdr)
+
+            note = Label(
+                text=(
+                    'These come from the meeting summary. On the web dashboard, '
+                    'tap Schedule next to an item (signed in) or open the Actions tab '
+                    'to generate AI suggestions. Execute Selected applies only to AI-generated actions.'
+                ),
+                font_size=FONT_SIZES['small'],
+                color=COLORS['gray_500'],
+                halign='left',
+                valign='top',
+                size_hint_y=None,
+            )
+            note.bind(width=lambda w, val: setattr(w, 'text_size', (val, None)))
+            note.bind(texture_size=lambda w, ts: setattr(w, 'height', ts[1] + 4))
+            content.add_widget(note)
+
+            for item in summary_items:
+                meta_bits = []
+                if item.get('assignee'):
+                    meta_bits.append(str(item['assignee']))
+                if item.get('due_date'):
+                    meta_bits.append(str(item['due_date']))
+                meta = f" · {' · '.join(meta_bits)}" if meta_bits else ''
+                line = f"{'[x] ' if item.get('completed') else ''}{item['task']}{meta}"
+
+                al = Label(
+                    text=line,
+                    font_size=FONT_SIZES['small'] + 1,
+                    color=COLORS['gray_300'],
+                    halign='left',
+                    valign='top',
+                    size_hint_y=None,
+                )
+                al.bind(width=lambda w, val: setattr(w, 'text_size', (val, None)))
+                al.bind(texture_size=lambda w, ts: setattr(w, 'height', ts[1] + 6))
+                content.add_widget(al)
+
+            self.execute_btn.disabled = True
+            self.execute_btn.opacity = 0.45
+
+        else:
+            empty = Label(
+                text='No action items found.',
+                font_size=FONT_SIZES['body'],
+                color=COLORS['gray_500'],
+                halign='center',
+                size_hint_y=None,
+                height=40,
+            )
+            content.add_widget(empty)
+            self.execute_btn.disabled = True
+            self.execute_btn.opacity = 0.45
 
         scroll.add_widget(content)
         self.content_area.add_widget(scroll)

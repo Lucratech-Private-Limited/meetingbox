@@ -373,12 +373,12 @@ export default function MeetingDetailPage() {
       <div>
         {activeTab === 'summary' && (
           <>
-            <SummaryCard summary={meeting.summary} />
+            <SummaryCard summary={meeting.summary} meetingId={meeting.id} />
             {/* Show local summary below if it exists */}
             {meeting.local_summary && (
               <div className="mt-6">
                 <h3 className="text-lg font-semibold text-gray-900 mb-4">Local Summary</h3>
-                <SummaryCard summary={meeting.local_summary} />
+                <SummaryCard summary={meeting.local_summary} meetingId={meeting.id} />
               </div>
             )}
           </>
