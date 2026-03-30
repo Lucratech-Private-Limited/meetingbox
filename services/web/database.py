@@ -196,6 +196,48 @@ def init_database() -> None:
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_actions_meeting_id ON actions(meeting_id)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_actions_status ON actions(status)")
 
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS assistant_audits (
+              id TEXT PRIMARY KEY,
+              created_at TEXT NOT NULL,
+              user_id TEXT,
+              meeting_id TEXT,
+              source TEXT NOT NULL,
+              message TEXT NOT NULL,
+              routed_agent_id TEXT,
+              routing_method TEXT,
+              response_json TEXT,
+              FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pending_assistant_actions (
+              id TEXT PRIMARY KEY,
+              created_at TEXT NOT NULL,
+              user_id TEXT,
+              audit_id TEXT NOT NULL,
+              agent_id TEXT NOT NULL,
+              tool_name TEXT NOT NULL,
+              payload TEXT NOT NULL,
+              status TEXT DEFAULT 'pending',
+              result_json TEXT,
+              error TEXT,
+              resolved_at TEXT,
+              FOREIGN KEY (user_id) REFERENCES users(id),
+              FOREIGN KEY (audit_id) REFERENCES assistant_audits(id)
+            )
+            """
+        )
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_assistant_audits_created ON assistant_audits(created_at)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_assistant_audits_user ON assistant_audits(user_id)")
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_pending_assistant_user_status ON pending_assistant_actions(user_id, status)"
+        )
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_pending_assistant_audit ON pending_assistant_actions(audit_id)")
+
         conn.commit()
     finally:
         conn.close()

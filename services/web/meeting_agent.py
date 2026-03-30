@@ -114,6 +114,18 @@ async def run_meeting_agent_pipeline(
     },
   )
 
+  try:
+    from assistant_service import log_pipeline_completion_audit
+
+    log_pipeline_completion_audit(
+      redis_client,
+      session_id,
+      current_user.get("id") if current_user else None,
+      summary_result,
+    )
+  except Exception:
+    logger.exception("log_pipeline_completion_audit failed meeting_id=%s", session_id)
+
   _emit_stage(redis_client, session_id, "completed", "Meeting processing complete.")
   logger.info("meeting_agent finished meeting_id=%s", session_id)
   return summary_result

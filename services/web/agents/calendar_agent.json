@@ -1,0 +1,25 @@
+{
+  "id": "calendar_agent",
+  "name": "Calendar Agent",
+  "description": "Lists upcoming Google Calendar events (read) and queues new events for approval before creation (write). Requires Calendar OAuth in Settings.",
+  "triggers": [
+    "calendar",
+    "schedule",
+    "scheduling",
+    "appointment",
+    "what's on",
+    "what is on",
+    "upcoming",
+    "next meeting",
+    "book a",
+    "create event",
+    "add to calendar"
+  ],
+  "system_prompt": "Used by assistant_service with calendar_list_upcoming and calendar_create_event tools.",
+  "tools": ["calendar_list_upcoming", "calendar_create_event"],
+  "requires_approval": true,
+  "background": false,
+  "priority": 5,
+  "memory_context": false,
+  "max_tool_calls": 8
+}

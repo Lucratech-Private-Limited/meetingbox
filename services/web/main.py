@@ -18,7 +18,10 @@ from starlette.types import Scope
 import redis
 
 from database import init_database, get_connection
+from agent_registry import load_agent_definitions
 from routes.meetings import router as meetings_router
+from routes.agents import router as agents_router
+from routes.assistant import router as assistant_router
 from routes.system import router as system_router
 from routes.device import router as device_router
 from routes.auth import router as auth_router
@@ -31,6 +34,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelna
 logger = logging.getLogger("meetingbox.web")
 
 init_database()
+load_agent_definitions()
 
 REDIS_HOST = os.getenv("REDIS_HOST", "redis")
 STATIC_DIR = Path(os.getenv("STATIC_DIR", "/app/static"))
@@ -181,6 +185,8 @@ app.add_middleware(
 )
 
 app.include_router(auth_router, prefix="/api/auth", tags=["auth"])
+app.include_router(agents_router, prefix="/api/agents", tags=["agents"])
+app.include_router(assistant_router, prefix="/api/assistant", tags=["assistant"])
 app.include_router(meetings_router, prefix="/api/meetings", tags=["meetings"])
 app.include_router(system_router, prefix="/api/system", tags=["system"])
 app.include_router(device_router, prefix="/api/device", tags=["device"])
