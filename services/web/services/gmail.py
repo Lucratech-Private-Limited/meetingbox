@@ -12,6 +12,45 @@ from googleapiclient.discovery import build
 logger = logging.getLogger(__name__)
 
 
+def list_recent_messages(
+    credentials,
+    max_results: int = 10,
+    q: str = "",
+) -> list[dict]:
+    """
+    List recent message metadata (From, Subject, Date, snippet, threadId).
+    Requires gmail.readonly scope.
+    """
+    service = build("gmail", "v1", credentials=credentials, cache_discovery=False)
+    max_results = max(1, min(int(max_results), 30))
+    kwargs: dict = {"userId": "me", "maxResults": max_results}
+    if q and q.strip():
+        kwargs["q"] = q.strip()
+    results = service.users().messages().list(**kwargs).execute()
+    messages = results.get("messages", [])
+    out: list[dict] = []
+    for ref in messages:
+        mid = ref.get("id")
+        if not mid:
+            continue
+        m = service.users().messages().get(
+            userId="me",
+            id=mid,
+            format="metadata",
+            metadataHeaders=["From", "Subject", "Date"],
+        ).execute()
+        headers = {h["name"]: h["value"] for h in m.get("payload", {}).get("headers", [])}
+        out.append({
+            "id": mid,
+            "threadId": m.get("threadId"),
+            "snippet": m.get("snippet", ""),
+            "from": headers.get("From", ""),
+            "subject": headers.get("Subject", ""),
+            "date": headers.get("Date", ""),
+        })
+    return out
+
+
 def send_email(
     credentials,
     to: str,
@@ -20,6 +59,7 @@ def send_email(
     html_body: str | None = None,
     cc: str | None = None,
     bcc: str | None = None,
+    thread_id: str | None = None,
 ) -> dict:
     """
     Send an email via Gmail API.
@@ -54,10 +94,14 @@ def send_email(
 
     raw = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
 
+    send_body: dict = {"raw": raw}
+    if thread_id and str(thread_id).strip():
+        send_body["threadId"] = str(thread_id).strip()
+
     result = (
         service.users()
         .messages()
-        .send(userId="me", body={"raw": raw})
+        .send(userId="me", body=send_body)
         .execute()
     )
 

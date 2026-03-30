@@ -1,0 +1,27 @@
+{
+  "id": "communication_agent",
+  "name": "Communication Agent",
+  "description": "Lists recent Gmail (headers + snippet) when asked; queues outbound email (plain or HTML, optional thread) for approval before send.",
+  "triggers": [
+    "email",
+    "e-mail",
+    "mail",
+    "gmail",
+    "send a message",
+    "draft an email",
+    "write an email",
+    "inbox",
+    "unread",
+    "check mail",
+    "recent email",
+    "notify",
+    "message the team"
+  ],
+  "system_prompt": "assistant_service: gmail_list_recent for reads; gmail_send_email for sends (pending approval).",
+  "tools": ["gmail_list_recent", "gmail_send_email"],
+  "requires_approval": true,
+  "background": false,
+  "priority": 4,
+  "memory_context": false,
+  "max_tool_calls": 8
+}

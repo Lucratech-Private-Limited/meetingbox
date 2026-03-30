@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import uuid
 from datetime import datetime
 from typing import Any, Optional
@@ -17,12 +18,13 @@ from database import get_connection
 from orchestrator import RouteResult, route_intent
 from tools.base_tool import ToolError
 from tools.calendar_tool import calendar_create_from_payload, calendar_list_upcoming
-from tools.gmail_tool import gmail_send_from_payload
+from tools.gmail_tool import gmail_list_recent, gmail_send_from_payload
 
 logger = logging.getLogger("meetingbox.assistant")
 
 TOOL_CAL_LIST = "calendar_list_upcoming"
 TOOL_CAL_CREATE = "calendar_create_event"
+TOOL_GMAIL_LIST = "gmail_list_recent"
 TOOL_GMAIL_SEND = "gmail_send_email"
 WRITE_TOOLS = frozenset({TOOL_CAL_CREATE, TOOL_GMAIL_SEND})
 
@@ -142,48 +144,104 @@ def plan_calendar_steps(message: str) -> list[dict[str, Any]]:
   return _llm_calendar_plan(message) or _heuristic_calendar_plan(message)
 
 
-def _llm_gmail_plan(message: str) -> dict[str, Any] | None:
+def _llm_communication_plan(message: str) -> list[dict[str, Any]] | None:
   client = _get_anthropic()
   if not client:
     return None
   import os
 
   prompt = (
-    "Extract email send parameters. Return **only** valid JSON:\n"
-    '{"to": "recipient@example.com", "subject": "...", "body": "...", "cc": []}\n'
+    "Plan Gmail tools for the user message. Return **only** valid JSON: "
+    "{\"steps\": [ {\"tool\": \"gmail_list_recent\"|\"gmail_send_email\", "
+    "\"args\": object, \"is_write\": boolean } ] }.\n"
+    "Rules:\n"
+    "- Use gmail_list_recent for inbox, unread, recent mail, checking email, what arrived.\n"
+    "  Args: max_results (int 1–30, default 15), q (optional Gmail search query e.g. "
+    "is:unread or from:x).\n"
+    "- Use gmail_send_email for sending mail. Args: to, subject, body, cc (array), "
+    "bcc (optional array), html_body (optional), thread_id (optional, for replies).\n"
+    "- gmail_send_email must have is_write true.\n"
     f"User message:\n{message.strip()[:4000]}\n"
   )
   model = os.getenv("AI_MODEL", "claude-sonnet-4-20250514")
   try:
     resp = client.messages.create(
       model=model,
-      max_tokens=1200,
+      max_tokens=1600,
       messages=[{"role": "user", "content": prompt}],
     )
   except Exception:
-    logger.exception("gmail plan LLM failed")
+    logger.exception("communication plan LLM failed")
     return None
   text = getattr(resp.content[0], "text", "") or ""
   try:
     data = _parse_json_loose(text)
   except json.JSONDecodeError:
+    logger.warning("communication plan not JSON: %s", text[:200])
     return None
-  if not isinstance(data, dict):
+  steps = data.get("steps") if isinstance(data, dict) else None
+  if not isinstance(steps, list) or not steps:
     return None
-  return data
+  normalized: list[dict[str, Any]] = []
+  for step in steps:
+    if not isinstance(step, dict):
+      continue
+    tool = str(step.get("tool") or "").strip()
+    if tool not in (TOOL_GMAIL_LIST, TOOL_GMAIL_SEND):
+      continue
+    args = step.get("args") if isinstance(step.get("args"), dict) else {}
+    is_write = bool(step.get("is_write"))
+    if tool == TOOL_GMAIL_SEND:
+      is_write = True
+    normalized.append({"tool": tool, "args": args, "is_write": is_write})
+  return normalized or None
 
 
-def _heuristic_gmail_plan(message: str) -> dict[str, Any]:
-  return {
-    "to": "",
-    "subject": "Message from MeetingBox",
-    "body": message.strip()[:8000] or "(empty)",
-    "cc": [],
-  }
+def _extract_emails_from_text(text: str) -> list[str]:
+  return re.findall(r"[\w.+-]+@[\w-]+\.[\w.-]+", text)
 
 
-def plan_gmail_payload(message: str) -> dict[str, Any]:
-  return _llm_gmail_plan(message) or _heuristic_gmail_plan(message)
+def _heuristic_communication_plan(message: str) -> list[dict[str, Any]]:
+  m = message.lower()
+  list_markers = (
+    "inbox",
+    "unread",
+    "recent email",
+    "recent mail",
+    "check mail",
+    "check my mail",
+    "my email",
+    "list mail",
+    "any new mail",
+    "what email",
+    "what emails",
+    "last email",
+    "emails did i",
+    "messages in gmail",
+  )
+  if any(x in m for x in list_markers):
+    q = "is:unread" if "unread" in m else ""
+    return [{"tool": TOOL_GMAIL_LIST, "args": {"max_results": 15, "q": q}, "is_write": False}]
+
+  emails = _extract_emails_from_text(message)
+  first_to = emails[0] if emails else ""
+  return [{
+    "tool": TOOL_GMAIL_SEND,
+    "args": {
+      "to": first_to,
+      "subject": "Message from MeetingBox",
+      "body": message.strip()[:8000] or "(empty)",
+      "cc": [],
+      "bcc": [],
+      "html_body": "",
+      "thread_id": "",
+    },
+    "is_write": True,
+  }]
+
+
+def plan_communication_steps(message: str) -> list[dict[str, Any]]:
+  return _llm_communication_plan(message) or _heuristic_communication_plan(message)
 
 
 def _row_factory(cursor, row):
@@ -284,7 +342,7 @@ def process_assistant_intent(
   if not route.agent_id:
     msg = (
       "I could not route that to a specialist. Try phrases about your **calendar** "
-      "or **email**, or connect Gmail/Calendar in Settings."
+      "or **email** / **inbox**, or connect Gmail/Calendar in Settings."
     )
     payload = {
       "assistant_message": msg,
@@ -376,27 +434,57 @@ def process_assistant_intent(
     if not assistant_lines:
       assistant_lines.append("Calendar request processed. See tool_results for details.")
 
-  elif agent_id == "gmail_agent":
-    gpayload = plan_gmail_payload(text)
-    if not user_id:
-      tool_results.append({
-        "tool": TOOL_GMAIL_SEND,
-        "error": "Sign in is required to send email.",
-      })
-      assistant_lines.append("Sign in to send email from MeetingBox.")
-    else:
-      pid = str(uuid.uuid4())
-      pending_rows.append((pid, agent_id, TOOL_GMAIL_SEND, gpayload))
-      pending_meta.append({"id": pid, "tool_name": TOOL_GMAIL_SEND, "status": "pending"})
-      tool_results.append({
-        "tool": TOOL_GMAIL_SEND,
-        "queued": True,
-        "pending_id": pid,
-        "draft": gpayload,
-      })
+  elif agent_id in ("gmail_agent", "communication_agent"):
+    steps = plan_communication_steps(text)
+    for step in steps:
+      tool = step["tool"]
+      args = dict(step.get("args") or {})
+
+      if tool == TOOL_GMAIL_LIST:
+        if not user_id:
+          tool_results.append({
+            "tool": tool,
+            "error": "Sign in is required to read Gmail.",
+          })
+          continue
+        try:
+          res = gmail_list_recent(
+            user_id,
+            max_results=int(args.get("max_results", 15)),
+            q=str(args.get("q") or ""),
+          )
+          tool_results.append({"tool": tool, "result": res})
+        except ToolError as e:
+          tool_results.append({"tool": tool, "error": str(e)})
+      elif tool == TOOL_GMAIL_SEND:
+        if not user_id:
+          tool_results.append({
+            "tool": tool,
+            "error": "Sign in is required to draft email.",
+          })
+          continue
+        pid = str(uuid.uuid4())
+        pending_rows.append((pid, agent_id, tool, args))
+        pending_meta.append({"id": pid, "tool_name": tool, "status": "pending"})
+        tool_results.append({
+          "tool": tool,
+          "queued": True,
+          "pending_id": pid,
+          "draft": args,
+        })
+      else:
+        tool_results.append({"tool": tool, "error": "Unknown communication tool"})
+
+    if pending_meta:
       assistant_lines.append(
-        "I drafted an outbound email and queued it for your approval before sending."
+        "I queued outbound email for your approval. Edit the draft in Settings → Integrations → Assistant queue if needed."
       )
+    listed = next((t for t in tool_results if t.get("tool") == TOOL_GMAIL_LIST and "result" in t), None)
+    if listed and "result" in listed:
+      n = listed["result"].get("count", 0)
+      assistant_lines.append(f"Here are recent messages ({n} shown). See tool_results for details.")
+    if not assistant_lines:
+      assistant_lines.append("Communication request processed. See tool_results for details.")
 
   else:
     assistant_lines.append(
@@ -426,6 +514,44 @@ def process_assistant_intent(
   )
   response_payload["audit_id"] = audit_id
   return response_payload
+
+
+def update_pending_assistant_payload(
+  pending_id: str,
+  user_id: str,
+  payload: dict[str, Any],
+) -> dict[str, Any]:
+  """Replace stored JSON payload for a pending email draft (pre-approve edit)."""
+  conn = get_connection()
+  conn.row_factory = _row_factory
+  try:
+    cur = conn.cursor()
+    cur.execute(
+      "SELECT * FROM pending_assistant_actions WHERE id = ? AND user_id = ?",
+      (pending_id, user_id),
+    )
+    row = cur.fetchone()
+    if not row:
+      raise HTTPException(status_code=404, detail="Pending action not found")
+    if row["status"] != "pending":
+      raise HTTPException(status_code=400, detail=f"Action is not pending (status={row['status']})")
+    if row["tool_name"] != TOOL_GMAIL_SEND:
+      raise HTTPException(status_code=400, detail="Only email drafts can be edited here")
+    cur.execute(
+      "UPDATE pending_assistant_actions SET payload = ? WHERE id = ?",
+      (json.dumps(payload), pending_id),
+    )
+    conn.commit()
+    cur.execute("SELECT * FROM pending_assistant_actions WHERE id = ?", (pending_id,))
+    updated = cur.fetchone()
+  finally:
+    conn.close()
+
+  return {
+    "id": pending_id,
+    "tool_name": updated["tool_name"],
+    "payload": json.loads(updated["payload"] or "{}"),
+  }
 
 
 def list_pending_actions_for_user(user_id: str) -> list[dict[str, Any]]:

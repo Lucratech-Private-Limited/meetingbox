@@ -10,6 +10,7 @@ from assistant_service import (
   list_pending_actions_for_user,
   process_assistant_intent,
   reject_pending_action,
+  update_pending_assistant_payload,
 )
 from auth import get_current_user, get_optional_user
 
@@ -19,6 +20,10 @@ router = APIRouter()
 class IntentRequest(BaseModel):
   message: str = Field(..., min_length=1, max_length=8000)
   meeting_id: Optional[str] = None
+
+
+class PendingPayloadUpdate(BaseModel):
+  payload: dict
 
 
 @router.post("/intent")
@@ -42,6 +47,15 @@ async def post_intent(
 @router.get("/pending-actions")
 async def get_pending_actions(current_user: dict = Depends(get_current_user)):
   return {"pending": list_pending_actions_for_user(current_user["id"])}
+
+
+@router.patch("/pending-actions/{pending_id}")
+async def patch_pending_payload(
+  pending_id: str,
+  body: PendingPayloadUpdate,
+  current_user: dict = Depends(get_current_user),
+):
+  return update_pending_assistant_payload(pending_id, current_user["id"], body.payload)
 
 
 @router.post("/pending-actions/{pending_id}/approve")

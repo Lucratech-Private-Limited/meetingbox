@@ -1,12 +1,27 @@
-"""Gmail tool adapter — send mail via stored OAuth (Phase 3)."""
+"""Gmail tool adapter — list + send via stored OAuth (communication agent)."""
 
 from __future__ import annotations
 
 from typing import Any
 
 from routes.integrations import get_credentials_for_provider
-from services.gmail import send_email
+from services.gmail import list_recent_messages, send_email
 from tools.base_tool import ToolError
+
+
+def gmail_list_recent(
+    user_id: str,
+    max_results: int = 10,
+    q: str = "",
+) -> dict[str, Any]:
+  if not user_id:
+    raise ToolError("Sign in is required to read Gmail.")
+  creds = get_credentials_for_provider(user_id, "gmail")
+  if not creds:
+    raise ToolError("Gmail is not connected. Connect it in Settings.")
+  max_results = max(1, min(int(max_results), 30))
+  messages = list_recent_messages(creds, max_results=max_results, q=q or "")
+  return {"messages": messages, "count": len(messages)}
 
 
 def gmail_send_from_payload(user_id: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -24,12 +39,25 @@ def gmail_send_from_payload(user_id: str, payload: dict[str, Any]) -> dict[str, 
     raise ToolError("Recipient address (to) is required.")
   subject = str(payload.get("subject") or "(no subject)")
   body = str(payload.get("body") or "")
+  html_raw = payload.get("html_body")
+  html_body = str(html_raw).strip() if html_raw not in (None, "") else None
   cc = payload.get("cc")
-  cc_str = ", ".join(cc) if isinstance(cc, list) else (str(cc) if cc else None)
+  cc_str = ", ".join(str(x) for x in cc) if isinstance(cc, list) else (str(cc) if cc else None)
+  bcc = payload.get("bcc")
+  if isinstance(bcc, list):
+    bcc_str = ", ".join(str(x).strip() for x in bcc if str(x).strip())
+  else:
+    bcc_str = str(bcc).strip() if bcc else None
+  thread_id = payload.get("thread_id") or payload.get("threadId")
+  thread_id = str(thread_id).strip() if thread_id else None
+
   return send_email(
     credentials=creds,
     to=to,
     subject=subject,
     body=body,
+    html_body=html_body,
     cc=cc_str,
+    bcc=bcc_str or None,
+    thread_id=thread_id,
   )

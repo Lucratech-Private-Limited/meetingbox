@@ -50,3 +50,21 @@ export async function rejectAssistantPending(pendingId: string): Promise<unknown
   )
   return data
 }
+
+export interface PatchPendingResult {
+  id: string
+  tool_name: string
+  payload: Record<string, unknown>
+}
+
+/** Replace stored payload for a pending email draft (pre-approve edit). */
+export async function patchAssistantPending(
+  pendingId: string,
+  payload: Record<string, unknown>
+): Promise<PatchPendingResult> {
+  const { data } = await apiClient.patch<PatchPendingResult>(
+    `/api/assistant/pending-actions/${pendingId}`,
+    { payload }
+  )
+  return data
+}

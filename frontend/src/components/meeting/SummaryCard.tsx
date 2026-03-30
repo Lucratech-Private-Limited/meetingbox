@@ -14,6 +14,7 @@ interface SummaryCardProps {
 export default function SummaryCard({ summary, meetingId }: SummaryCardProps) {
   const token = useAuthStore((s) => s.token)
   const [schedulingIdx, setSchedulingIdx] = useState<number | null>(null)
+  const [emailingIdx, setEmailingIdx] = useState<number | null>(null)
 
   const handleSchedule = async (item: ActionItem, idx: number) => {
     if (!token) {
@@ -51,6 +52,43 @@ export default function SummaryCard({ summary, meetingId }: SummaryCardProps) {
       setSchedulingIdx(null)
     }
   }
+
+  const handleEmail = async (item: ActionItem, idx: number) => {
+    if (!token) {
+      toast.error('Sign in to queue an email draft.')
+      return
+    }
+    if (!meetingId) {
+      toast.error('Missing meeting id.')
+      return
+    }
+    const parts = [
+      'Draft and send an email for this meeting action item:',
+      `"${item.task}".`,
+      item.assignee ? `Related person or assignee: ${item.assignee}.` : '',
+      item.due_date ? `Mentioned deadline: ${item.due_date}.` : '',
+    ].filter(Boolean)
+    const message = parts.join(' ')
+    setEmailingIdx(idx)
+    try {
+      const res = await postAssistantIntent(message, meetingId)
+      toast.success(res.assistant_message || 'Email draft queued.')
+      if (res.pending_actions && res.pending_actions.length > 0) {
+        toast('Open Settings → Integrations → Assistant queue to review, edit, and approve the email.', {
+          duration: 6000,
+        })
+      }
+    } catch (err: unknown) {
+      const msg =
+        err && typeof err === 'object' && 'response' in err
+          ? String((err as { response?: { data?: { detail?: string } } }).response?.data?.detail ?? '')
+          : ''
+      toast.error(msg || 'Could not queue email draft.')
+    } finally {
+      setEmailingIdx(null)
+    }
+  }
+
   if (!summary) {
     return (
       <div className="bg-white rounded-lg border border-gray-200 p-6">
@@ -107,8 +145,9 @@ export default function SummaryCard({ summary, meetingId }: SummaryCardProps) {
         <div className="bg-white rounded-lg border border-gray-200 p-6">
           <h3 className="text-lg font-semibold text-gray-900 mb-4">Action Items</h3>
           <p className="text-sm text-gray-600 mb-4">
-            Use <span className="font-medium">Schedule</span> to queue a Google Calendar draft (requires sign-in and
-            Calendar connected). Approve it under your account pending actions if prompted.
+            Use <span className="font-medium">Schedule</span> or <span className="font-medium">Email</span> to queue a
+            calendar event or Gmail draft (sign-in and Google Calendar / Gmail connected). Approve or edit drafts under
+            Settings → Integrations → Assistant queue.
           </p>
           <ul className="space-y-4">
             {summary.action_items.map((item, idx) => (
@@ -144,14 +183,24 @@ export default function SummaryCard({ summary, meetingId }: SummaryCardProps) {
                     </div>
                   )}
                 </div>
-                <button
-                  type="button"
-                  disabled={!token || schedulingIdx !== null}
-                  onClick={() => void handleSchedule(item, idx)}
-                  className="shrink-0 rounded-lg border border-primary-200 bg-primary-50 px-3 py-1.5 text-xs font-medium text-primary-800 hover:bg-primary-100 disabled:opacity-40 disabled:cursor-not-allowed"
-                >
-                  {schedulingIdx === idx ? 'Queuing…' : 'Schedule'}
-                </button>
+                <div className="flex shrink-0 flex-col gap-1.5 sm:flex-row sm:items-center">
+                  <button
+                    type="button"
+                    disabled={!token || schedulingIdx !== null}
+                    onClick={() => void handleSchedule(item, idx)}
+                    className="rounded-lg border border-primary-200 bg-primary-50 px-3 py-1.5 text-xs font-medium text-primary-800 hover:bg-primary-100 disabled:opacity-40 disabled:cursor-not-allowed"
+                  >
+                    {schedulingIdx === idx ? 'Queuing…' : 'Schedule'}
+                  </button>
+                  <button
+                    type="button"
+                    disabled={!token || emailingIdx !== null}
+                    onClick={() => void handleEmail(item, idx)}
+                    className="rounded-lg border border-gray-200 bg-white px-3 py-1.5 text-xs font-medium text-gray-800 hover:bg-gray-50 disabled:opacity-40 disabled:cursor-not-allowed"
+                  >
+                    {emailingIdx === idx ? 'Queuing…' : 'Email'}
+                  </button>
+                </div>
               </li>
             ))}
           </ul>
