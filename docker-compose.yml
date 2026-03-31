@@ -27,8 +27,6 @@ services:
   #   docker compose --profile docker-audio up -d
   # ================================================================
   audio:
-    profiles:
-      - docker-audio
     build:
       context: ./services/audio
     container_name: meetingbox-audio
@@ -178,8 +176,6 @@ services:
     container_name: meetingbox-ui
     # Match web/audio/transcription (UID 1000) so ./data/config is writable.
     user: "1000:1000"
-    profiles:
-      - screen
     restart: unless-stopped
     depends_on:
       - web
