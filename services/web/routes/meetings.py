@@ -649,6 +649,11 @@ async def summarize_meeting(meeting_id: str, current_user: Optional[dict] = Depe
           "- Include ONLY the following section inside full_report:"
           "  **DETAILED ACCOUNT**"
 
+          "STRUCTURE RULE:"
+          "- The `full_report` must contain narrative sections only."
+          "- Do NOT duplicate structured data (decisions, risks, questions) as standalone sections inside the report."
+          "- You may reference them naturally in prose, but not as headings or lists."
+
           "- Do NOT include sections titled:"
           "**OPEN QUESTIONS**, **RISKS**, **CONCERNS**, **DECISIONS**, or similar,"
           " as these are handled separately in structured fields. "
