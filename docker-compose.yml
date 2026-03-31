@@ -52,68 +52,68 @@ services:
     networks:
       - meetingbox-net
 
-  transcription:
-    profiles:
-      - local-workers
-    build:
-      context: ./services/transcription
-    container_name: meetingbox-transcription
-    restart: unless-stopped
-    depends_on:
-      - redis
-    user: "1000:1000"            # Run as host meetingbox user so data volume writes succeed
-    environment:
-      - PYTHONUNBUFFERED=1
-      # Allow runtime tuning on mini-PC without rebuilding images.
-      - WHISPER_MODEL_PATH=${WHISPER_MODEL_PATH:-/app/whisper.cpp/models/ggml-tiny.bin}
-      - WHISPER_THREADS=${WHISPER_THREADS:-4}
-    volumes:
-      - ./data/audio:/data/audio
-      - ./data/transcripts:/data/transcripts
-    networks:
-      - meetingbox-net
+  # transcription:
+  #   profiles:
+  #     - local-workers
+  #   build:
+  #     context: ./services/transcription
+  #   container_name: meetingbox-transcription
+  #   restart: unless-stopped
+  #   depends_on:
+  #     - redis
+  #   user: "1000:1000"            # Run as host meetingbox user so data volume writes succeed
+  #   environment:
+  #     - PYTHONUNBUFFERED=1
+  #     # Allow runtime tuning on mini-PC without rebuilding images.
+  #     - WHISPER_MODEL_PATH=${WHISPER_MODEL_PATH:-/app/whisper.cpp/models/ggml-tiny.bin}
+  #     - WHISPER_THREADS=${WHISPER_THREADS:-4}
+  #   volumes:
+  #     - ./data/audio:/data/audio
+  #     - ./data/transcripts:/data/transcripts
+  #   networks:
+  #     - meetingbox-net
 
-  ai:
-    profiles:
-      - local-workers
-    build:
-      context: ./services/ai
-    container_name: meetingbox-ai
-    restart: unless-stopped
-    depends_on:
-      - redis
-      - ollama
-    user: "1000:1000"            # Run as host meetingbox user so data volume writes succeed
-    environment:
-      - PYTHONUNBUFFERED=1
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
-      - OLLAMA_HOST=http://ollama:11434
-      - LOCAL_LLM_MODEL=${LOCAL_LLM_MODEL:-phi3:mini}
-      - USE_LOCAL_LLM=${USE_LOCAL_LLM:-true}
-    volumes:
-      - ./data/transcripts:/data/transcripts
-    networks:
-      - meetingbox-net
+  # ai:
+  #   profiles:
+  #     - local-workers
+  #   build:
+  #     context: ./services/ai
+  #   container_name: meetingbox-ai
+  #   restart: unless-stopped
+  #   depends_on:
+  #     - redis
+  #     - ollama
+  #   user: "1000:1000"            # Run as host meetingbox user so data volume writes succeed
+  #   environment:
+  #     - PYTHONUNBUFFERED=1
+  #     - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+  #     - OLLAMA_HOST=http://ollama:11434
+  #     - LOCAL_LLM_MODEL=${LOCAL_LLM_MODEL:-phi3:mini}
+  #     - USE_LOCAL_LLM=${USE_LOCAL_LLM:-true}
+  #   volumes:
+  #     - ./data/transcripts:/data/transcripts
+  #   networks:
+  #     - meetingbox-net
 
-  ollama:
-    profiles:
-      - local-workers
-    build:
-      context: ./services/ollama
-    container_name: meetingbox-ollama
-    restart: unless-stopped
-    environment:
-      - LOCAL_LLM_MODEL=${LOCAL_LLM_MODEL:-phi3:mini}
-    volumes:
-      - ollama-data:/root/.ollama
-    healthcheck:
-      test: ["CMD", "ollama", "list"]
-      interval: 15s
-      timeout: 10s
-      retries: 10
-      start_period: 60s
-    networks:
-      - meetingbox-net
+  # ollama:
+  #   profiles:
+  #     - local-workers
+  #   build:
+  #     context: ./services/ollama
+  #   container_name: meetingbox-ollama
+  #   restart: unless-stopped
+  #   environment:
+  #     - LOCAL_LLM_MODEL=${LOCAL_LLM_MODEL:-phi3:mini}
+  #   volumes:
+  #     - ollama-data:/root/.ollama
+  #   healthcheck:
+  #     test: ["CMD", "ollama", "list"]
+  #     interval: 15s
+  #     timeout: 10s
+  #     retries: 10
+  #     start_period: 60s
+  #   networks:
+  #     - meetingbox-net
 
   web:
     build:
