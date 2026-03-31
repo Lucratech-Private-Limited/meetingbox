@@ -646,7 +646,12 @@ async def summarize_meeting(meeting_id: str, current_user: Optional[dict] = Depe
           "  unless explicitly supported by the transcript.\n\n"
 
           "FORMATTING (critical for display):\n"
-          "- Before each major section heading (e.g. **DETAILED ACCOUNT**, **OPEN QUESTIONS**, **RISKS / CONCERNS**), "
+          "- Include ONLY the following section inside full_report:"
+          "  **DETAILED ACCOUNT**"
+
+          "- Do NOT include sections titled:"
+          "**OPEN QUESTIONS**, **RISKS**, **CONCERNS**, **DECISIONS**, or similar,"
+          " as these are handled separately in structured fields. "
           "insert two newline characters (\\n\\n).\n"
           "- Use a single newline between paragraphs within a section.\n\n"
 
