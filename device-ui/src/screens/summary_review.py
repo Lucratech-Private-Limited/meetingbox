@@ -225,20 +225,6 @@ class SummaryReviewScreen(BaseScreen):
                 dl.bind(texture_size=lambda w, ts: setattr(w, 'height', ts[1] + 4))
                 content.add_widget(dl)
 
-        topics = self._summary_data.get('topics', [])
-        if topics:
-            topics_str = '  '.join(str(t) for t in topics)
-            tl = Label(
-                text=topics_str,
-                font_size=FONT_SIZES['small'],
-                color=COLORS['gray_500'],
-                halign='left',
-                size_hint_y=None,
-                height=20,
-            )
-            tl.bind(width=lambda w, val: setattr(w, 'text_size', (val, None)))
-            content.add_widget(tl)
-
         scroll.add_widget(content)
         self.content_area.add_widget(scroll)
 

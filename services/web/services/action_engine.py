@@ -204,7 +204,6 @@ def _build_generation_prompt(context: dict[str, Any], capabilities: list[dict[st
         f"Summary: {context['summary']}\n"
         f"Decisions: {json.dumps(context['decisions'])}\n"
         f"Human follow-ups: {json.dumps(context['action_items'])}\n"
-        f"Topics: {json.dumps(context['topics'])}\n"
         f"Transcript:\n{context['transcript']}\n"
     )
 

@@ -98,8 +98,8 @@ class AIService:
       "discussion_points": _ensure_str_list(data.get("discussion_points")),
       "decisions": _ensure_str_list(data.get("decisions")),
       "action_items": [item for item in normalized_actions if item["task"]],
-      "topics": _ensure_str_list(data.get("topics")),
-      "sentiment": str(data.get("sentiment", "")).strip(),
+      "topics": [],
+      "sentiment": "",
     }
 
   def _fetch_processing_state(self, meeting_id: str) -> dict[str, Any]:
@@ -219,17 +219,13 @@ class AIService:
       '   - "email_draft" — for follow-ups that are naturally an email\n'
       '   - "calendar_invite" — for next meetings or time-blocking commitments\n'
       '   - "task" — for general human to-do items\n'
-      "   Only include action items that are explicitly grounded in the meeting.\n"
-      "5. 3-5 topic hashtags\n"
-      "6. Overall sentiment (single word or short phrase)\n\n"
+      "   Only include action items that are explicitly grounded in the meeting.\n\n"
       "Return **only** valid JSON with no additional text, in this exact shape:\n"
       '{\n'
       '  "summary": "...",\n'
       '  "discussion_points": ["...", "..."],\n'
       '  "decisions": ["...", "..."],\n'
-      '  "action_items": [{"task": "...", "assignee": "...", "due_date": "...", "type": "task"}],\n'
-      '  "topics": ["#topic1", "#topic2"],\n'
-      '  "sentiment": "Productive"\n'
+      '  "action_items": [{"task": "...", "assignee": "...", "due_date": "...", "type": "task"}]\n'
       "}\n\n"
       f"Transcript:\n\n{transcript}"
     )
@@ -244,9 +240,7 @@ class AIService:
       '  "summary": "...",\n'
       '  "discussion_points": ["...", "..."],\n'
       '  "decisions": ["...", "..."],\n'
-      '  "action_items": [{"task": "...", "assignee": "...", "due_date": "...", "type": "task"}],\n'
-      '  "topics": ["#topic1", "#topic2"],\n'
-      '  "sentiment": "Productive"\n'
+      '  "action_items": [{"task": "...", "assignee": "...", "due_date": "...", "type": "task"}]\n'
       "}\n\n"
       f"Current summary JSON:\n{json.dumps(current_summary, ensure_ascii=True)}\n\n"
       f"New transcript chunk:\n\n{transcript_delta}"

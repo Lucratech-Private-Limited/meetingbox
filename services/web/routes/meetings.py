@@ -79,20 +79,20 @@ def _generate_session_id() -> str:
     return f"{ts}_{suffix}"
 
 
-def _derive_title(summary: str, topics: list) -> str:
-    """Derive a short human-readable meeting title from report text or topics."""
-    if topics:
-      clean = [t.strip().lstrip("#") for t in topics[:3] if isinstance(t, str) and t.strip()]
-      if clean:
-        title = " / ".join(clean)
-        return title[:80]
-    if summary:
-      first = summary.split(".")[0].strip()
-      if len(first) > 80:
-        first = first[:77] + "..."
-      if first:
-        return first
-    return ""
+def _derive_title(report_body: str) -> str:
+    """Derive a short human-readable meeting title from the report text."""
+    if not report_body:
+      return ""
+    line = report_body.strip().split("\n")[0].strip()
+    if not line:
+      return ""
+    if len(line) > 100:
+      first_sent = line.split(".")[0].strip()
+      if first_sent and len(first_sent) <= 100:
+        line = first_sent + ("." if first_sent[-1] not in ".?!" else "")
+    if len(line) > 80:
+      return line[:77] + "..."
+    return line
 
 
 def _coerce_str_list(raw: object) -> list[str]:
@@ -163,9 +163,7 @@ class LocalSummary(BaseModel):
 
 
 def _normalize_summary_data(data: dict) -> dict:
-  """Normalize LLM output so decisions/topics are always lists of strings.
-  LLMs sometimes return decisions as objects like {"decision": "...", "responsible_party": null}
-  instead of plain strings. This coerces everything to strings."""
+  """Normalize LLM output so decisions are lists of strings and action_items are dicts."""
   # Normalize decisions
   raw_decisions = data.get("decisions", [])
   decisions = []
@@ -179,18 +177,6 @@ def _normalize_summary_data(data: dict) -> dict:
       decisions.append(str(d))
   data["decisions"] = decisions
 
-  # Normalize topics
-  raw_topics = data.get("topics", [])
-  topics = []
-  for t in raw_topics:
-    if isinstance(t, str):
-      topics.append(t)
-    elif isinstance(t, dict):
-      topics.append(t.get("topic") or t.get("name") or t.get("text") or str(t))
-    else:
-      topics.append(str(t))
-  data["topics"] = topics
-
   # Normalize action_items (ensure they're dicts)
   raw_actions = data.get("action_items", [])
   actions = []
@@ -203,13 +189,12 @@ def _normalize_summary_data(data: dict) -> dict:
       actions.append({"task": str(a), "assignee": None, "due_date": None})
   data["action_items"] = actions
 
-  # Ensure sentiment is a string
-  sentiment = data.get("sentiment", "")
-  if not isinstance(sentiment, str):
-    data["sentiment"] = str(sentiment)
-
   data["open_questions"] = _coerce_str_list(data.get("open_questions"))
   data["risks_or_concerns"] = _coerce_str_list(data.get("risks_or_concerns"))
+
+  # Topics/sentiment are not generated or shown in the product; keep API/DB columns empty.
+  data["topics"] = []
+  data["sentiment"] = ""
 
   return data
 
@@ -635,7 +620,9 @@ async def summarize_meeting(meeting_id: str, current_user: Optional[dict] = Depe
     "until you hit your output limit—prioritize completeness of the narrative over brevity.\n"
     "- Use **dense prose paragraphs** for the main story. Bullets are only for lists (action-like lists, explicit enumerations from the call). "
     "Do **not** replace the narrative with bullet-only outlines.\n"
-    "- Include a **DETAILED ACCOUNT** subsection (heading in plain text) that walks through what happened in **order** (or by topic with clear transitions), "
+    "- **Formatting (critical for display):** Before each major section heading (e.g. **DETAILED ACCOUNT**, **OPEN QUESTIONS**, **RISKS / CONCERNS**), "
+    "insert **two newline characters** (`\\n\\n`). Use a **single newline** between paragraphs within a section so the report is not one wall of text.\n"
+    "- Include a **DETAILED ACCOUNT** subsection (heading on its own line) that walks through what happened in **order** (or by topic with clear transitions), "
     "quoting or paraphrasing concrete details: numbers, dates, product names, objections, examples, who advocated for what.\n\n"
     "Rules:\n"
     "- Ground every claim in the transcript. Do not invent facts, people, or commitments.\n"
@@ -646,8 +633,6 @@ async def summarize_meeting(meeting_id: str, current_user: Optional[dict] = Depe
     "- `decisions`: concrete decisions or conclusions reached (strings). Empty list if none.\n"
     "- `action_items`: only items explicitly assigned or committed in the meeting. Each object MUST include "
     '"type": one of "email_draft" | "calendar_invite" | "task".\n'
-    "- `topics`: 3–8 short hashtags (strings).\n"
-    "- `sentiment`: one word or short phrase characterizing the overall tone.\n"
     "- `open_questions`: unresolved questions or ambiguities visible in the transcript.\n"
     "- `risks_or_concerns`: risks, blockers, or worries stated in the meeting.\n\n"
     "Return **only** valid JSON with this shape (no markdown fences outside the JSON):\n"
@@ -656,8 +641,6 @@ async def summarize_meeting(meeting_id: str, current_user: Optional[dict] = Depe
     '  "full_report": "(long string) multi-section narrative with a DETAILED ACCOUNT; use single quotes for quoted speech where possible so JSON stays valid",\n'
     '  "decisions": ["..."],\n'
     '  "action_items": [{"task": "...", "assignee": "...", "due_date": "", "type": "task"}],\n'
-    '  "topics": ["#topic"],\n'
-    '  "sentiment": "...",\n'
     '  "open_questions": ["..."],\n'
     '  "risks_or_concerns": ["..."]\n'
     "}\n\n"
@@ -700,7 +683,7 @@ async def summarize_meeting(meeting_id: str, current_user: Optional[dict] = Depe
   except json.JSONDecodeError:
     raise HTTPException(status_code=500, detail="Failed to parse JSON from Claude response.")
 
-  # Normalize LLM output (decisions/topics may be objects instead of strings)
+  # Normalize LLM output (decisions/action_items may need coercion)
   data = _normalize_summary_data(data)
 
   report_body = _compose_stored_report_body(data)
@@ -728,7 +711,7 @@ async def summarize_meeting(meeting_id: str, current_user: Optional[dict] = Depe
       ),
     )
     rt = (data.get("report_title") or "").strip()
-    auto_title = (rt[:80] if rt else "") or _derive_title(report_body, data.get("topics", []))
+    auto_title = (rt[:80] if rt else "") or _derive_title(report_body)
     if auto_title and (meeting.get("title", "").startswith("Meeting ") or not meeting.get("title")):
       cur.execute("UPDATE meetings SET status = 'completed', end_time = ?, title = ? WHERE id = ?", (datetime.now().isoformat(), auto_title, meeting_id))
     else:
@@ -812,12 +795,6 @@ async def email_summary(meeting_id: str, body: EmailRequest, current_user: dict 
   except (json.JSONDecodeError, TypeError):
     pass
 
-  topics = []
-  try:
-    topics = json.loads(chosen.get("topics") or "[]")
-  except (json.JSONDecodeError, TypeError):
-    pass
-
   action_items = []
   try:
     action_items = json.loads(chosen.get("action_items") or "[]")
@@ -839,8 +816,6 @@ async def email_summary(meeting_id: str, body: EmailRequest, current_user: dict 
         body_parts.append(f"  - {line}")
       else:
         body_parts.append(f"  - {a}")
-  if topics:
-    body_parts.append(f"\nTopics: {', '.join(topics)}")
 
   email_body = "\n".join(body_parts)
 
@@ -963,12 +938,6 @@ async def export_meeting(meeting_id: str, fmt: str, current_user: Optional[dict]
     except (json.JSONDecodeError, TypeError):
       pass
     try:
-      topics = json.loads(row.get("topics") or "[]")
-      if topics:
-        summary_text += "\nTopics: " + ", ".join(topics) + "\n"
-    except (json.JSONDecodeError, TypeError):
-      pass
-    try:
       actions = json.loads(row.get("action_items") or "[]")
       if actions:
         summary_text += "\nAction Items:\n"
@@ -982,8 +951,6 @@ async def export_meeting(meeting_id: str, fmt: str, current_user: Optional[dict]
             summary_text += f"  - {a}\n"
     except (json.JSONDecodeError, TypeError):
       pass
-    if row.get("sentiment"):
-      summary_text += f"\nSentiment: {row['sentiment']}\n"
 
   safe_title = title.replace(" ", "_")[:50]
 

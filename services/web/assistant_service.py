@@ -936,7 +936,7 @@ def log_pipeline_completion_audit(
       "pipeline": "meeting_agent",
       "summary_status": summary_snapshot.get("status"),
       "report_title": title,
-      "topics_count": len(summary_snapshot.get("topics") or []),
+      "decisions_count": len(summary_snapshot.get("decisions") or []),
       "action_items_count": len(summary_snapshot.get("action_items") or []),
     },
     default=str,

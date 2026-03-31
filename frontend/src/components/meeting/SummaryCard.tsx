@@ -1,4 +1,4 @@
-// Renders the AI-generated meeting summary with topics, decisions, and action items
+// Renders the AI-generated meeting summary with decisions and action items
 
 import { useState } from 'react'
 import toast from 'react-hot-toast'
@@ -103,25 +103,10 @@ export default function SummaryCard({ summary, meetingId }: SummaryCardProps) {
       {/* Main Summary */}
       <div className="bg-white rounded-lg border border-gray-200 p-6">
         <h3 className="text-lg font-semibold text-gray-900 mb-4">Summary</h3>
-        <p className="text-gray-700 leading-relaxed">{summary.summary}</p>
-      </div>
-
-      {/* Key Topics */}
-      {summary.topics?.length > 0 && (
-        <div className="bg-white rounded-lg border border-gray-200 p-6">
-          <h3 className="text-lg font-semibold text-gray-900 mb-4">Key Topics</h3>
-          <div className="flex flex-wrap gap-2">
-            {summary.topics.map((topic) => (
-              <span
-                key={topic}
-                className="inline-flex items-center px-3 py-1 rounded-full text-sm bg-primary-50 text-primary-700"
-              >
-                {topic}
-              </span>
-            ))}
-          </div>
+        <div className="text-gray-700 leading-relaxed whitespace-pre-wrap break-words">
+          {summary.summary}
         </div>
-      )}
+      </div>
 
       {/* Decisions Made */}
       {summary.decisions?.length > 0 && (
@@ -204,14 +189,6 @@ export default function SummaryCard({ summary, meetingId }: SummaryCardProps) {
               </li>
             ))}
           </ul>
-        </div>
-      )}
-
-      {/* Sentiment */}
-      {summary.sentiment && (
-        <div className="bg-white rounded-lg border border-gray-200 p-6">
-          <h3 className="text-lg font-semibold text-gray-900 mb-4">Meeting Sentiment</h3>
-          <p className="text-gray-700">{summary.sentiment}</p>
         </div>
       )}
     </div>
