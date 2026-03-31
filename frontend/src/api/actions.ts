@@ -26,8 +26,15 @@ export const actionsApi = {
     await client.post(`/api/actions/${actionId}/dismiss`)
   },
 
-  execute: async (actionId: string): Promise<ExecuteResult> => {
-    const response = await client.post(`/api/actions/${actionId}/execute`)
+  execute: async (
+    actionId: string,
+    payloadOverride?: Record<string, unknown> | null,
+  ): Promise<ExecuteResult> => {
+    const hasOverride = payloadOverride && Object.keys(payloadOverride).length > 0
+    const response = await client.post(
+      `/api/actions/${actionId}/execute`,
+      hasOverride ? { payload: payloadOverride } : {},
+    )
     return response.data
   },
 

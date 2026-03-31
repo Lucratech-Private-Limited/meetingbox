@@ -344,7 +344,7 @@ export default function MeetingDetailPage() {
                 {actions.length} AI action{actions.length > 1 ? 's' : ''} ready to execute
               </h3>
               <p className="mt-1 text-sm text-yellow-700">
-                These are connector-aware actions the AI can carry out from this meeting.
+                Gmail and Google Calendar follow-ups only. Review details before each send or event creation.
               </p>
             </div>
           </div>
@@ -398,9 +398,10 @@ export default function MeetingDetailPage() {
           <div className="space-y-4">
             <div className="flex items-center justify-between rounded-2xl border border-gray-200 bg-white px-5 py-4">
               <div>
-                <h3 className="text-sm font-semibold text-gray-900">Agentic actions</h3>
+                <h3 className="text-sm font-semibold text-gray-900">Calendar &amp; email</h3>
                 <p className="text-sm text-gray-600">
-                  AI suggests only actions it can execute with active connectors or save in MeetingBox.
+                  Suggested follow-ups for your connected Gmail and Google Calendar. Connect both under Settings →
+                  Integrations to refresh suggestions.
                 </p>
               </div>
               <button
@@ -416,9 +417,9 @@ export default function MeetingDetailPage() {
                 <svg className="mx-auto h-12 w-12 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
                 </svg>
-                <h3 className="mt-2 text-sm font-medium text-gray-900">No AI actions yet</h3>
+                <h3 className="mt-2 text-sm font-medium text-gray-900">No calendar or email actions yet</h3>
                 <p className="mt-1 text-sm text-gray-500">
-                  Generate suggestions after the summary is ready to see connector-aware actions here.
+                  Connect Gmail and/or Calendar, then refresh suggestions after the summary is ready.
                 </p>
               </div>
             ) : (

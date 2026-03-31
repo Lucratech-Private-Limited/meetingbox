@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 import uuid
 from datetime import datetime
 from typing import Any
@@ -179,23 +180,30 @@ def get_meeting_context(meeting_id: str) -> dict[str, Any]:
     }
 
 
-def _build_generation_prompt(context: dict[str, Any], capabilities: list[dict[str, Any]]) -> str:
+def _build_generation_prompt_gmail_calendar(context: dict[str, Any], capabilities: list[dict[str, Any]]) -> str:
     capability_text = json.dumps(capabilities, indent=2)
+    tz_hint = os.getenv("CALENDAR_DEFAULT_TIMEZONE", "UTC")
     return (
-        "You are generating high-value, agentic meeting actions.\n"
-        "Do not restate generic human follow-ups. Propose only actions that an AI system can execute now.\n"
-        "Only use connectors present in the capability catalog. If no external connector fits, prefer internal artifacts.\n"
-        "You may only use these action kinds: cost_analysis, decision_brief, risk_register, task_digest, followup_email, schedule_followup.\n"
-        "Return 0 to 5 actions as a JSON array. Each item must match this shape:\n"
+        "You are generating meeting follow-up actions that the user can run from MeetingBox.\n"
+        "Only Gmail (follow-up email) and Google Calendar (schedule follow-up) are allowed.\n"
+        "Propose at most 3 actions total. Do not propose duplicates or near-duplicates (same intent).\n"
+        "Each action must be clearly grounded in the meeting content.\n\n"
+        "You may only use these action kinds: followup_email, schedule_followup.\n"
+        "- followup_email → connector_target gmail, execution_mode message_send\n"
+        "- schedule_followup → connector_target calendar, execution_mode event_create\n\n"
+        "For schedule_followup, put a tentative draft in payload: "
+        'suggested_date (YYYY-MM-DD), suggested_time (HH:MM 24h), duration_minutes (int), '
+        f"timezone (IANA, default \"{tz_hint}\"), attendees ([] emails), description (optional).\n\n"
+        "Return 0 to 3 actions as a JSON array. Each item must match this shape:\n"
         "[{\n"
-        '  "kind": "cost_analysis",\n'
-        '  "title": "Create cost analysis for vendor options",\n'
-        '  "description": "One-sentence explanation of what will be produced or sent.",\n'
-        '  "why_this_matters": "Why this action is valuable now.",\n'
-        '  "connector_target": "internal | gmail | calendar",\n'
-        '  "execution_mode": "artifact_create | message_send | event_create",\n'
+        '  "kind": "followup_email",\n'
+        '  "title": "Short label",\n'
+        '  "description": "One-sentence explanation.",\n'
+        '  "why_this_matters": "Why now.",\n'
+        '  "connector_target": "gmail",\n'
+        '  "execution_mode": "message_send",\n'
         '  "payload": {},\n'
-        '  "source_signals": ["signal one", "signal two"],\n'
+        '  "source_signals": ["..."],\n'
         '  "confidence": 0.0\n'
         "}]\n\n"
         f"Capability catalog:\n{capability_text}\n\n"
@@ -248,8 +256,10 @@ def _build_email_prompt(action: dict[str, Any], context: dict[str, Any]) -> str:
 
 
 def _build_calendar_prompt(action: dict[str, Any], context: dict[str, Any]) -> str:
+    tz = os.getenv("CALENDAR_DEFAULT_TIMEZONE", "UTC")
     return (
-        "Create a practical follow-up meeting invitation from this meeting.\n"
+        "Create a practical follow-up calendar event from this meeting.\n"
+        f"Use IANA timezone \"{tz}\" for suggested_date + suggested_time unless the transcript specifies a different zone or city.\n"
         "Return only valid JSON with this shape:\n"
         '{\n'
         '  "title": "...",\n'
@@ -257,7 +267,8 @@ def _build_calendar_prompt(action: dict[str, Any], context: dict[str, Any]) -> s
         '  "attendees": ["person@example.com"],\n'
         '  "duration_minutes": 30,\n'
         '  "suggested_date": "YYYY-MM-DD",\n'
-        '  "suggested_time": "HH:MM"\n'
+        '  "suggested_time": "HH:MM",\n'
+        f'  "timezone": "{tz}"\n'
         "}\n\n"
         f"Action:\n{json.dumps(action, indent=2)}\n\n"
         f"Meeting context:\n{json.dumps(context, indent=2)}"
@@ -286,14 +297,45 @@ def _call_claude_json(prompt: str) -> Any:
         raise HTTPException(status_code=500, detail=f"Failed to parse Claude response: {exc}")
 
 
+def _normalize_title_key(title: str) -> str:
+    return " ".join((title or "").lower().split())[:160]
+
+
 def _dedupe_key(item: dict[str, Any]) -> str:
     return "|".join(
         [
             str(item.get("kind", "")).strip().lower(),
             str(item.get("connector_target", "")).strip().lower(),
-            str(item.get("title", "")).strip().lower(),
+            _normalize_title_key(str(item.get("title", "")).strip()),
         ]
     )
+
+
+def _capabilities_gmail_calendar_only(capabilities: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [c for c in capabilities if c.get("connector_target") in ("gmail", "calendar")]
+
+
+def _find_pending_action_duplicate(
+    cur: Any,
+    meeting_id: str,
+    kind: str,
+    connector_target: str,
+    title_key: str,
+) -> dict[str, Any] | None:
+    cur.execute(
+        """
+        SELECT * FROM actions
+        WHERE meeting_id = ?
+          AND lower(trim(kind)) = lower(trim(?))
+          AND lower(trim(connector_target)) = lower(trim(?))
+          AND status = 'pending'
+        """,
+        (meeting_id, kind, connector_target),
+    )
+    for row in cur.fetchall():
+        if _normalize_title_key((row.get("title") or "").strip()) == title_key:
+            return row
+    return None
 
 
 def generate_actions_for_meeting(meeting_id: str, user_id: str | None) -> list[dict[str, Any]]:
@@ -301,8 +343,13 @@ def generate_actions_for_meeting(meeting_id: str, user_id: str | None) -> list[d
     if not context["summary"] and not context["transcript"]:
         raise HTTPException(status_code=400, detail="No meeting summary or transcript available to generate actions.")
 
-    capabilities = get_action_capabilities(user_id)
-    generated = _call_claude_json(_build_generation_prompt(context, capabilities))
+    capabilities = _capabilities_gmail_calendar_only(get_action_capabilities(user_id))
+    if not capabilities:
+        raise HTTPException(
+            status_code=400,
+            detail="Connect Gmail and/or Google Calendar under Settings → Integrations to generate actions.",
+        )
+    generated = _call_claude_json(_build_generation_prompt_gmail_calendar(context, capabilities))
     if not isinstance(generated, list):
         raise HTTPException(status_code=500, detail="Claude returned invalid action data.")
 
@@ -348,19 +395,10 @@ def generate_actions_for_meeting(meeting_id: str, user_id: str | None) -> list[d
         cur = conn.cursor()
         stored: list[dict[str, Any]] = []
         for action in normalized:
-            cur.execute(
-                """
-                SELECT *
-                FROM actions
-                WHERE meeting_id = ?
-                  AND lower(trim(kind)) = lower(trim(?))
-                  AND lower(trim(title)) = lower(trim(?))
-                  AND lower(trim(connector_target)) = lower(trim(?))
-                LIMIT 1
-                """,
-                (meeting_id, action["kind"], action["title"], action["connector_target"]),
+            title_key = _normalize_title_key(action["title"])
+            existing = _find_pending_action_duplicate(
+                cur, meeting_id, action["kind"], action["connector_target"], title_key
             )
-            existing = cur.fetchone()
             if existing:
                 cur.execute(
                     """
@@ -419,7 +457,13 @@ def list_actions_for_meeting(meeting_id: str) -> list[dict[str, Any]]:
     try:
         cur = conn.cursor()
         cur.execute("SELECT * FROM actions WHERE meeting_id = ? ORDER BY created_at DESC", (meeting_id,))
-        return [_normalize_action_record(row) for row in cur.fetchall()]
+        rows = cur.fetchall()
+        out = []
+        for row in rows:
+            rec = _normalize_action_record(row)
+            if rec.get("connector_target") in ("gmail", "calendar"):
+                out.append(rec)
+        return out
     finally:
         conn.close()
 
@@ -469,7 +513,47 @@ def dismiss_action_record(action_id: str) -> dict[str, str]:
     return {"id": action_id, "status": "dismissed"}
 
 
-def execute_action_record(action_id: str, user_id: str | None) -> dict[str, Any]:
+def _coerce_email_list(val: Any) -> list[str]:
+    if val is None:
+        return []
+    if isinstance(val, list):
+        return [str(x).strip() for x in val if str(x).strip()]
+    s = str(val).strip()
+    if not s:
+        return []
+    return [p.strip() for p in re.split(r"[\s,;]+", s) if p.strip()]
+
+
+def _gmail_fields_ready(p: dict[str, Any]) -> bool:
+    sub = (str(p.get("subject") or "")).strip()
+    body = (str(p.get("body") or "")).strip()
+    to = p.get("to")
+    if not sub or not body:
+        return False
+    if isinstance(to, list):
+        return any(str(x).strip() for x in to)
+    return bool(str(to or "").strip())
+
+
+def _calendar_fields_ready(p: dict[str, Any]) -> bool:
+    return bool(str(p.get("suggested_date") or "").strip() and str(p.get("suggested_time") or "").strip())
+
+
+def _merge_pref_over_llm(llm: dict[str, Any], pref: dict[str, Any]) -> dict[str, Any]:
+    """User-provided fields in pref win over LLM output."""
+    out = dict(llm)
+    for k, v in pref.items():
+        if v is None:
+            continue
+        if isinstance(v, str) and not v.strip():
+            continue
+        if isinstance(v, list) and len(v) == 0:
+            continue
+        out[k] = v
+    return out
+
+
+def execute_action_record(action_id: str, user_id: str | None, payload_override: dict[str, Any] | None = None) -> dict[str, Any]:
     conn = get_connection()
     conn.row_factory = _row_factory
     try:
@@ -492,36 +576,49 @@ def execute_action_record(action_id: str, user_id: str | None) -> dict[str, Any]
         }
 
     context = get_meeting_context(normalized["meeting_id"])
-    kind = normalized["kind"]
     connector_target = normalized["connector_target"]
     result_payload: dict[str, Any]
     artifact: dict[str, Any] | None = None
     delivery_status = "saved"
 
+    merged_in = dict(normalized["payload"] or {})
+    if payload_override:
+        merged_in = {**merged_in, **payload_override}
+    action_for_llm = {**normalized, "payload": merged_in}
+
     if connector_target == "internal":
-        result_payload = _call_claude_json(_build_internal_artifact_prompt(normalized, context))
-        artifact = result_payload if isinstance(result_payload, dict) else {"content": result_payload}
-        delivery_status = "saved_internal_artifact"
+        raise HTTPException(
+            status_code=400,
+            detail="Internal artifacts are not available in the Actions tab. Dismiss legacy actions or use an older client.",
+        )
     elif connector_target == "gmail":
         if not user_id:
             raise HTTPException(status_code=400, detail="Logged-in user required to execute Gmail actions.")
         creds = get_credentials_for_provider(user_id, "gmail")
         if not creds:
             raise HTTPException(status_code=400, detail="Gmail is not connected.")
-        result_payload = _call_claude_json(_build_email_prompt(normalized, context))
-        recipients = result_payload.get("to", [])
-        if isinstance(recipients, list):
-            to = ", ".join([str(item).strip() for item in recipients if str(item).strip()])
+        if _gmail_fields_ready(merged_in):
+            result_payload = dict(merged_in)
         else:
-            to = str(recipients or "").strip()
+            llm = _call_claude_json(_build_email_prompt(action_for_llm, context))
+            result_payload = _merge_pref_over_llm(llm, merged_in)
+        to_list = _coerce_email_list(result_payload.get("to"))
+        if not to_list:
+            raise HTTPException(status_code=400, detail="At least one recipient email is required.")
+        to = ", ".join(to_list)
+        cc_val = result_payload.get("cc")
+        if isinstance(cc_val, list):
+            cc_str = ", ".join(_coerce_email_list(cc_val))
+        else:
+            cc_str = (str(cc_val).strip() if cc_val else "") or None
         gmail_result = send_email(
             credentials=creds,
             to=to,
-            subject=result_payload.get("subject", normalized["title"]),
-            body=result_payload.get("body", ""),
-            cc=", ".join(result_payload.get("cc", [])) if isinstance(result_payload.get("cc"), list) else result_payload.get("cc"),
+            subject=str(result_payload.get("subject") or normalized["title"] or "Follow-up"),
+            body=str(result_payload.get("body") or ""),
+            cc=cc_str,
         )
-        result_payload["to"] = recipients if isinstance(recipients, list) else [to]
+        result_payload["to"] = to_list
         result_payload["gmail_message_id"] = gmail_result.get("id")
         delivery_status = "sent_via_gmail"
     elif connector_target == "calendar":
@@ -530,18 +627,36 @@ def execute_action_record(action_id: str, user_id: str | None) -> dict[str, Any]
         creds = get_credentials_for_provider(user_id, "calendar")
         if not creds:
             raise HTTPException(status_code=400, detail="Google Calendar is not connected.")
-        result_payload = _call_claude_json(_build_calendar_prompt(normalized, context))
-        start_date = result_payload.get("suggested_date", "")
-        start_time = result_payload.get("suggested_time", "10:00")
-        start_iso = f"{start_date}T{start_time}:00" if start_date else None
+        if _calendar_fields_ready(merged_in):
+            result_payload = dict(merged_in)
+        else:
+            llm = _call_claude_json(_build_calendar_prompt(action_for_llm, context))
+            result_payload = _merge_pref_over_llm(llm, merged_in)
+        start_date = str(result_payload.get("suggested_date") or "").strip()
+        start_time = str(result_payload.get("suggested_time") or "10:00").strip()
+        if start_time.count(":") == 2:
+            start_time = ":".join(start_time.split(":")[:2])
+        if not start_date:
+            raise HTTPException(
+                status_code=400,
+                detail="Calendar event needs a date. Add suggested_date in review or regenerate the action.",
+            )
+        tz_use = str(result_payload.get("timezone") or os.getenv("CALENDAR_DEFAULT_TIMEZONE") or "UTC").strip()
+        attendees = _coerce_email_list(result_payload.get("attendees"))
         calendar_result = create_event(
             credentials=creds,
-            title=result_payload.get("title", normalized["title"]),
-            start_time=start_iso,
-            duration_minutes=int(result_payload.get("duration_minutes", 30)),
-            description=result_payload.get("description", ""),
-            attendees=result_payload.get("attendees", []),
+            title=str(result_payload.get("title") or normalized["title"] or "Follow-up"),
+            start_date=start_date,
+            start_time_hhmm=start_time,
+            timezone=tz_use,
+            duration_minutes=int(result_payload.get("duration_minutes", 30) or 30),
+            description=str(result_payload.get("description") or ""),
+            attendees=attendees,
         )
+        result_payload["suggested_date"] = start_date
+        result_payload["suggested_time"] = start_time
+        result_payload["timezone"] = tz_use
+        result_payload["attendees"] = attendees
         result_payload["calendar_event_id"] = calendar_result.get("id")
         result_payload["calendar_link"] = calendar_result.get("htmlLink")
         delivery_status = "created_via_calendar"
