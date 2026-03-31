@@ -71,12 +71,6 @@ export const meetingsApi = {
     await client.post(`/api/meetings/${id}/summarize`)
   },
 
-  // Summarize locally (Ollama)
-  summarizeLocal: async (id: string): Promise<{ status: string; meeting_id?: string }> => {
-    const response = await client.post(`/api/meetings/${id}/summarize-local`)
-    return response.data
-  },
-
   // Get audio recording URL for a meeting
   getAudioUrl: (id: string): string => {
     return `/api/meetings/${id}/audio`

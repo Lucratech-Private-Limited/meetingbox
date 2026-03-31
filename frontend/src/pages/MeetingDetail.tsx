@@ -27,7 +27,6 @@ export default function MeetingDetailPage() {
   const [loading, setLoading] = useState(true)
   const [activeTab, setActiveTab] = useState<Tab>('summary')
   const [summarizing, setSummarizing] = useState(false)
-  const [summarizingLocal, setSummarizingLocal] = useState(false)
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false)
   const [isDeleting, setIsDeleting] = useState(false)
   const [isEditingTitle, setIsEditingTitle] = useState(false)
@@ -40,13 +39,11 @@ export default function MeetingDetailPage() {
       setLoading(true)
       const meetingData = await meetingsApi.get(id)
 
-      // Backend always returns { meeting, segments, summary, local_summary }
       const raw = meetingData as unknown as Record<string, unknown>
       const normalized: MeetingDetailType = {
         ...(raw.meeting as MeetingDetailType),
         segments: (raw.segments as MeetingDetailType['segments']) ?? [],
         summary: (raw.summary as MeetingDetailType['summary']) ?? null,
-        local_summary: (raw.local_summary as MeetingDetailType['local_summary']) ?? null,
       }
 
       setMeeting(normalized)
@@ -87,7 +84,7 @@ export default function MeetingDetailPage() {
 
   useEffect(() => {
     if (!meeting || !id) return
-    const hasSummarySource = !!meeting.summary || !!meeting.local_summary
+    const hasSummarySource = !!meeting.summary
     if (!hasSummarySource || actions.length > 0 || isGeneratingActions) return
     void handleGenerateActions()
   }, [actions.length, handleGenerateActions, id, isGeneratingActions, meeting])
@@ -123,20 +120,6 @@ export default function MeetingDetailPage() {
       toast.error(msg)
     } finally {
       setSummarizing(false)
-    }
-  }
-
-  const handleSummarizeLocal = async () => {
-    if (!id) return
-    setSummarizingLocal(true)
-    try {
-      await meetingsApi.summarizeLocal(id)
-      await loadMeetingData()
-      toast.success('Local summary requested. It will appear when processing finishes.')
-    } catch {
-      toast.error('Local summarization failed. Is Ollama running?')
-    } finally {
-      setSummarizingLocal(false)
     }
   }
 
@@ -213,7 +196,6 @@ export default function MeetingDetailPage() {
 
   const hasTranscript = meeting.segments && meeting.segments.length > 0
   const hasSummary = !!meeting.summary
-  const hasLocalSummary = !!meeting.local_summary
 
   return (
     <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
@@ -308,27 +290,16 @@ export default function MeetingDetailPage() {
         </div>
       </div>
 
-      {/* Summarize buttons — only when transcript exists and no summary yet */}
-      {hasTranscript && (!hasSummary || !hasLocalSummary) && (
+      {/* Summarize button — only when transcript exists and no API summary yet */}
+      {hasTranscript && !hasSummary && (
         <div className="mb-6 bg-white rounded-lg border border-gray-200 p-4 flex flex-wrap items-center gap-3">
-          {!hasSummary && (
-            <button
-              onClick={handleSummarize}
-              disabled={summarizing}
-              className="px-4 py-2 bg-indigo-600 text-white text-sm font-medium rounded-lg hover:bg-indigo-700 disabled:opacity-50"
-            >
-              {summarizing ? 'Summarizing...' : 'Summarize with API'}
-            </button>
-          )}
-          {!hasLocalSummary && (
-            <button
-              onClick={handleSummarizeLocal}
-              disabled={summarizingLocal}
-              className="px-4 py-2 bg-emerald-600 text-white text-sm font-medium rounded-lg hover:bg-emerald-700 disabled:opacity-50"
-            >
-              {summarizingLocal ? 'Requesting...' : 'Request Local Summary'}
-            </button>
-          )}
+          <button
+            onClick={handleSummarize}
+            disabled={summarizing}
+            className="px-4 py-2 bg-indigo-600 text-white text-sm font-medium rounded-lg hover:bg-indigo-700 disabled:opacity-50"
+          >
+            {summarizing ? 'Summarizing...' : 'Summarize with API'}
+          </button>
         </div>
       )}
 
@@ -378,16 +349,7 @@ export default function MeetingDetailPage() {
       {/* Tab content */}
       <div>
         {activeTab === 'summary' && (
-          <>
-            <SummaryCard summary={meeting.summary} meetingId={meeting.id} />
-            {/* Show local summary below if it exists */}
-            {meeting.local_summary && (
-              <div className="mt-6">
-                <h3 className="text-lg font-semibold text-gray-900 mb-4">Local Summary</h3>
-                <SummaryCard summary={meeting.local_summary} meetingId={meeting.id} />
-              </div>
-            )}
-          </>
+          <SummaryCard summary={meeting.summary} meetingId={meeting.id} />
         )}
 
         {activeTab === 'transcript' && (

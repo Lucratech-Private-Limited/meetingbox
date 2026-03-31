@@ -15,7 +15,6 @@ export interface Meeting {
 export interface MeetingDetail extends Meeting {
   segments: TranscriptSegment[]
   summary: MeetingSummary | null
-  local_summary?: LocalSummary | null
 }
 
 export interface TranscriptSegment {
@@ -33,10 +32,6 @@ export interface MeetingSummary {
   decisions: string[]
   topics: string[]
   sentiment: string
-}
-
-export interface LocalSummary extends MeetingSummary {
-  model_name: string
 }
 
 export interface ActionItem {
