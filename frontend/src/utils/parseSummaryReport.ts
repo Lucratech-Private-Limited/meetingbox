@@ -1,6 +1,7 @@
 /**
  * Split composed meeting report text (web/API) into UI sections.
- * Matches backend _compose_stored_report_body markers and DETAILED ACCOUNT headings.
+ * Matches backend _compose_stored_report_body (--- markers) and model output
+ * from the summarize prompt: **DETAILED ACCOUNT**, **OPEN QUESTIONS**, **RISKS / CONCERNS**.
  */
 
 export interface ParsedMeetingReport {
@@ -12,24 +13,43 @@ export interface ParsedMeetingReport {
   risksConcerns: string[]
 }
 
-const RISKS_SPLIT = /\r?\n\r?\n---\r?\nRISKS\s*\/\s*CONCERNS\r?\n/i
-const OPEN_SPLIT = /\r?\n\r?\n---\r?\nOPEN QUESTIONS\r?\n/i
-// Heading inserted by the model; allow one or two newlines before it
-const DETAILED_SPLIT = /\r?\n(?:\r?\n)?DETAILED ACCOUNT\s*\r?\n/i
+/** Backend compose: \n\n---\nRISKS / CONCERNS\n — or model: \n\n**RISKS / CONCERNS**\n */
+const RISKS_MARKER =
+  /\r?\n\r?\n(?:---\r?\n)?\*{0,2}RISKS\s*\/\s*CONCERNS\*{0,2}\s*\r?\n/i
+
+/** Backend: \n\n---\nOPEN QUESTIONS\n — or model: \n\n**OPEN QUESTIONS**\n */
+const OPEN_MARKER =
+  /\r?\n\r?\n(?:---\r?\n)?\*{0,2}OPEN QUESTIONS\*{0,2}\s*\r?\n/i
+
+/** Model may use **DETAILED ACCOUNT** at line start or after a blank line. */
+const DETAILED_SPLIT =
+  /(?:^|\r?\n(?:\r?\n)?)\*{0,2}DETAILED ACCOUNT\*{0,2}\s*\r?\n/i
+
+function splitOnLastMarker(text: string, marker: RegExp): [string, string] {
+  const r = new RegExp(marker.source, marker.flags.includes('g') ? marker.flags : `${marker.flags}g`)
+  let last: RegExpExecArray | null = null
+  let m: RegExpExecArray | null
+  r.lastIndex = 0
+  while ((m = r.exec(text)) !== null) {
+    last = m
+  }
+  if (!last) return [text, '']
+  return [text.slice(0, last.index), text.slice(last.index + last[0].length)]
+}
 
 function splitBulletBlock(block: string): string[] {
   const lines = block.trim().split(/\r?\n/)
   const out: string[] = []
   for (const line of lines) {
-    const t = line.replace(/^\s*[•\-*]\s*/, '').trim()
+    const t = line
+      .replace(/^\s*(?:[•\-*]|\d+[.)])\s+/, '')
+      .replace(/^\s*\[[ xX]\]\s*/, '')
+      .trim()
     if (t) out.push(t)
   }
   return out.length > 0 ? out : block.trim() ? [block.trim()] : []
 }
 
-/**
- * First segment: text before DETAILED ACCOUNT; second: after (rest of main body before --- sections).
- */
 function splitDetailedAccount(mainPart: string): { overview: string; detailed: string } {
   const m = mainPart.match(DETAILED_SPLIT)
   if (!m || m.index === undefined) {
@@ -43,23 +63,9 @@ function splitDetailedAccount(mainPart: string): { overview: string; detailed: s
 
 export function parseSummaryReport(fullText: string): ParsedMeetingReport {
   const t = fullText ?? ''
-  let beforeRisks = t
-  let risksBody = ''
 
-  const risksParts = t.split(RISKS_SPLIT)
-  if (risksParts.length > 1) {
-    beforeRisks = risksParts[0] ?? ''
-    risksBody = (risksParts[1] ?? '').trim()
-  }
-
-  let mainPart = beforeRisks.trim()
-  let openBody = ''
-
-  const openParts = beforeRisks.split(OPEN_SPLIT)
-  if (openParts.length > 1) {
-    mainPart = (openParts[0] ?? '').trim()
-    openBody = (openParts[1] ?? '').trim()
-  }
+  const [beforeRisks, risksBody] = splitOnLastMarker(t, RISKS_MARKER)
+  const [mainPart, openBody] = splitOnLastMarker(beforeRisks, OPEN_MARKER)
 
   const { overview, detailed } = splitDetailedAccount(mainPart)
 

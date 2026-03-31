@@ -609,9 +609,9 @@ async def summarize_meeting(meeting_id: str, current_user: Optional[dict] = Depe
     mins = int((r["start_time"] or 0) // 60)
     secs = int((r["start_time"] or 0) % 60)
     parts.append(f"[{mins:02d}:{secs:02d}] Segment {r['segment_num']}: {r['text']}")
-    transcript = "\n\n".join(parts)
+  transcript = "\n\n".join(parts)
 
-    prompt = (
+  prompt = (
           "You are producing a **FULL MEETING REPORT** from the transcript. Output must read like a substantive written record, "
           "**not** an executive summary, **not** a handful of bullets, and **not** one short page.\n\n"
 
@@ -684,7 +684,7 @@ async def summarize_meeting(meeting_id: str, current_user: Optional[dict] = Depe
           "}\n\n"
 
           f"Transcript:\n\n{transcript}"
-)
+  )
 
   model = os.getenv("AI_MODEL", "claude-sonnet-4-20250514")
   max_tokens = int(os.getenv("AI_REPORT_MAX_TOKENS", os.getenv("AI_MAX_TOKENS", "16384")))

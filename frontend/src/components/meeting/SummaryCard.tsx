@@ -124,7 +124,7 @@ export default function SummaryCard({ summary, meetingId }: SummaryCardProps) {
 
       {!useLegacySummaryOnly && Boolean(parsed.overview) && (
         <div className="bg-white rounded-lg border border-gray-200 p-6">
-          <h3 className="text-lg font-semibold text-gray-900 mb-4">Summary</h3>
+          <h3 className="text-lg font-semibold text-gray-900 mb-4">Overview</h3>
           <div className={proseClass}>{parsed.overview}</div>
         </div>
       )}
