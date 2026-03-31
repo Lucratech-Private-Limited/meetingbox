@@ -609,43 +609,82 @@ async def summarize_meeting(meeting_id: str, current_user: Optional[dict] = Depe
     mins = int((r["start_time"] or 0) // 60)
     secs = int((r["start_time"] or 0) % 60)
     parts.append(f"[{mins:02d}:{secs:02d}] Segment {r['segment_num']}: {r['text']}")
-  transcript = "\n\n".join(parts)
+    transcript = "\n\n".join(parts)
 
-  prompt = (
-    "You are producing a **FULL MEETING REPORT** from the transcript. Output must read like a substantive written record, "
-    "**not** an executive summary, **not** a handful of bullets, and **not** one short page.\n\n"
-    "LENGTH & DEPTH (critical):\n"
-    "- Scale `full_report` with transcript size: short meetings → still multiple solid paragraphs; long meetings → very long report with many sections.\n"
-    "- Target **at least** several hundred words whenever the transcript has more than ~300 words. For long transcripts, aim for **thousands of words** "
-    "until you hit your output limit—prioritize completeness of the narrative over brevity.\n"
-    "- Use **dense prose paragraphs** for the main story. Bullets are only for lists (action-like lists, explicit enumerations from the call). "
-    "Do **not** replace the narrative with bullet-only outlines.\n"
-    "- **Formatting (critical for display):** Before each major section heading (e.g. **DETAILED ACCOUNT**, **OPEN QUESTIONS**, **RISKS / CONCERNS**), "
-    "insert **two newline characters** (`\\n\\n`). Use a **single newline** between paragraphs within a section so the report is not one wall of text.\n"
-    "- Include a **DETAILED ACCOUNT** subsection (heading on its own line) that walks through what happened in **order** (or by topic with clear transitions), "
-    "quoting or paraphrasing concrete details: numbers, dates, product names, objections, examples, who advocated for what.\n\n"
-    "Rules:\n"
-    "- Ground every claim in the transcript. Do not invent facts, people, or commitments.\n"
-    "- When lines include [MM:SS] timestamps, cite them when anchoring events.\n"
-    "- Write for someone who missed the meeting; include *who said what* when the transcript supports it.\n"
-    "- If audio/transcript is thin, say so in the report—do not pad with fiction.\n\n"
-    "Also extract structured fields for downstream use:\n"
-    "- `decisions`: concrete decisions or conclusions reached (strings). Empty list if none.\n"
-    "- `action_items`: only items explicitly assigned or committed in the meeting. Each object MUST include "
-    '"type": one of "email_draft" | "calendar_invite" | "task".\n'
-    "- `open_questions`: unresolved questions or ambiguities visible in the transcript.\n"
-    "- `risks_or_concerns`: risks, blockers, or worries stated in the meeting.\n\n"
-    "Return **only** valid JSON with this shape (no markdown fences outside the JSON):\n"
-    "{\n"
-    '  "report_title": "Short title for the meeting (max ~80 chars)",\n'
-    '  "full_report": "(long string) multi-section narrative with a DETAILED ACCOUNT; use single quotes for quoted speech where possible so JSON stays valid",\n'
-    '  "decisions": ["..."],\n'
-    '  "action_items": [{"task": "...", "assignee": "...", "due_date": "", "type": "task"}],\n'
-    '  "open_questions": ["..."],\n'
-    '  "risks_or_concerns": ["..."]\n'
-    "}\n\n"
-    f"Transcript:\n\n{transcript}"
-  )
+    prompt = (
+          "You are producing a **FULL MEETING REPORT** from the transcript. Output must read like a substantive written record, "
+          "**not** an executive summary, **not** a handful of bullets, and **not** one short page.\n\n"
+
+          "CORE PRINCIPLE:\n"
+          "- The report must scale with informational density, not just transcript length.\n"
+          "- Do not expand beyond what the transcript can realistically support.\n\n"
+
+          "LENGTH & DEPTH (adaptive):\n"
+          "- If the transcript is short (<150–200 words) OR contains a single speaker with limited content:\n"
+          "  - Keep the report concise but complete.\n"
+          "  - Do NOT artificially increase length.\n"
+          "  - Avoid repeating the same idea in multiple ways.\n"
+          "  - Prefer clarity and accuracy over volume.\n"
+          "- If the transcript is medium or long:\n"
+          "  - Expand proportionally with depth and detail.\n"
+          "  - Include multiple sections and detailed explanations where supported.\n\n"
+
+          "WRITING STYLE:\n"
+          "- Use dense prose paragraphs for the main narrative.\n"
+          "- Bullets are allowed ONLY for:\n"
+          "  - action-like lists\n"
+          "  - clearly enumerated items from the transcript\n"
+          "- Do NOT replace narrative with bullet-heavy output.\n\n"
+
+          "ANTI-PADDING RULES (strict):\n"
+          "- Every paragraph must introduce new information.\n"
+          "- Do NOT restate the same point using different wording.\n"
+          "- Do NOT use generic filler phrases like:\n"
+          "  - 'methodical approach'\n"
+          "  - 'comprehensive evaluation'\n"
+          "  - 'significant findings'\n"
+          "  unless explicitly supported by the transcript.\n\n"
+
+          "FORMATTING (critical for display):\n"
+          "- Before each major section heading (e.g. **DETAILED ACCOUNT**, **OPEN QUESTIONS**, **RISKS / CONCERNS**), "
+          "insert two newline characters (\\n\\n).\n"
+          "- Use a single newline between paragraphs within a section.\n\n"
+
+          "DETAILED ACCOUNT (mandatory section):\n"
+          "- Include a section titled **DETAILED ACCOUNT**.\n"
+          "- Present what happened:\n"
+          "  - in chronological order OR\n"
+          "  - grouped by topic with clear transitions\n"
+          "- Ground everything in the transcript:\n"
+          "  - include numbers, dates, system stats, tools, and decisions\n"
+          "- If timestamps like [MM:SS] exist, reference them when relevant.\n"
+          "- Attribute statements when possible (e.g., 'the speaker noted...').\n\n"
+
+          "REALISM CONSTRAINT:\n"
+          "- If the transcript is thin, explicitly acknowledge that.\n"
+          "- Do NOT invent:\n"
+          "  - additional participants\n"
+          "  - hidden reasoning\n"
+          "  - implied processes not stated in the transcript\n\n"
+
+          "- `decisions`: concrete decisions or conclusions reached (strings). Empty list if none.\n"
+          "- `action_items`: only items explicitly assigned or committed in the meeting. Each object MUST include "
+          "\"type\": one of \"email_draft\" | \"calendar_invite\" | \"task\".\n"
+          "- `open_questions`: unresolved questions or ambiguities visible in the transcript.\n"
+          "- `risks_or_concerns`: risks, blockers, or worries stated in the meeting.\n\n"
+
+          "Return only valid JSON with this shape (no markdown fences outside the JSON):\n"
+          "{\n"
+          "  \"report_title\": \"Short title for the meeting (max ~80 chars)\",\n"
+          "  \"full_report\": \"(long string) multi-section narrative with a DETAILED ACCOUNT; use single quotes for quoted speech where possible so JSON stays valid\",\n"
+          "  \"decisions\": [\"...\"],\n"
+          "  \"action_items\": [{\"task\": \"...\", \"assignee\": \"...\", \"due_date\": \"\", \"type\": \"task\"}],\n"
+          "  \"open_questions\": [\"...\"],\n"
+          "  \"risks_or_concerns\": [\"...\"]\n"
+          "}\n\n"
+
+          f"Transcript:\n\n{transcript}"
+)
 
   model = os.getenv("AI_MODEL", "claude-sonnet-4-20250514")
   max_tokens = int(os.getenv("AI_REPORT_MAX_TOKENS", os.getenv("AI_MAX_TOKENS", "16384")))
