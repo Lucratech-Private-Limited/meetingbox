@@ -260,6 +260,19 @@ class BackendClient:
             logger.error(f"Failed to get actions for meeting {meeting_id}: {e}")
             raise
 
+    async def generate_actions(self, meeting_id: str) -> List[Dict]:
+        """POST /api/meetings/{meeting_id}/actions/generate"""
+        try:
+            resp = await self.client.post(
+                f"{self.base_url}/api/meetings/{meeting_id}/actions/generate",
+                timeout=120.0,
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.error(f"Failed to generate actions for meeting {meeting_id}: {e}")
+            raise
+
     async def execute_action(
             self,
             action_id: str,

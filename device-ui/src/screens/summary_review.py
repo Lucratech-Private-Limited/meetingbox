@@ -37,6 +37,7 @@ class SummaryReviewScreen(BaseScreen):
         self._summary_data = {}
         self._actions_data = []
         self._selected_actions = set()
+        self._auto_generate_attempted = False
         self._current_tab = 'summary'
         self._build_ui()
 
@@ -118,6 +119,7 @@ class SummaryReviewScreen(BaseScreen):
         self._summary_data = summary_data or {}
         self._actions_data = []
         self._selected_actions = set()
+        self._auto_generate_attempted = False
         self._load_actions()
 
     def _load_actions(self):
@@ -127,6 +129,23 @@ class SummaryReviewScreen(BaseScreen):
         async def _fetch():
             try:
                 actions = await self.backend.get_actions(self.meeting_id)
+
+                has_summary_content = bool(
+                    (self._summary_data or {}).get('summary')
+                    or (self._summary_data or {}).get('action_items')
+                    or (self._summary_data or {}).get('decisions')
+                )
+                if (
+                    not actions
+                    and has_summary_content
+                    and not self._auto_generate_attempted
+                ):
+                    self._auto_generate_attempted = True
+                    try:
+                        actions = await self.backend.generate_actions(self.meeting_id)
+                    except Exception as gen_err:
+                        logger.error(f"Failed to auto-generate actions: {gen_err}")
+
                 def _update(_dt):
                     self._actions_data = actions
                     if self._current_tab == 'actions':
@@ -248,7 +267,7 @@ class SummaryReviewScreen(BaseScreen):
 
         if agentic:
             hdr = Label(
-                text='AI actions — tap Calendar or Draft mail per row (or select + Execute Selected)',
+                text='AI actions — tap Execute on any row, or select multiple and use Execute Selected',
                 font_size=FONT_SIZES['small'],
                 bold=True,
                 color=COLORS['blue'],
@@ -300,9 +319,8 @@ class SummaryReviewScreen(BaseScreen):
 
                 ct = str(action.get('connector_target', '')).lower()
                 if ct in ('calendar', 'gmail') and action.get('id'):
-                    run_lbl = 'Calendar' if ct == 'calendar' else 'Draft mail'
                     run_btn = SecondaryButton(
-                        text=run_lbl,
+                        text='Execute',
                         font_size=FONT_SIZES['small'],
                         size_hint=(None, None),
                         width=96,
@@ -336,8 +354,8 @@ class SummaryReviewScreen(BaseScreen):
             note = Label(
                 text=(
                     'These come from the meeting summary. On the web dashboard, '
-                    'tap Schedule next to an item (signed in) or open the Actions tab '
-                    'to generate AI suggestions. Execute Selected applies only to AI-generated actions.'
+                    'AI Gmail and Calendar actions are generated automatically when available. '
+                    'If they still do not appear, connect integrations and reopen this screen.'
                 ),
                 font_size=FONT_SIZES['small'],
                 color=COLORS['gray_500'],
