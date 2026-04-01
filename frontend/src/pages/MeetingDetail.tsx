@@ -1,6 +1,6 @@
 // Meeting detail page — summary, transcript, actions tabs, export, summarize buttons
 
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { useParams, useNavigate, Link } from 'react-router-dom'
 import { format } from 'date-fns'
 import { meetingsApi } from '../api/meetings'
@@ -32,6 +32,15 @@ export default function MeetingDetailPage() {
   const [isEditingTitle, setIsEditingTitle] = useState(false)
   const [editTitle, setEditTitle] = useState('')
   const [isGeneratingActions, setIsGeneratingActions] = useState(false)
+  /**
+   * Last meeting "content fingerprint" we auto-generated for (id + whether summary/transcript exist).
+   * When a summary is added after load (e.g. Summarize), fingerprint changes and we try again.
+   */
+  const autoGenerateFingerprintRef = useRef<string | null>(null)
+
+  useEffect(() => {
+    autoGenerateFingerprintRef.current = null
+  }, [id])
 
   const loadMeetingData = useCallback(async () => {
     if (!id) return
@@ -49,12 +58,34 @@ export default function MeetingDetailPage() {
 
       setMeeting(normalized)
 
+      let actionsResult: AgenticAction[] = []
+      let listOk = false
       try {
-        const actionsData = await actionsApi.list(id)
-        setActions(actionsData)
+        actionsResult = await actionsApi.list(id)
+        listOk = true
       } catch {
         toast.error('Could not load meeting actions.')
       }
+
+      if (listOk) {
+        const segmentsLen = normalized.segments?.length ?? 0
+        const hasSourceForActions = !!(normalized.summary || segmentsLen > 0)
+        const fingerprint = `${id}:sum=${Boolean(normalized.summary)}:seg=${segmentsLen}`
+        if (
+          hasSourceForActions &&
+          actionsResult.length === 0 &&
+          autoGenerateFingerprintRef.current !== fingerprint
+        ) {
+          autoGenerateFingerprintRef.current = fingerprint
+          try {
+            actionsResult = await actionsApi.generate(id)
+          } catch {
+            /* integrations or LLM may be unavailable — user can use Refresh Suggestions */
+          }
+        }
+      }
+
+      setActions(actionsResult)
     } catch {
       // Error state handled by loading/empty UI
     } finally {
@@ -357,8 +388,9 @@ export default function MeetingDetailPage() {
               <div>
                 <h3 className="text-sm font-semibold text-gray-900">Calendar &amp; email</h3>
                 <p className="text-sm text-gray-600">
-                  Suggested follow-ups for your connected Gmail and Google Calendar. Use Refresh when you want new
-                  suggestions; connect accounts under Settings → Integrations.
+                  Suggested follow-ups load automatically when this meeting has a summary or transcript and your
+                  accounts are connected. Use Refresh when you want new suggestions; connect accounts under Settings →
+                  Integrations.
                 </p>
               </div>
               <button
@@ -376,8 +408,8 @@ export default function MeetingDetailPage() {
                 </svg>
                 <h3 className="mt-2 text-sm font-medium text-gray-900">No calendar or email actions yet</h3>
                 <p className="mt-1 text-sm text-gray-500">
-                  Connect Gmail and/or Calendar if needed, then click <span className="font-medium">Refresh Suggestions</span>{' '}
-                  above (suggestions are not created automatically when you open this page).
+                  Connect Gmail and/or Calendar under Settings, ensure this meeting has a summary or transcript, then open
+                  this tab again or click <span className="font-medium">Refresh Suggestions</span>.
                 </p>
               </div>
             ) : (

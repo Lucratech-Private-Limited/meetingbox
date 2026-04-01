@@ -248,7 +248,7 @@ class SummaryReviewScreen(BaseScreen):
 
         if agentic:
             hdr = Label(
-                text='AI actions — Execute: Calendar = event, Gmail = draft only',
+                text='AI actions — tap Calendar or Draft mail per row (or select + Execute Selected)',
                 font_size=FONT_SIZES['small'],
                 bold=True,
                 color=COLORS['blue'],
@@ -264,8 +264,8 @@ class SummaryReviewScreen(BaseScreen):
                 row = BoxLayout(
                     orientation='horizontal',
                     size_hint_y=None,
-                    height=36,
-                    spacing=8,
+                    height=44,
+                    spacing=6,
                 )
 
                 cb = CheckBox(
@@ -297,6 +297,22 @@ class SummaryReviewScreen(BaseScreen):
                 )
                 al.bind(width=lambda w, val: setattr(w, 'text_size', (val, None)))
                 row.add_widget(al)
+
+                ct = str(action.get('connector_target', '')).lower()
+                if ct in ('calendar', 'gmail') and action.get('id'):
+                    run_lbl = 'Calendar' if ct == 'calendar' else 'Draft mail'
+                    run_btn = SecondaryButton(
+                        text=run_lbl,
+                        font_size=FONT_SIZES['small'],
+                        size_hint=(None, None),
+                        width=96,
+                        height=34,
+                    )
+                    is_pending = status == 'pending'
+                    run_btn.disabled = not is_pending
+                    run_btn.opacity = 1.0 if is_pending else 0.45
+                    run_btn.bind(on_press=partial(self._on_single_action_execute, action))
+                    row.add_widget(run_btn)
 
                 content.add_widget(row)
 
@@ -378,6 +394,56 @@ class SummaryReviewScreen(BaseScreen):
             self._selected_actions.add(action_id)
         else:
             self._selected_actions.discard(action_id)
+
+    def _on_single_action_execute(self, action, _inst):
+        """Run one agentic action: calendar → create event; gmail → save draft only."""
+        action_id = action.get('id')
+        if not action_id:
+            return
+        ct = str(action.get('connector_target', '')).lower()
+        if ct not in ('gmail', 'calendar'):
+            return
+        if (action.get('status') or 'pending') != 'pending':
+            return
+        create_draft = ct == 'gmail'
+
+        async def _run():
+            try:
+                await self.backend.execute_action(action_id, create_draft=create_draft)
+                msg = (
+                    'Calendar event was created. Check Google Calendar.'
+                    if not create_draft
+                    else 'Email draft was saved. Open Gmail → Drafts.'
+                )
+
+                def _after_ok(_dt):
+                    self._load_actions()
+                    dlg = ModalDialog(
+                        title='Done',
+                        message=msg,
+                        confirm_text='OK',
+                        cancel_text='',
+                        on_confirm=lambda: None,
+                    )
+                    self.add_widget(dlg)
+
+                Clock.schedule_once(_after_ok, 0)
+            except Exception as e:
+                logger.error(f"Single action execute failed {action_id}: {e}")
+
+                def _err(_dt):
+                    dlg = ModalDialog(
+                        title='Action failed',
+                        message=str(e)[:500] or 'Could not complete action. Try the web dashboard.',
+                        confirm_text='OK',
+                        cancel_text='',
+                        on_confirm=lambda: None,
+                    )
+                    self.add_widget(dlg)
+
+                Clock.schedule_once(_err, 0)
+
+        run_async(_run())
 
     def _on_close(self, _inst):
         self.goto('home', transition='fade')
