@@ -37,6 +37,7 @@ export default function MeetingDetailPage() {
     if (!id) return
     try {
       setLoading(true)
+      setActions([])
       const meetingData = await meetingsApi.get(id)
 
       const raw = meetingData as unknown as Record<string, unknown>
@@ -52,7 +53,7 @@ export default function MeetingDetailPage() {
         const actionsData = await actionsApi.list(id)
         setActions(actionsData)
       } catch {
-        setActions([])
+        toast.error('Could not load meeting actions.')
       }
     } catch {
       // Error state handled by loading/empty UI
@@ -69,8 +70,9 @@ export default function MeetingDetailPage() {
     if (!id) return
     try {
       setIsGeneratingActions(true)
-      const generated = await actionsApi.generate(id)
-      setActions(generated)
+      await actionsApi.generate(id)
+      const actionsData = await actionsApi.list(id)
+      setActions(actionsData)
     } catch (err: unknown) {
       const msg =
         err && typeof err === 'object' && 'response' in err
@@ -81,13 +83,6 @@ export default function MeetingDetailPage() {
       setIsGeneratingActions(false)
     }
   }, [id])
-
-  useEffect(() => {
-    if (!meeting || !id) return
-    const hasSummarySource = !!meeting.summary
-    if (!hasSummarySource || actions.length > 0 || isGeneratingActions) return
-    void handleGenerateActions()
-  }, [actions.length, handleGenerateActions, id, isGeneratingActions, meeting])
 
   const handleExport = async (fmt: 'pdf' | 'txt') => {
     if (!id) return
@@ -362,8 +357,8 @@ export default function MeetingDetailPage() {
               <div>
                 <h3 className="text-sm font-semibold text-gray-900">Calendar &amp; email</h3>
                 <p className="text-sm text-gray-600">
-                  Suggested follow-ups for your connected Gmail and Google Calendar. Connect both under Settings →
-                  Integrations to refresh suggestions.
+                  Suggested follow-ups for your connected Gmail and Google Calendar. Use Refresh when you want new
+                  suggestions; connect accounts under Settings → Integrations.
                 </p>
               </div>
               <button
@@ -381,7 +376,8 @@ export default function MeetingDetailPage() {
                 </svg>
                 <h3 className="mt-2 text-sm font-medium text-gray-900">No calendar or email actions yet</h3>
                 <p className="mt-1 text-sm text-gray-500">
-                  Connect Gmail and/or Calendar, then refresh suggestions after the summary is ready.
+                  Connect Gmail and/or Calendar if needed, then click <span className="font-medium">Refresh Suggestions</span>{' '}
+                  above (suggestions are not created automatically when you open this page).
                 </p>
               </div>
             ) : (
