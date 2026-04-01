@@ -16,6 +16,9 @@ const connectorLabels: Record<string, string> = {
   notion: 'Notion',
 }
 
+/** Default IANA zone for calendar actions when payload/browser zone is missing (India / IST). */
+const DEFAULT_CALENDAR_TZ = 'Asia/Kolkata'
+
 const COMMON_TIMEZONES = [
   'UTC',
   'America/New_York',
@@ -147,7 +150,7 @@ export default function ActionCard({ action, onChanged }: ActionCardProps) {
   const [calDate, setCalDate] = useState('')
   const [calTime, setCalTime] = useState('10:00')
   const [calDuration, setCalDuration] = useState(30)
-  const [calTimezone, setCalTimezone] = useState('UTC')
+  const [calTimezone, setCalTimezone] = useState(DEFAULT_CALENDAR_TZ)
   const [calAttendees, setCalAttendees] = useState('')
 
   const [mailTo, setMailTo] = useState('')
@@ -166,7 +169,7 @@ export default function ActionCard({ action, onChanged }: ActionCardProps) {
     const defaultTz =
       (typeof p.timezone === 'string' && p.timezone) ||
       Intl.DateTimeFormat().resolvedOptions().timeZone ||
-      'UTC'
+      DEFAULT_CALENDAR_TZ
     if (action.connector_target === 'calendar') {
       const tmatch = String(p.suggested_time ?? '10:00').match(/^(\d{1,2}):(\d{2})/)
       const hhmm = tmatch ? `${tmatch[1].padStart(2, '0')}:${tmatch[2]}` : '10:00'
@@ -198,7 +201,7 @@ export default function ActionCard({ action, onChanged }: ActionCardProps) {
         suggested_date: calDate.trim(),
         suggested_time: calTime.trim(),
         duration_minutes: calDuration,
-        timezone: calTimezone.trim() || 'UTC',
+        timezone: calTimezone.trim() || DEFAULT_CALENDAR_TZ,
         attendees: parseEmailsFromText(calAttendees),
       }
     }

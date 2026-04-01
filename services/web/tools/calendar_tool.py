@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from routes.integrations import get_credentials_for_provider
-from services.calendar import create_event, list_upcoming_events
+from services.calendar import create_event, default_calendar_tz_name, list_upcoming_events
 from tools.base_tool import ToolError
 
 
@@ -40,7 +40,7 @@ def calendar_create_from_payload(user_id: str, payload: dict[str, Any]) -> dict[
   description = str(payload.get("description") or "")
   attendees = payload.get("attendees") if isinstance(payload.get("attendees"), list) else []
   location = str(payload.get("location") or "")
-  timezone = str(payload.get("timezone") or "UTC")
+  timezone = str(payload.get("timezone") or default_calendar_tz_name())
   return create_event(
     credentials=creds,
     title=title,

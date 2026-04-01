@@ -11,9 +11,18 @@ from googleapiclient.discovery import build
 
 logger = logging.getLogger(__name__)
 
+# When CALENDAR_DEFAULT_TIMEZONE is unset, use India (Delhi) — IST, no DST.
+DEFAULT_CALENDAR_IANA = "Asia/Kolkata"
+
+
+def default_calendar_tz_name() -> str:
+    """IANA zone for interpreting wall-clock calendar date/time when env is unset."""
+    raw = (os.getenv("CALENDAR_DEFAULT_TIMEZONE") or "").strip()
+    return raw or DEFAULT_CALENDAR_IANA
+
 
 def _default_tz_name() -> str:
-    return (os.getenv("CALENDAR_DEFAULT_TIMEZONE") or "UTC").strip() or "UTC"
+    return default_calendar_tz_name()
 
 
 def _safe_zone(tz_name: str) -> ZoneInfo:
@@ -85,7 +94,7 @@ def create_event(
         Google Calendar API event dict with 'id', 'htmlLink', etc.
     """
     service = build("calendar", "v3", credentials=credentials, cache_discovery=False)
-    tz_name = (timezone or _default_tz_name()).strip() or "UTC"
+    tz_name = (timezone or _default_tz_name()).strip() or _default_tz_name()
     zone = _safe_zone(tz_name)
 
     start_dt: datetime | None = None

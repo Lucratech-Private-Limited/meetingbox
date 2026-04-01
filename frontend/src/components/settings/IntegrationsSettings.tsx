@@ -3,14 +3,12 @@ import { useSearchParams } from 'react-router-dom'
 import { integrationsApi } from '../../api/integrations'
 import type { Integration } from '../../types/user'
 import LoadingSpinner from '../ui/LoadingSpinner'
-import AssistantPendingSection from './AssistantPendingSection'
 import toast from 'react-hot-toast'
 
 export default function IntegrationsSettings() {
   const [integrations, setIntegrations] = useState<Integration[]>([])
   const [loading, setLoading] = useState(true)
   const [connecting, setConnecting] = useState<string | null>(null)
-  const [assistantRefreshKey, setAssistantRefreshKey] = useState(0)
   const [searchParams, setSearchParams] = useSearchParams()
 
   const loadIntegrations = useCallback(async () => {
@@ -38,7 +36,6 @@ export default function IntegrationsSettings() {
       const msg = email ? `${provider} connected as ${email}!` : `${provider} connected!`
       toast.success(msg, { duration: 5000 })
       loadIntegrations()
-      setAssistantRefreshKey((k) => k + 1)
     } else if (status === 'error') {
       const reason = searchParams.get('reason') || 'Unknown error'
       toast.error(`Connection failed: ${reason.replace(/_/g, ' ')}`, { duration: 8000 })
@@ -88,8 +85,6 @@ export default function IntegrationsSettings() {
 
   return (
     <div className="space-y-4">
-      <AssistantPendingSection refreshKey={assistantRefreshKey} />
-
       {integrations.length === 0 ? (
         <div className="bg-white rounded-lg border border-gray-200 p-6 text-center">
           <p className="text-gray-500">

@@ -17,6 +17,7 @@ from agent_registry import get_agent
 from database import get_connection
 from orchestrator import RouteResult, route_intent
 from tools.base_tool import ToolError
+from services.calendar import default_calendar_tz_name
 from tools.calendar_tool import calendar_create_from_payload, calendar_list_upcoming
 from tools.gmail_tool import gmail_list_recent, gmail_send_from_payload
 from tools.memory_tool import memory_fetch_meeting, memory_search_meetings
@@ -74,7 +75,8 @@ def _llm_calendar_plan(message: str) -> list[dict[str, Any]] | None:
     "Rules:\n"
     "- Use calendar_list_upcoming for viewing schedule, what's on, upcoming events.\n"
     "- Use calendar_create_event for scheduling, booking, creating events. Args may include "
-    "title, description, start_time (ISO or null for default), duration_minutes, attendees (emails), timezone.\n"
+    "title, description, start_time (ISO or null for default), duration_minutes, attendees (emails), timezone "
+    f'(IANA; default "{default_calendar_tz_name()}").\n'
     "- At most one create per message unless user clearly asks for multiple.\n"
     f"User message:\n{message.strip()[:4000]}\n"
   )
@@ -133,6 +135,7 @@ def _heuristic_calendar_plan(message: str) -> list[dict[str, Any]]:
         "start_time": None,
         "duration_minutes": 30,
         "attendees": [],
+        "timezone": default_calendar_tz_name(),
       },
       "is_write": True,
     }]

@@ -10,7 +10,7 @@ from fastapi import HTTPException
 
 from database import get_connection
 from routes.integrations import get_action_capabilities, get_credentials_for_provider
-from services.calendar import create_event
+from services.calendar import create_event, default_calendar_tz_name
 from services.gmail import create_draft as gmail_create_draft
 from services.gmail import send_email
 
@@ -183,7 +183,7 @@ def get_meeting_context(meeting_id: str) -> dict[str, Any]:
 
 def _build_generation_prompt_gmail_calendar(context: dict[str, Any], capabilities: list[dict[str, Any]]) -> str:
     capability_text = json.dumps(capabilities, indent=2)
-    tz_hint = os.getenv("CALENDAR_DEFAULT_TIMEZONE", "UTC")
+    tz_hint = default_calendar_tz_name()
     return (
         "You are generating meeting follow-up actions that the user can run from MeetingBox.\n"
         "Only Gmail (follow-up email) and Google Calendar (schedule follow-up) are allowed.\n"
@@ -261,7 +261,7 @@ def _build_email_prompt(action: dict[str, Any], context: dict[str, Any]) -> str:
 
 
 def _build_calendar_prompt(action: dict[str, Any], context: dict[str, Any]) -> str:
-    tz = os.getenv("CALENDAR_DEFAULT_TIMEZONE", "UTC")
+    tz = default_calendar_tz_name()
     return (
         "Create a practical follow-up calendar event from this meeting.\n"
         f"Use IANA timezone \"{tz}\" for suggested_date + suggested_time unless the transcript specifies a different zone or city.\n"
@@ -680,7 +680,7 @@ def execute_action_record(
                 status_code=400,
                 detail="Calendar event needs a date. Add suggested_date in review or regenerate the action.",
             )
-        tz_use = str(result_payload.get("timezone") or os.getenv("CALENDAR_DEFAULT_TIMEZONE") or "UTC").strip()
+        tz_use = (str(result_payload.get("timezone") or "").strip() or default_calendar_tz_name())
         attendees = _coerce_email_list(result_payload.get("attendees"))
         calendar_result = create_event(
             credentials=creds,
