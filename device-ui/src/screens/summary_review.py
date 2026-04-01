@@ -447,12 +447,14 @@ class SummaryReviewScreen(BaseScreen):
 
                 Clock.schedule_once(_after_ok, 0)
             except Exception as e:
-                logger.error(f"Single action execute failed {action_id}: {e}")
+                # Python 3.12+ deletes `e` after this block; capture text before scheduling UI.
+                err_text = (str(e) or 'Could not complete action. Try the web dashboard.')[:500]
+                logger.error("Single action execute failed %s: %s", action_id, err_text)
 
                 def _err(_dt):
                     dlg = ModalDialog(
                         title='Action failed',
-                        message=str(e)[:500] or 'Could not complete action. Try the web dashboard.',
+                        message=err_text,
                         confirm_text='OK',
                         cancel_text='',
                         on_confirm=lambda: None,

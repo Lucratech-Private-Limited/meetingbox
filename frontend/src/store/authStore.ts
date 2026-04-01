@@ -4,9 +4,11 @@ import { apiClient } from '../api/client'
 interface User {
   id: string
   username: string
+  email?: string | null
   display_name: string
   role: string
   onboarding_complete: boolean
+  avatar_url?: string | null
 }
 
 interface AuthState {
@@ -16,10 +18,9 @@ interface AuthState {
   loading: boolean
 
   initialize: () => Promise<void>
-  login: (username: string, password: string) => Promise<{ token: string; user: User }>
-  register: (username: string, password: string, displayName: string) => Promise<void>
+  startGoogleSignIn: () => Promise<void>
+  consumeGoogleCallback: (token: string) => Promise<User>
   logout: () => void
-  setAuthFromSetup: (token: string, user: User) => void
   completeOnboarding: () => Promise<void>
 }
 
@@ -60,21 +61,9 @@ export const useAuthStore = create<AuthState>((set) => ({
     })
   },
 
-  login: async (username: string, password: string) => {
-    const { data } = await apiClient.post('/api/auth/login', { username, password })
-    localStorage.setItem('auth_token', data.token)
-    set({ token: data.token, user: data.user, hasUsers: true })
-    return data
-  },
-
-  register: async (username: string, password: string, displayName: string) => {
-    const { data } = await apiClient.post('/api/auth/register', {
-      username,
-      password,
-      display_name: displayName,
-    })
-    localStorage.setItem('auth_token', data.token)
-    set({ token: data.token, user: data.user, hasUsers: true })
+  startGoogleSignIn: async () => {
+    const { data } = await apiClient.get('/api/auth/google/auth-url')
+    window.location.href = data.auth_url
   },
 
   logout: () => {
@@ -83,9 +72,18 @@ export const useAuthStore = create<AuthState>((set) => ({
     window.location.href = '/login'
   },
 
-  setAuthFromSetup: (token: string, user: User) => {
+  consumeGoogleCallback: async (token: string) => {
     localStorage.setItem('auth_token', token)
-    set({ token, user })
+    try {
+      const { data } = await apiClient.get('/api/auth/me')
+      const user = data as User
+      set({ token, user, hasUsers: true })
+      return user
+    } catch (err) {
+      localStorage.removeItem('auth_token')
+      set({ token: null, user: null })
+      throw err
+    }
   },
 
   completeOnboarding: async () => {

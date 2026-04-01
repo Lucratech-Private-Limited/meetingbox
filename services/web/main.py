@@ -24,6 +24,7 @@ from routes.agents import router as agents_router
 from routes.assistant import router as assistant_router
 from routes.system import router as system_router
 from routes.device import router as device_router
+from routes.devices import router as devices_router
 from routes.auth import router as auth_router
 from routes.actions import router as actions_router
 from routes.integrations import router as integrations_router
@@ -190,6 +191,7 @@ app.include_router(assistant_router, prefix="/api/assistant", tags=["assistant"]
 app.include_router(meetings_router, prefix="/api/meetings", tags=["meetings"])
 app.include_router(system_router, prefix="/api/system", tags=["system"])
 app.include_router(device_router, prefix="/api/device", tags=["device"])
+app.include_router(devices_router, prefix="/api", tags=["devices"])
 app.include_router(actions_router, prefix="/api", tags=["actions"])
 app.include_router(integrations_router, prefix="/api", tags=["integrations"])
 

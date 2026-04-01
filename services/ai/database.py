@@ -19,6 +19,8 @@ def init_database() -> None:
         """
         CREATE TABLE IF NOT EXISTS meetings (
           id TEXT PRIMARY KEY,
+          user_id TEXT,
+          device_id TEXT,
           title TEXT,
           start_time TEXT,
           end_time TEXT,
@@ -106,6 +108,14 @@ def init_database() -> None:
         cursor.execute("ALTER TABLE local_summaries ADD COLUMN is_final INTEGER DEFAULT 0")
     except sqlite3.OperationalError:
         pass
+    for statement in [
+        "ALTER TABLE meetings ADD COLUMN user_id TEXT",
+        "ALTER TABLE meetings ADD COLUMN device_id TEXT",
+    ]:
+        try:
+            cursor.execute(statement)
+        except sqlite3.OperationalError:
+            pass
 
     cursor.execute(
         """
@@ -113,8 +123,12 @@ def init_database() -> None:
           id TEXT PRIMARY KEY,
           username TEXT UNIQUE NOT NULL,
           password_hash TEXT NOT NULL,
+          email TEXT,
           display_name TEXT,
           role TEXT DEFAULT 'user',
+          auth_provider TEXT DEFAULT 'local',
+          google_sub TEXT,
+          avatar_url TEXT,
           onboarding_complete INTEGER DEFAULT 0,
           created_at TEXT
         )
@@ -126,6 +140,71 @@ def init_database() -> None:
         cursor.execute("ALTER TABLE users ADD COLUMN onboarding_complete INTEGER DEFAULT 0")
     except sqlite3.OperationalError:
         pass  # Column already exists
+    for statement in [
+        "ALTER TABLE users ADD COLUMN email TEXT",
+        "ALTER TABLE users ADD COLUMN auth_provider TEXT DEFAULT 'local'",
+        "ALTER TABLE users ADD COLUMN google_sub TEXT",
+        "ALTER TABLE users ADD COLUMN avatar_url TEXT",
+    ]:
+        try:
+            cursor.execute(statement)
+        except sqlite3.OperationalError:
+            pass
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS devices (
+          id TEXT PRIMARY KEY,
+          user_id TEXT NOT NULL,
+          device_name TEXT,
+          serial_number TEXT,
+          auth_token_hash TEXT,
+          status TEXT DEFAULT 'active',
+          paired_at TEXT,
+          unpaired_at TEXT,
+          last_seen_at TEXT,
+          created_at TEXT,
+          FOREIGN KEY (user_id) REFERENCES users(id)
+        )
+        """
+    )
+    for statement in [
+        "ALTER TABLE devices ADD COLUMN serial_number TEXT",
+        "ALTER TABLE devices ADD COLUMN auth_token_hash TEXT",
+        "ALTER TABLE devices ADD COLUMN status TEXT DEFAULT 'active'",
+        "ALTER TABLE devices ADD COLUMN paired_at TEXT",
+        "ALTER TABLE devices ADD COLUMN unpaired_at TEXT",
+        "ALTER TABLE devices ADD COLUMN last_seen_at TEXT",
+    ]:
+        try:
+            cursor.execute(statement)
+        except sqlite3.OperationalError:
+            pass
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS device_pairing_codes (
+          code TEXT PRIMARY KEY,
+          user_id TEXT NOT NULL,
+          device_id TEXT,
+          expires_at TEXT NOT NULL,
+          claimed_at TEXT,
+          created_at TEXT NOT NULL,
+          FOREIGN KEY (user_id) REFERENCES users(id),
+          FOREIGN KEY (device_id) REFERENCES devices(id)
+        )
+        """
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS app_settings (
+          key TEXT PRIMARY KEY,
+          value TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        )
+        """
+    )
 
     cursor.execute(
         """
@@ -188,12 +267,30 @@ def init_database() -> None:
     )
 
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_integrations_user_provider ON integrations(user_id, provider)")
+    cursor.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email_unique ON users(email) WHERE email IS NOT NULL AND TRIM(email) != ''"
+    )
+    cursor.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_google_sub_unique ON users(google_sub) WHERE google_sub IS NOT NULL AND TRIM(google_sub) != ''"
+    )
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_meetings_user_id ON meetings(user_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_meetings_device_id ON meetings(device_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_devices_user_id ON devices(user_id)")
+    cursor.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_devices_token_hash_unique ON devices(auth_token_hash) WHERE auth_token_hash IS NOT NULL AND TRIM(auth_token_hash) != ''"
+    )
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_pairing_codes_user_id ON device_pairing_codes(user_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_pairing_codes_expires_at ON device_pairing_codes(expires_at)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_segments_meeting_id ON segments(meeting_id)")
     cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_segments_meeting_segment_num ON segments(meeting_id, segment_num)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_meetings_status ON meetings(status)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_meetings_created_at ON meetings(created_at)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_actions_meeting_id ON actions(meeting_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_actions_status ON actions(status)")
+    cursor.execute(
+        "INSERT OR IGNORE INTO app_settings (key, value, updated_at) VALUES (?, ?, datetime('now'))",
+        ("max_meeting_upload_seconds", "10800"),
+    )
 
     conn.commit()
     conn.close()

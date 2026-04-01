@@ -75,7 +75,7 @@ async def run_meeting_agent_pipeline(
   session_id: str,
   dest_wav: Path,
   duration_seconds: int,
-  current_user: Optional[dict],
+  current_actor: Optional[dict],
 ) -> dict[str, Any]:
   """
   Full post-meeting run after WAV is saved. Lazy-imports routes.meetings to avoid circular imports at startup.
@@ -101,7 +101,7 @@ async def run_meeting_agent_pipeline(
   )
 
   _emit_stage(redis_client, session_id, "reporting", "Building meeting report…")
-  summary_result = await meetings_routes.summarize_meeting(session_id, current_user)
+  summary_result = await meetings_routes.summarize_meeting(session_id, current_actor)
 
   _emit(
     redis_client,
@@ -120,7 +120,7 @@ async def run_meeting_agent_pipeline(
     log_pipeline_completion_audit(
       redis_client,
       session_id,
-      current_user.get("id") if current_user else None,
+      current_actor["user"]["id"] if current_actor else None,
       summary_result,
     )
   except Exception:

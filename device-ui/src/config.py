@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 
 BACKEND_URL = os.getenv('BACKEND_URL', 'http://localhost:8000')
 BACKEND_WS_URL = os.getenv('BACKEND_WS_URL', 'ws://localhost:8000/ws')
+DEVICE_AUTH_TOKEN = os.getenv('DEVICE_AUTH_TOKEN', '')
 
 # Use mock backend for testing (set MOCK_BACKEND=1)
 USE_MOCK_BACKEND = os.getenv('MOCK_BACKEND', '0') == '1'

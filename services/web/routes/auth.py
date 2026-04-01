@@ -1,24 +1,29 @@
 """
-Authentication Routes -- register, login, user management.
+Authentication Routes -- Google sign-in for dashboard users.
 """
 
 import logging
-import time
+import os
+import re
+import secrets
 import uuid
-from collections import defaultdict
 from datetime import datetime
-from typing import Optional
+from urllib.parse import quote_plus, urlencode
 
-from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel, field_validator
+import httpx
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.responses import RedirectResponse
+from jose import JWTError, jwt as jose_jwt
 
 from auth import (
-    hash_password,
-    verify_password,
-    create_access_token,
-    get_user_by_username,
+    SECRET_KEY,
     count_users,
+    create_access_token,
     get_current_user,
+    get_user_by_email,
+    get_user_by_google_sub,
+    get_user_by_username,
+    hash_password,
 )
 from database import get_connection
 
@@ -26,160 +31,253 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-# Simple in-memory rate limiter for registration (IP -> list of timestamps)
-_register_attempts: dict[str, list[float]] = defaultdict(list)
-_REGISTER_LIMIT = 5  # max registrations per IP
-_REGISTER_WINDOW = 3600  # per hour
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
+GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
+GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+GOOGLE_USERINFO_URL = "https://www.googleapis.com/oauth2/v2/userinfo"
+FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "http://localhost:5173").rstrip("/")
+APP_BASE_URL = os.getenv("APP_BASE_URL", "http://localhost:8000").rstrip("/")
+GOOGLE_LOGIN_SCOPES = "openid email profile"
 
 
-class RegisterRequest(BaseModel):
-    username: str
-    password: str
-    display_name: Optional[str] = None
-
-    @field_validator("username")
-    @classmethod
-    def username_valid(cls, v: str) -> str:
-        v = v.strip().lower()
-        if len(v) < 3:
-            raise ValueError("Username must be at least 3 characters")
-        if not all(c.isalnum() or c == '_' for c in v):
-            raise ValueError("Username must be alphanumeric (underscores allowed)")
-        return v
-
-    @field_validator("password")
-    @classmethod
-    def password_valid(cls, v: str) -> str:
-        if len(v) < 6:
-            raise ValueError("Password must be at least 6 characters")
-        return v
+def _check_google_configured() -> None:
+    if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET:
+        raise HTTPException(
+            status_code=503,
+            detail="Google OAuth is not configured. Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET env vars.",
+        )
 
 
-class LoginRequest(BaseModel):
-    username: str
-    password: str
+def _infer_backend_base_url(request: Request) -> str:
+    raw_host = (request.headers.get("x-forwarded-host") or request.headers.get("host") or "").strip()
+    if raw_host:
+        host = raw_host.split(",")[0].strip()
+        proto_raw = (request.headers.get("x-forwarded-proto") or "").strip().lower()
+        proto = proto_raw.split(",")[0].strip() if proto_raw else (request.url.scheme or "http")
+        return f"{proto}://{host}".rstrip("/")
+    return APP_BASE_URL
+
+
+def _infer_frontend_base_url(request: Request) -> str:
+    origin = (request.headers.get("origin") or "").strip()
+    if origin:
+        return origin.rstrip("/")
+    referer = (request.headers.get("referer") or "").strip()
+    if "://" in referer:
+        parts = referer.split("/", 3)
+        if len(parts) >= 3:
+            return f"{parts[0]}//{parts[2]}".rstrip("/")
+    return FRONTEND_BASE_URL
+
+
+def _google_redirect_uri(request: Request) -> str:
+    return f"{_infer_backend_base_url(request)}/api/auth/google/callback"
+
+
+def _state_token(frontend_base: str) -> str:
+    return jose_jwt.encode(
+        {"nonce": uuid.uuid4().hex, "frontend_base": frontend_base},
+        SECRET_KEY,
+        algorithm="HS256",
+    )
+
+
+def _decode_state_token(state: str) -> dict:
+    try:
+        return jose_jwt.decode(state, SECRET_KEY, algorithms=["HS256"])
+    except JWTError as exc:
+        raise HTTPException(status_code=400, detail="Invalid or expired OAuth state.") from exc
+
+
+def _user_response(user: dict) -> dict:
+    username = (user.get("username") or user.get("email") or "").strip()
+    display_name = (user.get("display_name") or user.get("email") or username or "MeetingBox User").strip()
+    return {
+        "id": user["id"],
+        "username": username,
+        "email": user.get("email"),
+        "display_name": display_name,
+        "role": user.get("role", "user"),
+        "onboarding_complete": bool(user.get("onboarding_complete", 0)),
+        "avatar_url": user.get("avatar_url"),
+    }
+
+
+def _make_unique_username(email: str) -> str:
+    preferred = (email or "").strip().lower()
+    if preferred and not get_user_by_username(preferred):
+        return preferred
+
+    local_part = preferred.split("@", 1)[0] if "@" in preferred else preferred
+    base = re.sub(r"[^a-z0-9_]+", "_", local_part).strip("_") or "user"
+    candidate = base
+    suffix = 1
+    while get_user_by_username(candidate):
+        suffix += 1
+        candidate = f"{base}_{suffix}"
+    return candidate
+
+
+def _upsert_google_user(profile: dict) -> dict:
+    google_sub = str(profile.get("id") or "").strip()
+    email = str(profile.get("email") or "").strip().lower()
+    if not google_sub or not email:
+        raise HTTPException(status_code=400, detail="Google profile did not include a valid id/email.")
+
+    existing = get_user_by_google_sub(google_sub) or get_user_by_email(email)
+    now = datetime.utcnow().isoformat()
+
+    conn = get_connection()
+    conn.row_factory = lambda c, r: {col[0]: r[i] for i, col in enumerate(c.description)}
+    try:
+        cur = conn.cursor()
+        if existing:
+            cur.execute(
+                """
+                UPDATE users
+                SET email = ?, google_sub = ?, auth_provider = 'google', display_name = ?, avatar_url = ?
+                WHERE id = ?
+                """,
+                (
+                    email,
+                    google_sub,
+                    (profile.get("name") or email).strip(),
+                    profile.get("picture"),
+                    existing["id"],
+                ),
+            )
+            conn.commit()
+            cur.execute("SELECT * FROM users WHERE id = ?", (existing["id"],))
+            return cur.fetchone()
+
+        role = "admin" if count_users() == 0 else "user"
+        user_id = str(uuid.uuid4())
+        username = _make_unique_username(email)
+        cur.execute(
+            """
+            INSERT INTO users
+              (id, username, password_hash, email, display_name, role, auth_provider, google_sub, avatar_url, onboarding_complete, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, 'google', ?, ?, 0, ?)
+            """,
+            (
+                user_id,
+                username,
+                hash_password(secrets.token_urlsafe(32)),
+                email,
+                (profile.get("name") or email).strip(),
+                role,
+                google_sub,
+                profile.get("picture"),
+                now,
+            ),
+        )
+        conn.commit()
+        cur.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+        return cur.fetchone()
+    finally:
+        conn.close()
 
 
 @router.get("/has-users")
 async def has_users():
-    """Check whether any users exist (used by onboarding)."""
     return {"has_users": count_users() > 0}
 
 
-def _user_response(user_id: str, username: str, display_name: str, role: str, onboarding_complete: int) -> dict:
-    """Build a consistent user dict for auth responses."""
-    return {
-        "id": user_id,
-        "username": username,
-        "display_name": display_name,
-        "role": role,
-        "onboarding_complete": bool(onboarding_complete),
+@router.get("/google/auth-url")
+async def google_auth_url(request: Request):
+    _check_google_configured()
+    frontend_base = _infer_frontend_base_url(request)
+    params = {
+        "client_id": GOOGLE_CLIENT_ID,
+        "redirect_uri": _google_redirect_uri(request),
+        "response_type": "code",
+        "scope": GOOGLE_LOGIN_SCOPES,
+        "access_type": "offline",
+        "prompt": "select_account",
+        "state": _state_token(frontend_base),
     }
+    return {"auth_url": f"{GOOGLE_AUTH_URL}?{urlencode(params)}"}
+
+
+@router.get("/google/callback")
+async def google_callback(
+    request: Request,
+    code: str = Query(default=""),
+    state: str = Query(default=""),
+    error: str = Query(default=""),
+):
+    frontend_base = FRONTEND_BASE_URL
+    if state:
+        try:
+            frontend_base = _decode_state_token(state).get("frontend_base") or FRONTEND_BASE_URL
+        except HTTPException:
+            pass
+
+    if error:
+        return RedirectResponse(url=f"{frontend_base}/login?error={quote_plus(error)}")
+    if not code or not state:
+        return RedirectResponse(url=f"{frontend_base}/login?error=missing_params")
+
+    _check_google_configured()
+    redirect_uri = _google_redirect_uri(request)
+
+    try:
+        payload = _decode_state_token(state)
+        frontend_base = payload.get("frontend_base") or frontend_base
+        async with httpx.AsyncClient(timeout=20) as http:
+            token_resp = await http.post(
+                GOOGLE_TOKEN_URL,
+                data={
+                    "code": code,
+                    "client_id": GOOGLE_CLIENT_ID,
+                    "client_secret": GOOGLE_CLIENT_SECRET,
+                    "redirect_uri": redirect_uri,
+                    "grant_type": "authorization_code",
+                },
+            )
+            token_resp.raise_for_status()
+            access_token = token_resp.json().get("access_token")
+            if not access_token:
+                raise HTTPException(status_code=400, detail="Google token response missing access token.")
+            profile_resp = await http.get(
+                GOOGLE_USERINFO_URL,
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+            profile_resp.raise_for_status()
+            user = _upsert_google_user(profile_resp.json())
+    except HTTPException as exc:
+        return RedirectResponse(url=f"{frontend_base}/login?error={quote_plus(str(exc.detail))}")
+    except Exception as exc:
+        logger.exception("Google sign-in failed: %s", exc)
+        return RedirectResponse(url=f"{frontend_base}/login?error=google_sign_in_failed")
+
+    token = create_access_token({"sub": user["id"], "role": user["role"]})
+    return RedirectResponse(url=f"{frontend_base}/auth/callback?token={quote_plus(token)}")
 
 
 @router.post("/setup")
-async def setup_first_user(body: RegisterRequest):
-    """Create the first admin user. Only works when no users exist."""
-    user_id = str(uuid.uuid4())
-    now = datetime.utcnow().isoformat()
-    hashed = hash_password(body.password)
-
-    conn = get_connection()
-    try:
-        # Use BEGIN IMMEDIATE to serialize concurrent setup attempts
-        conn.execute("BEGIN IMMEDIATE")
-        cur = conn.cursor()
-        cur.execute("SELECT COUNT(*) FROM users")
-        if cur.fetchone()[0] > 0:
-            conn.rollback()
-            raise HTTPException(status_code=400, detail="Setup already completed. Use /login.")
-
-        conn.execute(
-            "INSERT INTO users (id, username, password_hash, display_name, role, onboarding_complete, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (user_id, body.username, hashed, body.display_name or body.username, "admin", 0, now),
-        )
-        conn.commit()
-    except HTTPException:
-        raise
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
-
-    token = create_access_token({"sub": user_id, "role": "admin"})
-    logger.info("First admin user created: %s", body.username)
-    return {
-        "token": token,
-        "user": _user_response(user_id, body.username, body.display_name or body.username, "admin", 0),
-    }
+async def setup_not_supported():
+    raise HTTPException(status_code=410, detail="MeetingBox now uses Google sign-in only.")
 
 
 @router.post("/register")
-async def register(body: RegisterRequest, request: Request):
-    """Self-register a new user. Rate-limited to prevent abuse."""
-    # Rate limit by client IP
-    client_ip = request.client.host if request.client else "unknown"
-    now = time.time()
-    _register_attempts[client_ip] = [t for t in _register_attempts[client_ip] if now - t < _REGISTER_WINDOW]
-    if len(_register_attempts[client_ip]) >= _REGISTER_LIMIT:
-        raise HTTPException(status_code=429, detail="Too many registration attempts. Please try again later.")
-    _register_attempts[client_ip].append(now)
-
-    if get_user_by_username(body.username):
-        raise HTTPException(status_code=409, detail="Username already taken")
-
-    user_id = str(uuid.uuid4())
-    now = datetime.utcnow().isoformat()
-    hashed = hash_password(body.password)
-
-    conn = get_connection()
-    try:
-        conn.execute(
-            "INSERT INTO users (id, username, password_hash, display_name, role, onboarding_complete, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (user_id, body.username, hashed, body.display_name or body.username, "user", 0, now),
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-    token = create_access_token({"sub": user_id, "role": "user"})
-    logger.info("New user registered: %s", body.username)
-    return {
-        "token": token,
-        "user": _user_response(user_id, body.username, body.display_name or body.username, "user", 0),
-    }
+async def register_not_supported():
+    raise HTTPException(status_code=410, detail="MeetingBox now uses Google sign-in only.")
 
 
 @router.post("/login")
-async def login(body: LoginRequest):
-    """Authenticate and return a JWT token."""
-    user = get_user_by_username(body.username.strip().lower())
-    if not user or not verify_password(body.password, user["password_hash"]):
-        raise HTTPException(status_code=401, detail="Invalid username or password")
-
-    token = create_access_token({"sub": user["id"], "role": user["role"]})
-    return {
-        "token": token,
-        "user": _user_response(
-            user["id"], user["username"], user["display_name"],
-            user["role"], user.get("onboarding_complete", 0),
-        ),
-    }
+async def login_not_supported():
+    raise HTTPException(status_code=410, detail="MeetingBox now uses Google sign-in only.")
 
 
 @router.get("/me")
 async def get_me(current_user: dict = Depends(get_current_user)):
-    """Return the currently authenticated user."""
-    return _user_response(
-        current_user["id"], current_user["username"], current_user["display_name"],
-        current_user["role"], current_user.get("onboarding_complete", 0),
-    )
+    return _user_response(current_user)
 
 
 @router.post("/complete-onboarding")
 async def complete_onboarding(current_user: dict = Depends(get_current_user)):
-    """Mark the authenticated user's onboarding as complete."""
     conn = get_connection()
     try:
         conn.execute(

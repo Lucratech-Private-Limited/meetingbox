@@ -17,6 +17,17 @@ export interface Integration {
   email?: string | null
 }
 
+export interface Device {
+  id: string
+  device_name: string
+  serial_number?: string | null
+  status: string
+  paired_at?: string | null
+  unpaired_at?: string | null
+  last_seen_at?: string | null
+  created_at?: string | null
+}
+
 export interface SystemInfo {
   cpu_percent: number
   memory_percent: number

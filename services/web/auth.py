@@ -1,7 +1,8 @@
 """
-Authentication utilities -- JWT tokens and password hashing.
+Authentication utilities for dashboard users and paired devices.
 """
 
+import hashlib
 import logging
 import os
 import secrets
@@ -48,6 +49,10 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 security = HTTPBearer(auto_error=False)
 
 
+def _dict_row_factory(c, r):
+    return {col[0]: r[i] for i, col in enumerate(c.description)}
+
+
 def hash_password(password: str) -> str:
     return pwd_context.hash(password)
 
@@ -63,9 +68,17 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 
+def create_device_api_token() -> str:
+    return "mbd_" + secrets.token_urlsafe(32)
+
+
+def hash_api_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
 def get_user_by_username(username: str) -> Optional[dict]:
     conn = get_connection()
-    conn.row_factory = lambda c, r: {col[0]: r[i] for i, col in enumerate(c.description)}
+    conn.row_factory = _dict_row_factory
     try:
         cur = conn.cursor()
         cur.execute("SELECT * FROM users WHERE username = ?", (username,))
@@ -74,13 +87,66 @@ def get_user_by_username(username: str) -> Optional[dict]:
         conn.close()
 
 
+def get_user_by_email(email: str) -> Optional[dict]:
+    conn = get_connection()
+    conn.row_factory = _dict_row_factory
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM users WHERE LOWER(COALESCE(email, '')) = LOWER(?)", (email.strip(),))
+        return cur.fetchone()
+    finally:
+        conn.close()
+
+
+def get_user_by_google_sub(google_sub: str) -> Optional[dict]:
+    conn = get_connection()
+    conn.row_factory = _dict_row_factory
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM users WHERE google_sub = ?", (google_sub,))
+        return cur.fetchone()
+    finally:
+        conn.close()
+
+
 def get_user_by_id(user_id: str) -> Optional[dict]:
     conn = get_connection()
-    conn.row_factory = lambda c, r: {col[0]: r[i] for i, col in enumerate(c.description)}
+    conn.row_factory = _dict_row_factory
     try:
         cur = conn.cursor()
         cur.execute("SELECT * FROM users WHERE id = ?", (user_id,))
         return cur.fetchone()
+    finally:
+        conn.close()
+
+
+def get_device_by_token(token: str) -> Optional[dict]:
+    conn = get_connection()
+    conn.row_factory = _dict_row_factory
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT d.*, u.id AS owner_user_id, u.email AS owner_email, u.display_name AS owner_display_name
+            FROM devices d
+            JOIN users u ON u.id = d.user_id
+            WHERE d.auth_token_hash = ? AND COALESCE(d.status, 'active') = 'active'
+            """,
+            (hash_api_token(token),),
+        )
+        return cur.fetchone()
+    finally:
+        conn.close()
+
+
+def touch_device_last_seen(device_id: str) -> None:
+    conn = get_connection()
+    try:
+        conn.execute(
+            "UPDATE devices SET last_seen_at = ? WHERE id = ?",
+            (datetime.utcnow().isoformat(), device_id),
+        )
+        conn.commit()
     finally:
         conn.close()
 
@@ -95,6 +161,17 @@ def count_users() -> int:
         conn.close()
 
 
+def _get_jwt_user(token: str) -> Optional[dict]:
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id: str = payload.get("sub")
+        if not user_id or payload.get("token_type") == "device":
+            return None
+    except JWTError:
+        return None
+    return get_user_by_id(user_id)
+
+
 async def get_current_user(
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ) -> dict:
@@ -104,18 +181,9 @@ async def get_current_user(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Not authenticated",
         )
-    token = credentials.credentials
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        user_id: str = payload.get("sub")
-        if user_id is None:
-            raise HTTPException(status_code=401, detail="Invalid token")
-    except JWTError:
-        raise HTTPException(status_code=401, detail="Invalid token")
-
-    user = get_user_by_id(user_id)
+    user = _get_jwt_user(credentials.credentials)
     if user is None:
-        raise HTTPException(status_code=401, detail="User not found")
+        raise HTTPException(status_code=401, detail="Invalid token")
     return user
 
 
@@ -129,3 +197,38 @@ async def get_optional_user(
         return await get_current_user(credentials)
     except HTTPException:
         return None
+
+
+async def get_optional_actor(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+) -> Optional[dict]:
+    """Return either {"type": "user"} or {"type": "device"} actor context."""
+    if credentials is None:
+        return None
+
+    token = credentials.credentials
+    user = _get_jwt_user(token)
+    if user is not None:
+        return {"type": "user", "user": user}
+
+    device = get_device_by_token(token)
+    if device is not None:
+        touch_device_last_seen(device["id"])
+        return {
+            "type": "device",
+            "device": device,
+            "user": {
+                "id": device["owner_user_id"],
+                "email": device.get("owner_email"),
+                "display_name": device.get("owner_display_name"),
+            },
+        }
+    return None
+
+
+async def get_current_actor(
+    actor: Optional[dict] = Depends(get_optional_actor),
+) -> dict:
+    if actor is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
+    return actor

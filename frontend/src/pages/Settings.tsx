@@ -1,18 +1,20 @@
 import { Tab } from '@headlessui/react'
 import { useSearchParams } from 'react-router-dom'
 import GeneralSettings from '../components/settings/GeneralSettings'
+import DevicesSettings from '../components/settings/DevicesSettings'
 import IntegrationsSettings from '../components/settings/IntegrationsSettings'
 import PrivacySettings from '../components/settings/PrivacySettings'
 
 const tabs = [
   { name: 'General', component: GeneralSettings },
+  { name: 'Devices', component: DevicesSettings },
   { name: 'Integrations', component: IntegrationsSettings },
   { name: 'Privacy', component: PrivacySettings },
 ]
 
 export default function Settings() {
   const [searchParams] = useSearchParams()
-  const defaultTab = searchParams.has('integration') ? 1 : 0
+  const defaultTab = searchParams.has('integration') ? 2 : 0
 
   return (
     <div className="max-w-4xl mx-auto px-4 py-8">

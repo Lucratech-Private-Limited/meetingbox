@@ -4,10 +4,10 @@ import { Toaster } from 'react-hot-toast'
 import { useAuthStore } from './store/authStore'
 import Layout from './components/layout/Layout'
 import ErrorBoundary from './components/ErrorBoundary'
-import Onboarding from './pages/Onboarding'
 import PersonalOnboarding from './pages/PersonalOnboarding'
 import Login from './pages/Login'
 import Register from './pages/Register'
+import AuthCallback from './pages/AuthCallback'
 import Dashboard from './pages/Dashboard'
 import MeetingDetail from './pages/MeetingDetail'
 import LiveRecording from './pages/LiveRecording'
@@ -43,7 +43,6 @@ export default function App() {
   const initialize = useAuthStore((s) => s.initialize)
   const token = useAuthStore((s) => s.token)
   const user = useAuthStore((s) => s.user)
-  const hasUsers = useAuthStore((s) => s.hasUsers)
   const loading = useAuthStore((s) => s.loading)
 
   useEffect(() => {
@@ -66,41 +65,20 @@ export default function App() {
         <Toaster position="top-right" />
 
         <Routes>
-          {/* First-time device setup -- only when no users exist */}
-          <Route
-            path="/setup"
-            element={
-              hasUsers === false ? <Onboarding /> : <Navigate to="/login" />
-            }
-          />
+          <Route path="/setup" element={<Navigate to="/login" replace />} />
+          <Route path="/register" element={<Register />} />
 
-          {/* Self-registration -- only when users already exist and not logged in */}
-          <Route
-            path="/register"
-            element={
-              hasUsers === false ? (
-                <Navigate to="/setup" />
-              ) : isAuthed ? (
-                <Navigate to={user?.onboarding_complete ? '/dashboard' : '/onboarding'} />
-              ) : (
-                <Register />
-              )
-            }
-          />
-
-          {/* Login */}
           <Route
             path="/login"
             element={
-              hasUsers === false ? (
-                <Navigate to="/setup" />
-              ) : isAuthed ? (
+              isAuthed ? (
                 <Navigate to={user?.onboarding_complete ? '/dashboard' : '/onboarding'} />
               ) : (
                 <Login />
               )
             }
           />
+          <Route path="/auth/callback" element={<AuthCallback />} />
 
           {/* Personal onboarding -- logged in but onboarding not complete */}
           <Route
@@ -138,9 +116,7 @@ export default function App() {
           <Route
             path="*"
             element={
-              hasUsers === false ? (
-                <Navigate to="/setup" />
-              ) : isAuthed ? (
+              isAuthed ? (
                 <Navigate to="/dashboard" />
               ) : (
                 <Navigate to="/login" />

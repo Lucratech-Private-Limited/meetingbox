@@ -18,6 +18,7 @@ from websockets.exceptions import ConnectionClosed
 from config import (
     BACKEND_URL,
     BACKEND_WS_URL,
+    DEVICE_AUTH_TOKEN,
     API_TIMEOUT,
     WS_RECONNECT_DELAY,
     WS_MAX_RECONNECT_ATTEMPTS,
@@ -54,7 +55,10 @@ class BackendClient:
     def __init__(self, base_url: str = BACKEND_URL):
         self.base_url = base_url.rstrip('/')
         self.ws_url = BACKEND_WS_URL
-        self.client = httpx.AsyncClient(timeout=API_TIMEOUT)
+        headers = {}
+        if DEVICE_AUTH_TOKEN:
+            headers["Authorization"] = f"Bearer {DEVICE_AUTH_TOKEN}"
+        self.client = httpx.AsyncClient(timeout=API_TIMEOUT, headers=headers)
         self.ws_connection = None
         self._ws_reconnect_attempts = 0
 
@@ -291,6 +295,18 @@ class BackendClient:
             )
             resp.raise_for_status()
             return resp.json()
+        except httpx.HTTPStatusError as e:
+            detail = ""
+            try:
+                data = e.response.json()
+                if isinstance(data, dict) and data.get("detail") is not None:
+                    d = data["detail"]
+                    detail = d if isinstance(d, str) else json.dumps(d)
+            except Exception:
+                detail = (e.response.text or "")[:500]
+            msg = (detail or e.response.reason_phrase or str(e)).strip()
+            logger.error("Failed to execute action %s: HTTP %s %s", action_id, e.response.status_code, msg)
+            raise RuntimeError(msg) from e
         except Exception as e:
             logger.error(f"Failed to execute action {action_id}: {e}")
             raise

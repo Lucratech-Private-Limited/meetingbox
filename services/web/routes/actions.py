@@ -4,10 +4,11 @@ Agentic actions routes: generation, listing, editing, execution, and dismissal.
 
 from typing import Any, Optional
 
-from fastapi import APIRouter, Body, Depends
+from fastapi import APIRouter, Body, Depends, HTTPException
 from pydantic import BaseModel
 
-from auth import get_optional_user
+from auth import get_optional_actor
+from database import get_connection
 from services.action_engine import (
     dismiss_action_record,
     execute_action_record,
@@ -17,6 +18,50 @@ from services.action_engine import (
 )
 
 router = APIRouter()
+
+
+def _actor_scope(actor: Optional[dict]) -> tuple[str, tuple[object, ...]]:
+    if not actor:
+        return "", ()
+    if actor["type"] == "device":
+        return "m.device_id = ?", (actor["device"]["id"],)
+    return "m.user_id = ?", (actor["user"]["id"],)
+
+
+def _assert_meeting_access(meeting_id: str, actor: Optional[dict]) -> None:
+    scope_sql, scope_params = _actor_scope(actor)
+    if not scope_sql:
+        return
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(f"SELECT 1 FROM meetings m WHERE m.id = ? AND {scope_sql}", (meeting_id, *scope_params))
+        if not cur.fetchone():
+            raise HTTPException(status_code=404, detail="Meeting not found")
+    finally:
+        conn.close()
+
+
+def _assert_action_access(action_id: str, actor: Optional[dict]) -> None:
+    scope_sql, scope_params = _actor_scope(actor)
+    if not scope_sql:
+        return
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            f"""
+            SELECT 1
+            FROM actions a
+            JOIN meetings m ON m.id = a.meeting_id
+            WHERE a.id = ? AND {scope_sql}
+            """,
+            (action_id, *scope_params),
+        )
+        if not cur.fetchone():
+            raise HTTPException(status_code=404, detail="Action not found")
+    finally:
+        conn.close()
 
 
 class ActionResponse(BaseModel):
@@ -55,18 +100,21 @@ class ExecuteActionRequest(BaseModel):
 
 
 @router.get("/meetings/{meeting_id}/actions", response_model=list[ActionResponse])
-async def list_actions(meeting_id: str, current_user: Optional[dict] = Depends(get_optional_user)):
+async def list_actions(meeting_id: str, current_actor: Optional[dict] = Depends(get_optional_actor)):
+    _assert_meeting_access(meeting_id, current_actor)
     return list_actions_for_meeting(meeting_id)
 
 
 @router.post("/meetings/{meeting_id}/actions/generate", response_model=list[ActionResponse])
-async def generate_actions(meeting_id: str, current_user: Optional[dict] = Depends(get_optional_user)):
-    user_id = current_user["id"] if current_user else None
+async def generate_actions(meeting_id: str, current_actor: Optional[dict] = Depends(get_optional_actor)):
+    _assert_meeting_access(meeting_id, current_actor)
+    user_id = current_actor["user"]["id"] if current_actor else None
     return generate_actions_for_meeting(meeting_id, user_id)
 
 
 @router.patch("/actions/{action_id}", response_model=ActionResponse)
-async def update_action(action_id: str, body: ActionUpdateRequest, current_user: Optional[dict] = Depends(get_optional_user)):
+async def update_action(action_id: str, body: ActionUpdateRequest, current_actor: Optional[dict] = Depends(get_optional_actor)):
+    _assert_action_access(action_id, current_actor)
     return update_action_record(
         action_id,
         title=body.title,
@@ -76,7 +124,8 @@ async def update_action(action_id: str, body: ActionUpdateRequest, current_user:
 
 
 @router.post("/actions/{action_id}/dismiss")
-async def dismiss_action(action_id: str, current_user: Optional[dict] = Depends(get_optional_user)):
+async def dismiss_action(action_id: str, current_actor: Optional[dict] = Depends(get_optional_actor)):
+    _assert_action_access(action_id, current_actor)
     return dismiss_action_record(action_id)
 
 
@@ -84,9 +133,10 @@ async def dismiss_action(action_id: str, current_user: Optional[dict] = Depends(
 async def execute_action(
     action_id: str,
     body: ExecuteActionRequest = Body(default_factory=ExecuteActionRequest),
-    current_user: Optional[dict] = Depends(get_optional_user),
+    current_actor: Optional[dict] = Depends(get_optional_actor),
 ):
-    user_id = current_user["id"] if current_user else None
+    _assert_action_access(action_id, current_actor)
+    user_id = current_actor["user"]["id"] if current_actor else None
     override = body.payload if body and body.payload else None
     draft = bool(body.create_draft) if body else False
     return execute_action_record(action_id, user_id, override, create_draft=draft)

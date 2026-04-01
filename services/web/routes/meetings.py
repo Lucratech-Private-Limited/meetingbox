@@ -16,7 +16,7 @@ import redis
 import shutil
 import httpx
 
-from auth import get_current_user, get_optional_user
+from auth import get_current_user, get_optional_actor
 from database import get_connection
 from meeting_agent import run_meeting_agent_pipeline
 
@@ -125,6 +125,8 @@ UPLOAD_AUDIO_EXTENSIONS = {".wav", ".webm", ".ogg", ".mp4", ".m4a"}
 
 class MeetingResponse(BaseModel):
   id: str
+  user_id: Optional[str] = None
+  device_id: Optional[str] = None
   title: str
   start_time: str
   end_time: Optional[str]
@@ -198,14 +200,15 @@ def _normalize_summary_data(data: dict) -> dict:
   return data
 
 
-def _resolve_user_id_for_post_summarize_actions(current_user: Optional[dict]) -> Optional[str]:
+def _resolve_user_id_for_post_summarize_actions(actor: Optional[dict]) -> Optional[str]:
   """
   Logged-in web clients: use their user id.
   Device UI calls summarize without JWT: if exactly one user has Gmail/Calendar connected,
   use that user so agentic actions can be generated in the same response (typical home setup).
   """
-  if current_user and current_user.get("id"):
-    return str(current_user["id"])
+  direct_user_id = _actor_user_id(actor)
+  if direct_user_id:
+    return str(direct_user_id)
   conn = get_connection()
   try:
     cur = conn.cursor()
@@ -230,11 +233,49 @@ class MeetingDetail(BaseModel):
   local_summary: Optional[LocalSummary]
 
 
+def _app_setting_int(key: str, default: int) -> int:
+  conn = get_connection()
+  try:
+    cur = conn.cursor()
+    cur.execute("SELECT value FROM app_settings WHERE key = ?", (key,))
+    row = cur.fetchone()
+  finally:
+    conn.close()
+  if not row or row[0] is None:
+    return default
+  try:
+    return int(str(row[0]).strip())
+  except (TypeError, ValueError):
+    return default
+
+
+def _actor_user_id(actor: Optional[dict]) -> Optional[str]:
+  if not actor:
+    return None
+  if actor["type"] == "device":
+    return actor["user"]["id"]
+  return actor["user"]["id"]
+
+
+def _actor_device_id(actor: Optional[dict]) -> Optional[str]:
+  if not actor or actor["type"] != "device":
+    return None
+  return actor["device"]["id"]
+
+
+def _meeting_access_filter(actor: Optional[dict], alias: str = "meetings") -> tuple[str, list[object]]:
+  if not actor:
+    return "", []
+  column = f"{alias}.device_id" if actor["type"] == "device" else f"{alias}.user_id"
+  value = _actor_device_id(actor) if actor["type"] == "device" else _actor_user_id(actor)
+  return f"{column} = ?", [value]
+
+
 # --- Start / Stop meeting (wire to Redis for audio service) ---
-# Recording control uses get_optional_user so the device-ui (no login) can start/stop/pause/resume.
+# Recording control accepts a signed-in user or a paired device token.
 
 @router.post("/start")
-async def start_meeting(current_user: Optional[dict] = Depends(get_optional_user)):
+async def start_meeting(current_actor: Optional[dict] = Depends(get_optional_actor)):
   """Start a new recording. Sends command to audio service via Redis."""
   session_id = _generate_session_id()
   _get_redis().publish("commands", json.dumps({"action": "start_recording", "session_id": session_id}))
@@ -244,7 +285,7 @@ async def start_meeting(current_user: Optional[dict] = Depends(get_optional_user
 
 
 @router.post("/stop")
-async def stop_meeting(current_user: Optional[dict] = Depends(get_optional_user)):
+async def stop_meeting(current_actor: Optional[dict] = Depends(get_optional_actor)):
   """Stop the current recording. Sends command to audio service via Redis."""
   session_id = _get_redis().get("current_meeting_id")
   _get_redis().publish(
@@ -258,7 +299,7 @@ async def stop_meeting(current_user: Optional[dict] = Depends(get_optional_user)
 
 
 @router.get("/recording-status")
-async def recording_status(current_user: Optional[dict] = Depends(get_optional_user)):
+async def recording_status(current_actor: Optional[dict] = Depends(get_optional_actor)):
   """Current recording state for the dashboard."""
   state = _get_redis().get("recording_state") or "idle"
   current_id = _get_redis().get("current_meeting_id")
@@ -266,7 +307,7 @@ async def recording_status(current_user: Optional[dict] = Depends(get_optional_u
 
 
 @router.post("/reset-recording-state")
-async def reset_recording_state(current_user: Optional[dict] = Depends(get_optional_user)):
+async def reset_recording_state(current_actor: Optional[dict] = Depends(get_optional_actor)):
   """Clear recording state so the dashboard shows Start/Record buttons again (e.g. if stuck on Processing)."""
   _get_redis().set("recording_state", "idle")
   _get_redis().delete("current_meeting_id")
@@ -274,7 +315,7 @@ async def reset_recording_state(current_user: Optional[dict] = Depends(get_optio
 
 
 @router.post("/pause")
-async def pause_meeting(current_user: Optional[dict] = Depends(get_optional_user)):
+async def pause_meeting(current_actor: Optional[dict] = Depends(get_optional_actor)):
   """Pause the current recording."""
   state = _get_redis().get("recording_state") or "idle"
   if state != "recording":
@@ -289,7 +330,7 @@ async def pause_meeting(current_user: Optional[dict] = Depends(get_optional_user
 
 
 @router.post("/resume")
-async def resume_meeting(current_user: Optional[dict] = Depends(get_optional_user)):
+async def resume_meeting(current_actor: Optional[dict] = Depends(get_optional_actor)):
   """Resume a paused recording."""
   state = _get_redis().get("recording_state") or "idle"
   if state != "paused":
@@ -309,14 +350,20 @@ class MeetingUpdateRequest(BaseModel):
 
 
 @router.patch("/{meeting_id}")
-async def update_meeting(meeting_id: str, body: MeetingUpdateRequest, current_user: Optional[dict] = Depends(get_optional_user)):
+async def update_meeting(meeting_id: str, body: MeetingUpdateRequest, current_actor: Optional[dict] = Depends(get_optional_actor)):
   """Update editable fields of a meeting (title, status)."""
   conn = get_connection()
   conn.execute("PRAGMA foreign_keys = ON")
   conn.row_factory = lambda cursor, row: {col[0]: row[idx] for idx, col in enumerate(cursor.description)}
   try:
     cur = conn.cursor()
-    cur.execute("SELECT * FROM meetings WHERE id = ?", (meeting_id,))
+    where_sql, where_params = _meeting_access_filter(current_actor)
+    query = "SELECT * FROM meetings WHERE id = ?"
+    query_params: list[object] = [meeting_id]
+    if where_sql:
+      query += f" AND {where_sql}"
+      query_params.extend(where_params)
+    cur.execute(query, query_params)
     meeting = cur.fetchone()
     if not meeting:
       raise HTTPException(status_code=404, detail="Meeting not found")
@@ -337,20 +384,26 @@ async def update_meeting(meeting_id: str, body: MeetingUpdateRequest, current_us
     cur.execute(f"UPDATE meetings SET {', '.join(updates)} WHERE id = ?", params)
     conn.commit()
 
-    cur.execute("SELECT * FROM meetings WHERE id = ?", (meeting_id,))
+    cur.execute(query, query_params)
     return cur.fetchone()
   finally:
     conn.close()
 
 
 @router.delete("/{meeting_id}")
-async def delete_meeting(meeting_id: str, current_user: Optional[dict] = Depends(get_optional_user)):
+async def delete_meeting(meeting_id: str, current_actor: Optional[dict] = Depends(get_optional_actor)):
   """Delete a meeting and all its associated data."""
   conn = get_connection()
   conn.execute("PRAGMA foreign_keys = ON")
   try:
     cur = conn.cursor()
-    cur.execute("SELECT id, audio_path FROM meetings WHERE id = ?", (meeting_id,))
+    where_sql, where_params = _meeting_access_filter(current_actor)
+    query = "SELECT id, audio_path FROM meetings WHERE id = ?"
+    query_params: list[object] = [meeting_id]
+    if where_sql:
+      query += f" AND {where_sql}"
+      query_params.extend(where_params)
+    cur.execute(query, query_params)
     row = cur.fetchone()
     if not row:
       raise HTTPException(status_code=404, detail="Meeting not found")
@@ -376,13 +429,13 @@ async def delete_meeting(meeting_id: str, current_user: Optional[dict] = Depends
 # --- Test WAV ingest (bypass mic: feed a WAV file into transcription → AI pipeline) ---
 
 @router.post("/test/ingest-wav")
-async def ingest_test_wav(file: UploadFile = File(...), current_user: dict | None = Depends(get_optional_user)):
+async def ingest_test_wav(file: UploadFile = File(...), current_actor: dict | None = Depends(get_optional_actor)):
   """
   Upload a WAV file to run through the cloud-only Anthropic pipeline.
   """
   if not file.filename or not file.filename.lower().endswith(".wav"):
     raise HTTPException(status_code=400, detail="Upload must be a .wav file")
-  return await upload_audio(file=file, session_id=_generate_session_id(), _current_user=current_user)
+  return await upload_audio(file=file, session_id=_generate_session_id(), current_actor=current_actor)
 
 
 def _ensure_16k_mono_wav(source: Path, dest: Path) -> None:
@@ -433,7 +486,7 @@ def _transcribe_audio_with_openai(audio_path: Path) -> str:
 async def upload_audio(
   file: UploadFile = File(...),
   session_id: Optional[str] = Form(default=None),
-  _current_user: Optional[dict] = Depends(get_optional_user),
+  current_actor: Optional[dict] = Depends(get_optional_actor),
 ):
   """
   Upload audio from your computer (e.g. browser recording). Accepts WAV, WebM, OGG, MP4.
@@ -476,6 +529,17 @@ async def upload_audio(
   except Exception:
     duration_seconds = 0
 
+  max_duration_seconds = _app_setting_int("max_meeting_upload_seconds", 10800)
+  if duration_seconds and duration_seconds > max_duration_seconds:
+    dest_wav.unlink(missing_ok=True)
+    raise HTTPException(
+      status_code=413,
+      detail=f"Meeting audio exceeds the configured upload limit of {max_duration_seconds // 3600} hour(s).",
+    )
+
+  owner_user_id = _actor_user_id(current_actor)
+  owner_device_id = _actor_device_id(current_actor)
+
   _get_redis().publish(
     "events",
     json.dumps({
@@ -497,15 +561,34 @@ async def upload_audio(
     if not exists:
       cur.execute(
         """
-        INSERT INTO meetings (id, title, start_time, end_time, duration, audio_path, status, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO meetings (id, user_id, device_id, title, start_time, end_time, duration, audio_path, status, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (session_id, f"Meeting {session_id}", now_iso, None, None, str(dest_wav), "transcribing", now_iso),
+        (
+          session_id,
+          owner_user_id,
+          owner_device_id,
+          f"Meeting {session_id}",
+          now_iso,
+          None,
+          None,
+          str(dest_wav),
+          "transcribing",
+          now_iso,
+        ),
       )
     else:
       cur.execute(
-        "UPDATE meetings SET audio_path = ?, status = ?, start_time = COALESCE(start_time, ?) WHERE id = ?",
-        (str(dest_wav), "transcribing", now_iso, session_id),
+        """
+        UPDATE meetings
+        SET user_id = COALESCE(user_id, ?),
+            device_id = COALESCE(device_id, ?),
+            audio_path = ?,
+            status = ?,
+            start_time = COALESCE(start_time, ?)
+        WHERE id = ?
+        """,
+        (owner_user_id, owner_device_id, str(dest_wav), "transcribing", now_iso, session_id),
       )
     conn.commit()
   finally:
@@ -517,7 +600,7 @@ async def upload_audio(
       session_id,
       dest_wav,
       duration_seconds,
-      _current_user,
+      current_actor,
     )
 
     _get_redis().set("recording_state", "idle")
@@ -540,7 +623,7 @@ async def upload_audio(
 
 
 @router.get("/")
-async def list_meetings(limit: int = 50, offset: int = 0, status: Optional[str] = None, current_user: Optional[dict] = Depends(get_optional_user)):
+async def list_meetings(limit: int = 50, offset: int = 0, status: Optional[str] = None, current_actor: Optional[dict] = Depends(get_optional_actor)):
   conn = get_connection()
   conn.execute("PRAGMA foreign_keys = ON")
   conn.row_factory = lambda cursor, row: {col[0]: row[idx] for idx, col in enumerate(cursor.description)}  # type: ignore
@@ -552,9 +635,16 @@ async def list_meetings(limit: int = 50, offset: int = 0, status: Optional[str] 
       FROM meetings m
     """
     params: list[object] = []
+    filters: list[str] = []
+    scope_sql, scope_params = _meeting_access_filter(current_actor, alias="m")
+    if scope_sql:
+      filters.append(scope_sql)
+      params.extend(scope_params)
     if status:
-      query += " WHERE m.status = ?"
+      filters.append("m.status = ?")
       params.append(status)
+    if filters:
+      query += " WHERE " + " AND ".join(filters)
     query += " ORDER BY m.created_at DESC LIMIT ? OFFSET ?"
     params.extend([limit, offset])
     cur.execute(query, params)
@@ -586,7 +676,7 @@ def _anthropic_message_text(resp) -> str:
 
 
 @router.post("/{meeting_id}/summarize")
-async def summarize_meeting(meeting_id: str, current_user: Optional[dict] = Depends(get_optional_user)):
+async def summarize_meeting(meeting_id: str, current_actor: Optional[dict] = Depends(get_optional_actor)):
   """Generate a detailed meeting report from the transcript using Claude (stored in summaries.summary)."""
   client = _get_anthropic_client()
   if not client:
@@ -598,7 +688,13 @@ async def summarize_meeting(meeting_id: str, current_user: Optional[dict] = Depe
   try:
     cur = conn.cursor()
 
-    cur.execute("SELECT * FROM meetings WHERE id = ?", (meeting_id,))
+    scope_sql, scope_params = _meeting_access_filter(current_actor)
+    meeting_query = "SELECT * FROM meetings WHERE id = ?"
+    meeting_params: list[object] = [meeting_id]
+    if scope_sql:
+      meeting_query += f" AND {scope_sql}"
+      meeting_params.extend(scope_params)
+    cur.execute(meeting_query, meeting_params)
     meeting = cur.fetchone()
     if not meeting:
       raise HTTPException(status_code=404, detail="Meeting not found")
@@ -795,7 +891,7 @@ async def summarize_meeting(meeting_id: str, current_user: Optional[dict] = Depe
 
   # Create Gmail/Calendar agentic actions in the same request so clients (e.g. device UI)
   # see suggestions as soon as the summary response returns, without a second round-trip.
-  user_for_actions = _resolve_user_id_for_post_summarize_actions(current_user)
+  user_for_actions = _resolve_user_id_for_post_summarize_actions(current_actor)
   if not user_for_actions:
     logger.info(
       "Skipping post-summarize agentic actions for meeting %s: sign in or connect integrations on one account",
@@ -827,9 +923,9 @@ async def summarize_meeting(meeting_id: str, current_user: Optional[dict] = Depe
 
 
 @router.post("/{meeting_id}/summarize-local")
-async def summarize_meeting_local(meeting_id: str, current_user: Optional[dict] = Depends(get_optional_user)):
+async def summarize_meeting_local(meeting_id: str, current_actor: Optional[dict] = Depends(get_optional_actor)):
   """Compatibility route: force Anthropic summary instead of local LLM."""
-  return await summarize_meeting(meeting_id, current_user)
+  return await summarize_meeting(meeting_id, current_actor)
 
 
 class EmailRequest(BaseModel):
@@ -853,7 +949,7 @@ async def email_summary(meeting_id: str, body: EmailRequest, current_user: dict 
   conn.row_factory = lambda cursor, row: {col[0]: row[idx] for idx, col in enumerate(cursor.description)}
   try:
     cur = conn.cursor()
-    cur.execute("SELECT * FROM meetings WHERE id = ?", (meeting_id,))
+    cur.execute("SELECT * FROM meetings WHERE id = ? AND user_id = ?", (meeting_id, user_id))
     meeting = cur.fetchone()
     if not meeting:
       raise HTTPException(status_code=404, detail="Meeting not found")
@@ -927,14 +1023,20 @@ async def email_summary(meeting_id: str, body: EmailRequest, current_user: dict 
 
 
 @router.get("/{meeting_id}/audio")
-async def get_meeting_audio(meeting_id: str, current_user: Optional[dict] = Depends(get_optional_user)):
+async def get_meeting_audio(meeting_id: str, current_actor: Optional[dict] = Depends(get_optional_actor)):
   """Stream the audio recording file for a meeting."""
   from fastapi.responses import FileResponse
 
   conn = get_connection()
   try:
     cur = conn.cursor()
-    cur.execute("SELECT audio_path FROM meetings WHERE id = ?", (meeting_id,))
+    scope_sql, scope_params = _meeting_access_filter(current_actor)
+    query = "SELECT audio_path FROM meetings WHERE id = ?"
+    query_params: list[object] = [meeting_id]
+    if scope_sql:
+      query += f" AND {scope_sql}"
+      query_params.extend(scope_params)
+    cur.execute(query, query_params)
     row = cur.fetchone()
     if not row:
       raise HTTPException(status_code=404, detail="Meeting not found")
@@ -966,7 +1068,7 @@ async def get_meeting_audio(meeting_id: str, current_user: Optional[dict] = Depe
 
 
 @router.get("/{meeting_id}/export/{fmt}")
-async def export_meeting(meeting_id: str, fmt: str, current_user: Optional[dict] = Depends(get_optional_user)):
+async def export_meeting(meeting_id: str, fmt: str, current_actor: Optional[dict] = Depends(get_optional_actor)):
   """Export a meeting as TXT or PDF."""
   from fastapi.responses import Response
 
@@ -978,7 +1080,13 @@ async def export_meeting(meeting_id: str, fmt: str, current_user: Optional[dict]
   try:
     cur = conn.cursor()
 
-    cur.execute("SELECT * FROM meetings WHERE id = ?", (meeting_id,))
+    scope_sql, scope_params = _meeting_access_filter(current_actor)
+    meeting_query = "SELECT * FROM meetings WHERE id = ?"
+    meeting_params: list[object] = [meeting_id]
+    if scope_sql:
+      meeting_query += f" AND {scope_sql}"
+      meeting_params.extend(scope_params)
+    cur.execute(meeting_query, meeting_params)
     meeting = cur.fetchone()
     if not meeting:
       raise HTTPException(status_code=404, detail="Meeting not found")
@@ -1101,14 +1209,20 @@ async def export_meeting(meeting_id: str, fmt: str, current_user: Optional[dict]
 
 
 @router.get("/{meeting_id}", response_model=MeetingDetail)
-async def get_meeting(meeting_id: str, current_user: Optional[dict] = Depends(get_optional_user)):
+async def get_meeting(meeting_id: str, current_actor: Optional[dict] = Depends(get_optional_actor)):
   conn = get_connection()
   conn.execute("PRAGMA foreign_keys = ON")
   conn.row_factory = lambda cursor, row: {col[0]: row[idx] for idx, col in enumerate(cursor.description)}  # type: ignore
   try:
     cur = conn.cursor()
 
-    cur.execute("SELECT * FROM meetings WHERE id = ?", (meeting_id,))
+    scope_sql, scope_params = _meeting_access_filter(current_actor)
+    meeting_query = "SELECT * FROM meetings WHERE id = ?"
+    meeting_params: list[object] = [meeting_id]
+    if scope_sql:
+      meeting_query += f" AND {scope_sql}"
+      meeting_params.extend(scope_params)
+    cur.execute(meeting_query, meeting_params)
     meeting = cur.fetchone()
     if not meeting:
       raise HTTPException(status_code=404, detail="Meeting not found")
