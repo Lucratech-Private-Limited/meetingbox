@@ -198,6 +198,31 @@ def _normalize_summary_data(data: dict) -> dict:
   return data
 
 
+def _resolve_user_id_for_post_summarize_actions(current_user: Optional[dict]) -> Optional[str]:
+  """
+  Logged-in web clients: use their user id.
+  Device UI calls summarize without JWT: if exactly one user has Gmail/Calendar connected,
+  use that user so agentic actions can be generated in the same response (typical home setup).
+  """
+  if current_user and current_user.get("id"):
+    return str(current_user["id"])
+  conn = get_connection()
+  try:
+    cur = conn.cursor()
+    cur.execute(
+      """
+      SELECT DISTINCT user_id FROM integrations
+      WHERE provider IN ('gmail', 'calendar') AND user_id IS NOT NULL AND TRIM(user_id) != ''
+      """,
+    )
+    ids = [str(r[0]).strip() for r in cur.fetchall() if r and r[0]]
+    if len(ids) == 1:
+      return ids[0]
+  finally:
+    conn.close()
+  return None
+
+
 class MeetingDetail(BaseModel):
   meeting: MeetingResponse
   segments: List[TranscriptSegment]
@@ -767,6 +792,26 @@ async def summarize_meeting(meeting_id: str, current_user: Optional[dict] = Depe
     conn.commit()
   finally:
     conn.close()
+
+  # Create Gmail/Calendar agentic actions in the same request so clients (e.g. device UI)
+  # see suggestions as soon as the summary response returns, without a second round-trip.
+  user_for_actions = _resolve_user_id_for_post_summarize_actions(current_user)
+  if not user_for_actions:
+    logger.info(
+      "Skipping post-summarize agentic actions for meeting %s: sign in or connect integrations on one account",
+      meeting_id,
+    )
+  else:
+    try:
+      from services.action_engine import generate_actions_for_meeting
+
+      generate_actions_for_meeting(meeting_id, user_for_actions)
+    except Exception as exc:
+      logger.warning(
+        "Agentic actions not generated after summarize for meeting %s: %s",
+        meeting_id,
+        exc,
+      )
 
   return {
     "status": "generated",

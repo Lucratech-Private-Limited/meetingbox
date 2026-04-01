@@ -353,9 +353,9 @@ class SummaryReviewScreen(BaseScreen):
 
             note = Label(
                 text=(
-                    'These come from the meeting summary. On the web dashboard, '
-                    'AI Gmail and Calendar actions are generated automatically when available. '
-                    'If they still do not appear, connect integrations and reopen this screen.'
+                    'These are checklist items from the report. Gmail/Calendar actions are created on the server '
+                    'with the report when you are signed in and integrations are connected. '
+                    'If the AI Actions list is still empty, connect accounts in the web app or reopen this screen.'
                 ),
                 font_size=FONT_SIZES['small'],
                 color=COLORS['gray_500'],

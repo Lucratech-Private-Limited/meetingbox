@@ -630,6 +630,14 @@ class MeetingBoxApp(App):
         """After transcription completes, auto-trigger summarization then show review screen."""
         async def _run():
             try:
+                def _status_actions(_dt):
+                    screen = self.screen_manager.get_screen('processing')
+                    if hasattr(screen, 'set_processing_status'):
+                        screen.set_processing_status(
+                            'Finishing report and Gmail/Calendar suggestions…',
+                        )
+
+                Clock.schedule_once(_status_actions, 0)
                 summary = await self.backend.summarize_meeting_local(meeting_id)
 
                 def _show(_dt):
