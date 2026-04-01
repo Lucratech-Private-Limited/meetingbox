@@ -2,7 +2,7 @@
 
 import { useMemo, useState } from 'react'
 import toast from 'react-hot-toast'
-import type { MeetingSummary, ActionItem } from '../../types/meeting'
+import type { MeetingSummary, ActionItem, ActionItemType } from '../../types/meeting'
 import { postAssistantIntent } from '../../api/assistant'
 import { useAuthStore } from '../../store/authStore'
 import { parseSummaryReport } from '../../utils/parseSummaryReport'
@@ -10,6 +10,26 @@ import { parseSummaryReport } from '../../utils/parseSummaryReport'
 interface SummaryCardProps {
   summary: MeetingSummary | null
   meetingId?: string | null
+}
+
+function normalizeActionItemType(raw: unknown): ActionItemType | undefined {
+  if (raw !== 'email_draft' && raw !== 'calendar_invite' && raw !== 'task') {
+    return undefined
+  }
+  return raw
+}
+
+/** When type is missing, show both buttons so older meeting payloads still work. */
+function showScheduleForItem(item: ActionItem): boolean {
+  const t = normalizeActionItemType(item.type)
+  if (t === undefined) return true
+  return t === 'calendar_invite'
+}
+
+function showEmailForItem(item: ActionItem): boolean {
+  const t = normalizeActionItemType(item.type)
+  if (t === undefined) return true
+  return t === 'email_draft'
 }
 
 export default function SummaryCard({ summary, meetingId }: SummaryCardProps) {
@@ -210,9 +230,9 @@ export default function SummaryCard({ summary, meetingId }: SummaryCardProps) {
         <div className="bg-white rounded-lg border border-gray-200 p-6">
           <h3 className="text-lg font-semibold text-gray-900 mb-4">Action Items</h3>
           <p className="text-sm text-gray-600 mb-4">
-            Use <span className="font-medium">Schedule</span> or <span className="font-medium">Email</span> to queue a
-            calendar event or Gmail draft (sign-in and Google Calendar / Gmail connected). Approve or edit drafts under
-            Settings → Integrations → Assistant queue.
+            <span className="font-medium">Schedule</span> appears for calendar-style items;{' '}
+            <span className="font-medium">Email</span> for email follow-ups. General tasks have no shortcut. Sign in and
+            connect Google Calendar / Gmail; approve under Settings → Integrations → Assistant queue.
           </p>
           <ul className="space-y-4">
             {summary.action_items.map((item, idx) => (
@@ -247,25 +267,34 @@ export default function SummaryCard({ summary, meetingId }: SummaryCardProps) {
                       )}
                     </div>
                   )}
+                  {normalizeActionItemType(item.type) === 'task' && (
+                    <p className="mt-1 text-xs text-gray-500">General task (no calendar or email shortcut).</p>
+                  )}
                 </div>
-                <div className="flex shrink-0 flex-col gap-1.5 sm:flex-row sm:items-center">
-                  <button
-                    type="button"
-                    disabled={!token || schedulingIdx !== null}
-                    onClick={() => void handleSchedule(item, idx)}
-                    className="rounded-lg border border-primary-200 bg-primary-50 px-3 py-1.5 text-xs font-medium text-primary-800 hover:bg-primary-100 disabled:opacity-40 disabled:cursor-not-allowed"
-                  >
-                    {schedulingIdx === idx ? 'Queuing…' : 'Schedule'}
-                  </button>
-                  <button
-                    type="button"
-                    disabled={!token || emailingIdx !== null}
-                    onClick={() => void handleEmail(item, idx)}
-                    className="rounded-lg border border-gray-200 bg-white px-3 py-1.5 text-xs font-medium text-gray-800 hover:bg-gray-50 disabled:opacity-40 disabled:cursor-not-allowed"
-                  >
-                    {emailingIdx === idx ? 'Queuing…' : 'Email'}
-                  </button>
-                </div>
+                {(showScheduleForItem(item) || showEmailForItem(item)) && (
+                  <div className="flex shrink-0 flex-col gap-1.5 sm:flex-row sm:items-center">
+                    {showScheduleForItem(item) && (
+                      <button
+                        type="button"
+                        disabled={!token || schedulingIdx !== null}
+                        onClick={() => void handleSchedule(item, idx)}
+                        className="rounded-lg border border-primary-200 bg-primary-50 px-3 py-1.5 text-xs font-medium text-primary-800 hover:bg-primary-100 disabled:opacity-40 disabled:cursor-not-allowed"
+                      >
+                        {schedulingIdx === idx ? 'Queuing…' : 'Schedule'}
+                      </button>
+                    )}
+                    {showEmailForItem(item) && (
+                      <button
+                        type="button"
+                        disabled={!token || emailingIdx !== null}
+                        onClick={() => void handleEmail(item, idx)}
+                        className="rounded-lg border border-gray-200 bg-white px-3 py-1.5 text-xs font-medium text-gray-800 hover:bg-gray-50 disabled:opacity-40 disabled:cursor-not-allowed"
+                      >
+                        {emailingIdx === idx ? 'Queuing…' : 'Email'}
+                      </button>
+                    )}
+                  </div>
+                )}
               </li>
             ))}
           </ul>

@@ -34,9 +34,14 @@ export interface MeetingSummary {
   sentiment: string
 }
 
+/** From API summarize JSON; drives which Assistant shortcuts appear in Summary. */
+export type ActionItemType = 'email_draft' | 'calendar_invite' | 'task'
+
 export interface ActionItem {
   task: string
   assignee: string | null
   due_date: string | null
   completed?: boolean
+  /** If omitted, both Schedule and Email are shown (legacy summaries). */
+  type?: ActionItemType
 }
