@@ -248,7 +248,7 @@ class SummaryReviewScreen(BaseScreen):
 
         if agentic:
             hdr = Label(
-                text='AI actions (select, then Execute)',
+                text='AI actions — Execute: Calendar = event, Gmail = draft only',
                 font_size=FONT_SIZES['small'],
                 bold=True,
                 color=COLORS['blue'],
@@ -389,7 +389,18 @@ class SummaryReviewScreen(BaseScreen):
         async def _run():
             for action_id in list(self._selected_actions):
                 try:
-                    await self.backend.execute_action(action_id)
+                    act = next(
+                        (a for a in (self._actions_data or []) if a.get('id') == action_id),
+                        None,
+                    )
+                    is_gmail = (
+                        act
+                        and str(act.get('connector_target', '')).lower() == 'gmail'
+                    )
+                    await self.backend.execute_action(
+                        action_id,
+                        create_draft=bool(is_gmail),
+                    )
                 except Exception as e:
                     logger.error(f"Failed to execute action {action_id}: {e}")
 
@@ -399,8 +410,9 @@ class SummaryReviewScreen(BaseScreen):
         dialog = ModalDialog(
             title='Actions Queued',
             message=(
-                f'Your actions are being executed.\n'
-                f'Check {DASHBOARD_URL} for details.'
+                'Calendar selections create events. Gmail selections save drafts only '
+                '(not sent). Check your Gmail Drafts and the dashboard.\n'
+                f'Dashboard: {DASHBOARD_URL}'
             ),
             confirm_text='OK',
             cancel_text='',

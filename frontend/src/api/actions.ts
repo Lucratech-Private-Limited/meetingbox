@@ -29,12 +29,16 @@ export const actionsApi = {
   execute: async (
     actionId: string,
     payloadOverride?: Record<string, unknown> | null,
+    options?: { createDraft?: boolean },
   ): Promise<ExecuteResult> => {
-    const hasOverride = payloadOverride && Object.keys(payloadOverride).length > 0
-    const response = await client.post(
-      `/api/actions/${actionId}/execute`,
-      hasOverride ? { payload: payloadOverride } : {},
-    )
+    const body: Record<string, unknown> = {}
+    if (payloadOverride && Object.keys(payloadOverride).length > 0) {
+      body.payload = payloadOverride
+    }
+    if (options?.createDraft) {
+      body.create_draft = true
+    }
+    const response = await client.post(`/api/actions/${actionId}/execute`, body)
     return response.data
   },
 

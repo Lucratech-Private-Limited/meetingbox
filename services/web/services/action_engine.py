@@ -11,6 +11,7 @@ from fastapi import HTTPException
 from database import get_connection
 from routes.integrations import get_action_capabilities, get_credentials_for_provider
 from services.calendar import create_event
+from services.gmail import create_draft as gmail_create_draft
 from services.gmail import send_email
 
 logger = logging.getLogger(__name__)
@@ -188,9 +189,13 @@ def _build_generation_prompt_gmail_calendar(context: dict[str, Any], capabilitie
         "Only Gmail (follow-up email) and Google Calendar (schedule follow-up) are allowed.\n"
         "Propose at most 3 actions total. Do not propose duplicates or near-duplicates (same intent).\n"
         "Each action must be clearly grounded in the meeting content.\n\n"
+        "If the meeting is only a test, a monologue, prompt experimentation, narration, or otherwise has no real external follow-up, return an empty array.\n"
+        "Do not invent stakeholders, dates, times, attendees, or follow-ups that are not supported by the transcript or summary.\n"
         "You may only use these action kinds: followup_email, schedule_followup.\n"
         "- followup_email → connector_target gmail, execution_mode message_send\n"
         "- schedule_followup → connector_target calendar, execution_mode event_create\n\n"
+        "For followup_email, only emit an action if there is a concrete follow-up worth emailing about. Include payload with subject and body draft text.\n"
+        "For schedule_followup, only emit an action if there is a concrete next meeting/check-in/block worth scheduling. Include payload with suggested_date and suggested_time.\n"
         "For schedule_followup, put a tentative draft in payload: "
         'suggested_date (YYYY-MM-DD), suggested_time (HH:MM 24h), duration_minutes (int), '
         f"timezone (IANA, default \"{tz_hint}\"), attendees ([] emails), description (optional).\n\n"
@@ -338,6 +343,32 @@ def _find_pending_action_duplicate(
     return None
 
 
+def _has_meaningful_gmail_draft(payload: dict[str, Any]) -> bool:
+    subject = str(payload.get("subject") or "").strip()
+    body = str(payload.get("body") or "").strip()
+    return bool(subject and body)
+
+
+def _has_meaningful_calendar_draft(payload: dict[str, Any]) -> bool:
+    suggested_date = str(payload.get("suggested_date") or "").strip()
+    suggested_time = str(payload.get("suggested_time") or "").strip()
+    return bool(suggested_date and suggested_time)
+
+
+def _is_valid_generated_action(action: dict[str, Any]) -> bool:
+    title = str(action.get("title") or "").strip()
+    description = str(action.get("description") or "").strip()
+    payload = action.get("payload") if isinstance(action.get("payload"), dict) else {}
+    connector_target = str(action.get("connector_target") or "").strip()
+    if not title:
+        return False
+    if connector_target == "gmail":
+        return _has_meaningful_gmail_draft(payload)
+    if connector_target == "calendar":
+        return _has_meaningful_calendar_draft(payload) and bool(title or description)
+    return False
+
+
 def generate_actions_for_meeting(meeting_id: str, user_id: str | None) -> list[dict[str, Any]]:
     context = get_meeting_context(meeting_id)
     if not context["summary"] and not context["transcript"]:
@@ -381,45 +412,31 @@ def generate_actions_for_meeting(meeting_id: str, user_id: str | None) -> list[d
                 "source_signals": item.get("source_signals", []),
             },
         }
-        if not action["title"]:
+        if not _is_valid_generated_action(action):
             continue
         key = _dedupe_key(action)
         if key in seen:
             continue
         seen.add(key)
         normalized.append(action)
+        if len(normalized) >= 3:
+            break
 
     conn = get_connection()
     conn.row_factory = _row_factory
     try:
         cur = conn.cursor()
+        cur.execute(
+            """
+            DELETE FROM actions
+            WHERE meeting_id = ?
+              AND status = 'pending'
+              AND connector_target IN ('gmail', 'calendar')
+            """,
+            (meeting_id,),
+        )
         stored: list[dict[str, Any]] = []
         for action in normalized:
-            title_key = _normalize_title_key(action["title"])
-            existing = _find_pending_action_duplicate(
-                cur, meeting_id, action["kind"], action["connector_target"], title_key
-            )
-            if existing:
-                cur.execute(
-                    """
-                    UPDATE actions
-                    SET description = ?, confidence = ?, payload = ?, draft = ?, execution_mode = ?, type = ?
-                    WHERE id = ?
-                    """,
-                    (
-                        action["description"],
-                        action["confidence"],
-                        json.dumps(action["payload"]),
-                        json.dumps(action["draft"]),
-                        action["execution_mode"],
-                        action["type"],
-                        existing["id"],
-                    ),
-                )
-                cur.execute("SELECT * FROM actions WHERE id = ?", (existing["id"],))
-                stored.append(_normalize_action_record(cur.fetchone()))
-                continue
-
             action_id = str(uuid.uuid4())
             now = datetime.utcnow().isoformat()
             cur.execute(
@@ -553,7 +570,13 @@ def _merge_pref_over_llm(llm: dict[str, Any], pref: dict[str, Any]) -> dict[str,
     return out
 
 
-def execute_action_record(action_id: str, user_id: str | None, payload_override: dict[str, Any] | None = None) -> dict[str, Any]:
+def execute_action_record(
+    action_id: str,
+    user_id: str | None,
+    payload_override: dict[str, Any] | None = None,
+    *,
+    create_draft: bool = False,
+) -> dict[str, Any]:
     conn = get_connection()
     conn.row_factory = _row_factory
     try:
@@ -611,16 +634,32 @@ def execute_action_record(action_id: str, user_id: str | None, payload_override:
             cc_str = ", ".join(_coerce_email_list(cc_val))
         else:
             cc_str = (str(cc_val).strip() if cc_val else "") or None
-        gmail_result = send_email(
-            credentials=creds,
-            to=to,
-            subject=str(result_payload.get("subject") or normalized["title"] or "Follow-up"),
-            body=str(result_payload.get("body") or ""),
-            cc=cc_str,
-        )
-        result_payload["to"] = to_list
-        result_payload["gmail_message_id"] = gmail_result.get("id")
-        delivery_status = "sent_via_gmail"
+        subject_str = str(result_payload.get("subject") or normalized["title"] or "Follow-up")
+        body_str = str(result_payload.get("body") or "")
+        if create_draft:
+            draft_res = gmail_create_draft(
+                credentials=creds,
+                to=to,
+                subject=subject_str,
+                body=body_str,
+                cc=cc_str,
+            )
+            result_payload["to"] = to_list
+            result_payload["gmail_draft_id"] = draft_res.get("id")
+            msg = draft_res.get("message") or {}
+            result_payload["gmail_message_id"] = msg.get("id")
+            delivery_status = "saved_gmail_draft"
+        else:
+            gmail_result = send_email(
+                credentials=creds,
+                to=to,
+                subject=subject_str,
+                body=body_str,
+                cc=cc_str,
+            )
+            result_payload["to"] = to_list
+            result_payload["gmail_message_id"] = gmail_result.get("id")
+            delivery_status = "sent_via_gmail"
     elif connector_target == "calendar":
         if not user_id:
             raise HTTPException(status_code=400, detail="Logged-in user required to execute Calendar actions.")

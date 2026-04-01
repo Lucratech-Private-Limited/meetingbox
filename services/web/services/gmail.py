@@ -109,6 +109,34 @@ def send_email(
     return result
 
 
+def create_draft(
+    credentials,
+    to: str,
+    subject: str,
+    body: str,
+    cc: str | None = None,
+) -> dict:
+    """
+    Create a Gmail draft (does not send). Requires gmail.compose scope.
+    """
+    service = build("gmail", "v1", credentials=credentials, cache_discovery=False)
+    message = MIMEText(body, "plain")
+    message["to"] = to
+    message["subject"] = subject
+    if cc:
+        message["cc"] = cc
+    raw = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
+    draft_body = {"message": {"raw": raw}}
+    result = (
+        service.users()
+        .drafts()
+        .create(userId="me", body=draft_body)
+        .execute()
+    )
+    logger.info("Gmail draft created: id=%s subject=%s", result.get("id"), subject)
+    return result
+
+
 def get_user_email(credentials) -> str:
     """Return the authenticated Gmail user's email address."""
     service = build("gmail", "v1", credentials=credentials, cache_discovery=False)

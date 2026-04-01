@@ -260,11 +260,20 @@ class BackendClient:
             logger.error(f"Failed to get actions for meeting {meeting_id}: {e}")
             raise
 
-    async def execute_action(self, action_id: str) -> Dict:
-        """POST /api/actions/{action_id}/execute"""
+    async def execute_action(
+            self,
+            action_id: str,
+            *,
+            create_draft: bool = False,
+    ) -> Dict:
+        """POST /api/actions/{action_id}/execute — Gmail: create_draft saves to Gmail drafts instead of sending."""
         try:
+            body: Dict = {}
+            if create_draft:
+                body["create_draft"] = True
             resp = await self.client.post(
                 f"{self.base_url}/api/actions/{action_id}/execute",
+                json=body,
                 timeout=120.0,
             )
             resp.raise_for_status()

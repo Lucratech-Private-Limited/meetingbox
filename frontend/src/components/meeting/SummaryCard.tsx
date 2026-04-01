@@ -19,7 +19,7 @@ function normalizeActionItemType(raw: unknown): ActionItemType | undefined {
   return raw
 }
 
-/** When type is missing, show both buttons so older meeting payloads still work. */
+/** When type is missing, treat as both calendar + email for legacy summaries. */
 function showScheduleForItem(item: ActionItem): boolean {
   const t = normalizeActionItemType(item.type)
   if (t === undefined) return true
@@ -32,86 +32,86 @@ function showEmailForItem(item: ActionItem): boolean {
   return t === 'email_draft'
 }
 
+function itemHasFollowUpShortcut(item: ActionItem): boolean {
+  return showScheduleForItem(item) || showEmailForItem(item)
+}
+
 export default function SummaryCard({ summary, meetingId }: SummaryCardProps) {
   const token = useAuthStore((s) => s.token)
-  const [schedulingIdx, setSchedulingIdx] = useState<number | null>(null)
-  const [emailingIdx, setEmailingIdx] = useState<number | null>(null)
+  const [planningFollowUps, setPlanningFollowUps] = useState(false)
 
   const parsed = useMemo(
     () => parseSummaryReport(summary?.summary ?? ''),
     [summary],
   )
 
-  const handleSchedule = async (item: ActionItem, idx: number) => {
-    if (!token) {
-      toast.error('Sign in to queue a calendar event.')
-      return
-    }
-    if (!meetingId) {
-      toast.error('Missing meeting id.')
-      return
-    }
+  const queueCalendarIntent = async (item: ActionItem) => {
     const parts = [
       'Schedule a calendar event for this meeting action item:',
       `"${item.task}".`,
       item.due_date ? `Time or deadline mentioned: ${item.due_date}.` : '',
       item.assignee ? `Assignee: ${item.assignee}.` : '',
     ].filter(Boolean)
-    const message = parts.join(' ')
-    setSchedulingIdx(idx)
-    try {
-      const res = await postAssistantIntent(message, meetingId)
-      toast.success(res.assistant_message || 'Calendar request sent.')
-      if (res.pending_actions && res.pending_actions.length > 0) {
-        toast(
-          'Open Settings → Integrations and use Assistant queue → Approve to create the calendar event.',
-          { duration: 6000 },
-        )
-      }
-    } catch (err: unknown) {
-      const msg =
-        err && typeof err === 'object' && 'response' in err
-          ? String((err as { response?: { data?: { detail?: string } } }).response?.data?.detail ?? '')
-          : ''
-      toast.error(msg || 'Could not queue calendar request.')
-    } finally {
-      setSchedulingIdx(null)
-    }
+    await postAssistantIntent(parts.join(' '), meetingId!)
   }
 
-  const handleEmail = async (item: ActionItem, idx: number) => {
+  const queueEmailDraftIntent = async (item: ActionItem) => {
+    const parts = [
+      'Create a Gmail draft only — do not send the email. Action item:',
+      `"${item.task}".`,
+      item.assignee ? `Related person or assignee: ${item.assignee}.` : '',
+      item.due_date ? `Mentioned deadline: ${item.due_date}.` : '',
+    ].filter(Boolean)
+    await postAssistantIntent(parts.join(' '), meetingId!)
+  }
+
+  const handlePlanFollowUps = async () => {
     if (!token) {
-      toast.error('Sign in to queue an email draft.')
+      toast.error('Sign in to queue calendar and email follow-ups.')
       return
     }
     if (!meetingId) {
       toast.error('Missing meeting id.')
       return
     }
-    const parts = [
-      'Draft and send an email for this meeting action item:',
-      `"${item.task}".`,
-      item.assignee ? `Related person or assignee: ${item.assignee}.` : '',
-      item.due_date ? `Mentioned deadline: ${item.due_date}.` : '',
-    ].filter(Boolean)
-    const message = parts.join(' ')
-    setEmailingIdx(idx)
+    const items = summary?.action_items ?? []
+    const toPlan = items.filter(itemHasFollowUpShortcut)
+    if (toPlan.length === 0) {
+      toast.error('No calendar or email action items to queue.')
+      return
+    }
+    setPlanningFollowUps(true)
     try {
-      const res = await postAssistantIntent(message, meetingId)
-      toast.success(res.assistant_message || 'Email draft queued.')
-      if (res.pending_actions && res.pending_actions.length > 0) {
-        toast('Open Settings → Integrations → Assistant queue to review, edit, and approve the email.', {
-          duration: 6000,
-        })
+      let nCal = 0
+      let nMail = 0
+      for (const item of items) {
+        try {
+          if (showScheduleForItem(item)) {
+            await queueCalendarIntent(item)
+            nCal += 1
+          }
+          if (showEmailForItem(item)) {
+            await queueEmailDraftIntent(item)
+            nMail += 1
+          }
+        } catch (err: unknown) {
+          const msg =
+            err && typeof err === 'object' && 'response' in err
+              ? String((err as { response?: { data?: { detail?: string } } }).response?.data?.detail ?? '')
+              : ''
+          toast.error(msg || `Could not queue: ${item.task.slice(0, 60)}…`)
+          throw err
+        }
       }
-    } catch (err: unknown) {
-      const msg =
-        err && typeof err === 'object' && 'response' in err
-          ? String((err as { response?: { data?: { detail?: string } } }).response?.data?.detail ?? '')
-          : ''
-      toast.error(msg || 'Could not queue email draft.')
+      const bits = []
+      if (nCal) bits.push(`${nCal} calendar request(s)`)
+      if (nMail) bits.push(`${nMail} email draft request(s)`)
+      toast.success(`Queued ${bits.join(' and ')} with the assistant.`)
+      toast('Review and approve under Settings → Integrations → Assistant queue.', { duration: 6500 })
+    } catch {
+      /* toast already shown */
     } finally {
-      setEmailingIdx(null)
+      setPlanningFollowUps(false)
     }
   }
 
@@ -132,6 +132,7 @@ export default function SummaryCard({ summary, meetingId }: SummaryCardProps) {
   const useLegacySummaryOnly = !hasParsedSections && Boolean(summary.summary?.trim())
 
   const proseClass = 'text-gray-700 leading-relaxed whitespace-pre-wrap break-words'
+  const actionableItems = (summary.action_items ?? []).filter(itemHasFollowUpShortcut)
 
   return (
     <div className="space-y-6">
@@ -228,25 +229,30 @@ export default function SummaryCard({ summary, meetingId }: SummaryCardProps) {
       {/* Action Items */}
       {summary.action_items?.length > 0 && (
         <div className="bg-white rounded-lg border border-gray-200 p-6">
-          <h3 className="text-lg font-semibold text-gray-900 mb-4">Action Items</h3>
-          <p className="text-sm text-gray-600 mb-4">
-            <span className="font-medium">Schedule</span> appears for calendar-style items;{' '}
-            <span className="font-medium">Email</span> for email follow-ups. General tasks have no shortcut. Sign in and
-            connect Google Calendar / Gmail; approve under Settings → Integrations → Assistant queue.
-          </p>
+          <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+            <div className="min-w-0 flex-1">
+              <h3 className="text-lg font-semibold text-gray-900">Action Items</h3>
+              <p className="mt-1 text-sm text-gray-600">
+                Calendar invites and email drafts are sent to the assistant for approval. Connect Gmail and Calendar under
+                Settings → Integrations.
+              </p>
+            </div>
+            {actionableItems.length > 0 && (
+              <button
+                type="button"
+                disabled={!token || planningFollowUps}
+                onClick={() => void handlePlanFollowUps()}
+                className="shrink-0 rounded-lg bg-primary-600 px-4 py-2 text-sm font-medium text-white hover:bg-primary-700 disabled:opacity-40 disabled:cursor-not-allowed sm:mt-0"
+              >
+                {planningFollowUps ? 'Queuing…' : 'Plan follow-ups'}
+              </button>
+            )}
+          </div>
           <ul className="space-y-4">
             {summary.action_items.map((item, idx) => (
-              <li key={`${idx}-${item.task.slice(0, 80)}`} className="flex items-start gap-3">
-                <input
-                  type="checkbox"
-                  checked={item.completed}
-                  readOnly
-                  className="mt-1 h-4 w-4 text-primary-600 border-gray-300 rounded focus:ring-primary-500 shrink-0"
-                />
-                <div className="flex-1 min-w-0">
-                  <p className={`text-gray-900 ${item.completed ? 'line-through' : ''}`}>
-                    {item.task}
-                  </p>
+              <li key={`${idx}-${item.task.slice(0, 80)}`} className="border-b border-gray-100 pb-4 last:border-0 last:pb-0">
+                <div className="min-w-0">
+                  <p className={`text-gray-900 ${item.completed ? 'line-through text-gray-500' : ''}`}>{item.task}</p>
                   {(item.assignee || item.due_date) && (
                     <div className="mt-1 flex flex-wrap items-center gap-x-4 gap-y-1 text-sm text-gray-500">
                       {item.assignee && (
@@ -267,34 +273,19 @@ export default function SummaryCard({ summary, meetingId }: SummaryCardProps) {
                       )}
                     </div>
                   )}
+                  {normalizeActionItemType(item.type) === 'calendar_invite' && (
+                    <p className="mt-1 text-xs text-gray-500">Included when you use Plan follow-ups → calendar request.</p>
+                  )}
+                  {normalizeActionItemType(item.type) === 'email_draft' && (
+                    <p className="mt-1 text-xs text-gray-500">Included when you use Plan follow-ups → Gmail draft (not sent until you send from Gmail).</p>
+                  )}
                   {normalizeActionItemType(item.type) === 'task' && (
-                    <p className="mt-1 text-xs text-gray-500">General task (no calendar or email shortcut).</p>
+                    <p className="mt-1 text-xs text-gray-500">General task — not queued with Plan follow-ups.</p>
+                  )}
+                  {normalizeActionItemType(item.type) === undefined && itemHasFollowUpShortcut(item) && (
+                    <p className="mt-1 text-xs text-gray-500">Legacy item: both calendar and email requests may be queued.</p>
                   )}
                 </div>
-                {(showScheduleForItem(item) || showEmailForItem(item)) && (
-                  <div className="flex shrink-0 flex-col gap-1.5 sm:flex-row sm:items-center">
-                    {showScheduleForItem(item) && (
-                      <button
-                        type="button"
-                        disabled={!token || schedulingIdx !== null}
-                        onClick={() => void handleSchedule(item, idx)}
-                        className="rounded-lg border border-primary-200 bg-primary-50 px-3 py-1.5 text-xs font-medium text-primary-800 hover:bg-primary-100 disabled:opacity-40 disabled:cursor-not-allowed"
-                      >
-                        {schedulingIdx === idx ? 'Queuing…' : 'Schedule'}
-                      </button>
-                    )}
-                    {showEmailForItem(item) && (
-                      <button
-                        type="button"
-                        disabled={!token || emailingIdx !== null}
-                        onClick={() => void handleEmail(item, idx)}
-                        className="rounded-lg border border-gray-200 bg-white px-3 py-1.5 text-xs font-medium text-gray-800 hover:bg-gray-50 disabled:opacity-40 disabled:cursor-not-allowed"
-                      >
-                        {emailingIdx === idx ? 'Queuing…' : 'Email'}
-                      </button>
-                    )}
-                  </div>
-                )}
               </li>
             ))}
           </ul>

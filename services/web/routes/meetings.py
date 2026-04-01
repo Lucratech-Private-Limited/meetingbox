@@ -19,7 +19,6 @@ import httpx
 from auth import get_current_user, get_optional_user
 from database import get_connection
 from meeting_agent import run_meeting_agent_pipeline
-from services.action_engine import generate_actions_for_meeting
 
 logger = logging.getLogger(__name__)
 
@@ -768,14 +767,6 @@ async def summarize_meeting(meeting_id: str, current_user: Optional[dict] = Depe
     conn.commit()
   finally:
     conn.close()
-
-  if current_user:
-    try:
-      generate_actions_for_meeting(meeting_id, current_user["id"])
-    except HTTPException:
-      raise
-    except Exception:
-      logger.exception("Agentic action generation failed for %s", meeting_id)
 
   return {
     "status": "generated",

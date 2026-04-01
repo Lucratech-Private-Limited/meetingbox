@@ -50,6 +50,8 @@ class ExecuteActionRequest(BaseModel):
     """Optional fields merged into the action payload before execute (user review step)."""
 
     payload: Optional[dict[str, Any]] = None
+    #: If true and connector is Gmail, create a draft only (does not send). Ignored for Calendar.
+    create_draft: Optional[bool] = False
 
 
 @router.get("/meetings/{meeting_id}/actions", response_model=list[ActionResponse])
@@ -86,4 +88,5 @@ async def execute_action(
 ):
     user_id = current_user["id"] if current_user else None
     override = body.payload if body and body.payload else None
-    return execute_action_record(action_id, user_id, override)
+    draft = bool(body.create_draft) if body else False
+    return execute_action_record(action_id, user_id, override, create_draft=draft)

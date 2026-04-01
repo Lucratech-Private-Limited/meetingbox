@@ -45,6 +45,7 @@ REVOKE_URL = "https://oauth2.googleapis.com/revoke"
 SCOPES_BY_PROVIDER = {
     "gmail": " ".join([
         "https://www.googleapis.com/auth/gmail.send",
+        "https://www.googleapis.com/auth/gmail.compose",
         "https://www.googleapis.com/auth/gmail.readonly",
         "https://www.googleapis.com/auth/userinfo.email",
     ]),
