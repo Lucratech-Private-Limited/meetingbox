@@ -9,6 +9,13 @@ from pathlib import Path
 
 from typing import Optional
 
+# Load services/web/.env into os.environ before any local imports read env vars.
+try:
+  from dotenv import load_dotenv
+  load_dotenv(Path(__file__).resolve().parent / ".env")
+except ImportError:
+  pass
+
 from fastapi import Depends, FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
