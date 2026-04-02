@@ -8,7 +8,7 @@ import re
 import secrets
 import uuid
 from datetime import datetime
-from urllib.parse import quote_plus, urlencode
+from urllib.parse import quote_plus, urlencode, urlparse
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -38,7 +38,15 @@ GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 GOOGLE_USERINFO_URL = "https://www.googleapis.com/oauth2/v2/userinfo"
 FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "http://localhost:5173").rstrip("/")
 APP_BASE_URL = os.getenv("APP_BASE_URL", "http://localhost:8000").rstrip("/")
+# Public origin for Google OAuth redirect_uri (must match Authorized redirect URIs in Google Cloud).
+# Required on LAN: Google rejects http://192.168.x.x/... — use a hostname (e.g. http://meetingbox.home:8000)
+# in /etc/hosts + this var, or HTTPS in production.
+OAUTH_PUBLIC_BASE_URL = os.getenv("OAUTH_PUBLIC_BASE_URL", "").strip().rstrip("/")
 GOOGLE_LOGIN_SCOPES = "openid email profile"
+
+_PRIVATE_IP_RE = re.compile(
+    r"^(?:10\.|192\.168\.|172\.(?:1[6-9]|2\d|3[01])\.)(?:\d{1,3}\.){1}\d{1,3}$"
+)
 
 
 def _check_google_configured() -> None:
@@ -59,6 +67,39 @@ def _infer_backend_base_url(request: Request) -> str:
     return APP_BASE_URL
 
 
+def _hostname_is_rfc1918_literal(host: str) -> bool:
+    if not host or host.lower() in ("localhost", "127.0.0.1", "::1"):
+        return False
+    host = host.split(":")[0].strip()
+    return bool(_PRIVATE_IP_RE.match(host))
+
+
+def _url_uses_rfc1918_host(url: str) -> bool:
+    try:
+        host = urlparse(url).hostname or ""
+    except ValueError:
+        return False
+    return _hostname_is_rfc1918_literal(host)
+
+
+def _oauth_backend_base(request: Request) -> str:
+    """
+    Origin used in Google redirect_uri. Must match Google Cloud Console exactly.
+    """
+    if OAUTH_PUBLIC_BASE_URL:
+        return OAUTH_PUBLIC_BASE_URL
+    inferred = _infer_backend_base_url(request)
+    if _url_uses_rfc1918_host(inferred):
+        logger.warning(
+            "Google OAuth redirect would use a raw private IP (%s). Google returns "
+            "invalid_request for that. Set OAUTH_PUBLIC_BASE_URL to a hostname, e.g. "
+            "http://meetingbox.home:8000 (add 192.168.x.x meetingbox.home to /etc/hosts) "
+            "and add the same callback URL in Google Cloud Console.",
+            inferred,
+        )
+    return inferred
+
+
 def _infer_frontend_base_url(request: Request) -> str:
     origin = (request.headers.get("origin") or "").strip()
     if origin:
@@ -72,7 +113,7 @@ def _infer_frontend_base_url(request: Request) -> str:
 
 
 def _google_redirect_uri(request: Request) -> str:
-    return f"{_infer_backend_base_url(request)}/api/auth/google/callback"
+    return f"{_oauth_backend_base(request)}/api/auth/google/callback"
 
 
 def _state_token(frontend_base: str) -> str:
