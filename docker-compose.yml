@@ -40,6 +40,9 @@ services:
       - "host.docker.internal:host-gateway"
     environment:
       - PYTHONUNBUFFERED=1
+      - REDIS_HOST=redis
+      - RECORDINGS_DIR=/data/audio/recordings
+      - TEMP_SEGMENTS_DIR=/data/audio/temp
       - AUDIO_INPUT_DEVICE_INDEX=${AUDIO_INPUT_DEVICE_INDEX:-}
       - AUDIO_INPUT_DEVICE_NAME=${AUDIO_INPUT_DEVICE_NAME:-}
       - UPLOAD_AUDIO_ON_STOP=${UPLOAD_AUDIO_ON_STOP:-1}
@@ -128,6 +131,9 @@ services:
         condition: service_started
     environment:
       - PYTHONUNBUFFERED=1
+      - REDIS_HOST=redis
+      - MEETINGBOX_DB_PATH=/data/transcripts/meetings.db
+      - RECORDINGS_DIR=/data/audio/recordings
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - OPENAI_TRANSCRIBE_MODEL=${OPENAI_TRANSCRIBE_MODEL:-whisper-1}
