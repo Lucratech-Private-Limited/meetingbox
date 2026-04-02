@@ -31,8 +31,10 @@ source "$ACTIVATE"
 # so paired-device auth and backend URLs stay aligned.
 if [[ -f "$REPO_ROOT/.env" ]]; then
   set -a
+  # Root .env may be edited on Windows and contain CRLF line endings.
+  # Strip carriage returns so manual Linux launches still work.
   # shellcheck source=/dev/null
-  source "$REPO_ROOT/.env"
+  source /dev/stdin <<<"$(tr -d '\r' < "$REPO_ROOT/.env")"
   set +a
 fi
 
