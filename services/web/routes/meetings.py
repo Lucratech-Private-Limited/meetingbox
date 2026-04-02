@@ -65,7 +65,8 @@ def _get_redis() -> redis.Redis:
     _redis_client = redis.Redis(host=REDIS_HOST, port=6379, decode_responses=True)
   return _redis_client
 
-RECORDINGS_DIR = Path("/data/audio/recordings")
+# Must match audio capture + MEETINGBOX_ROOT layout (native installs use e.g. /opt/meetingbox/data/...).
+RECORDINGS_DIR = Path(os.getenv("RECORDINGS_DIR", "/data/audio/recordings"))
 RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
 
 MAX_UPLOAD_SIZE = 500 * 1024 * 1024  # 500 MB

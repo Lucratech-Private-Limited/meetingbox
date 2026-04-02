@@ -60,6 +60,8 @@ class AudioCaptureService:
       self.upload_audio_timeout_seconds = max(60, int(os.getenv("UPLOAD_AUDIO_TIMEOUT_SECONDS", "1200")))
     except ValueError:
       self.upload_audio_timeout_seconds = 1200
+    # Same token as device-ui: paired device Bearer so uploads get user_id/device_id on the server.
+    self._upload_auth_token = os.getenv("DEVICE_AUTH_TOKEN", "").strip()
 
     self.audio = pyaudio.PyAudio()
     self.stream: pyaudio.Stream | None = None
@@ -402,10 +404,13 @@ class AudioCaptureService:
 
     try:
       boundary, body = self._build_multipart_payload(wav_path, session_id)
+      headers = {"Content-Type": f"multipart/form-data; boundary={boundary}"}
+      if self._upload_auth_token:
+        headers["Authorization"] = f"Bearer {self._upload_auth_token}"
       req = urlrequest.Request(
         self.upload_audio_api_url,
         data=body,
-        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        headers=headers,
         method="POST",
       )
       with urlrequest.urlopen(req, timeout=self.upload_audio_timeout_seconds) as resp:
@@ -471,10 +476,12 @@ class AudioCaptureService:
 
     session_id = self.current_session_id
     uploaded = False
+    attempted_upload = False
     if self.upload_on_stop and final_path and session_id:
+      attempted_upload = True
       uploaded = self._upload_recording_via_api(final_path, session_id)
 
-    if not uploaded:
+    if attempted_upload and not uploaded:
       self.redis_client.publish(
         "events",
         json.dumps(
