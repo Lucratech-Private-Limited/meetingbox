@@ -13,6 +13,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 VENV_DIR="${VENV_DIR:-.venv}"
 ACTIVATE="$VENV_DIR/bin/activate"
@@ -25,6 +26,15 @@ fi
 
 # shellcheck source=/dev/null
 source "$ACTIVATE"
+
+# Manual device-ui launches should inherit the same shared env as docker-audio
+# so paired-device auth and backend URLs stay aligned.
+if [[ -f "$REPO_ROOT/.env" ]]; then
+  set -a
+  # shellcheck source=/dev/null
+  source "$REPO_ROOT/.env"
+  set +a
+fi
 
 export DISPLAY_WIDTH="${DISPLAY_WIDTH:-1024}"
 export DISPLAY_HEIGHT="${DISPLAY_HEIGHT:-600}"

@@ -1,6 +1,6 @@
 // Dashboard — primary landing page showing meeting list, stats, search & filter
 
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { apiClient } from '../api/client'
 import { useMeetings } from '../hooks/useMeetings'
@@ -15,7 +15,7 @@ import toast from 'react-hot-toast'
 type RecordingState = 'idle' | 'recording' | 'processing'
 
 export default function Dashboard() {
-  const { meetings, loading, startRecording, deleteMeeting } = useMeetings()
+  const { meetings, loading, fetchMeetings, startRecording, deleteMeeting } = useMeetings()
   const navigate = useNavigate()
   const [searchQuery, setSearchQuery] = useState('')
   const [filter, setFilter] = useState<DateFilter>('today')
@@ -24,16 +24,22 @@ export default function Dashboard() {
   const [recordingState, setRecordingState] = useState<RecordingState>('idle')
   const [sessionId, setSessionId] = useState<string | null>(null)
   const [diskPercent, setDiskPercent] = useState<number | null>(null)
+  const previousRecordingState = useRef<RecordingState>('idle')
 
   const pollRecordingStatus = useCallback(async () => {
     try {
       const res = await meetingsApi.getRecordingStatus()
-      setRecordingState(res.state as RecordingState)
+      const nextState = res.state as RecordingState
+      if (previousRecordingState.current === 'processing' && nextState === 'idle') {
+        await fetchMeetings()
+      }
+      previousRecordingState.current = nextState
+      setRecordingState(nextState)
       setSessionId(res.session_id)
     } catch {
       // Backend may be offline — stay idle
     }
-  }, [])
+  }, [fetchMeetings])
 
   useEffect(() => {
     pollRecordingStatus()
