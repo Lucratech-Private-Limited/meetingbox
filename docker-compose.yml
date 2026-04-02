@@ -34,13 +34,18 @@ services:
     depends_on:
       - redis
     user: "1000:1000"            # Run as host meetingbox user so data volume writes succeed
+    # Reach FastAPI on the host or on published port 8000 (host uvicorn / nginx → web).
+    # Inside a container, http://web:8000 only works when meetingbox-web is running in Compose.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
       - PYTHONUNBUFFERED=1
       - AUDIO_INPUT_DEVICE_INDEX=${AUDIO_INPUT_DEVICE_INDEX:-}
       - AUDIO_INPUT_DEVICE_NAME=${AUDIO_INPUT_DEVICE_NAME:-}
       - UPLOAD_AUDIO_ON_STOP=${UPLOAD_AUDIO_ON_STOP:-1}
-      - UPLOAD_AUDIO_API_URL=${UPLOAD_AUDIO_API_URL:-http://web:8000/api/meetings/upload-audio}
+      - UPLOAD_AUDIO_API_URL=${UPLOAD_AUDIO_API_URL:-http://host.docker.internal:8000/api/meetings/upload-audio}
       - UPLOAD_AUDIO_TIMEOUT_SECONDS=${UPLOAD_AUDIO_TIMEOUT_SECONDS:-1200}
+      - DEVICE_AUTH_TOKEN=${DEVICE_AUTH_TOKEN:-}
     volumes:
       - ./data/audio:/data/audio
     devices:
