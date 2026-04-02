@@ -161,7 +161,7 @@ class MeetingBoxReadyScreen(BaseScreen):
         card = BoxLayout(
             orientation="vertical",
             size_hint=(0.92, None),
-            height=168,
+            height=220,
             pos_hint={"center_x": 0.5},
             padding=[16, 12],
             spacing=0,
@@ -180,6 +180,7 @@ class MeetingBoxReadyScreen(BaseScreen):
             Color(*COLORS["gray_800"])
             self._div1 = Line(points=[0, 0, 0, 0], width=1)
             self._div2 = Line(points=[0, 0, 0, 0], width=1)
+            self._div3 = Line(points=[0, 0, 0, 0], width=1)
 
         def _decor(*_a):
             self._card_bg.pos = card.pos
@@ -192,28 +193,35 @@ class MeetingBoxReadyScreen(BaseScreen):
                 BORDER_RADIUS,
             )
             y1 = card.y + card.height - 56
-            y2 = card.y + card.height - 112
+            y2 = y1 - 44
+            y3 = y2 - 44
             x0, x1 = card.x + 14, card.right - 14
             self._div1.points = [x0, y1, x1, y1]
             self._div2.points = [x0, y2, x1, y2]
+            self._div3.points = [x0, y3, x1, y3]
 
         card.bind(pos=_decor, size=_decor)
 
         self._room_value = Label(text="—")
+        self._account_value = Label(text="—")
         self._lang_value = Label(text="🌐 English (US)")
         self._wifi_value = Label(text="📶 —")
 
         card.add_widget(self._summary_row("Room Name", self._room_value))
+        card.add_widget(self._summary_row("Google account", self._account_value))
         card.add_widget(self._summary_row("Language", self._lang_value))
         card.add_widget(self._summary_row("WiFi", self._wifi_value))
         return card
 
     def on_enter(self):
         room = getattr(self.app, "device_name", "MeetingBox") or "MeetingBox"
+        acct = getattr(self.app, "paired_owner_email", "") or ""
         lang = getattr(self.app, "setup_language", "English (US)") or "English (US)"
         wifi = getattr(self.app, "connected_wifi_ssid", "") or "—"
         if self._room_value:
             self._room_value.text = room
+        if self._account_value:
+            self._account_value.text = acct if acct else "—"
         if self._lang_value:
             self._lang_value.text = f"🌐 {lang}"
         if self._wifi_value:

@@ -93,7 +93,7 @@ from screens.room_name import RoomNameScreen
 from screens.network_choice import NetworkChoiceScreen
 from screens.wifi_setup import WiFiSetupScreen
 from screens.wifi_connected import WiFiConnectedScreen
-from screens.create_profile import CreateProfileScreen
+from screens.pair_device import PairDeviceScreen
 from screens.meetingbox_ready import MeetingBoxReadyScreen
 from screens.setup_progress import SetupProgressScreen
 from screens.all_set import AllSetScreen
@@ -190,6 +190,7 @@ class MeetingBoxApp(App):
         self.current_display_name = None
         self.connected_wifi_ssid = ''
         self.setup_network_is_ethernet = False
+        self.paired_owner_email = None
 
         # Screen manager & nav stack
         self.screen_manager = None
@@ -230,7 +231,7 @@ class MeetingBoxApp(App):
         self.screen_manager.add_widget(NetworkChoiceScreen(name='network_choice'))
         self.screen_manager.add_widget(WiFiSetupScreen(name='wifi_setup'))
         self.screen_manager.add_widget(WiFiConnectedScreen(name='wifi_connected'))
-        self.screen_manager.add_widget(CreateProfileScreen(name='create_profile'))
+        self.screen_manager.add_widget(PairDeviceScreen(name='pair_device'))
         self.screen_manager.add_widget(MeetingBoxReadyScreen(name='meetingbox_ready'))
         self.screen_manager.add_widget(SetupProgressScreen(name='setup_progress'))
         self.screen_manager.add_widget(AllSetScreen(name='all_set'))
@@ -342,7 +343,7 @@ class MeetingBoxApp(App):
             # If setup completed elsewhere (e.g. marker synced), leave onboarding.
             onboarding_screens = {
                 'welcome', 'room_name', 'network_choice', 'setup_progress', 'wifi_setup',
-                'wifi_connected', 'create_profile', 'meetingbox_ready', 'all_set',
+                'wifi_connected', 'pair_device', 'meetingbox_ready', 'all_set',
             }
             current = self.screen_manager.current
             if current in onboarding_screens:
@@ -422,7 +423,7 @@ class MeetingBoxApp(App):
             # Skip non-core screens in stack when going back
             skip = {
                 'splash', 'welcome', 'network_choice', 'wifi_setup', 'wifi_connected',
-                'setup_progress', 'all_set', 'create_profile', 'meetingbox_ready',
+                'setup_progress', 'all_set', 'pair_device', 'meetingbox_ready',
             }
             while target in skip and self._nav_stack:
                 target = self._nav_stack.pop()

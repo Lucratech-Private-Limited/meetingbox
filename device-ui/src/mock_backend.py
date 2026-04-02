@@ -197,6 +197,35 @@ class MockBackendClient:
         logger.info("[MOCK] Setup complete: %s", meta)
         return {"status": "ok", "metadata": meta}
 
+    async def claim_device(
+        self,
+        code: str,
+        device_name: str = None,
+        serial_number: str = None,
+    ) -> Dict:
+        """Mock POST /api/devices/claim — persists a fake token for UI testing."""
+        await asyncio.sleep(0.2)
+        from config import persist_device_auth_token
+
+        name = (device_name or "MeetingBox").strip() or "MeetingBox"
+        self._settings["device_name"] = name
+        token = "mock_mbd_claim_token"
+        persist_device_auth_token(token)
+        c = (code or "").strip()
+        if len(c) < 6:
+            raise ValueError("Pairing code must be at least 6 characters.")
+        logger.info("[MOCK] Device claimed: %s", name)
+        return {
+            "access_token": token,
+            "device": {
+                "id": "mock-device-id",
+                "device_name": name,
+                "status": "active",
+            },
+            "owner_user_id": "mock-user",
+            "owner_email": "you@example.com",
+        }
+
     # ==================================================================
     # INTEGRATIONS
     # ==================================================================

@@ -272,4 +272,4 @@ class WiFiConnectedScreen(BaseScreen):
         run_async(_run())
 
     def _on_continue(self, _inst):
-        self.goto("create_profile", transition="slide_left")
+        self.goto("pair_device", transition="slide_left")

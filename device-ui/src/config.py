@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 BACKEND_URL = os.getenv('BACKEND_URL', 'http://localhost:8000')
 BACKEND_WS_URL = os.getenv('BACKEND_WS_URL', 'ws://localhost:8000/ws')
 DEVICE_AUTH_TOKEN = os.getenv('DEVICE_AUTH_TOKEN', '')
+DEVICE_AUTH_TOKEN_FILE_NAME = 'device_auth_token'
 
 # Use mock backend for testing (set MOCK_BACKEND=1)
 USE_MOCK_BACKEND = os.getenv('MOCK_BACKEND', '0') == '1'
@@ -331,6 +332,40 @@ def setup_complete_marker_paths_for_write() -> tuple[Path, ...]:
             uniq.append(d)
     return tuple(d / '.setup_complete' for d in uniq)
 
+
+def get_device_auth_token() -> str:
+    """
+    Bearer token for device API routes: env DEVICE_AUTH_TOKEN, else file
+    ``{resolve_device_config_dir()}/device_auth_token`` (written after pairing).
+    """
+    env = (DEVICE_AUTH_TOKEN or '').strip()
+    if env:
+        return env
+    path = resolve_device_config_dir() / DEVICE_AUTH_TOKEN_FILE_NAME
+    try:
+        if path.is_file():
+            return path.read_text(encoding='utf-8').strip()
+    except OSError:
+        pass
+    return ''
+
+
+def persist_device_auth_token(token: str) -> bool:
+    """Save device API token next to profiles / setup marker (best-effort)."""
+    t = (token or '').strip()
+    if not t:
+        return False
+    path = resolve_device_config_dir() / DEVICE_AUTH_TOKEN_FILE_NAME
+    try:
+        path.write_text(t + '\n', encoding='utf-8')
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
+        return True
+    except OSError as e:
+        logger.warning('Could not persist device auth token: %s', e)
+        return False
 
 
 try:

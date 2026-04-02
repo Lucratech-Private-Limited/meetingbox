@@ -18,10 +18,11 @@ from websockets.exceptions import ConnectionClosed
 from config import (
     BACKEND_URL,
     BACKEND_WS_URL,
-    DEVICE_AUTH_TOKEN,
     API_TIMEOUT,
     WS_RECONNECT_DELAY,
     WS_MAX_RECONNECT_ATTEMPTS,
+    get_device_auth_token,
+    persist_device_auth_token,
 )
 
 logger = logging.getLogger(__name__)
@@ -50,14 +51,16 @@ class BackendClient:
       Check updates:   GET  /api/device/check-updates      (device route)
       Install update:  POST /api/device/install-update     (device route)
       WebSocket:       ws://host:port/ws
+      Claim pairing:   POST /api/devices/claim              (no auth)
     """
 
     def __init__(self, base_url: str = BACKEND_URL):
         self.base_url = base_url.rstrip('/')
         self.ws_url = BACKEND_WS_URL
         headers = {}
-        if DEVICE_AUTH_TOKEN:
-            headers["Authorization"] = f"Bearer {DEVICE_AUTH_TOKEN}"
+        token = get_device_auth_token()
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
         self.client = httpx.AsyncClient(timeout=API_TIMEOUT, headers=headers)
         self.ws_connection = None
         self._ws_reconnect_attempts = 0
@@ -66,6 +69,45 @@ class BackendClient:
         await self.client.aclose()
         if self.ws_connection:
             await self.ws_connection.close()
+
+    def set_device_auth_header(self, token: Optional[str]) -> None:
+        t = (token or "").strip()
+        if t:
+            self.client.headers["Authorization"] = f"Bearer {t}"
+        else:
+            self.client.headers.pop("Authorization", None)
+
+    async def claim_device(
+        self,
+        code: str,
+        device_name: Optional[str] = None,
+        serial_number: Optional[str] = None,
+    ) -> Dict:
+        """
+        POST /api/devices/claim (no auth). Returns device + access_token; persists token.
+        """
+        payload: Dict[str, str] = {"code": (code or "").strip()}
+        if device_name is not None:
+            dn = (device_name or "").strip()
+            if dn:
+                payload["device_name"] = dn
+        if serial_number:
+            sn = serial_number.strip()
+            if sn:
+                payload["serial_number"] = sn
+        async with httpx.AsyncClient(timeout=API_TIMEOUT) as raw:
+            resp = await raw.post(
+                f"{self.base_url}/api/devices/claim",
+                json=payload,
+            )
+        resp.raise_for_status()
+        data = resp.json()
+        access = (data.get("access_token") or "").strip()
+        if not access:
+            raise ValueError("Claim response missing access_token")
+        persist_device_auth_token(access)
+        self.set_device_auth_header(access)
+        return data
 
     # ==================================================================
     # MEETINGS API
