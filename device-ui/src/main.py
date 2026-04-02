@@ -90,6 +90,7 @@ from profile_store import get_active_profile
 from screens.splash import SplashScreen
 from screens.welcome import WelcomeScreen
 from screens.room_name import RoomNameScreen
+from screens.network_choice import NetworkChoiceScreen
 from screens.wifi_setup import WiFiSetupScreen
 from screens.wifi_connected import WiFiConnectedScreen
 from screens.create_profile import CreateProfileScreen
@@ -188,6 +189,7 @@ class MeetingBoxApp(App):
         self.current_user_id = None
         self.current_display_name = None
         self.connected_wifi_ssid = ''
+        self.setup_network_is_ethernet = False
 
         # Screen manager & nav stack
         self.screen_manager = None
@@ -225,6 +227,7 @@ class MeetingBoxApp(App):
         self.screen_manager.add_widget(SplashScreen(name='splash'))
         self.screen_manager.add_widget(WelcomeScreen(name='welcome'))
         self.screen_manager.add_widget(RoomNameScreen(name='room_name'))
+        self.screen_manager.add_widget(NetworkChoiceScreen(name='network_choice'))
         self.screen_manager.add_widget(WiFiSetupScreen(name='wifi_setup'))
         self.screen_manager.add_widget(WiFiConnectedScreen(name='wifi_connected'))
         self.screen_manager.add_widget(CreateProfileScreen(name='create_profile'))
@@ -338,7 +341,7 @@ class MeetingBoxApp(App):
                 self._setup_poll = None
             # If setup completed elsewhere (e.g. marker synced), leave onboarding.
             onboarding_screens = {
-                'welcome', 'room_name', 'setup_progress', 'wifi_setup',
+                'welcome', 'room_name', 'network_choice', 'setup_progress', 'wifi_setup',
                 'wifi_connected', 'create_profile', 'meetingbox_ready', 'all_set',
             }
             current = self.screen_manager.current
@@ -418,7 +421,7 @@ class MeetingBoxApp(App):
             target = self._nav_stack.pop()
             # Skip non-core screens in stack when going back
             skip = {
-                'splash', 'welcome', 'wifi_setup', 'wifi_connected',
+                'splash', 'welcome', 'network_choice', 'wifi_setup', 'wifi_connected',
                 'setup_progress', 'all_set', 'create_profile', 'meetingbox_ready',
             }
             while target in skip and self._nav_stack:
@@ -595,7 +598,7 @@ class MeetingBoxApp(App):
     def on_setup_complete(self, data):
         """Handle setup_complete event globally -- works from any onboarding screen."""
         logger.info("Setup complete event received")
-        onboarding_screens = {'welcome', 'room_name', 'setup_progress'}
+        onboarding_screens = {'welcome', 'room_name', 'network_choice', 'setup_progress'}
         current = self.screen_manager.current
 
         def _advance(_dt):

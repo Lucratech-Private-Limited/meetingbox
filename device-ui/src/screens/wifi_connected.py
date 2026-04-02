@@ -42,6 +42,8 @@ class WiFiConnectedScreen(BaseScreen):
         self._continue_btn = None
         self._ip_value = None
         self._url_value = None
+        self._title_lbl = None
+        self._subtitle_lbl = None
         self._build_ui()
 
     def _build_ui(self):
@@ -82,7 +84,7 @@ class WiFiConnectedScreen(BaseScreen):
         root.add_widget(self._build_success_icon())
         root.add_widget(Widget(size_hint=(1, None), height=14))
 
-        title = Label(
+        self._title_lbl = Label(
             text="You're connected",
             font_size=FONT_SIZES["huge"],
             bold=True,
@@ -91,10 +93,10 @@ class WiFiConnectedScreen(BaseScreen):
             size_hint=(1, None),
             height=42,
         )
-        title.bind(size=title.setter("text_size"))
-        root.add_widget(title)
+        self._title_lbl.bind(size=self._title_lbl.setter("text_size"))
+        root.add_widget(self._title_lbl)
 
-        subtitle = Label(
+        self._subtitle_lbl = Label(
             text="Your MeetingBox is now connected and ready to use.",
             font_size=FONT_SIZES["body"],
             color=COLORS["gray_400"],
@@ -102,8 +104,8 @@ class WiFiConnectedScreen(BaseScreen):
             size_hint=(1, None),
             height=28,
         )
-        subtitle.bind(size=subtitle.setter("text_size"))
-        root.add_widget(subtitle)
+        self._subtitle_lbl.bind(size=self._subtitle_lbl.setter("text_size"))
+        root.add_widget(self._subtitle_lbl)
 
         root.add_widget(Widget(size_hint=(1, None), height=16))
         root.add_widget(self._build_info_card())
@@ -226,6 +228,26 @@ class WiFiConnectedScreen(BaseScreen):
 
     def on_enter(self):
         self._wifi_ssid = getattr(self.app, "connected_wifi_ssid", "") or ""
+        if self._wifi_ssid == "Wired Ethernet" or getattr(
+            self.app, "setup_network_is_ethernet", False
+        ):
+            if self._title_lbl is not None:
+                self._title_lbl.text = "You're connected"
+            if self._subtitle_lbl is not None:
+                self._subtitle_lbl.text = (
+                    "Using wired Ethernet. Continue when this device can reach the network."
+                )
+            if self._icon is not None:
+                self._icon.text = "🔌✓"
+        else:
+            if self._title_lbl is not None:
+                self._title_lbl.text = "You're connected"
+            if self._subtitle_lbl is not None:
+                self._subtitle_lbl.text = (
+                    "Your MeetingBox is now connected and ready to use."
+                )
+            if self._icon is not None:
+                self._icon.text = "📶✓"
         self._ip_address = "Loading..."
         if self._ip_value is not None:
             self._ip_value.text = self._ip_address

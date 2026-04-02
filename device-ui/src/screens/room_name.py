@@ -227,7 +227,7 @@ class RoomNameScreen(BaseScreen):
 
     def _on_skip(self, _inst):
         self.app.device_name = 'MeetingBox'
-        self.goto('wifi_setup', transition='slide_left')
+        self.goto('network_choice', transition='slide_left')
 
     def _on_next(self, _inst):
         name = (self._text_input.text or '').strip()
@@ -246,7 +246,7 @@ class RoomNameScreen(BaseScreen):
                 Clock.schedule_once(
                     lambda _dt: setattr(self.app, 'device_name', name), 0)
                 Clock.schedule_once(
-                    lambda _dt: self.goto('wifi_setup', transition='slide_left'), 0)
+                    lambda _dt: self.goto('network_choice', transition='slide_left'), 0)
             except Exception:
                 Clock.schedule_once(
                     lambda _dt: self.add_widget(ModalDialog(

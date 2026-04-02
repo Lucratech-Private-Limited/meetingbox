@@ -789,4 +789,5 @@ class WiFiSetupScreen(BaseScreen):
         if not self._ready_for_next:
             return
         self.app.connected_wifi_ssid = self._connected_ssid or ''
+        self.app.setup_network_is_ethernet = False
         self.goto('wifi_connected', transition='fade')
