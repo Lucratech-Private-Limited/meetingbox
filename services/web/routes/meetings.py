@@ -264,6 +264,37 @@ def _actor_device_id(actor: Optional[dict]) -> Optional[str]:
   return actor["device"]["id"]
 
 
+def _session_owner_key(session_id: str) -> str:
+  return f"meeting_session_owner:{session_id}"
+
+
+def _store_session_owner(session_id: str, actor: Optional[dict]) -> None:
+  user_id = _actor_user_id(actor)
+  device_id = _actor_device_id(actor)
+  if not session_id or (not user_id and not device_id):
+    return
+  _get_redis().setex(
+    _session_owner_key(session_id),
+    6 * 60 * 60,
+    json.dumps({"user_id": user_id, "device_id": device_id}),
+  )
+
+
+def _load_session_owner(session_id: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+  if not session_id:
+    return None, None
+  raw = _get_redis().get(_session_owner_key(session_id))
+  if not raw:
+    return None, None
+  try:
+    data = json.loads(raw)
+  except json.JSONDecodeError:
+    return None, None
+  user_id = str(data.get("user_id") or "").strip() or None
+  device_id = str(data.get("device_id") or "").strip() or None
+  return user_id, device_id
+
+
 def _meeting_access_filter(actor: Optional[dict], alias: str = "meetings") -> tuple[str, list[object]]:
   if not actor:
     return "", []
@@ -279,6 +310,7 @@ def _meeting_access_filter(actor: Optional[dict], alias: str = "meetings") -> tu
 async def start_meeting(current_actor: Optional[dict] = Depends(get_optional_actor)):
   """Start a new recording. Sends command to audio service via Redis."""
   session_id = _generate_session_id()
+  _store_session_owner(session_id, current_actor)
   _get_redis().publish("commands", json.dumps({"action": "start_recording", "session_id": session_id}))
   _get_redis().set("current_meeting_id", session_id)
   _get_redis().set("recording_state", "recording")
@@ -540,6 +572,8 @@ async def upload_audio(
 
   owner_user_id = _actor_user_id(current_actor)
   owner_device_id = _actor_device_id(current_actor)
+  if not owner_user_id and not owner_device_id:
+    owner_user_id, owner_device_id = _load_session_owner(session_id)
 
   _get_redis().publish(
     "events",
@@ -606,10 +640,12 @@ async def upload_audio(
 
     _get_redis().set("recording_state", "idle")
     _get_redis().delete("current_meeting_id")
+    _get_redis().delete(_session_owner_key(session_id))
     return {"session_id": session_id, "path": str(dest_wav), "status": "completed"}
   except HTTPException as exc:
     _get_redis().set("recording_state", "idle")
     _get_redis().delete("current_meeting_id")
+    _get_redis().delete(_session_owner_key(session_id))
     _get_redis().publish(
       "events",
       json.dumps({
