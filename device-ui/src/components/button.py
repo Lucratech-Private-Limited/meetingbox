@@ -10,6 +10,7 @@ Features:
 
 from kivy.uix.button import Button
 from kivy.graphics import Color, RoundedRectangle, Line
+from kivy.metrics import dp
 from config import COLORS, FONT_SIZES, BORDER_RADIUS
 
 
@@ -41,7 +42,12 @@ class PremiumButton(Button):
         self.markup = True
 
         self.bind(pos=self._draw, size=self._draw)
+        self.bind(size=self._sync_label_text_size)
         self._draw()
+
+    def _sync_label_text_size(self, *args):
+        if self.width > 1 and self.height > 1:
+            self.text_size = (self.width - dp(12), self.height - dp(4))
 
     # -- rendering -----------------------------------------------------------
 
@@ -132,6 +138,11 @@ class SecondaryButton(Button):
 
         self._pressed = False
         self.bind(pos=self._draw, size=self._draw)
+        self.bind(size=self._sync_label_text_size)
+
+    def _sync_label_text_size(self, *args):
+        if self.width > 1 and self.height > 1:
+            self.text_size = (self.width - dp(12), self.height - dp(4))
 
     def _draw(self, *_args):
         self.canvas.before.clear()

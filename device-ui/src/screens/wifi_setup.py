@@ -78,9 +78,8 @@ class _WiFiRow(ButtonBehavior, BoxLayout):
         with self.canvas.before:
             Color(*COLORS['surface_light'])
             self._bg = Rectangle(pos=self.pos, size=self.size)
-        with self.canvas.after:
             Color(*COLORS['gray_800'])
-            self._sep = Line(points=[self.x, self.y, self.x + self.width, self.y], width=1)
+            self._sep = Line(width=1)
         self.bind(
             pos=lambda w, *_: setattr(self._bg, 'pos', w.pos),
             size=lambda w, *_: setattr(self._bg, 'size', w.size),
@@ -161,7 +160,11 @@ class _WiFiRow(ButtonBehavior, BoxLayout):
             self.add_widget(right)
 
     def _update_sep(self, *_args):
-        self._sep.points = [self.x, self.y, self.x + self.width, self.y]
+        inset = 0.5
+        self._sep.points = [
+            self.x + inset, self.y + inset,
+            self.x + self.width - inset, self.y + inset,
+        ]
 
 
 class WiFiSetupScreen(BaseScreen):
@@ -176,7 +179,12 @@ class WiFiSetupScreen(BaseScreen):
         self._build_ui()
 
     def _build_ui(self):
-        root = BoxLayout(orientation='vertical', padding=[20, 10, 20, 14], spacing=0)
+        root = BoxLayout(
+            orientation='vertical',
+            padding=[20, 10, 20, 14],
+            spacing=0,
+            size_hint=(1, 1),
+        )
         root.canvas.before.clear()
         with root.canvas.before:
             Color(*WIFI_BG)

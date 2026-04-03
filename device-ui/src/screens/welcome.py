@@ -13,6 +13,7 @@ from pathlib import Path
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.floatlayout import FloatLayout
 from kivy.uix.anchorlayout import AnchorLayout
+from kivy.uix.scrollview import ScrollView
 from kivy.uix.label import Label
 from kivy.uix.widget import Widget
 from kivy.uix.image import Image
@@ -70,8 +71,19 @@ class WelcomeScreen(BaseScreen):
                 )
                 root.add_widget(img)
 
-        # Content layout
-        content = BoxLayout(orientation='vertical', padding=[SPACING['screen_padding'], 0])
+        # Content layout (scrollable so CTA stays reachable on short displays)
+        scroll = ScrollView(
+            do_scroll_x=False,
+            size_hint=(1, 1),
+            bar_width=8,
+            pos_hint={'x': 0, 'y': 0},
+        )
+        content = BoxLayout(
+            orientation='vertical',
+            padding=[SPACING['screen_padding'], 0],
+            size_hint_y=None,
+        )
+        content.bind(minimum_height=content.setter('height'))
 
         # Header: logo + "MeetingBox" (top-left)
         header = BoxLayout(
@@ -102,8 +114,8 @@ class WelcomeScreen(BaseScreen):
         header.add_widget(brand)
         content.add_widget(header)
 
-        # Top spacer
-        content.add_widget(Widget(size_hint=(1, 0.12)))
+        # Top spacer (fixed — avoids eating the whole viewport on small heights)
+        content.add_widget(Widget(size_hint=(1, None), height=28))
 
         # Hero: title + subtitle (centered)
         title = Label(
@@ -131,8 +143,7 @@ class WelcomeScreen(BaseScreen):
         subtitle.bind(size=subtitle.setter('text_size'))
         content.add_widget(subtitle)
 
-        # Spacer
-        content.add_widget(Widget(size_hint=(1, 0.15)))
+        content.add_widget(Widget(size_hint=(1, None), height=36))
 
         # CTA button (uses Button.png asset with "Start Your First Meeting")
         btn_wrap = BoxLayout(size_hint=(1, None), height=70, padding=[80, 0])
@@ -145,8 +156,7 @@ class WelcomeScreen(BaseScreen):
         btn_wrap.add_widget(cta_btn)
         content.add_widget(btn_wrap)
 
-        # Spacer
-        content.add_widget(Widget(size_hint=(1, 0.1)))
+        content.add_widget(Widget(size_hint=(1, None), height=24))
 
         # Footer: shield + "Enterprise-grade security included" (centered)
         footer_wrap = AnchorLayout(
@@ -165,10 +175,10 @@ class WelcomeScreen(BaseScreen):
         footer_wrap.add_widget(shield_img)
         content.add_widget(footer_wrap)
 
-        # Bottom spacer
-        content.add_widget(Widget(size_hint=(1, 0.05)))
+        content.add_widget(Widget(size_hint=(1, None), height=24))
 
-        root.add_widget(content)
+        scroll.add_widget(content)
+        root.add_widget(scroll)
         self.add_widget(root)
 
     def _update_bg(self, widget, value):

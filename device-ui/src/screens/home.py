@@ -25,10 +25,10 @@ _ICON_SIZE = 16
 def _format_home_next_meeting(next_meeting) -> str:
     """Return 1–2 lines: title and local date/time (or all-day) for the home screen."""
     if not next_meeting:
-        return "No upcoming calendar events"
+        return "No executed calendar actions yet"
     title = (next_meeting.get("title") or "Calendar event").strip()
     if not title:
-        return "No upcoming calendar events"
+        return "No executed calendar actions yet"
     start = (next_meeting.get("start") or "").strip()
     if not start:
         return title

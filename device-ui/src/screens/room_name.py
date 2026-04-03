@@ -8,6 +8,7 @@ from pathlib import Path
 
 from kivy.clock import Clock
 from kivy.uix.boxlayout import BoxLayout
+from kivy.uix.scrollview import ScrollView
 from kivy.uix.label import Label
 from kivy.uix.widget import Widget
 from kivy.uix.image import Image
@@ -41,7 +42,12 @@ class RoomNameScreen(BaseScreen):
         self._build_ui()
 
     def _build_ui(self):
-        root = BoxLayout(orientation='vertical', padding=[24, 12, 24, 16], spacing=0)
+        root = BoxLayout(
+            orientation='vertical',
+            padding=[24, 12, 24, 16],
+            spacing=0,
+            size_hint=(1, 1),
+        )
         root.canvas.before.clear()
         with root.canvas.before:
             Color(*ROOM_BG)
@@ -80,7 +86,20 @@ class RoomNameScreen(BaseScreen):
         header.add_widget(brand)
         root.add_widget(header)
 
-        root.add_widget(Widget(size_hint=(1, None), height=8))
+        scroll = ScrollView(
+            do_scroll_x=False,
+            size_hint=(1, 1),
+            bar_width=8,
+        )
+        inner = BoxLayout(
+            orientation='vertical',
+            spacing=0,
+            size_hint_y=None,
+            padding=[0, 4, 0, 8],
+        )
+        inner.bind(minimum_height=inner.setter('height'))
+
+        inner.add_widget(Widget(size_hint=(1, None), height=4))
 
         title = Label(
             text='Name this room',
@@ -93,7 +112,7 @@ class RoomNameScreen(BaseScreen):
             height=44,
         )
         title.bind(size=title.setter('text_size'))
-        root.add_widget(title)
+        inner.add_widget(title)
 
         subtitle = Label(
             text='This name will appear on the device and label your recordings.',
@@ -105,9 +124,9 @@ class RoomNameScreen(BaseScreen):
             height=40,
         )
         subtitle.bind(size=subtitle.setter('text_size'))
-        root.add_widget(subtitle)
+        inner.add_widget(subtitle)
 
-        root.add_widget(Widget(size_hint=(1, None), height=12))
+        inner.add_widget(Widget(size_hint=(1, None), height=12))
 
         self._text_input = TextInput(
             hint_text='e.g. Boardroom A',
@@ -123,9 +142,9 @@ class RoomNameScreen(BaseScreen):
             hint_text_color=COLORS['gray_600'],
             cursor_color=COLORS['white'],
         )
-        root.add_widget(self._text_input)
+        inner.add_widget(self._text_input)
 
-        root.add_widget(Widget(size_hint=(1, None), height=16))
+        inner.add_widget(Widget(size_hint=(1, None), height=16))
 
         sug_label = Label(
             text='SUGGESTED NAMES',
@@ -138,16 +157,24 @@ class RoomNameScreen(BaseScreen):
             height=22,
         )
         sug_label.bind(size=sug_label.setter('text_size'))
-        root.add_widget(sug_label)
+        inner.add_widget(sug_label)
 
-        root.add_widget(Widget(size_hint=(1, None), height=8))
+        inner.add_widget(Widget(size_hint=(1, None), height=8))
 
+        chip_scroll = ScrollView(
+            do_scroll_y=False,
+            size_hint=(1, None),
+            height=52,
+            bar_width=6,
+        )
         chips_row = BoxLayout(
             orientation='horizontal',
-            size_hint=(1, None),
+            size_hint=(None, None),
             height=48,
             spacing=10,
         )
+
+        chips_row.bind(minimum_width=chips_row.setter('width'))
 
         for name in SUGGESTED_NAMES:
             w = max(120, int(len(name) * 11 + 36))
@@ -160,9 +187,10 @@ class RoomNameScreen(BaseScreen):
             chip.bind(on_press=lambda inst, n=name: self._apply_chip(n))
             chips_row.add_widget(chip)
 
-        root.add_widget(chips_row)
+        chip_scroll.add_widget(chips_row)
+        inner.add_widget(chip_scroll)
 
-        root.add_widget(Widget(size_hint=(1, 1)))
+        inner.add_widget(Widget(size_hint=(1, None), height=12))
 
         # Divider
         sep = Widget(size_hint=(1, None), height=1)
@@ -173,9 +201,10 @@ class RoomNameScreen(BaseScreen):
             pos=self._draw_sep,
             size=self._draw_sep,
         )
-        root.add_widget(sep)
+        inner.add_widget(sep)
 
-        root.add_widget(Widget(size_hint=(1, None), height=12))
+        scroll.add_widget(inner)
+        root.add_widget(scroll)
 
         footer = BoxLayout(
             orientation='horizontal',

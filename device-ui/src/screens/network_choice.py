@@ -13,6 +13,7 @@ from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.label import Label
 from kivy.uix.widget import Widget
 from kivy.uix.image import Image
+from kivy.uix.scrollview import ScrollView
 
 from async_helper import run_async
 from components.button import PrimaryButton, SecondaryButton
@@ -37,7 +38,12 @@ class NetworkChoiceScreen(BaseScreen):
         self._build_ui()
 
     def _build_ui(self):
-        root = BoxLayout(orientation="vertical", padding=[24, 12, 24, 16], spacing=0)
+        root = BoxLayout(
+            orientation="vertical",
+            padding=[24, 12, 24, 16],
+            spacing=0,
+            size_hint=(1, 1),
+        )
         root.canvas.before.clear()
         with root.canvas.before:
             Color(*SCREEN_BG)
@@ -72,7 +78,14 @@ class NetworkChoiceScreen(BaseScreen):
         header.add_widget(brand)
         root.add_widget(header)
 
-        root.add_widget(Widget(size_hint=(1, None), height=12))
+        scroll = ScrollView(do_scroll_x=False, size_hint=(1, 1), bar_width=8)
+        inner = BoxLayout(
+            orientation="vertical",
+            spacing=0,
+            size_hint_y=None,
+            padding=[0, 8, 0, 8],
+        )
+        inner.bind(minimum_height=inner.setter("height"))
 
         title = Label(
             text="Connect to the internet",
@@ -85,7 +98,7 @@ class NetworkChoiceScreen(BaseScreen):
             height=44,
         )
         title.bind(size=title.setter("text_size"))
-        root.add_widget(title)
+        inner.add_widget(title)
 
         subtitle = Label(
             text="Use Wi‑Fi, or skip if this device already has a working wired connection.",
@@ -97,7 +110,7 @@ class NetworkChoiceScreen(BaseScreen):
             height=52,
         )
         subtitle.bind(size=subtitle.setter("text_size"))
-        root.add_widget(subtitle)
+        inner.add_widget(subtitle)
 
         self._hint_label = Label(
             text="",
@@ -109,9 +122,9 @@ class NetworkChoiceScreen(BaseScreen):
             height=36,
         )
         self._hint_label.bind(size=self._hint_label.setter("text_size"))
-        root.add_widget(self._hint_label)
+        inner.add_widget(self._hint_label)
 
-        root.add_widget(Widget(size_hint=(1, None), height=16))
+        inner.add_widget(Widget(size_hint=(1, None), height=16))
 
         wifi_btn = PrimaryButton(
             text="Set up Wi‑Fi",
@@ -120,9 +133,9 @@ class NetworkChoiceScreen(BaseScreen):
             font_size=FONT_SIZES["medium"],
         )
         wifi_btn.bind(on_press=self._on_wifi)
-        root.add_widget(wifi_btn)
+        inner.add_widget(wifi_btn)
 
-        root.add_widget(Widget(size_hint=(1, None), height=12))
+        inner.add_widget(Widget(size_hint=(1, None), height=12))
 
         eth_btn = SecondaryButton(
             text="Use wired Ethernet (skip Wi‑Fi)",
@@ -131,9 +144,10 @@ class NetworkChoiceScreen(BaseScreen):
             font_size=FONT_SIZES["medium"],
         )
         eth_btn.bind(on_press=self._on_ethernet)
-        root.add_widget(eth_btn)
+        inner.add_widget(eth_btn)
 
-        root.add_widget(Widget(size_hint=(1, 1)))
+        scroll.add_widget(inner)
+        root.add_widget(scroll)
 
         footer = BoxLayout(
             orientation="horizontal",

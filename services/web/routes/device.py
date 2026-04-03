@@ -15,6 +15,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -295,28 +296,79 @@ async def device_unpair_self(device: dict = Depends(get_current_device_row)):
     return {"status": "unpaired", "device_id": device_id}
 
 
-def _next_calendar_event_for_user(user_id: Optional[str]) -> Optional[dict[str, Any]]:
-    if not user_id:
-        return None
+def _normalize_hhmmss(time_raw: str) -> str:
+    s = (time_raw or "10:00").strip()
+    if s.count(":") == 2:
+        parts = s.split(":")
+    else:
+        parts = s.split(":") + ["0"]
     try:
-        from routes.integrations import get_credentials_for_provider
-        from services.calendar import list_upcoming_events
-    except Exception:
+        h = max(0, min(23, int(parts[0])))
+        m = max(0, min(59, int(parts[1])))
+        return f"{h:02d}:{m:02d}:00"
+    except (ValueError, IndexError):
+        return "10:00:00"
+
+
+def _latest_executed_calendar_meeting_for_scope(
+    scope_sql: str,
+    scope_params: list[Any],
+) -> Optional[dict[str, Any]]:
+    """
+    Most recently executed Google Calendar action created from MeetingBox for this user/device scope.
+    Uses stored payload (suggested_date/time, calendar_link) — not the live Google Calendar feed.
+    """
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            f"""
+            SELECT a.title, a.payload
+            FROM actions a
+            JOIN meetings m ON m.id = a.meeting_id
+            WHERE a.status = 'executed'
+              AND lower(coalesce(trim(a.connector_target), '')) = 'calendar'
+              AND {scope_sql}
+            ORDER BY datetime(COALESCE(a.executed_at, a.created_at)) DESC
+            LIMIT 1
+            """,
+            scope_params,
+        )
+        row = cur.fetchone()
+    finally:
+        conn.close()
+    if not row:
         return None
-    creds = get_credentials_for_provider(user_id, "calendar")
-    if not creds:
-        return None
-    items = list_upcoming_events(creds, max_results=1)
-    if not items:
-        return None
-    ev = items[0]
-    start = ev.get("start") or {}
-    end = ev.get("end") or {}
+    title_db, payload_raw = row[0], row[1]
+    payload: dict[str, Any] = {}
+    try:
+        payload = json.loads(payload_raw or "{}")
+    except json.JSONDecodeError:
+        payload = {}
+    title = str(payload.get("title") or title_db or "Calendar event").strip()
+    date_s = str(payload.get("suggested_date") or "").strip()[:10]
+    time_norm = _normalize_hhmmss(str(payload.get("suggested_time") or "10:00"))
+    tz_name = str(payload.get("timezone") or "").strip()
+    start_out = ""
+    if date_s and len(date_s) >= 10:
+        try:
+            if tz_name:
+                try:
+                    dt = datetime.strptime(f"{date_s} {time_norm}", "%Y-%m-%d %H:%M:%S")
+                    dt = dt.replace(tzinfo=ZoneInfo(tz_name))
+                    start_out = dt.isoformat()
+                except Exception:
+                    start_out = f"{date_s}T{time_norm}"
+            else:
+                start_out = f"{date_s}T{time_norm}"
+        except Exception:
+            start_out = f"{date_s}T{time_norm}" if date_s else ""
     return {
-        "title": (ev.get("summary") or "Calendar event").strip(),
-        "start": start.get("dateTime") or start.get("date") or "",
-        "end": end.get("dateTime") or end.get("date") or "",
-        "html_link": ev.get("htmlLink"),
+        "title": title,
+        "start": start_out,
+        "end": "",
+        "html_link": payload.get("calendar_link"),
+        "source": "executed_calendar_action",
     }
 
 
@@ -325,7 +377,8 @@ async def device_home_summary(
     current_actor: Optional[dict] = Depends(get_optional_actor),
 ) -> dict[str, Any]:
     """
-    Next Google Calendar event + pending action counts for the signed-in user or paired device.
+    Last executed MeetingBox calendar action (created on Google Calendar via dashboard/device)
+    plus pending action counts for the signed-in user or paired device.
     """
     empty = {
         "next_meeting": None,
@@ -374,7 +427,7 @@ async def device_home_summary(
         conn.close()
 
     return {
-        "next_meeting": _next_calendar_event_for_user(user_id),
+        "next_meeting": _latest_executed_calendar_meeting_for_scope(scope_sql, scope_params),
         "pending_actions_today": today_cnt,
         "pending_actions_total": total,
     }

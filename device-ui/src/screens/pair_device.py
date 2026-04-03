@@ -68,7 +68,12 @@ class PairDeviceScreen(BaseScreen):
         self._build_ui()
 
     def _build_ui(self):
-        root = BoxLayout(orientation="vertical", padding=[20, 8, 20, 12], spacing=0)
+        root = BoxLayout(
+            orientation="vertical",
+            padding=[20, 8, 20, 12],
+            spacing=0,
+            size_hint=(1, 1),
+        )
         with root.canvas.before:
             Color(*SCREEN_BG)
             self._root_bg = Rectangle(pos=root.pos, size=root.size)

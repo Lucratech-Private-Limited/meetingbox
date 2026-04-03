@@ -16,6 +16,8 @@ from kivy.graphics import Color, Rectangle, Line
 from kivy.animation import Animation
 from kivy.app import App
 
+from kivy.metrics import dp
+
 from config import ASSETS_DIR, COLORS, FONT_SIZES, STATUS_BAR_HEIGHT
 
 _GEAR_ICON = ASSETS_DIR / "recording" / "setteing gear icon.png"
@@ -52,9 +54,9 @@ class StatusBar(BoxLayout):
                  **kwargs):
 
         kwargs.setdefault('size_hint', (1, None))
-        kwargs.setdefault('height', STATUS_BAR_HEIGHT)
+        kwargs.setdefault('height', max(STATUS_BAR_HEIGHT, int(dp(48))))
         kwargs.setdefault('orientation', 'horizontal')
-        kwargs.setdefault('padding', [16, 8])
+        kwargs.setdefault('padding', [12, 6, 12, 6])
         kwargs.setdefault('spacing', 8)
 
         super().__init__(**kwargs)
@@ -64,30 +66,26 @@ class StatusBar(BoxLayout):
         self._back_button = back_button
         self._on_back = on_back
 
-        # Dark background
+        # Dark background + bottom separator (all on canvas.before so nothing draws over children)
         with self.canvas.before:
             Color(*COLORS['background'])
             self.bg_rect = Rectangle(pos=self.pos, size=self.size)
-
-        # Bottom separator
-        with self.canvas.after:
             Color(*COLORS['gray_800'])
-            self.border_line = Line(
-                points=[self.x, self.y, self.x + self.width, self.y],
-                width=1,
-            )
+            self.border_line = Line(width=1)
 
         self.bind(pos=self._update_bg, size=self._update_bg)
 
         # --- LEFT: back button OR dot + status ---
         if back_button:
             back_label = _GearButton(
-                text='←  BACK',
+                text='<  BACK',
                 font_size=FONT_SIZES['medium'],
                 color=COLORS['white'],
                 bold=True,
                 halign='left',
-                size_hint=(0.3, 1),
+                valign='middle',
+                size_hint=(None, 1),
+                width=int(dp(108)),
             )
             back_label.bind(size=back_label.setter('text_size'))
             if on_back:
@@ -101,7 +99,8 @@ class StatusBar(BoxLayout):
                 color=COLORS['white'],
                 bold=True,
                 halign='center',
-                size_hint=(0.5, 1),
+                valign='middle',
+                size_hint=(1, 1),
             )
             self.device_label.bind(size=self.device_label.setter('text_size'))
             self.add_widget(self.device_label)
@@ -111,7 +110,7 @@ class StatusBar(BoxLayout):
                 gear = self._make_gear()
                 self.add_widget(gear)
             else:
-                self.add_widget(Widget(size_hint=(0.2, 1)))
+                self.add_widget(Widget(size_hint=(None, 1), width=int(dp(8))))
 
         else:
             # dot + status text
@@ -171,7 +170,7 @@ class StatusBar(BoxLayout):
             gear = _GearImageButton(
                 source=str(_GEAR_ICON),
                 size_hint=(None, None),
-                size=(28, 28),
+                size=(int(dp(28)), int(dp(28))),
                 allow_stretch=True,
                 keep_ratio=True,
             )
@@ -180,8 +179,12 @@ class StatusBar(BoxLayout):
                 text='⚙',
                 font_size=FONT_SIZES['title'],
                 color=COLORS['gray_500'],
-                size_hint=(0.15, 1),
+                size_hint=(None, 1),
+                width=int(dp(36)),
+                halign='center',
+                valign='middle',
             )
+            gear.bind(size=gear.setter('text_size'))
         gear.bind(on_press=self._on_gear_pressed)
         return gear
 
@@ -193,9 +196,11 @@ class StatusBar(BoxLayout):
     def _update_bg(self, *_args):
         self.bg_rect.pos = self.pos
         self.bg_rect.size = self.size
+        # Hairline along bottom inside the bar (avoids covering child widgets)
+        inset = 0.5
         self.border_line.points = [
-            self.x, self.y,
-            self.x + self.width, self.y,
+            self.x + inset, self.y + inset,
+            self.x + self.width - inset, self.y + inset,
         ]
 
     def start_pulse(self):
