@@ -50,10 +50,21 @@ class WiFiNetworkItem(ButtonBehavior, BoxLayout):
         ssid.bind(size=ssid.setter('text_size'))
         self.add_widget(ssid)
 
-        # Signal
-        sig = network.get('signal_strength', 0)
-        bars = '▂▄▆█'[:max(1, sig // 25)]
-        sig_color = COLORS['blue'] if network.get('connected') else COLORS['gray_500']
+        # Signal strength (0–100): bar count + color tier
+        sig = int(network.get('signal_strength', 0) or 0)
+        if sig >= 70:
+            n_bars, sig_color = 4, COLORS['green']
+        elif sig >= 45:
+            n_bars, sig_color = 3, COLORS['yellow']
+        elif sig >= 25:
+            n_bars, sig_color = 2, COLORS['yellow']
+        elif sig >= 10:
+            n_bars, sig_color = 1, COLORS['red']
+        else:
+            n_bars, sig_color = 1, COLORS['gray_600']
+        bars = '▂▄▆█'[: max(1, n_bars)]
+        if not network.get('connected'):
+            sig_color = COLORS['gray_500']
         sig_label = Label(
             text=bars,
             font_size=FONT_SIZES['medium'],

@@ -13,6 +13,7 @@ from services.action_engine import (
     dismiss_action_record,
     execute_action_record,
     generate_actions_for_meeting,
+    ignore_action_record,
     list_actions_for_meeting,
     update_action_record,
 )
@@ -97,6 +98,8 @@ class ExecuteActionRequest(BaseModel):
     payload: Optional[dict[str, Any]] = None
     #: If true and connector is Gmail, create a draft only (does not send). Ignored for Calendar.
     create_draft: Optional[bool] = False
+    #: If true, run Gmail/Calendar again even when status is already executed (new draft/event).
+    repeat_execution: Optional[bool] = False
 
 
 @router.get("/meetings/{meeting_id}/actions", response_model=list[ActionResponse])
@@ -129,6 +132,13 @@ async def dismiss_action(action_id: str, current_actor: Optional[dict] = Depends
     return dismiss_action_record(action_id)
 
 
+@router.post("/actions/{action_id}/ignore")
+async def ignore_action(action_id: str, current_actor: Optional[dict] = Depends(get_optional_actor)):
+    """Stop showing the suggestion and exclude it from pending counts; row is kept."""
+    _assert_action_access(action_id, current_actor)
+    return ignore_action_record(action_id)
+
+
 @router.post("/actions/{action_id}/execute")
 async def execute_action(
     action_id: str,
@@ -139,4 +149,11 @@ async def execute_action(
     user_id = current_actor["user"]["id"] if current_actor else None
     override = body.payload if body and body.payload else None
     draft = bool(body.create_draft) if body else False
-    return execute_action_record(action_id, user_id, override, create_draft=draft)
+    repeat = bool(getattr(body, "repeat_execution", False)) if body else False
+    return execute_action_record(
+        action_id,
+        user_id,
+        override,
+        create_draft=draft,
+        repeat_execution=repeat,
+    )

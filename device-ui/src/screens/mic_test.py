@@ -1,4 +1,4 @@
-"""Microphone test screen with backend-driven live voice waveform."""
+"""Microphone test screen with local capture (sounddevice) plus backend/WS level stream."""
 
 import logging
 from collections import deque
@@ -16,6 +16,13 @@ from components.status_bar import StatusBar
 from config import COLORS, FONT_SIZES
 
 logger = logging.getLogger(__name__)
+
+try:
+    import numpy as np
+    import sounddevice as sd
+except ImportError:
+    np = None
+    sd = None
 
 
 class _TestWaveform(Widget):
@@ -55,14 +62,16 @@ class _TestWaveform(Widget):
 
 
 class MicTestScreen(BaseScreen):
-    """Microphone test screen – PRD §5.15."""
+    """Microphone test — levels from local PyAudio/sounddevice and/or meetingbox audio service via WS."""
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self._wave_event = None
         self._rms_history = deque(maxlen=_TestWaveform.NUM_BARS)
         self._last_level_ts = 0.0
-        self._mic_test_running = False
+        self._local_stream = None
+        self._enter_ts = 0.0
+        self._got_level = False
         for _ in range(_TestWaveform.NUM_BARS):
             self._rms_history.append(0.0)
         self._build_ui()
@@ -116,49 +125,89 @@ class MicTestScreen(BaseScreen):
 
         self.add_widget(root)
 
-    # ------------------------------------------------------------------
     def on_enter(self):
-        self._mic_test_running = False
+        self._enter_ts = time()
+        self._got_level = False
         self._last_level_ts = 0.0
         self.level_label.text = 'Starting microphone test...'
         self.level_label.color = COLORS['gray_400']
-        run_async(self._start_mic_test())
+        Clock.schedule_once(lambda _dt: self._open_local_input_stream(), 0)
+        run_async(self._notify_backend_start())
+        if self._wave_event:
+            self._wave_event.cancel()
         self._wave_event = Clock.schedule_interval(self._tick, 0.1)
 
     def on_leave(self):
         if self._wave_event:
             self._wave_event.cancel()
             self._wave_event = None
-        run_async(self._stop_mic_test())
+        self._close_local_stream()
+        run_async(self._notify_backend_stop())
 
-    # ------------------------------------------------------------------
-    # Backend mic test control
-    # ------------------------------------------------------------------
-    async def _start_mic_test(self):
+    def _open_local_input_stream(self):
+        if sd is None or np is None:
+            logger.debug("sounddevice/numpy not available — mic test will rely on backend WS only")
+            return
+        self._close_local_stream()
+        try:
+
+            def callback(indata, frames, t_info, status):
+                if status and str(status):
+                    logger.debug("sounddevice status: %s", status)
+                try:
+                    block = np.asarray(indata, dtype=np.float64).reshape(-1)
+                    if block.size == 0:
+                        return
+                    rms = float(np.sqrt(np.mean(np.square(block))))
+                    # sounddevice float32 samples are ~[-1, 1]; scale to ~same gates as int16/5000 path
+                    level = min(1.0, rms * 18.0)
+                    Clock.schedule_once(lambda dt, lv=level: self._apply_level(lv), 0)
+                except Exception:
+                    pass
+
+            self._local_stream = sd.InputStream(
+                channels=1,
+                samplerate=16000,
+                blocksize=1024,
+                dtype='float32',
+                callback=callback,
+            )
+            self._local_stream.start()
+            logger.info("Mic test: local capture stream started")
+        except Exception as e:
+            logger.warning("Mic test: local capture failed (%s) — using backend/WS if available", e)
+            self._local_stream = None
+
+    def _close_local_stream(self):
+        if self._local_stream is not None:
+            try:
+                self._local_stream.stop()
+                self._local_stream.close()
+            except Exception:
+                pass
+            self._local_stream = None
+
+    async def _notify_backend_start(self):
         try:
             await self.backend.start_mic_test()
-            self._mic_test_running = True
         except Exception as e:
-            logger.warning("Mic test start failed: %s", e)
-            self._mic_test_running = False
-            self.level_label.text = 'No microphone detected'
-            self.level_label.color = COLORS['red']
+            logger.debug("mic-test/start HTTP optional: %s", e)
 
-    async def _stop_mic_test(self):
+    async def _notify_backend_stop(self):
         try:
             await self.backend.stop_mic_test()
         except Exception:
             pass
-        self._mic_test_running = False
+
+    def _apply_level(self, level: float):
+        self.on_mic_test_level(level)
 
     def on_mic_test_level(self, level: float):
-        gated = 0.0 if level < 0.015 else min(1.0, level)
+        gated = 0.0 if level < 0.015 else min(1.0, float(level))
         self._rms_history.append(gated)
         self._last_level_ts = time()
+        self._got_level = True
 
-    # ------------------------------------------------------------------
-    # UI update tick
-    # ------------------------------------------------------------------
     def _tick(self, _dt):
         if self._last_level_ts and (time() - self._last_level_ts > 0.25):
             self._rms_history = deque([v * 0.82 for v in self._rms_history], maxlen=_TestWaveform.NUM_BARS)
@@ -167,12 +216,18 @@ class MicTestScreen(BaseScreen):
                   for v in self._rms_history]
         self.waveform.set_levels(levels)
 
-        if not self._mic_test_running:
-            self.level_label.text = 'No microphone detected'
+        elapsed = time() - self._enter_ts
+        if not self._got_level and elapsed > 2.5:
+            self.level_label.text = 'No microphone input detected'
             self.level_label.color = COLORS['red']
             return
 
-        peak = max(self._rms_history)
+        if not self._got_level:
+            self.level_label.text = 'Listening…'
+            self.level_label.color = COLORS['gray_400']
+            return
+
+        peak = max(self._rms_history) if self._rms_history else 0.0
         if peak > 0.15:
             self.level_label.text = 'Input Level: Good'
             self.level_label.color = COLORS['green']

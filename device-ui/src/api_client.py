@@ -324,12 +324,15 @@ class BackendClient:
             action_id: str,
             *,
             create_draft: bool = False,
+            repeat_execution: bool = False,
     ) -> Dict:
         """POST /api/actions/{action_id}/execute — Gmail: create_draft saves to Gmail drafts instead of sending."""
         try:
             body: Dict = {}
             if create_draft:
                 body["create_draft"] = True
+            if repeat_execution:
+                body["repeat_execution"] = True
             resp = await self.client.post(
                 f"{self.base_url}/api/actions/{action_id}/execute",
                 json=body,
@@ -469,6 +472,20 @@ class BackendClient:
     # ==================================================================
     # SYSTEM API
     # ==================================================================
+
+    async def get_home_summary(self) -> Dict:
+        """GET /api/device/home-summary — calendar + pending action counts (needs device/user auth)."""
+        try:
+            resp = await self.client.get(f"{self.base_url}/api/device/home-summary")
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.debug("home-summary unavailable: %s", e)
+            return {
+                "next_meeting": None,
+                "pending_actions_today": 0,
+                "pending_actions_total": 0,
+            }
 
     async def get_system_info(self) -> Dict:
         """

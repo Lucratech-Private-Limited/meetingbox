@@ -8,7 +8,7 @@ export type ActionKind =
 
 export type ConnectorTarget = 'internal' | 'gmail' | 'calendar' | 'slack' | 'notion'
 export type ExecutionMode = 'artifact_create' | 'message_send' | 'event_create'
-export type ActionStatus = 'pending' | 'executed' | 'dismissed'
+export type ActionStatus = 'pending' | 'executed' | 'dismissed' | 'ignored'
 
 export interface ActionArtifactSection {
   title: string

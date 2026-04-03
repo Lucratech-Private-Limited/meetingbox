@@ -9,6 +9,13 @@ import { actionsApi } from '../api/actions'
 import type { MeetingDetail as MeetingDetailType } from '../types/meeting'
 import type { AgenticAction } from '../types/action'
 import LoadingSpinner from '../components/ui/LoadingSpinner'
+
+/** Pending Gmail/Calendar actions that count toward dashboard alerts (matches device home-summary). */
+function isExecutablePendingAction(a: AgenticAction): boolean {
+  if (a.status !== 'pending') return false
+  const t = String(a.connector_target || '').toLowerCase()
+  return t === 'gmail' || t === 'calendar'
+}
 import Modal from '../components/ui/Modal'
 import Button from '../components/ui/Button'
 import TranscriptView from '../components/meeting/TranscriptView'
@@ -222,6 +229,7 @@ export default function MeetingDetailPage() {
 
   const hasTranscript = meeting.segments && meeting.segments.length > 0
   const hasSummary = !!meeting.summary
+  const pendingDashboardCount = actions.filter(isExecutablePendingAction).length
 
   return (
     <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
@@ -330,7 +338,7 @@ export default function MeetingDetailPage() {
       )}
 
       {/* Pending actions alert */}
-      {actions.length > 0 && (
+      {pendingDashboardCount > 0 && (
         <div className="mb-6 bg-yellow-50 border border-yellow-200 rounded-lg p-4">
           <div className="flex">
             <svg className="h-5 w-5 text-yellow-400 flex-shrink-0" fill="currentColor" viewBox="0 0 20 20">
@@ -338,7 +346,7 @@ export default function MeetingDetailPage() {
             </svg>
             <div className="ml-3">
               <h3 className="text-sm font-medium text-yellow-800">
-                {actions.length} AI action{actions.length > 1 ? 's' : ''} ready to execute
+                {pendingDashboardCount} AI action{pendingDashboardCount > 1 ? 's' : ''} ready to execute
               </h3>
               <p className="mt-1 text-sm text-yellow-700">
                 Gmail and Google Calendar follow-ups only. Review details before each send or event creation.
@@ -362,9 +370,9 @@ export default function MeetingDetailPage() {
               }`}
             >
               {tab.charAt(0).toUpperCase() + tab.slice(1)}
-              {tab === 'actions' && actions.length > 0 && (
+              {tab === 'actions' && pendingDashboardCount > 0 && (
                 <span className="ml-2 bg-yellow-100 text-yellow-800 py-0.5 px-2 rounded-full text-xs">
-                  {actions.length}
+                  {pendingDashboardCount}
                 </span>
               )}
             </button>

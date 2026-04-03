@@ -263,6 +263,19 @@ class MockBackendClient:
     # SYSTEM
     # ==================================================================
 
+    async def get_home_summary(self) -> Dict:
+        await asyncio.sleep(0.15)
+        return {
+            "next_meeting": {
+                "title": "Team sync",
+                "start": "2026-04-03T15:00:00+05:30",
+                "end": "2026-04-03T15:30:00+05:30",
+                "html_link": "https://calendar.google.com",
+            },
+            "pending_actions_today": 1,
+            "pending_actions_total": 2,
+        }
+
     async def get_system_info(self) -> Dict:
         await asyncio.sleep(0.2)
         return {

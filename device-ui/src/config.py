@@ -17,7 +17,19 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 
 BACKEND_URL = os.getenv('BACKEND_URL', 'http://localhost:8000')
-BACKEND_WS_URL = os.getenv('BACKEND_WS_URL', 'ws://localhost:8000/ws')
+
+
+def _default_ws_url(http_url: str) -> str:
+    """If BACKEND_WS_URL is unset, derive WebSocket URL from BACKEND_URL (http→ws, https→wss)."""
+    u = (http_url or "").strip().rstrip("/")
+    if u.startswith("https://"):
+        return "wss://" + u[8:] + "/ws"
+    if u.startswith("http://"):
+        return "ws://" + u[7:] + "/ws"
+    return "ws://localhost:8000/ws"
+
+
+BACKEND_WS_URL = (os.getenv("BACKEND_WS_URL", "") or "").strip() or _default_ws_url(BACKEND_URL)
 DEVICE_AUTH_TOKEN = os.getenv('DEVICE_AUTH_TOKEN', '')
 DEVICE_AUTH_TOKEN_FILE_NAME = 'device_auth_token'
 

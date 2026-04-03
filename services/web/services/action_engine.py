@@ -430,7 +430,7 @@ def generate_actions_for_meeting(meeting_id: str, user_id: str | None) -> list[d
             """
             DELETE FROM actions
             WHERE meeting_id = ?
-              AND status = 'pending'
+              AND status IN ('pending', 'dismissed')
               AND connector_target IN ('gmail', 'calendar')
             """,
             (meeting_id,),
@@ -473,7 +473,15 @@ def list_actions_for_meeting(meeting_id: str) -> list[dict[str, Any]]:
     conn.row_factory = _row_factory
     try:
         cur = conn.cursor()
-        cur.execute("SELECT * FROM actions WHERE meeting_id = ? ORDER BY created_at DESC", (meeting_id,))
+        cur.execute(
+            """
+            SELECT * FROM actions
+            WHERE meeting_id = ?
+              AND COALESCE(status, '') != 'ignored'
+            ORDER BY created_at DESC
+            """,
+            (meeting_id,),
+        )
         rows = cur.fetchall()
         out = []
         for row in rows:
@@ -530,6 +538,21 @@ def dismiss_action_record(action_id: str) -> dict[str, str]:
     return {"id": action_id, "status": "dismissed"}
 
 
+def ignore_action_record(action_id: str) -> dict[str, str]:
+    """Hide from lists and pending counts; row kept for audit."""
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT id FROM actions WHERE id = ?", (action_id,))
+        if not cur.fetchone():
+            raise HTTPException(status_code=404, detail="Action not found")
+        cur.execute("UPDATE actions SET status = 'ignored' WHERE id = ?", (action_id,))
+        conn.commit()
+    finally:
+        conn.close()
+    return {"id": action_id, "status": "ignored"}
+
+
 def _coerce_email_list(val: Any) -> list[str]:
     if val is None:
         return []
@@ -576,6 +599,7 @@ def execute_action_record(
     payload_override: dict[str, Any] | None = None,
     *,
     create_draft: bool = False,
+    repeat_execution: bool = False,
 ) -> dict[str, Any]:
     conn = get_connection()
     conn.row_factory = _row_factory
@@ -589,7 +613,7 @@ def execute_action_record(
         conn.close()
 
     normalized = _normalize_action_record(action)
-    if normalized["status"] == "executed":
+    if normalized["status"] == "executed" and not repeat_execution:
         return {
             "id": action_id,
             "status": "executed",

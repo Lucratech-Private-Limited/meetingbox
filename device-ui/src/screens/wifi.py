@@ -4,11 +4,15 @@ WiFi Settings Screen – Dark themed (480 × 320)
 Compact network list with scan button.
 """
 
+import logging
+from typing import Any, Dict, List, Optional
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.gridlayout import GridLayout
 from kivy.uix.scrollview import ScrollView
 from kivy.uix.label import Label
 from kivy.uix.textinput import TextInput
+from kivy.uix.widget import Widget
+from kivy.graphics import Color, RoundedRectangle
 from kivy.clock import Clock
 from async_helper import run_async
 
@@ -18,6 +22,75 @@ from components.wifi_network_item import WiFiNetworkItem
 from components.button import SecondaryButton, PrimaryButton
 from components.modal_dialog import ModalDialog
 from config import COLORS, FONT_SIZES, SPACING, BORDER_RADIUS
+
+logger = logging.getLogger(__name__)
+
+
+class _WifiSignalStrip(Widget):
+    """Four rising bars: count and color reflect signal strength (0–100) when connected."""
+
+    def __init__(self, **kwargs):
+        kwargs.setdefault("size_hint", (None, None))
+        kwargs.setdefault("size", (56, 30))
+        super().__init__(**kwargs)
+        self._pct = 0
+        self._connected = False
+        self.bind(pos=self._redraw, size=self._redraw)
+
+    def set_state(self, connected: bool, signal_pct: int) -> None:
+        self._connected = bool(connected)
+        self._pct = max(0, min(100, int(signal_pct)))
+        self._redraw()
+
+    def _bar_color(self):
+        if not self._connected:
+            return COLORS["gray_600"]
+        p = self._pct
+        if p >= 70:
+            return COLORS["green"]
+        if p >= 45:
+            return COLORS["yellow"]
+        if p >= 25:
+            return COLORS["yellow"]
+        return COLORS["red"]
+
+    def _lit_count(self) -> int:
+        if not self._connected:
+            return 0
+        p = self._pct
+        if p >= 80:
+            return 4
+        if p >= 55:
+            return 3
+        if p >= 30:
+            return 2
+        if p >= 10:
+            return 1
+        return 1
+
+    def _redraw(self, *_args):
+        self.canvas.clear()
+        bar_w = 9
+        gap = 3
+        heights = [7, 12, 17, 22]
+        x0 = self.x + 2
+        bottom = self.y + 3
+        lit = self._lit_count()
+        active_color = self._bar_color()
+        dim = COLORS["gray_800"]
+
+        with self.canvas:
+            for i in range(4):
+                h = heights[i]
+                if self._connected and i < lit:
+                    Color(*active_color)
+                else:
+                    Color(*dim)
+                RoundedRectangle(
+                    pos=(x0 + i * (bar_w + gap), bottom),
+                    size=(bar_w, h),
+                    radius=[2],
+                )
 
 
 class WiFiScreen(BaseScreen):
@@ -49,14 +122,40 @@ class WiFiScreen(BaseScreen):
 
         left = BoxLayout(orientation='vertical', size_hint=(0.7, 1), spacing=SPACING['button_spacing'])
 
-        self.current_label = Label(
-            text='Current: Loading…',
-            font_size=FONT_SIZES['small'],
-            size_hint=(1, None), height=18,
-            color=COLORS['gray_400'], halign='left',
+        status_row = BoxLayout(
+            orientation='horizontal',
+            size_hint=(1, None),
+            height=48,
+            spacing=12,
         )
-        self.current_label.bind(size=self.current_label.setter('text_size'))
-        left.add_widget(self.current_label)
+        self.signal_strip = _WifiSignalStrip()
+        status_row.add_widget(self.signal_strip)
+        status_col = BoxLayout(orientation='vertical', spacing=2)
+        self.status_title = Label(
+            text='Wi‑Fi status',
+            font_size=FONT_SIZES['medium'],
+            bold=True,
+            color=COLORS['white'],
+            halign='left',
+            valign='bottom',
+            size_hint=(1, None),
+            height=22,
+        )
+        self.status_title.bind(size=self.status_title.setter('text_size'))
+        status_col.add_widget(self.status_title)
+        self.status_detail = Label(
+            text='Loading…',
+            font_size=FONT_SIZES['small'],
+            color=COLORS['gray_400'],
+            halign='left',
+            valign='top',
+            size_hint=(1, None),
+            height=36,
+        )
+        self.status_detail.bind(size=self.status_detail.setter('text_size'))
+        status_col.add_widget(self.status_detail)
+        status_row.add_widget(status_col)
+        left.add_widget(status_row)
 
         scroll = ScrollView(do_scroll_x=False)
         self.networks_container = GridLayout(
@@ -89,20 +188,73 @@ class WiFiScreen(BaseScreen):
 
     def _load_networks(self):
         async def _load():
+            nets: list = []
+            info: dict = {}
             try:
-                nets = await self.backend.get_wifi_networks()
-                self.networks = nets
-                Clock.schedule_once(lambda _: self._populate(), 0)
-            except Exception:
-                pass
+                raw = await self.backend.get_wifi_networks()
+                if isinstance(raw, list):
+                    nets = raw
+            except Exception as e:
+                logger.warning("WiFi scan failed: %s", e)
+                nets = []
+            for n in nets:
+                if not isinstance(n, dict):
+                    continue
+                if "signal_strength" not in n and n.get("signal") is not None:
+                    try:
+                        n["signal_strength"] = int(n["signal"])
+                    except (TypeError, ValueError):
+                        n["signal_strength"] = 0
+            try:
+                info = await self.backend.get_system_info()
+            except Exception as e:
+                logger.debug("system info for WiFi screen: %s", e)
+                info = {}
+            self.networks = nets
+
+            def _apply(_dt):
+                self._populate(nets, info)
+
+            Clock.schedule_once(_apply, 0)
+
         run_async(_load())
 
-    def _populate(self):
+    def _populate(self, networks: Optional[List[Dict[str, Any]]] = None, info: Optional[Dict[str, Any]] = None):
+        nets = networks if networks is not None else getattr(self, "networks", []) or []
+        info = info or {}
+        ssid = (info.get("wifi_ssid") or "").strip()
+        sig = int(info.get("wifi_signal") or 0)
+        ip = (info.get("ip_address") or "").strip()
+        connected = bool(ssid)
+
+        self.signal_strip.set_state(connected, sig if connected else 0)
+        if connected:
+            self.status_title.text = "Connected"
+            self.status_detail.text = f"{ssid}\nSignal {sig}% · IP {ip or '—'}"
+        else:
+            self.status_title.text = "Not connected"
+            self.status_detail.text = "Select a network below or tap SCAN."
+
         self.networks_container.clear_widgets()
-        current = next((n for n in self.networks if n.get('connected')), None)
-        self.current_label.text = f"Current: {current['ssid']}" if current else 'Not connected'
-        for net in self.networks:
-            item = WiFiNetworkItem(network=net)
+        if not nets:
+            hint = Label(
+                text='No networks in list. Tap SCAN or check device Wi‑Fi.',
+                font_size=FONT_SIZES['small'],
+                color=COLORS['gray_500'],
+                halign='left',
+                valign='top',
+                size_hint_y=None,
+                height=56,
+            )
+            hint.bind(size=hint.setter('text_size'))
+            self.networks_container.add_widget(hint)
+            return
+
+        for net in nets:
+            n = dict(net) if isinstance(net, dict) else {}
+            if "signal_strength" not in n:
+                n["signal_strength"] = int(n.get("signal") or 0)
+            item = WiFiNetworkItem(network=n)
             item.bind(on_press=self._on_network)
             self.networks_container.add_widget(item)
 

@@ -10,7 +10,7 @@ from hardware import set_brightness
 
 class BrightnessPickerScreen(PickerBaseScreen):
     _title = 'Screen Brightness'
-    _description = None
+    _description = 'Linux sysfs backlight on the appliance; may have no effect on a dev PC (setting is still saved).'
     _options = [
         ('low', 'Low'),
         ('medium', 'Medium'),

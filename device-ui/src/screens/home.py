@@ -6,6 +6,7 @@ from pathlib import Path
 from kivy.clock import Clock
 from kivy.graphics import Color, Ellipse, Rectangle, RoundedRectangle
 from kivy.uix.behaviors import ButtonBehavior
+from kivy.uix.anchorlayout import AnchorLayout
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.floatlayout import FloatLayout
 from kivy.uix.image import Image
@@ -21,8 +22,26 @@ _CHIP_SIZE = 34
 _ICON_SIZE = 16
 
 
-class _LabelButton(ButtonBehavior, Label):
-    """Simple tappable label."""
+def _format_home_next_meeting(next_meeting) -> str:
+    """Return 1–2 lines: title and local date/time (or all-day) for the home screen."""
+    if not next_meeting:
+        return "No upcoming calendar events"
+    title = (next_meeting.get("title") or "Calendar event").strip()
+    if not title:
+        return "No upcoming calendar events"
+    start = (next_meeting.get("start") or "").strip()
+    if not start:
+        return title
+    try:
+        if "T" in start:
+            dt = datetime.fromisoformat(start.replace("Z", "+00:00"))
+            line = dt.strftime("%a %b %d · %I:%M %p")
+        else:
+            d = datetime.strptime(start[:10], "%Y-%m-%d")
+            line = d.strftime("%a %b %d (all day)")
+        return f"{title}\n{line}"
+    except (ValueError, OSError):
+        return f"{title}\n{start}"
 
 
 class _ImageButton(ButtonBehavior, Image):
@@ -66,6 +85,37 @@ class _IconChip(ButtonBehavior, FloatLayout):
         self.icon_img.color = color
 
 
+class _RoundTextChip(ButtonBehavior, FloatLayout):
+    """Circular chip with a text symbol (matches Wi‑Fi / mic chrome)."""
+
+    def __init__(self, symbol: str, **kwargs):
+        kwargs.setdefault("size_hint", (None, None))
+        kwargs.setdefault("size", (_CHIP_SIZE, _CHIP_SIZE))
+        super().__init__(**kwargs)
+        with self.canvas.before:
+            self._bg_color = Color(*COLORS["gray_800"])
+            self._bg_circle = Ellipse(pos=self.pos, size=self.size)
+        self.bind(pos=self._sync_bg, size=self._sync_bg)
+        self._lbl = Label(
+            text=symbol,
+            font_size=FONT_SIZES["title"],
+            color=COLORS["white"],
+            halign="center",
+            valign="middle",
+        )
+        self._lbl.bind(size=self._lbl.setter("text_size"))
+        self.add_widget(self._lbl)
+        self.bind(pos=self._center_lbl, size=self._center_lbl)
+
+    def _sync_bg(self, *_args):
+        self._bg_circle.pos = self.pos
+        self._bg_circle.size = self.size
+
+    def _center_lbl(self, *_args):
+        self._lbl.center_x = self.center_x
+        self._lbl.center_y = self.center_y
+
+
 class HomeScreen(BaseScreen):
     """Reference-style home screen with live clock and start button."""
 
@@ -101,13 +151,17 @@ class HomeScreen(BaseScreen):
             padding=[SPACING["screen_padding"], 12],
             spacing=10,
         )
-        left = BoxLayout(orientation="horizontal", size_hint=(0.50, 1), spacing=8)
+        left = BoxLayout(orientation="horizontal", size_hint=(0.50, 1), spacing=6)
+        icon_holder = AnchorLayout(size_hint=(None, 1), width=38)
         self.room_icon = Image(
             source=str(self._room_icon),
             size_hint=(None, None),
-            size=(24, 24),
+            size=(26, 26),
+            allow_stretch=True,
+            keep_ratio=True,
         )
-        left.add_widget(self.room_icon)
+        icon_holder.add_widget(self.room_icon)
+        left.add_widget(icon_holder)
         self.room_label = Label(
             text="MeetingBox",
             font_size=FONT_SIZES["medium"],
@@ -154,24 +208,9 @@ class HomeScreen(BaseScreen):
 
         gear_path = ASSETS_DIR / "recording" / "setteing gear icon.png"
         if gear_path.exists():
-            self.settings_btn = _ImageButton(
-                source=str(gear_path),
-                size_hint=(None, None),
-                size=(28, 28),
-                allow_stretch=True,
-                keep_ratio=True,
-            )
+            self.settings_btn = _IconChip(gear_path)
         else:
-            self.settings_btn = _LabelButton(
-                text="⚙",
-                font_size=FONT_SIZES["title"],
-                color=COLORS["gray_400"],
-                size_hint=(None, 1),
-                width=28,
-                halign="center",
-                valign="middle",
-            )
-            self.settings_btn.bind(size=self.settings_btn.setter("text_size"))
+            self.settings_btn = _RoundTextChip("⚙")
         self.settings_btn.bind(on_press=lambda *_: self.goto("settings", transition="slide_left"))
         right.add_widget(self.settings_btn)
         top.add_widget(right)
@@ -205,11 +244,11 @@ class HomeScreen(BaseScreen):
         root.add_widget(self.date_label)
 
         self.upcoming_label = Label(
-            text="No Upcoming Meetings",
+            text="Loading next meeting…",
             font_size=FONT_SIZES["medium"],
             color=COLORS["gray_400"],
             size_hint=(1, None),
-            height=30,
+            height=52,
             halign="center",
             valign="middle",
         )
@@ -217,56 +256,75 @@ class HomeScreen(BaseScreen):
         root.add_widget(self.upcoming_label)
         root.add_widget(Widget(size_hint=(1, None), height=4))
 
-        badge_wrap = BoxLayout(
-            orientation="horizontal",
+        stats_col = BoxLayout(
+            orientation="vertical",
             size_hint=(1, None),
-            height=32,
-            padding=[SPACING["screen_padding"], 0],
+            height=66,
+            spacing=8,
+            padding=[0, 0],
         )
-        badge_wrap.add_widget(Widget())
-        badge = BoxLayout(
-            orientation="horizontal",
-            size_hint=(None, None),
-            width=240,
-            height=28,
-            spacing=6,
-            padding=[10, 0],
-        )
-        with badge.canvas.before:
-            Color(*COLORS["surface"])
-            self._badge_bg = RoundedRectangle(pos=badge.pos, size=badge.size, radius=[12])
-        badge.bind(
-            pos=lambda w, _: setattr(self._badge_bg, "pos", w.pos),
-            size=lambda w, _: setattr(self._badge_bg, "size", w.size),
-        )
-        badge.add_widget(
-            Label(
-                text="●",
-                color=COLORS["gray_600"],
-                font_size=FONT_SIZES["small"],
-                size_hint=(None, 1),
-                width=10,
+
+        def _stat_row(dot_color, initial_text, attr_prefix):
+            row = BoxLayout(
+                orientation="horizontal",
+                size_hint=(1, None),
+                height=28,
+                padding=[SPACING["screen_padding"], 0],
             )
-        )
-        action_label = Label(
-            text="No open action items",
-            color=COLORS["gray_500"],
-            font_size=FONT_SIZES["small"],
-            halign="left",
-            valign="middle",
-        )
-        action_label.bind(size=action_label.setter("text_size"))
-        badge.add_widget(action_label)
-        badge_wrap.add_widget(badge)
-        badge_wrap.add_widget(Widget())
-        root.add_widget(badge_wrap)
+            row.add_widget(Widget())
+            badge = BoxLayout(
+                orientation="horizontal",
+                size_hint=(None, None),
+                width=280,
+                height=28,
+                spacing=6,
+                padding=[10, 0],
+            )
+            with badge.canvas.before:
+                Color(*COLORS["surface"])
+                r = RoundedRectangle(pos=badge.pos, size=badge.size, radius=[12])
+
+            def _sync_badge_pos(w, *_):
+                r.pos = w.pos
+
+            def _sync_badge_size(w, *_):
+                r.size = w.size
+
+            badge.bind(pos=_sync_badge_pos, size=_sync_badge_size)
+            badge.add_widget(
+                Label(
+                    text="●",
+                    color=dot_color,
+                    font_size=FONT_SIZES["small"],
+                    size_hint=(None, 1),
+                    width=10,
+                )
+            )
+            lbl = Label(
+                text=initial_text,
+                color=COLORS["gray_500"],
+                font_size=FONT_SIZES["small"],
+                halign="left",
+                valign="middle",
+            )
+            lbl.bind(size=lbl.setter("text_size"))
+            setattr(self, f"pending_{attr_prefix}_label", lbl)
+            badge.add_widget(lbl)
+            row.add_widget(badge)
+            row.add_widget(Widget())
+            stats_col.add_widget(row)
+
+        _stat_row(COLORS["yellow"], "Today: — pending", "today")
+        _stat_row(COLORS["gray_600"], "All open: — pending", "total")
+        root.add_widget(stats_col)
 
         root.add_widget(Widget())
 
         btn_row = BoxLayout(
             orientation="horizontal",
             size_hint=(1, None),
-            height=60,
+            height=88,
+            padding=[0, 0, 0, 22],
         )
         btn_row.add_widget(Widget())
         if self._start_button_asset.exists():
@@ -275,8 +333,8 @@ class HomeScreen(BaseScreen):
                 allow_stretch=True,
                 keep_ratio=True,
                 size_hint=(None, None),
-                height=56,
-                width=320,
+                height=70,
+                width=440,
             )
         else:
             self.start_btn = PrimaryButton(
@@ -284,8 +342,8 @@ class HomeScreen(BaseScreen):
                 font_size=FONT_SIZES["large"],
                 halign="center",
                 size_hint=(None, None),
-                height=56,
-                width=320,
+                height=70,
+                width=440,
             )
         self.start_btn.bind(on_press=self._on_start_recording)
         btn_row.add_widget(self.start_btn)
@@ -304,6 +362,7 @@ class HomeScreen(BaseScreen):
             self._clock_event.cancel()
         self._clock_event = Clock.schedule_interval(lambda _dt: self._update_clock_labels(), 1.0)
         self._load_system_status()
+        self._load_home_summary()
 
     def on_leave(self):
         if self._clock_event:
@@ -343,5 +402,30 @@ class HomeScreen(BaseScreen):
                 Clock.schedule_once(_apply, 0)
             except Exception:
                 pass
+
+        run_async(_fetch())
+
+    def _load_home_summary(self):
+        async def _fetch():
+            try:
+                data = await self.backend.get_home_summary()
+                today_n = int(data.get("pending_actions_today") or 0)
+                total_n = int(data.get("pending_actions_total") or 0)
+                next_m = data.get("next_meeting")
+                upcoming = _format_home_next_meeting(next_m)
+
+                def _apply(_dt):
+                    self.upcoming_label.text = upcoming
+                    self.pending_today_label.text = f"Today: {today_n} pending"
+                    self.pending_total_label.text = f"All open: {total_n} pending"
+
+                Clock.schedule_once(_apply, 0)
+            except Exception:
+                def _fallback(_dt):
+                    self.upcoming_label.text = _format_home_next_meeting(None)
+                    self.pending_today_label.text = "Today: — pending"
+                    self.pending_total_label.text = "All open: — pending"
+
+                Clock.schedule_once(_fallback, 0)
 
         run_async(_fetch())

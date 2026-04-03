@@ -14,14 +14,14 @@ import subprocess
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 import psutil
 import redis
 
-from auth import get_optional_user, get_current_device_row
+from auth import get_optional_user, get_optional_actor, get_current_device_row
 from database import get_connection
 
 router = APIRouter()
@@ -293,6 +293,91 @@ async def device_unpair_self(device: dict = Depends(get_current_device_row)):
     finally:
         conn.close()
     return {"status": "unpaired", "device_id": device_id}
+
+
+def _next_calendar_event_for_user(user_id: Optional[str]) -> Optional[dict[str, Any]]:
+    if not user_id:
+        return None
+    try:
+        from routes.integrations import get_credentials_for_provider
+        from services.calendar import list_upcoming_events
+    except Exception:
+        return None
+    creds = get_credentials_for_provider(user_id, "calendar")
+    if not creds:
+        return None
+    items = list_upcoming_events(creds, max_results=1)
+    if not items:
+        return None
+    ev = items[0]
+    start = ev.get("start") or {}
+    end = ev.get("end") or {}
+    return {
+        "title": (ev.get("summary") or "Calendar event").strip(),
+        "start": start.get("dateTime") or start.get("date") or "",
+        "end": end.get("dateTime") or end.get("date") or "",
+        "html_link": ev.get("htmlLink"),
+    }
+
+
+@router.get("/home-summary")
+async def device_home_summary(
+    current_actor: Optional[dict] = Depends(get_optional_actor),
+) -> dict[str, Any]:
+    """
+    Next Google Calendar event + pending action counts for the signed-in user or paired device.
+    """
+    empty = {
+        "next_meeting": None,
+        "pending_actions_today": 0,
+        "pending_actions_total": 0,
+    }
+    if not current_actor:
+        return empty
+    if current_actor["type"] == "device":
+        user_id = current_actor["device"].get("owner_user_id") or current_actor["user"]["id"]
+        device_id = current_actor["device"]["id"]
+        scope_sql = "(m.user_id = ? OR m.device_id = ?)"
+        scope_params: list[Any] = [user_id, device_id]
+    else:
+        user_id = current_actor["user"]["id"]
+        scope_sql = "m.user_id = ?"
+        scope_params = [user_id]
+
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            f"""
+            SELECT COUNT(*) FROM actions a
+            JOIN meetings m ON m.id = a.meeting_id
+            WHERE a.status = 'pending'
+              AND lower(coalesce(trim(a.connector_target), '')) IN ('gmail', 'calendar')
+              AND {scope_sql}
+            """,
+            scope_params,
+        )
+        total = int(cur.fetchone()[0])
+        cur.execute(
+            f"""
+            SELECT COUNT(*) FROM actions a
+            JOIN meetings m ON m.id = a.meeting_id
+            WHERE a.status = 'pending'
+              AND lower(coalesce(trim(a.connector_target), '')) IN ('gmail', 'calendar')
+              AND substr(a.created_at, 1, 10) = date('now')
+              AND {scope_sql}
+            """,
+            scope_params,
+        )
+        today_cnt = int(cur.fetchone()[0])
+    finally:
+        conn.close()
+
+    return {
+        "next_meeting": _next_calendar_event_for_user(user_id),
+        "pending_actions_today": today_cnt,
+        "pending_actions_total": total,
+    }
 
 
 # ======================================================================
@@ -605,16 +690,16 @@ async def install_update(current_user: Optional[dict] = Depends(get_optional_use
 # ======================================================================
 
 @router.get("/integrations")
-async def list_integrations(current_user: dict | None = Depends(get_optional_user)):
-    """List integration statuses (works for both authed and unauthed callers)."""
+async def list_integrations(current_actor: dict | None = Depends(get_optional_actor)):
+    """List integration statuses for dashboard JWT or paired device (owner account)."""
     meta = [
         {"id": "gmail", "name": "Gmail", "icon": "mail", "description": "Send AI-drafted emails"},
         {"id": "calendar", "name": "Google Calendar", "icon": "calendar", "description": "Auto-schedule meetings"},
     ]
-    if not current_user:
+    if not current_actor:
         return [{"connected": False, **m} for m in meta]
 
-    user_id = current_user["id"]
+    user_id = current_actor["user"]["id"]
     results = []
     for m in meta:
         conn = get_connection()

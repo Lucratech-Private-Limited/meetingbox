@@ -26,10 +26,14 @@ export const actionsApi = {
     await client.post(`/api/actions/${actionId}/dismiss`)
   },
 
+  ignore: async (actionId: string): Promise<void> => {
+    await client.post(`/api/actions/${actionId}/ignore`)
+  },
+
   execute: async (
     actionId: string,
     payloadOverride?: Record<string, unknown> | null,
-    options?: { createDraft?: boolean },
+    options?: { createDraft?: boolean; repeatExecution?: boolean },
   ): Promise<ExecuteResult> => {
     const body: Record<string, unknown> = {}
     if (payloadOverride && Object.keys(payloadOverride).length > 0) {
@@ -37,6 +41,9 @@ export const actionsApi = {
     }
     if (options?.createDraft) {
       body.create_draft = true
+    }
+    if (options?.repeatExecution) {
+      body.repeat_execution = true
     }
     const response = await client.post(`/api/actions/${actionId}/execute`, body)
     return response.data

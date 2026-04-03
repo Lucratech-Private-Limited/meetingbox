@@ -668,7 +668,10 @@ async def list_meetings(limit: int = 50, offset: int = 0, status: Optional[str] 
     cur = conn.cursor()
     query = """
       SELECT m.*,
-             (SELECT COUNT(*) FROM actions a WHERE a.meeting_id = m.id AND a.status = 'pending') AS pending_actions
+             (SELECT COUNT(*) FROM actions a
+              WHERE a.meeting_id = m.id
+                AND a.status = 'pending'
+                AND lower(coalesce(trim(a.connector_target), '')) IN ('gmail', 'calendar')) AS pending_actions
       FROM meetings m
     """
     params: list[object] = []

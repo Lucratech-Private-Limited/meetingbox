@@ -208,8 +208,8 @@ class RecordingScreen(BaseScreen):
         self.active_btn_row = BoxLayout(
             orientation="horizontal",
             size_hint=(1, None),
-            height=64,
-            padding=[SPACING["screen_padding"] * 4, 0],
+            height=76,
+            padding=[SPACING["screen_padding"] * 3, 0, SPACING["screen_padding"] * 3, 18],
             spacing=24,
         )
         self.active_btn_row.add_widget(Widget())
@@ -218,7 +218,7 @@ class RecordingScreen(BaseScreen):
         self.pause_btn = _ImageButton(
             source=str(pause_path),
             size_hint=(None, None),
-            size=(220, 50),
+            size=(268, 58),
             allow_stretch=True,
             keep_ratio=True,
         )
@@ -229,7 +229,7 @@ class RecordingScreen(BaseScreen):
         self.end_btn = _ImageButton(
             source=str(end_path),
             size_hint=(None, None),
-            size=(200, 50),
+            size=(252, 58),
             allow_stretch=True,
             keep_ratio=True,
         )
@@ -381,15 +381,15 @@ class RecordingScreen(BaseScreen):
         ov_btn_row = BoxLayout(
             orientation="horizontal",
             size_hint=(1, None),
-            height=64,
-            padding=[SPACING["screen_padding"], 0],
+            height=76,
+            padding=[SPACING["screen_padding"], 0, SPACING["screen_padding"], 18],
             spacing=0,
         )
         resume_path = _REC_ASSETS / "resume recording button.png"
         self.resume_btn = _ImageButton(
             source=str(resume_path),
             size_hint=(None, None),
-            size=(240, 50),
+            size=(292, 58),
             allow_stretch=True,
             keep_ratio=True,
         )
@@ -402,7 +402,7 @@ class RecordingScreen(BaseScreen):
         self.end_paused_btn = _ImageButton(
             source=str(end_paused_path),
             size_hint=(None, None),
-            size=(200, 50),
+            size=(252, 58),
             allow_stretch=True,
             keep_ratio=True,
         )

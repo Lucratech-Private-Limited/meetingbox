@@ -361,17 +361,19 @@ class SettingsScreen(BaseScreen):
                 gmail_status = f'Configure at {DASHBOARD_URL}'
                 cal_status = f'Configure at {DASHBOARD_URL}'
                 for integ in integrations:
+                    iid = (integ.get('id') or '').lower()
                     name = (integ.get('name') or '').lower()
-                    connected = integ.get('connected', False)
-                    email = integ.get('email', '')
-                    if 'gmail' in name or 'mail' in name:
-                        gmail_status = (f'Connected ({email})'
-                                        if connected
-                                        else f'Not connected · {DASHBOARD_URL}')
-                    elif 'calendar' in name:
-                        cal_status = (f'Connected ({email})'
-                                      if connected
-                                      else f'Not connected · {DASHBOARD_URL}')
+                    connected = bool(integ.get('connected'))
+                    email = (integ.get('email') or '').strip()
+                    acct = f' · {email}' if email else ''
+                    if iid == 'gmail' or 'gmail' in name or 'mail' in name:
+                        gmail_status = (
+                            f'Connected{acct}' if connected else f'Not connected · use {DASHBOARD_URL}'
+                        )
+                    elif iid == 'calendar' or 'calendar' in name:
+                        cal_status = (
+                            f'Connected{acct}' if connected else f'Not connected · use {DASHBOARD_URL}'
+                        )
 
                 def _update(_dt):
                     self.gmail_item.subtitle_label.text = gmail_status

@@ -27,6 +27,9 @@ from async_helper import run_async
 
 logger = logging.getLogger(__name__)
 
+# Horizontal space for checkbox + per-row Execute + spacing (must fit on screen)
+_ACTION_ROW_RESERVED = 28 + 96 + 20
+
 
 class SummaryReviewScreen(BaseScreen):
     """Post-recording screen with Report and Actions tabs."""
@@ -181,6 +184,33 @@ class SummaryReviewScreen(BaseScreen):
                     })
         return out
 
+    @staticmethod
+    def _effective_connector(action: dict) -> str:
+        """
+        gmail | calendar | '' — derive from connector_target and fall back to kind/type
+        so Execute still appears when the model returns mixed or alternate labels.
+        """
+        if not action:
+            return ''
+        ct = str(action.get('connector_target') or '').strip().lower()
+        if ct in ('gmail', 'calendar'):
+            return ct
+        if ct in ('google_calendar', 'gcal', 'google calendar'):
+            return 'calendar'
+        if ct in ('email', 'e-mail', 'mail'):
+            return 'gmail'
+        kind = str(action.get('kind') or '').strip().lower()
+        if kind == 'followup_email':
+            return 'gmail'
+        if kind == 'schedule_followup':
+            return 'calendar'
+        lt = str(action.get('type') or '').strip().lower()
+        if lt == 'email_draft':
+            return 'gmail'
+        if lt == 'calendar_invite':
+            return 'calendar'
+        return ''
+
     def _switch_tab(self, tab: str):
         self._current_tab = tab
         self._render_tab()
@@ -280,19 +310,25 @@ class SummaryReviewScreen(BaseScreen):
             content.add_widget(hdr)
 
             for action in agentic:
+                aid = action.get('id')
+                if not aid:
+                    logger.warning('Skipping action row without id: %s', action.get('title'))
+                    continue
+
                 row = BoxLayout(
                     orientation='horizontal',
                     size_hint_y=None,
-                    height=44,
+                    size_hint_x=1,
                     spacing=6,
+                    height=52,
                 )
 
                 cb = CheckBox(
                     size_hint=(None, None),
                     size=(28, 28),
-                    active=action['id'] in self._selected_actions,
+                    active=aid in self._selected_actions,
                 )
-                cb.bind(active=partial(self._on_action_toggle, action['id']))
+                cb.bind(active=partial(self._on_action_toggle, aid))
                 row.add_widget(cb)
 
                 title = action.get('title', 'Untitled action')
@@ -314,11 +350,22 @@ class SummaryReviewScreen(BaseScreen):
                     valign='middle',
                     size_hint=(1, 1),
                 )
-                al.bind(width=lambda w, val: setattr(w, 'text_size', (val, None)))
+
+                def _sync_label_text_size(*_a, lbl=al, rw=row, res=_ACTION_ROW_RESERVED):
+                    w = rw.width
+                    if w and w > res:
+                        lbl.text_size = (w - res, None)
+
+                row.bind(width=_sync_label_text_size)
+                al.bind(
+                    texture_size=lambda _lbl, ts, rw=row: setattr(
+                        rw, 'height', max(52, ts[1] + 14),
+                    ),
+                )
                 row.add_widget(al)
 
-                ct = str(action.get('connector_target', '')).lower()
-                if ct in ('calendar', 'gmail') and action.get('id'):
+                eff = self._effective_connector(action)
+                if eff in ('calendar', 'gmail'):
                     run_btn = SecondaryButton(
                         text='Execute',
                         font_size=FONT_SIZES['small'],
@@ -333,6 +380,8 @@ class SummaryReviewScreen(BaseScreen):
                     row.add_widget(run_btn)
 
                 content.add_widget(row)
+                Clock.schedule_once(lambda dt, fn=_sync_label_text_size: fn(), 0)
+                Clock.schedule_once(lambda dt, fn=_sync_label_text_size: fn(), 0.2)
 
             self.execute_btn.disabled = False
             self.execute_btn.opacity = 1
@@ -418,12 +467,12 @@ class SummaryReviewScreen(BaseScreen):
         action_id = action.get('id')
         if not action_id:
             return
-        ct = str(action.get('connector_target', '')).lower()
-        if ct not in ('gmail', 'calendar'):
+        eff = self._effective_connector(action)
+        if eff not in ('gmail', 'calendar'):
             return
         if (action.get('status') or 'pending') != 'pending':
             return
-        create_draft = ct == 'gmail'
+        create_draft = eff == 'gmail'
 
         async def _run():
             try:
@@ -479,13 +528,12 @@ class SummaryReviewScreen(BaseScreen):
                         (a for a in (self._actions_data or []) if a.get('id') == action_id),
                         None,
                     )
-                    is_gmail = (
-                        act
-                        and str(act.get('connector_target', '')).lower() == 'gmail'
-                    )
+                    eff = self._effective_connector(act or {})
+                    if eff not in ('gmail', 'calendar'):
+                        continue
                     await self.backend.execute_action(
                         action_id,
-                        create_draft=bool(is_gmail),
+                        create_draft=(eff == 'gmail'),
                     )
                 except Exception as e:
                     logger.error(f"Failed to execute action {action_id}: {e}")

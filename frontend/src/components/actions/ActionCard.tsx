@@ -144,6 +144,7 @@ export default function ActionCard({ action, onChanged }: ActionCardProps) {
   const [showReview, setShowReview] = useState(false)
   const [isExecuting, setIsExecuting] = useState(false)
   const [isDismissing, setIsDismissing] = useState(false)
+  const [isIgnoring, setIsIgnoring] = useState(false)
 
   const [calTitle, setCalTitle] = useState('')
   const [calDescription, setCalDescription] = useState('')
@@ -255,7 +256,9 @@ export default function ActionCard({ action, onChanged }: ActionCardProps) {
     try {
       setIsExecuting(true)
       const payload = buildExecutePayload()
-      await actionsApi.execute(action.id, payload)
+      await actionsApi.execute(action.id, payload, {
+        repeatExecution: action.status === 'executed',
+      })
       toast.success(action.connector_target === 'gmail' ? 'Email sent' : 'Calendar event created')
       setShowReview(false)
       onChanged()
@@ -280,6 +283,19 @@ export default function ActionCard({ action, onChanged }: ActionCardProps) {
       toast.error('Failed to dismiss action')
     } finally {
       setIsDismissing(false)
+    }
+  }
+
+  const handleIgnore = async () => {
+    try {
+      setIsIgnoring(true)
+      await actionsApi.ignore(action.id)
+      toast.success('Suggestion hidden (not counted as pending)')
+      onChanged()
+    } catch {
+      toast.error('Failed to ignore action')
+    } finally {
+      setIsIgnoring(false)
     }
   }
 
@@ -366,15 +382,25 @@ export default function ActionCard({ action, onChanged }: ActionCardProps) {
       </div>
 
       {!isDone && !isDismissed && (
-        <div className="flex items-center justify-between border-t border-gray-100 bg-gray-50/70 px-6 py-4">
-          <button
-            type="button"
-            onClick={handleDismiss}
-            disabled={isDismissing}
-            className="rounded-lg border border-gray-300 bg-white px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50 disabled:opacity-50"
-          >
-            {isDismissing ? 'Dismissing...' : 'Dismiss'}
-          </button>
+        <div className="flex flex-wrap items-center justify-between gap-2 border-t border-gray-100 bg-gray-50/70 px-6 py-4">
+          <div className="flex flex-wrap gap-2">
+            <button
+              type="button"
+              onClick={handleDismiss}
+              disabled={isDismissing}
+              className="rounded-lg border border-gray-300 bg-white px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50 disabled:opacity-50"
+            >
+              {isDismissing ? 'Dismissing...' : 'Dismiss'}
+            </button>
+            <button
+              type="button"
+              onClick={() => void handleIgnore()}
+              disabled={isIgnoring}
+              className="rounded-lg border border-gray-300 bg-white px-4 py-2 text-sm font-medium text-gray-600 hover:bg-gray-50 disabled:opacity-50"
+            >
+              {isIgnoring ? 'Hiding...' : 'Ignore'}
+            </button>
+          </div>
           {showConnectorReview ? (
             <button
               type="button"
@@ -386,6 +412,18 @@ export default function ActionCard({ action, onChanged }: ActionCardProps) {
           ) : (
             <p className="text-sm text-gray-500">This action type is not executable from the dashboard.</p>
           )}
+        </div>
+      )}
+
+      {isDone && !isDismissed && showConnectorReview && (
+        <div className="flex justify-end border-t border-gray-100 bg-gray-50/40 px-6 py-3">
+          <button
+            type="button"
+            onClick={openReview}
+            className="rounded-lg border border-gray-300 bg-white px-4 py-2 text-sm font-medium text-gray-600 hover:bg-gray-50"
+          >
+            Review &amp; run again
+          </button>
         </div>
       )}
 
@@ -539,7 +577,11 @@ export default function ActionCard({ action, onChanged }: ActionCardProps) {
                 type="button"
                 disabled={isExecuting}
                 onClick={() => void handleConfirmExecute()}
-                className="rounded-lg bg-primary-600 px-5 py-2 text-sm font-medium text-white hover:bg-primary-700 disabled:opacity-50"
+                className={
+                  action.status === 'executed'
+                    ? 'rounded-lg border border-gray-300 bg-white px-5 py-2 text-sm font-medium text-gray-800 hover:bg-gray-50 disabled:opacity-50'
+                    : 'rounded-lg bg-primary-600 px-5 py-2 text-sm font-medium text-white hover:bg-primary-700 disabled:opacity-50'
+                }
               >
                 {isExecuting ? 'Working...' : action.connector_target === 'gmail' ? 'Send email' : 'Create event'}
               </button>
