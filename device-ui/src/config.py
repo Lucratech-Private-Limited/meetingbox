@@ -386,7 +386,8 @@ def get_device_auth_token() -> str:
         path = d / DEVICE_AUTH_TOKEN_FILE_NAME
         try:
             if path.is_file():
-                t = path.read_text(encoding='utf-8').strip()
+                # utf-8-sig strips a BOM; a leading U+FEFF breaks token hashing on the server.
+                t = path.read_text(encoding='utf-8-sig').strip()
                 if t:
                     return t
         except OSError:

@@ -368,10 +368,10 @@ class MeetingBoxApp(App):
     def _pairing_watchdog(self, _dt):
         if USE_MOCK_BACKEND:
             return
-        if not get_device_auth_token().strip():
+        tok = get_device_auth_token().strip()
+        if not tok:
             return
-        if not self.backend.client.headers.get("Authorization"):
-            return
+        self.backend.set_device_auth_header(tok)
         run_async(self._pairing_watchdog_async())
 
     async def _pairing_watchdog_async(self):
@@ -379,6 +379,18 @@ class MeetingBoxApp(App):
             await self.backend.get_pairing_status()
         except httpx.HTTPStatusError as e:
             if e.response is not None and e.response.status_code == 401:
+                detail = None
+                try:
+                    body = e.response.json()
+                    d = body.get('detail')
+                    if isinstance(d, str):
+                        detail = d
+                except Exception:
+                    pass
+                logger.warning(
+                    "Pairing status 401 (%s); clearing local pairing",
+                    detail or 'no detail',
+                )
                 Clock.schedule_once(
                     lambda *_: self.on_account_unpaired(remote=True), 0)
         except Exception as e:
@@ -390,6 +402,11 @@ class MeetingBoxApp(App):
 
     def on_start(self):
         logger.info("MeetingBox UI started")
+        if not USE_MOCK_BACKEND:
+            # Always align the HTTP client Bearer with persisted token (file may differ from __init__).
+            tok = get_device_auth_token().strip()
+            if tok:
+                self.backend.set_device_auth_header(tok)
         Clock.schedule_once(self._check_backend, 2.0)
         if self.needs_setup():
             self._setup_poll = Clock.schedule_interval(self._global_setup_check, 3.0)
