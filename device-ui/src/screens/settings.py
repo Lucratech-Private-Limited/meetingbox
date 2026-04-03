@@ -451,6 +451,8 @@ class SettingsScreen(BaseScreen):
         async def _reset():
             try:
                 await self.backend.update_settings({'action': 'factory_reset'})
+                Clock.schedule_once(
+                    lambda _dt: self.app.reenter_onboarding_after_remote_reset(), 0)
             except Exception:
                 pass
         run_async(_reset())

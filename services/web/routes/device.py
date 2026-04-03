@@ -6,6 +6,7 @@ Manages: settings, WiFi, updates, system device info.
 """
 
 import json
+import logging
 import os
 import platform
 import shutil
@@ -24,6 +25,7 @@ from auth import get_optional_user
 from database import get_connection
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 REDIS_HOST = os.getenv("REDIS_HOST", "redis")
 _redis_client = None
 
@@ -48,6 +50,56 @@ DEVICE_MODEL = "MeetingBox v1.0"
 
 # Boot time for uptime calculation
 _BOOT_TIME = time.time()
+
+_DEFAULT_REBOOT_HELPER = "/usr/local/bin/meetingbox-host-reboot"
+
+
+def _trigger_system_reboot() -> bool:
+    """
+    Reboot the appliance. The slim web image has no sudo; in Docker use
+    MEETINGBOX_REBOOT_HELPER (host nsenter script) or MEETINGBOX_REBOOT_CMD.
+    """
+    env_cmd = (os.environ.get("MEETINGBOX_REBOOT_CMD") or "").strip()
+    if env_cmd:
+        try:
+            subprocess.Popen(env_cmd, shell=True, close_fds=True)
+            return True
+        except Exception as e:
+            logger.error("MEETINGBOX_REBOOT_CMD failed: %s", e)
+
+    helper = (os.environ.get("MEETINGBOX_REBOOT_HELPER") or "").strip()
+    for path in {h for h in (helper, _DEFAULT_REBOOT_HELPER) if h}:
+        p = Path(path)
+        if p.is_file():
+            try:
+                subprocess.Popen(["/bin/sh", str(p)], close_fds=True)
+                return True
+            except Exception as e:
+                logger.error("reboot helper %s failed: %s", path, e)
+
+    sudo = shutil.which("sudo")
+    if sudo:
+        for args in (["sudo", "-n", "reboot"], ["sudo", "-n", "shutdown", "-r", "now"]):
+            try:
+                subprocess.Popen(args, close_fds=True)
+                return True
+            except Exception as e:
+                logger.debug("reboot attempt %s: %s", args, e)
+
+    if os.geteuid() == 0:
+        rb = shutil.which("reboot") or "/sbin/reboot"
+        try:
+            subprocess.Popen([rb], close_fds=True)
+            return True
+        except Exception as e:
+            logger.error("reboot as root failed: %s", e)
+
+    logger.warning(
+        "System reboot was not started: configure MEETINGBOX_REBOOT_HELPER in "
+        "Docker, set MEETINGBOX_REBOOT_CMD, or grant passwordless sudo reboot "
+        "on the host."
+    )
+    return False
 
 
 def _nmcli_run(args: list, timeout: float = 30) -> subprocess.CompletedProcess:
@@ -223,27 +275,24 @@ async def update_settings(body: SettingsUpdate, current_user: Optional[dict] = D
     # Handle special actions
     action = updates.pop("action", None)
     if action == "restart":
-        # Schedule restart in background
-        try:
-            subprocess.Popen(["sudo", "reboot"], close_fds=True)
-        except Exception:
-            pass
+        _trigger_system_reboot()
         return {"status": "restarting"}
 
     if action == "factory_reset":
-        # Delete settings, profiles, setup marker, then reboot
+        # Delete settings, profiles, pairing token, setup marker, then reboot
         try:
             SETTINGS_FILE.unlink(missing_ok=True)
             PROFILES_FILE.unlink(missing_ok=True)
+            (SETTINGS_FILE.parent / "device_auth_token").unlink(missing_ok=True)
             # Remove setup marker from shared config volume
             SETUP_COMPLETE_FILE.unlink(missing_ok=True)
             for p in ["/data/config/.setup_complete",
                       "/opt/meetingbox/data/config/.setup_complete",
                       "/opt/meetingbox/.setup_complete"]:
                 Path(p).unlink(missing_ok=True)
-            subprocess.Popen(["sudo", "reboot"], close_fds=True)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error("factory_reset file cleanup: %s", e)
+        _trigger_system_reboot()
         return {"status": "resetting"}
 
     current.update(updates)

@@ -322,6 +322,16 @@ class MeetingBoxApp(App):
                 return False
         return True
 
+    def reenter_onboarding_after_remote_reset(self):
+        """After API factory reset: markers may be gone before reboot completes."""
+        if not self.needs_setup():
+            return
+        if getattr(self, '_setup_poll', None):
+            self._setup_poll.cancel()
+            self._setup_poll = None
+        self._setup_poll = Clock.schedule_interval(self._global_setup_check, 3.0)
+        self.goto_screen('splash', 'fade')
+
     # ==================================================================
     # APP LIFECYCLE
     # ==================================================================
