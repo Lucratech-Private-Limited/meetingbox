@@ -375,20 +375,23 @@ def _device_token_storage_dirs() -> tuple[Path, ...]:
 
 def get_device_auth_token() -> str:
     """
-    Bearer token for device API routes: env DEVICE_AUTH_TOKEN, else first
-    ``device_auth_token`` file found under any known config root.
+    Bearer token for device API routes: prefer a persisted ``device_auth_token``
+    file (claim always writes this) and fall back to env DEVICE_AUTH_TOKEN.
+
+    Env-first was wrong for dev/docker: a stale DEVICE_AUTH_TOKEN in .env or
+    compose overrides the file after pairing, so restart sends a bad Bearer,
+    pairing-status returns 401, and the UI clears pairing.
     """
-    env = (DEVICE_AUTH_TOKEN or '').strip()
-    if env:
-        return env
     for d in _device_token_storage_dirs():
         path = d / DEVICE_AUTH_TOKEN_FILE_NAME
         try:
             if path.is_file():
-                return path.read_text(encoding='utf-8').strip()
+                t = path.read_text(encoding='utf-8').strip()
+                if t:
+                    return t
         except OSError:
             continue
-    return ''
+    return (DEVICE_AUTH_TOKEN or "").strip()
 
 
 def clear_stored_device_auth_token() -> None:
