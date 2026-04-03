@@ -345,48 +345,90 @@ def setup_complete_marker_paths_for_write() -> tuple[Path, ...]:
     return tuple(d / '.setup_complete' for d in uniq)
 
 
+def _device_token_storage_dirs() -> tuple[Path, ...]:
+    """
+    Config roots that may hold ``device_auth_token``.
+
+    After reboot, ``resolve_device_config_dir()`` can switch (e.g. overlay
+    ``/data/config`` becomes writable when the compose volume mounts). If we only
+    ever read the token from the *current* primary, pairing looks "gone" even
+    though the file still exists under another root. We read/write all distinct
+    roots so the token survives path preference changes.
+    """
+    seen: set[str] = set()
+    out: list[Path] = []
+    for d in (
+        Path('/data/config'),
+        Path('/opt/meetingbox/data/config'),
+        resolve_device_config_dir(),
+        BASE_DIR / 'data' / 'config',
+    ):
+        try:
+            key = str(d.resolve())
+        except OSError:
+            key = str(d)
+        if key not in seen:
+            seen.add(key)
+            out.append(d)
+    return tuple(out)
+
+
 def get_device_auth_token() -> str:
     """
-    Bearer token for device API routes: env DEVICE_AUTH_TOKEN, else file
-    ``{resolve_device_config_dir()}/device_auth_token`` (written after pairing).
+    Bearer token for device API routes: env DEVICE_AUTH_TOKEN, else first
+    ``device_auth_token`` file found under any known config root.
     """
     env = (DEVICE_AUTH_TOKEN or '').strip()
     if env:
         return env
-    path = resolve_device_config_dir() / DEVICE_AUTH_TOKEN_FILE_NAME
-    try:
-        if path.is_file():
-            return path.read_text(encoding='utf-8').strip()
-    except OSError:
-        pass
+    for d in _device_token_storage_dirs():
+        path = d / DEVICE_AUTH_TOKEN_FILE_NAME
+        try:
+            if path.is_file():
+                return path.read_text(encoding='utf-8').strip()
+        except OSError:
+            continue
     return ''
 
 
 def clear_stored_device_auth_token() -> None:
     """Remove persisted mbd_ token (after unpair). Env DEVICE_AUTH_TOKEN is unchanged."""
-    path = resolve_device_config_dir() / DEVICE_AUTH_TOKEN_FILE_NAME
-    try:
-        path.unlink(missing_ok=True)
-    except OSError as e:
-        logger.warning('Could not remove device auth token file %s: %s', path, e)
+    for d in _device_token_storage_dirs():
+        path = d / DEVICE_AUTH_TOKEN_FILE_NAME
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as e:
+            logger.warning('Could not remove device auth token file %s: %s', path, e)
 
 
 def persist_device_auth_token(token: str) -> bool:
-    """Save device API token next to profiles / setup marker (best-effort)."""
+    """Save device API token under every writable config root (best-effort)."""
     t = (token or '').strip()
     if not t:
         return False
-    path = resolve_device_config_dir() / DEVICE_AUTH_TOKEN_FILE_NAME
-    try:
-        path.write_text(t + '\n', encoding='utf-8')
+    ok_any = False
+    for d in _device_token_storage_dirs():
+        if d in (Path('/data/config'), Path('/opt/meetingbox/data/config')):
+            if not _system_config_dir_usable(d):
+                continue
+        else:
+            try:
+                d.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                continue
+        path = d / DEVICE_AUTH_TOKEN_FILE_NAME
         try:
-            path.chmod(0o600)
-        except OSError:
-            pass
-        return True
-    except OSError as e:
-        logger.warning('Could not persist device auth token: %s', e)
-        return False
+            path.write_text(t + '\n', encoding='utf-8')
+            try:
+                path.chmod(0o600)
+            except OSError:
+                pass
+            ok_any = True
+        except OSError as e:
+            logger.debug('Could not persist device auth token to %s: %s', path, e)
+    if not ok_any:
+        logger.warning('Could not persist device auth token to any config directory')
+    return ok_any
 
 
 try:
