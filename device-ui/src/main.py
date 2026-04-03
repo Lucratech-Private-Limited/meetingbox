@@ -151,6 +151,15 @@ logger = logging.getLogger(__name__)
 # Import async helper (starts background loop on import)
 from async_helper import run_async, get_async_loop
 
+# Recording start/stop uses optional auth; a 401 on pairing-status during this flow
+# would clear the local token and break summary/actions. Defer unpair until idle.
+_PAIRING_UNPAIR_DEFER_SCREENS = frozenset({
+    'recording',
+    'processing',
+    'summary_review',
+    'complete',
+})
+
 
 # ==================================================================
 # Application
@@ -387,12 +396,20 @@ class MeetingBoxApp(App):
                         detail = d
                 except Exception:
                     pass
-                logger.warning(
-                    "Pairing status 401 (%s); clearing local pairing",
-                    detail or 'no detail',
-                )
-                Clock.schedule_once(
-                    lambda *_: self.on_account_unpaired(remote=True), 0)
+                logger.warning("Pairing status 401 (%s)", detail or 'no detail')
+
+                def _apply_remote_unpair(_clk):
+                    cur = self.screen_manager.current
+                    if cur in _PAIRING_UNPAIR_DEFER_SCREENS:
+                        logger.warning(
+                            "Deferring remote unpair while on screen %s "
+                            "(recording pipeline does not require device Bearer)",
+                            cur,
+                        )
+                        return
+                    self.on_account_unpaired(remote=True)
+
+                Clock.schedule_once(_apply_remote_unpair, 0)
         except Exception as e:
             logger.debug("Pairing check skipped: %s", e)
 
