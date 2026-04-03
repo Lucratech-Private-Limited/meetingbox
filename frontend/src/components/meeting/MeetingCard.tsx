@@ -41,13 +41,16 @@ export default function MeetingCard({ meeting, onDelete }: MeetingCardProps) {
     }
   }
 
+  const pendingN = meeting.pending_actions ?? 0
+  const executedN = meeting.executed_actions ?? 0
+
   return (
     <>
       <Link
         to={`/meeting/${meeting.id}`}
-        className="group block bg-white rounded-lg border border-gray-200 hover:border-primary-500 hover:shadow-md transition-all relative"
+        className="group flex h-full flex-col bg-white rounded-lg border border-gray-200 hover:border-primary-500 hover:shadow-md transition-all relative"
       >
-        <div className="p-6">
+        <div className="flex flex-col flex-1 p-6">
           {/* Title and status */}
           <div className="flex items-center justify-between mb-3">
             <h3 className="text-lg font-semibold text-gray-900 truncate flex-1 mr-2">
@@ -90,15 +93,38 @@ export default function MeetingCard({ meeting, onDelete }: MeetingCardProps) {
                 {Math.floor(meeting.duration / 60)} minutes
               </div>
             )}
+          </div>
 
-            {(meeting.pending_actions ?? 0) > 0 && (
-              <div className="flex items-center text-yellow-600">
-                <svg className="w-4 h-4 mr-2" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
-                </svg>
-                {meeting.pending_actions} pending action{meeting.pending_actions! > 1 ? 's' : ''}
-              </div>
-            )}
+          {/* Agentic actions: bottom-right style row */}
+          <div className="mt-auto pt-4 flex justify-end items-center gap-3 text-xs">
+            <span
+              className={`inline-flex items-center gap-1 ${pendingN > 0 ? 'text-amber-600' : 'text-gray-400'}`}
+              title={`${pendingN} pending Gmail/Calendar action${pendingN !== 1 ? 's' : ''}`}
+            >
+              <svg className="w-4 h-4 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden>
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  strokeWidth={2}
+                  d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"
+                />
+              </svg>
+              <span className="tabular-nums font-medium">{pendingN}</span>
+            </span>
+            <span
+              className={`inline-flex items-center gap-1 ${executedN > 0 ? 'text-emerald-600' : 'text-gray-400'}`}
+              title={`${executedN} executed Gmail/Calendar action${executedN !== 1 ? 's' : ''}`}
+            >
+              <svg className="w-4 h-4 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden>
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  strokeWidth={2}
+                  d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"
+                />
+              </svg>
+              <span className="tabular-nums font-medium">{executedN}</span>
+            </span>
           </div>
         </div>
       </Link>

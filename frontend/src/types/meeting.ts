@@ -10,6 +10,8 @@ export interface Meeting {
   audio_path: string | null
   created_at: string
   pending_actions?: number
+  /** Gmail/Calendar agentic actions run from this meeting */
+  executed_actions?: number
 }
 
 export interface MeetingDetail extends Meeting {
