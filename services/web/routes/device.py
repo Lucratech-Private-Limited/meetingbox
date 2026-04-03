@@ -42,6 +42,33 @@ SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
 SETUP_COMPLETE_FILE = SETTINGS_FILE.parent / ".setup_complete"
 PROFILES_FILE = SETTINGS_FILE.parent / "device_profiles.json"
 
+
+def _all_setup_marker_paths_for_reset() -> list[Path]:
+    """Every `.setup_complete` path we know about — factory reset must clear all."""
+    out: list[Path] = []
+    seen: set[str] = set()
+
+    def add(p: Path) -> None:
+        try:
+            key = str(p.resolve())
+        except OSError:
+            key = str(p)
+        if key not in seen:
+            seen.add(key)
+            out.append(p)
+
+    add(SETUP_COMPLETE_FILE)
+    for p in (
+        Path("/data/config/.setup_complete"),
+        Path("/opt/meetingbox/data/config/.setup_complete"),
+        Path("/opt/meetingbox/.setup_complete"),
+    ):
+        add(p)
+    root = (os.environ.get("MEETINGBOX_PROJECT_ROOT") or "").strip()
+    if root:
+        add(Path(root) / "data" / "config" / ".setup_complete")
+    return out
+
 # NetworkManager WiFi interface (override if not wlan0, e.g. wlp2s0)
 WIFI_IFACE = os.getenv("WIFI_INTERFACE", "wlan0")
 
@@ -279,17 +306,16 @@ async def update_settings(body: SettingsUpdate, current_user: Optional[dict] = D
         return {"status": "restarting"}
 
     if action == "factory_reset":
-        # Delete settings, profiles, pairing token, setup marker, then reboot
+        # Delete settings, profiles, pairing token, every setup marker, then reboot
         try:
             SETTINGS_FILE.unlink(missing_ok=True)
             PROFILES_FILE.unlink(missing_ok=True)
             (SETTINGS_FILE.parent / "device_auth_token").unlink(missing_ok=True)
-            # Remove setup marker from shared config volume
-            SETUP_COMPLETE_FILE.unlink(missing_ok=True)
-            for p in ["/data/config/.setup_complete",
-                      "/opt/meetingbox/data/config/.setup_complete",
-                      "/opt/meetingbox/.setup_complete"]:
-                Path(p).unlink(missing_ok=True)
+            for p in _all_setup_marker_paths_for_reset():
+                try:
+                    p.unlink(missing_ok=True)
+                except OSError as err:
+                    logger.warning("factory_reset: could not remove %s: %s", p, err)
         except Exception as e:
             logger.error("factory_reset file cleanup: %s", e)
         _trigger_system_reboot()
@@ -375,6 +401,7 @@ async def device_info(current_user: Optional[dict] = Depends(get_optional_user))
         "storage_total": disk.total,
         "uptime": uptime_seconds,
         "meetings_count": meetings_count,
+        "setup_complete": SETUP_COMPLETE_FILE.exists(),
     }
 
 

@@ -36,7 +36,14 @@ async def system_status() -> dict:
 @router.get("/device-info")
 async def device_info() -> dict:
   """Extended device info consumed by the OLED touch-screen UI."""
-  from routes.device import _load_settings, _get_wifi_info, _get_ip_address, _get_serial, FIRMWARE_VERSION
+  from routes.device import (
+    _load_settings,
+    _get_wifi_info,
+    _get_ip_address,
+    _get_serial,
+    FIRMWARE_VERSION,
+    SETUP_COMPLETE_FILE,
+  )
 
   settings = _load_settings()
   wifi = _get_wifi_info()
@@ -65,6 +72,7 @@ async def device_info() -> dict:
     "storage_total": disk.total,
     "uptime": uptime_seconds,
     "meetings_count": meetings_count,
+    "setup_complete": SETUP_COMPLETE_FILE.exists(),
   }
 
 

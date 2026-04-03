@@ -14,7 +14,8 @@ from kivy.animation import Animation
 from kivy.clock import Clock
 
 from screens.base_screen import BaseScreen
-from config import COLORS, FONT_SIZES, SPLASH_DURATION
+from async_helper import run_async
+from config import COLORS, FONT_SIZES, SPLASH_DURATION, USE_MOCK_BACKEND
 
 
 class SplashScreen(BaseScreen):
@@ -64,8 +65,33 @@ class SplashScreen(BaseScreen):
         Clock.unschedule(self._advance)
 
     def _advance(self, _dt):
-        """Move to next screen based on setup state."""
-        if self.app.needs_setup():
-            self.goto('welcome', transition='fade')
-        else:
-            self.goto('home', transition='fade')
+        """Move to next screen based on setup state (server marker is authoritative)."""
+        if USE_MOCK_BACKEND:
+            if self.app.needs_setup():
+                self.goto('welcome', transition='fade')
+            else:
+                self.goto('home', transition='fade')
+            return
+        run_async(self._advance_with_backend())
+
+    async def _advance_with_backend(self):
+        need = self.app.needs_setup()
+        try:
+            info = await self.backend.get_system_info()
+            if info.get('setup_complete') is False:
+                self.app.clear_local_setup_markers_best_effort()
+                need = True
+            elif info.get('setup_complete') is True:
+                need = False
+        except Exception:
+            pass
+
+        def _go(_clk):
+            if self.manager.current != 'splash':
+                return
+            if need:
+                self.goto('welcome', transition='fade')
+            else:
+                self.goto('home', transition='fade')
+
+        Clock.schedule_once(_go, 0)

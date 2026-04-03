@@ -126,10 +126,6 @@ services:
       context: ./services/web
     container_name: meetingbox-web
     restart: unless-stopped
-    # Allow nsenter reboot from scripts/host_reboot.sh (host PID 1)
-    pid: host
-    cap_add:
-      - SYS_ADMIN
     depends_on:
       redis:
         condition: service_started

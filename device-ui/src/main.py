@@ -322,9 +322,21 @@ class MeetingBoxApp(App):
                 return False
         return True
 
+    def clear_local_setup_markers_best_effort(self) -> None:
+        """Remove `.setup_complete` files this UI treats as authoritative."""
+        for marker_path in setup_complete_marker_paths_for_read():
+            try:
+                marker_path.unlink(missing_ok=True)
+            except OSError as e:
+                logger.debug("Could not remove setup marker %s: %s", marker_path, e)
+
     def reenter_onboarding_after_remote_reset(self):
         """After API factory reset: markers may be gone before reboot completes."""
+        self.clear_local_setup_markers_best_effort()
         if not self.needs_setup():
+            logger.warning(
+                "Factory reset did not leave the device in first-boot state "
+                "(a setup-complete marker may still exist on disk).")
             return
         if getattr(self, '_setup_poll', None):
             self._setup_poll.cancel()

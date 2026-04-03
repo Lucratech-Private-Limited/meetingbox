@@ -13,8 +13,16 @@
 # device-ui in production. This file adds device passthrough only.
 # /dev/dri is intentionally omitted for portability; some Pi images/devices
 # do not expose it, and Docker fails hard if a configured device path is missing.
+#
+# Appliance-only: host reboot from Settings requires host PID ns + privileges.
+# Do NOT add this to default compose — it can prevent `web` from starting (nginx 502).
 
 services:
+  web:
+    pid: host
+    cap_add:
+      - SYS_ADMIN
+
   device-ui:
     devices:
       - /dev/input:/dev/input
