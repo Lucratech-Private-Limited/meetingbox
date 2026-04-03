@@ -1,5 +1,6 @@
 """Home screen matching the new reference idle layout (1024x600)."""
 
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -21,12 +22,36 @@ from screens.base_screen import BaseScreen
 _CHIP_SIZE = 34
 _ICON_SIZE = 16
 
+# Calendar action titles often include "… - April 4th …" while we also format start on line 2.
+_DATEISH_TAIL_RE = re.compile(
+    r"(?i)(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|"
+    r"monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
+    r"\d{1,2}:\d{2}|"
+    r"\b\d{1,2}(st|nd|rd|th)\b|\bam\b|\bpm\b)",
+)
+
+
+def _strip_redundant_calendar_suffix(title: str) -> str:
+    """If title is 'Subject - …date-ish…', keep only Subject so line 2 is the single date line."""
+    t = (title or "").strip()
+    if not t:
+        return t
+    m = re.match(r"^(.*?)\s*[-–—]\s*(.+)$", t)
+    if not m:
+        return t
+    head, tail = m.group(1).strip(), m.group(2).strip()
+    if len(tail) < 4 or not _DATEISH_TAIL_RE.search(tail):
+        return t
+    return head if head else t
+
 
 def _format_home_next_meeting(next_meeting) -> str:
     """Return 1–2 lines: title and local date/time (or all-day) for the home screen."""
     if not next_meeting:
         return "No executed calendar actions yet"
-    title = (next_meeting.get("title") or "Calendar event").strip()
+    title = _strip_redundant_calendar_suffix(
+        (next_meeting.get("title") or "Calendar event").strip()
+    )
     if not title:
         return "No executed calendar actions yet"
     start = (next_meeting.get("start") or "").strip()
