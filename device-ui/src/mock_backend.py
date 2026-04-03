@@ -172,6 +172,21 @@ class MockBackendClient:
     # SETTINGS
     # ==================================================================
 
+    async def get_pairing_status(self) -> Dict:
+        await asyncio.sleep(0.1)
+        return {
+            "paired": True,
+            "device_id": "mock-device-id",
+            "device_name": self._settings.get("device_name", "MeetingBox"),
+            "owner_email": "you@example.com",
+        }
+
+    async def unpair_self(self) -> Dict:
+        await asyncio.sleep(0.2)
+        from config import clear_stored_device_auth_token
+        clear_stored_device_auth_token()
+        return {"status": "unpaired", "device_id": "mock-device-id"}
+
     async def get_settings(self) -> Dict:
         await asyncio.sleep(0.2)
         return dict(self._settings)

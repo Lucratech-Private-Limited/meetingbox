@@ -21,7 +21,7 @@ from pydantic import BaseModel
 import psutil
 import redis
 
-from auth import get_optional_user
+from auth import get_optional_user, get_current_device_row
 from database import get_connection
 
 router = APIRouter()
@@ -255,6 +255,44 @@ def _get_serial() -> str:
     except Exception:
         pass
     return "MB-00000000"
+
+
+# ======================================================================
+# PAIRING (device Bearer token required)
+# ======================================================================
+
+
+@router.get("/pairing-status")
+async def device_pairing_status(device: dict = Depends(get_current_device_row)):
+    """Return 401 if this device token was revoked (e.g. unpaired from dashboard)."""
+    return {
+        "paired": True,
+        "device_id": device["id"],
+        "device_name": device.get("device_name"),
+        "owner_email": device.get("owner_email"),
+    }
+
+
+@router.post("/unpair-self")
+async def device_unpair_self(device: dict = Depends(get_current_device_row)):
+    """Unlink this appliance from its owner account (device-initiated)."""
+    now = datetime.utcnow().isoformat()
+    device_id = device["id"]
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            UPDATE devices
+            SET status = 'unpaired', auth_token_hash = NULL, unpaired_at = ?
+            WHERE id = ?
+            """,
+            (now, device_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return {"status": "unpaired", "device_id": device_id}
 
 
 # ======================================================================

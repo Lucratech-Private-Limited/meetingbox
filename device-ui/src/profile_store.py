@@ -164,6 +164,13 @@ def get_active_profile(store: Optional[Dict[str, Any]] = None) -> Optional[Dict[
     return find_profile(s, aid)
 
 
+def clear_active_profile_selection() -> None:
+    """Clear active user on the device (e.g. after cloud unpair)."""
+    s = load_store()
+    s["active_user_id"] = None
+    save_store(s)
+
+
 def display_initials(display_name: str, max_len: int = 2) -> str:
     parts = (display_name or "").strip().split()
     if not parts:

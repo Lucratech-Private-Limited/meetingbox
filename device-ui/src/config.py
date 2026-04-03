@@ -350,6 +350,15 @@ def get_device_auth_token() -> str:
     return ''
 
 
+def clear_stored_device_auth_token() -> None:
+    """Remove persisted mbd_ token (after unpair). Env DEVICE_AUTH_TOKEN is unchanged."""
+    path = resolve_device_config_dir() / DEVICE_AUTH_TOKEN_FILE_NAME
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as e:
+        logger.warning('Could not remove device auth token file %s: %s', path, e)
+
+
 def persist_device_auth_token(token: str) -> bool:
     """Save device API token next to profiles / setup marker (best-effort)."""
     t = (token or '').strip()

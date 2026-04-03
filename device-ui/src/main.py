@@ -15,6 +15,8 @@ import sys
 import time
 from pathlib import Path
 
+import httpx
+
 # Ensure the directory containing this file (src) is on sys.path so that
 # imports of screens, components, config, api_client, etc. work regardless
 # of how the app is run (e.g. python src/main.py vs python -m src.main).
@@ -79,12 +81,14 @@ from config import (
     TRANSITION_DURATION,
     DEFAULT_PRIVACY_MODE,
     setup_complete_marker_paths_for_read,
+    get_device_auth_token,
+    clear_stored_device_auth_token,
 )
 
 from api_client import BackendClient
 from mock_backend import MockBackendClient
 from hardware import set_brightness, screen_off, screen_on
-from profile_store import get_active_profile
+from profile_store import get_active_profile, clear_active_profile_selection
 
 # Boot-flow screens
 from screens.splash import SplashScreen
@@ -198,6 +202,7 @@ class MeetingBoxApp(App):
 
         # WebSocket
         self.ws_task = None
+        self._pairing_poll = None
 
         # Screen timeout
         self._screen_timeout_minutes = 0  # 0 = never
@@ -344,6 +349,41 @@ class MeetingBoxApp(App):
         self._setup_poll = Clock.schedule_interval(self._global_setup_check, 3.0)
         self.goto_screen('splash', 'fade')
 
+    def on_account_unpaired(self, remote: bool = False):
+        """Clear local pairing after dashboard or device-initiated unpair."""
+        logger.info("Device unlinked from account (%s)",
+                    "remote revoke" if remote else "local unpair")
+        clear_stored_device_auth_token()
+        self.backend.set_device_auth_header(None)
+        self.current_user_id = None
+        self.current_display_name = None
+        self.paired_owner_email = None
+        try:
+            clear_active_profile_selection()
+        except Exception as e:
+            logger.debug("clear_active_profile_selection: %s", e)
+        self._nav_stack.clear()
+        self.goto_screen('pair_device', 'fade')
+
+    def _pairing_watchdog(self, _dt):
+        if USE_MOCK_BACKEND:
+            return
+        if not get_device_auth_token().strip():
+            return
+        if not self.backend.client.headers.get("Authorization"):
+            return
+        run_async(self._pairing_watchdog_async())
+
+    async def _pairing_watchdog_async(self):
+        try:
+            await self.backend.get_pairing_status()
+        except httpx.HTTPStatusError as e:
+            if e.response is not None and e.response.status_code == 401:
+                Clock.schedule_once(
+                    lambda *_: self.on_account_unpaired(remote=True), 0)
+        except Exception as e:
+            logger.debug("Pairing check skipped: %s", e)
+
     # ==================================================================
     # APP LIFECYCLE
     # ==================================================================
@@ -355,6 +395,9 @@ class MeetingBoxApp(App):
             self._setup_poll = Clock.schedule_interval(self._global_setup_check, 3.0)
         else:
             self._setup_poll = None
+        if not USE_MOCK_BACKEND:
+            self._pairing_poll = Clock.schedule_interval(
+                self._pairing_watchdog, 45.0)
 
     def _global_setup_check(self, _dt):
         """Global poll for setup_complete marker -- fires from any screen."""
@@ -375,6 +418,9 @@ class MeetingBoxApp(App):
         logger.info("MeetingBox UI stopping")
         if getattr(self, '_setup_poll', None):
             self._setup_poll.cancel()
+        if getattr(self, '_pairing_poll', None):
+            self._pairing_poll.cancel()
+            self._pairing_poll = None
         if self.ws_task and not self.ws_task.done():
             self.ws_task.cancel()
         run_async(self.backend.close())

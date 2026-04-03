@@ -58,6 +58,7 @@ async def list_devices(current_user: dict = Depends(get_current_user)):
             SELECT id, device_name, serial_number, status, paired_at, unpaired_at, last_seen_at, created_at
             FROM devices
             WHERE user_id = ?
+              AND (status IS NULL OR status = 'active')
             ORDER BY created_at DESC
             """,
             (current_user["id"],),

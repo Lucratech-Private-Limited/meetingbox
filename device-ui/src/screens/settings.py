@@ -213,6 +213,14 @@ class SettingsScreen(BaseScreen):
         # ---- MAINTENANCE ----
         self.container.add_widget(_section_header('MAINTENANCE'))
 
+        self.unpair_account_item = SettingsItem(
+            title='Unpair from account',
+            subtitle='Link again with a new pairing code',
+            mode='arrow',
+            on_press=lambda _: self._show_unpair_account_dialog(),
+        )
+        self.container.add_widget(self.unpair_account_item)
+
         self.restart_item = SettingsItem(
             title='Restart Device',
             subtitle='',
@@ -398,6 +406,30 @@ class SettingsScreen(BaseScreen):
     # ------------------------------------------------------------------
     # Restart dialog
     # ------------------------------------------------------------------
+    def _show_unpair_account_dialog(self):
+        dialog = ModalDialog(
+            title='Unpair this device?',
+            message=('This device will disconnect from your MeetingBox\n'
+                     'account. Gmail stays linked in the web dashboard.\n'
+                     'You will enter a new pairing code to reconnect.'),
+            confirm_text='UNPAIR',
+            cancel_text='CANCEL',
+            danger=True,
+            border_color=COLORS['red'],
+            on_confirm=self._execute_unpair_account,
+        )
+        self.add_widget(dialog)
+
+    def _execute_unpair_account(self):
+        async def _run():
+            try:
+                await self.backend.unpair_self()
+            except Exception:
+                pass
+            Clock.schedule_once(
+                lambda _dt: self.app.on_account_unpaired(remote=False), 0)
+        run_async(_run())
+
     def _show_restart_dialog(self):
         dialog = ModalDialog(
             title='Restart Device?',

@@ -368,6 +368,28 @@ class BackendClient:
     # SETTINGS API (device route)
     # ==================================================================
 
+    async def get_pairing_status(self) -> Dict:
+        """GET /api/device/pairing-status — 401 if unpaired from dashboard."""
+        try:
+            resp = await self.client.get(
+                f"{self.base_url}/api/device/pairing-status")
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.error("Pairing status failed: %s", e)
+            raise
+
+    async def unpair_self(self) -> Dict:
+        """POST /api/device/unpair-self — unlink this device from owner account."""
+        try:
+            resp = await self.client.post(
+                f"{self.base_url}/api/device/unpair-self")
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.error("Unpair self failed: %s", e)
+            raise
+
     async def get_settings(self) -> Dict:
         """GET /api/device/settings"""
         try:

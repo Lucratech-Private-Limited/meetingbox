@@ -232,3 +232,25 @@ async def get_current_actor(
     if actor is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
     return actor
+
+
+async def get_current_device_row(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+) -> dict:
+    """
+    Require a valid paired-device API token (Bearer mbd_…).
+    Used for pairing checks and device-initiated unpair.
+    """
+    if credentials is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing device credentials",
+        )
+    device = get_device_by_token(credentials.credentials)
+    if device is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Device not paired or access revoked",
+        )
+    touch_device_last_seen(device["id"])
+    return device
