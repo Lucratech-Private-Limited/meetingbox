@@ -190,58 +190,58 @@ services:
 
 
 
-  device-ui:
-    build:
-      context: ./device-ui
-    container_name: meetingbox-ui
-    # Match web/audio/transcription (UID 1000) so ./data/config is writable.
-    user: "1000:1000"
-    restart: unless-stopped
-    depends_on:
-      - web
-      - redis
-    environment:
-      - PYTHONUNBUFFERED=1
-      # Point to the web service inside the Docker network
-      - BACKEND_URL=http://web:8000
-      - BACKEND_WS_URL=ws://web:8000/ws
-      # Display: use the host X server
-      - DISPLAY=${DISPLAY:-:0}
-      # Kivy settings
-      - KIVY_WINDOW=sdl2
-      - KIVY_NO_CONSOLELOG=1
-      # Fullscreen mode — set to 1 for dedicated kiosk display,
-      # 0 for windowed mode on a normal desktop.
-      - FULLSCREEN=0
-      - MOCK_BACKEND=0
-      # GPU rendering: Mesa uses host DRI device (/dev/dri) for hardware
-      # acceleration. Remove the devices block and uncomment below if
-      # hardware fails (e.g. black screen):
-      # - LIBGL_ALWAYS_SOFTWARE=1
-    volumes:
-      # X11 socket — lets the container draw on the host display
-      - /tmp/.X11-unix:/tmp/.X11-unix:rw
-      # Persistent device config (settings, setup marker)
-      - ./data/config:/data/config
-      # No Xauthority mount needed — the host .xinitrc runs
-      # 'xhost +local:' which allows all local socket connections
-      # without a magic cookie. Mounting the file caused failures
-      # when it didn't exist yet at container start time.
-    devices:
-      # Pass the GPU into the container so Mesa can use hardware rendering.
-      # If this path does not exist on the host, remove this block.
-      - /dev/dri:/dev/dri
-    group_add:
-      # Give the container user access to DRI render nodes.
-      # GID 44  = video group on Ubuntu (card devices)
-      # GID 109 = render group on Ubuntu 24.04 (renderD* devices)
-      - "44"
-      - "109"
-    networks:
-      - meetingbox-net
-    # NOTE: For production with a touchscreen, uncomment:
-    # devices:
-    #   - /dev/input:/dev/input
+  # device-ui:
+  #   build:
+  #     context: ./device-ui
+  #   container_name: meetingbox-ui
+  #   # Match web/audio/transcription (UID 1000) so ./data/config is writable.
+  #   user: "1000:1000"
+  #   restart: unless-stopped
+  #   depends_on:
+  #     - web
+  #     - redis
+  #   environment:
+  #     - PYTHONUNBUFFERED=1
+  #     # Point to the web service inside the Docker network
+  #     - BACKEND_URL=http://web:8000
+  #     - BACKEND_WS_URL=ws://web:8000/ws
+  #     # Display: use the host X server
+  #     - DISPLAY=${DISPLAY:-:0}
+  #     # Kivy settings
+  #     - KIVY_WINDOW=sdl2
+  #     - KIVY_NO_CONSOLELOG=1
+  #     # Fullscreen mode — set to 1 for dedicated kiosk display,
+  #     # 0 for windowed mode on a normal desktop.
+  #     - FULLSCREEN=0
+  #     - MOCK_BACKEND=0
+  #     # GPU rendering: Mesa uses host DRI device (/dev/dri) for hardware
+  #     # acceleration. Remove the devices block and uncomment below if
+  #     # hardware fails (e.g. black screen):
+  #     # - LIBGL_ALWAYS_SOFTWARE=1
+  #   volumes:
+  #     # X11 socket — lets the container draw on the host display
+  #     - /tmp/.X11-unix:/tmp/.X11-unix:rw
+  #     # Persistent device config (settings, setup marker)
+  #     - ./data/config:/data/config
+  #     # No Xauthority mount needed — the host .xinitrc runs
+  #     # 'xhost +local:' which allows all local socket connections
+  #     # without a magic cookie. Mounting the file caused failures
+  #     # when it didn't exist yet at container start time.
+  #   devices:
+  #     # Pass the GPU into the container so Mesa can use hardware rendering.
+  #     # If this path does not exist on the host, remove this block.
+  #     - /dev/dri:/dev/dri
+  #   group_add:
+  #     # Give the container user access to DRI render nodes.
+  #     # GID 44  = video group on Ubuntu (card devices)
+  #     # GID 109 = render group on Ubuntu 24.04 (renderD* devices)
+  #     - "44"
+  #     - "109"
+  #   networks:
+  #     - meetingbox-net
+  #   # NOTE: For production with a touchscreen, uncomment:
+  #   # devices:
+  #   #   - /dev/input:/dev/input
 
 volumes:
   redis-data:
