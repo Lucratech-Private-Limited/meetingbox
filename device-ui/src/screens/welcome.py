@@ -2,28 +2,38 @@
 Welcome Screen – First-time setup introduction
 
 Trigger : Follows splash on first boot
-Content : Logo, "MeetingBox AI" hero, text CTA, security footer
-Action  : Tap button → Name room → WiFi Setup
+Content : Logo, "MeetingBox AI" hero, Button.png CTA (native aspect, rounded),
+          shield crop + text footer
+Action  : Tap CTA → Name room → WiFi Setup
 
 Design ref: UI_Ref_for_cursor/Welcome_Screen/Frame 1.png
+
+Exports: No API token is required to run the app. For sharper PNGs from Figma,
+export assets at 1× or 2× and replace files under assets/welcome/. A personal
+Figma access token is only needed for automated REST export scripts — not for users.
 """
 
+from io import BytesIO
 from pathlib import Path
+from typing import Optional
 
+from kivy.clock import Clock
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.floatlayout import FloatLayout
 from kivy.uix.anchorlayout import AnchorLayout
 from kivy.uix.label import Label
 from kivy.uix.widget import Widget
 from kivy.uix.image import Image
+from kivy.uix.behaviors import ButtonBehavior
 from kivy.graphics import Color, Rectangle
 
 from screens.base_screen import BaseScreen
-from components.button import PrimaryButton
-from config import COLORS, FONT_SIZES, ASSETS_DIR
+from config import COLORS, FONT_SIZES, ASSETS_DIR, DISPLAY_WIDTH
 
 WELCOME_DIR = ASSETS_DIR / 'welcome'
 LOGO_PATH = str(WELCOME_DIR / 'LOGO.png')
+BUTTON_PATH = str(WELCOME_DIR / 'Button.png')
+SHIELD_STRIP_PATH = str(WELCOME_DIR / 'shield.png')
 ELLIPSE_PATHS = [
     str(WELCOME_DIR / 'Ellipse 1.png'),
     str(WELCOME_DIR / 'Ellipse 2.png'),
@@ -32,6 +42,49 @@ ELLIPSE_PATHS = [
 
 # #0B0D11 — same near-black navy as the Figma design
 WELCOME_BG = (0.043, 0.051, 0.067, 1)
+
+# Target pill height for CTA; width follows Button.png aspect ratio (no stretch).
+_CTA_TARGET_H = 56
+
+
+class _ImageButton(ButtonBehavior, Image):
+    """Tappable image — use natural aspect ratio, do not distort bitmaps."""
+    pass
+
+
+def _make_security_icon_image() -> Optional[Image]:
+    """
+    shield.png is a wide strip (~251×20) with a small glyph on the left and
+    rasterised text on the right. Crop the left slice so we can show the glyph
+    next to a real Label for the sentence (avoids tiny unreadable raster text).
+    """
+    path = Path(SHIELD_STRIP_PATH)
+    if not path.is_file():
+        return None
+    try:
+        from PIL import Image as PILImage
+        from kivy.core.image import Image as CoreImage
+
+        pil = PILImage.open(path).convert('RGBA')
+        w, h = pil.size
+        crop_w = max(22, min(40, w // 8))
+        left = pil.crop((0, 0, min(crop_w, w), h))
+        buf = BytesIO()
+        left.save(buf, format='PNG')
+        buf.seek(0)
+        ci = CoreImage(buf, ext='png')
+        tw, th = ci.texture.size
+        disp_h = 20
+        disp_w = max(1, int(tw * disp_h / th))
+        return Image(
+            texture=ci.texture,
+            size=(disp_w, disp_h),
+            size_hint=(None, None),
+            allow_stretch=False,
+            keep_ratio=True,
+        )
+    except Exception:
+        return None
 
 
 class WelcomeScreen(BaseScreen):
@@ -111,8 +164,8 @@ class WelcomeScreen(BaseScreen):
 
         # ── Layer 3: hero content block (vertically centred) ───────────────
         # Heights:  title(78) + gap(14) + subtitle(28) + gap(32) +
-        #           button(56) + gap(18) + footer text(28)  = 254 px
-        HERO_H = 254
+        #           button(≤56) + gap(18) + footer(30)  ≈ 256 px
+        HERO_H = 260
 
         hero = BoxLayout(
             orientation='vertical',
@@ -154,36 +207,67 @@ class WelcomeScreen(BaseScreen):
 
         hero.add_widget(Widget(size_hint=(1, None), height=32))
 
-        # CTA — text label on PrimaryButton (fixed 400×56, no stretched bitmap)
+        # CTA — design Button.png (rounded pill + baked label); size from texture aspect
         btn_anchor = AnchorLayout(
             anchor_x='center',
             anchor_y='center',
             size_hint=(1, None),
-            height=56,
+            height=_CTA_TARGET_H,
         )
-        cta = PrimaryButton(
-            text='Start Your First Meeting',
-            font_size=FONT_SIZES['large'],
+        cta = _ImageButton(
+            source=BUTTON_PATH,
             size_hint=(None, None),
-            size=(400, 56),
+            size=(260, _CTA_TARGET_H),
+            allow_stretch=False,
+            keep_ratio=True,
+            fit_mode='contain',
         )
+
+        def _sync_cta_size(img, *args):
+            if not img.texture or img.texture.width < 2:
+                return
+            tw, th = img.texture.size
+            nh = _CTA_TARGET_H
+            nw = max(1, int(tw * nh / th))
+            max_w = int(DISPLAY_WIDTH * 0.90)
+            if nw > max_w:
+                nw = max_w
+                nh = max(1, int(th * nw / tw))
+            img.size = (nw, nh)
+            btn_anchor.height = max(btn_anchor.height, nh)
+
+        cta.bind(texture=_sync_cta_size)
         cta.bind(on_press=self._on_continue)
         btn_anchor.add_widget(cta)
+        Clock.schedule_once(lambda _dt: _sync_cta_size(cta), 0)
         hero.add_widget(btn_anchor)
 
         hero.add_widget(Widget(size_hint=(1, None), height=18))
 
+        footer = BoxLayout(
+            orientation='horizontal',
+            size_hint=(1, None),
+            height=30,
+            spacing=8,
+        )
+        footer.add_widget(Widget(size_hint=(1, 1)))
+        icon = _make_security_icon_image()
+        if icon:
+            footer.add_widget(icon)
         security_lbl = Label(
             text='Enterprise-grade security included',
             font_size=FONT_SIZES['small'],
             color=COLORS['gray_500'],
-            halign='center',
+            halign='left',
             valign='middle',
-            size_hint=(1, None),
-            height=28,
+            size_hint=(None, 1),
         )
-        security_lbl.bind(size=security_lbl.setter('text_size'))
-        hero.add_widget(security_lbl)
+        security_lbl.bind(
+            texture_size=lambda inst, ts: setattr(inst, 'size', (ts[0], max(ts[1], 22))),
+        )
+        footer.add_widget(security_lbl)
+        footer.add_widget(Widget(size_hint=(1, 1)))
+        hero.add_widget(footer)
 
         root.add_widget(hero)
         self.add_widget(root)
