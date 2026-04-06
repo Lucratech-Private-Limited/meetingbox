@@ -1,6 +1,5 @@
 """
-Link device — pairing code only; room/device name comes from the Name this room step.
-Shows a QR code for the web dashboard.
+Link device — pairing code and dashboard QR; device name still comes from setup when claiming.
 """
 
 from io import BytesIO
@@ -100,7 +99,6 @@ def _make_qr_image_widget(url: str, px: int = 116):
 class PairDeviceScreen(BaseScreen):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self._room_name_label = None
         self._code_input = None
         self._link_btn = None
         self._build_ui()
@@ -169,15 +167,14 @@ class PairDeviceScreen(BaseScreen):
         sub = Label(
             text=(
                 "Sign in on the dashboard (scan the QR code), open Settings → Devices, "
-                "and generate a pairing code. Enter only the code below — your room "
-                "name from setup is used as the device name."
+                "and generate a pairing code. Enter it below."
             ),
             font_size=FONT_SIZES["small"],
             color=COLORS["gray_400"],
             halign="center",
             valign="middle",
             size_hint=(1, None),
-            height=56,
+            height=44,
         )
         sub.bind(size=sub.setter("text_size"))
         body.add_widget(sub)
@@ -213,33 +210,7 @@ class PairDeviceScreen(BaseScreen):
         url_lbl.bind(size=url_lbl.setter("text_size"))
         body.add_widget(url_lbl)
 
-        body.add_widget(Widget(size_hint=(1, None), height=12))
-        body.add_widget(_field_label("Room / device name (from setup)"))
-        self._room_name_label = Label(
-            text="",
-            font_size=FONT_SIZES["medium"],
-            color=COLORS["white"],
-            halign="left",
-            valign="middle",
-            size_hint=(1, None),
-            height=44,
-            padding=[14, 10],
-        )
-        self._room_name_label.bind(size=self._room_name_label.setter("text_size"))
-        with self._room_name_label.canvas.before:
-            Color(*COLORS["surface_light"])
-            self._room_name_bg = Rectangle(
-                pos=self._room_name_label.pos, size=self._room_name_label.size
-            )
-
-        def _sync_room_bg(inst, *args):
-            self._room_name_bg.pos = inst.pos
-            self._room_name_bg.size = inst.size
-
-        self._room_name_label.bind(pos=_sync_room_bg, size=_sync_room_bg)
-        body.add_widget(self._room_name_label)
-
-        body.add_widget(Widget(size_hint=(1, None), height=8))
+        body.add_widget(Widget(size_hint=(1, None), height=16))
         body.add_widget(_field_label("Pairing code"))
         self._code_input = _text_input(hint_text="6-digit code from web")
         body.add_widget(self._code_input)
@@ -277,9 +248,6 @@ class PairDeviceScreen(BaseScreen):
     def on_enter(self):
         if self._code_input:
             self._code_input.text = ""
-        name = (getattr(self.app, "device_name", None) or "").strip() or "MeetingBox"
-        if self._room_name_label:
-            self._room_name_label.text = name
 
     def _on_link(self, _inst):
         name = (getattr(self.app, "device_name", None) or "").strip()
