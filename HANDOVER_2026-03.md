@@ -1,6 +1,6 @@
 # MeetingBox Handover
 
-Last updated: 2026-03-25
+Last updated: 2026-04-06
 
 ## Purpose
 
@@ -13,6 +13,37 @@ MeetingBox is an on-prem AI meeting appliance. It captures room audio, transcrib
 The project was originally built for a Raspberry Pi 5 with a 3.5-inch OLED touchscreen. It has now been migrated to run on a **Linux mini PC with Ubuntu Desktop and a standard monitor** connected via HDMI.
 
 **Current production target:** Intel mini PC, Ubuntu 24.04 Desktop, standard HDMI monitor, USB headset microphone, mouse/keyboard input, Docker Compose runtime.
+
+## Delta Update (2026-04-06)
+
+This section is the latest validated state and overrides older details below when there is a conflict.
+
+- Device pairing persistence was debugged and tightened in `device-ui/src/config.py` and `device-ui/src/main.py`.
+- `get_device_auth_token()` now prefers persisted token files before `DEVICE_AUTH_TOKEN` env fallback.
+- Persisted token reads now use `utf-8-sig` to tolerate BOM-prefixed token files.
+- Device UI startup and pairing watchdog now refresh the backend `Authorization` header from the persisted token before calling pairing APIs.
+- Remote unpair handling is deferred while on active recording / post-recording screens (`recording`, `processing`, `summary_review`, `complete`) so summary/action generation is not interrupted mid-session by a transient pairing-status 401.
+- Home screen next-meeting text was cleaned up to strip redundant date-like suffixes from meeting titles.
+- Web dashboard meeting cards now show both `pending_actions` and `executed_actions` counts in the lower-right area with simple icons.
+- Device settings power actions were extended:
+  - "Restart Device" now attempts a local host reboot path first, then backend fallback.
+  - "Power Off" was added with the same local-first then backend-fallback behavior.
+  - Factory reset now also triggers reboot behavior after reset completes.
+- Backend device settings API in `services/web/routes/device.py` now supports `poweroff` and reports whether host reboot / poweroff initiation was attempted.
+- Added `scripts/host_poweroff.sh` and corresponding compose wiring so the web service can request host shutdown when running inside Docker.
+- Setup flow updates:
+  - `device-ui/src/screens/room_name.py`: removed "Skip for now".
+  - The "Next Step" button is only enabled when a non-empty room name is entered.
+  - The entered room name is reused as the device name.
+  - `device-ui/src/screens/pair_device.py`: removed the read-only room/device name display from the link page.
+- Welcome screen (`device-ui/src/screens/welcome.py`) received multiple Figma-driven adjustments:
+  - Hero block is vertically centered.
+  - The CTA uses `Button.png` again and preserves its natural aspect ratio.
+  - The CTA was recently increased from 56 px to 70 px tall because it was smaller than the reference.
+  - The prior enterprise security image asset caused visible overlap because the baked text inside `shield.png` was still present; this was replaced with a text-rendered shield icon plus a separate label to eliminate overlap.
+- Recent visual status of the welcome screen:
+  - The overlapping enterprise-grade text issue is fixed in code.
+  - The CTA is larger than before and should be closer to the Figma reference, but this still needs an on-device visual check to confirm final sizing/alignment on the actual display.
 
 ## Delta Update (2026-03-25)
 
