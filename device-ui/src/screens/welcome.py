@@ -13,9 +13,7 @@ export assets at 1× or 2× and replace files under assets/welcome/. A personal
 Figma access token is only needed for automated REST export scripts — not for users.
 """
 
-from io import BytesIO
 from pathlib import Path
-from typing import Optional
 
 from kivy.clock import Clock
 from kivy.uix.boxlayout import BoxLayout
@@ -33,7 +31,6 @@ from config import COLORS, FONT_SIZES, ASSETS_DIR, DISPLAY_WIDTH
 WELCOME_DIR = ASSETS_DIR / 'welcome'
 LOGO_PATH = str(WELCOME_DIR / 'LOGO.png')
 BUTTON_PATH = str(WELCOME_DIR / 'Button.png')
-SHIELD_STRIP_PATH = str(WELCOME_DIR / 'shield.png')
 ELLIPSE_PATHS = [
     str(WELCOME_DIR / 'Ellipse 1.png'),
     str(WELCOME_DIR / 'Ellipse 2.png'),
@@ -43,48 +40,14 @@ ELLIPSE_PATHS = [
 # #0B0D11 — same near-black navy as the Figma design
 WELCOME_BG = (0.043, 0.051, 0.067, 1)
 
-# Target pill height for CTA; width follows Button.png aspect ratio (no stretch).
-_CTA_TARGET_H = 56
+# Button.png natural size: 412 × 94 px.
+# Render at 70 px tall → 412/94 × 70 ≈ 307 px wide (≈ 30 % of 1024).
+_CTA_TARGET_H = 70
 
 
 class _ImageButton(ButtonBehavior, Image):
-    """Tappable image — use natural aspect ratio, do not distort bitmaps."""
+    """Tappable image — preserves natural aspect ratio, never stretches."""
     pass
-
-
-def _make_security_icon_image() -> Optional[Image]:
-    """
-    shield.png is a wide strip (~251×20) with a small glyph on the left and
-    rasterised text on the right. Crop the left slice so we can show the glyph
-    next to a real Label for the sentence (avoids tiny unreadable raster text).
-    """
-    path = Path(SHIELD_STRIP_PATH)
-    if not path.is_file():
-        return None
-    try:
-        from PIL import Image as PILImage
-        from kivy.core.image import Image as CoreImage
-
-        pil = PILImage.open(path).convert('RGBA')
-        w, h = pil.size
-        crop_w = max(22, min(40, w // 8))
-        left = pil.crop((0, 0, min(crop_w, w), h))
-        buf = BytesIO()
-        left.save(buf, format='PNG')
-        buf.seek(0)
-        ci = CoreImage(buf, ext='png')
-        tw, th = ci.texture.size
-        disp_h = 20
-        disp_w = max(1, int(tw * disp_h / th))
-        return Image(
-            texture=ci.texture,
-            size=(disp_w, disp_h),
-            size_hint=(None, None),
-            allow_stretch=False,
-            keep_ratio=True,
-        )
-    except Exception:
-        return None
 
 
 class WelcomeScreen(BaseScreen):
@@ -164,8 +127,8 @@ class WelcomeScreen(BaseScreen):
 
         # ── Layer 3: hero content block (vertically centred) ───────────────
         # Heights:  title(78) + gap(14) + subtitle(28) + gap(32) +
-        #           button(≤56) + gap(18) + footer(30)  ≈ 256 px
-        HERO_H = 260
+        #           button(70) + gap(16) + footer(26)  = 264 px
+        HERO_H = 264
 
         hero = BoxLayout(
             orientation='vertical',
@@ -242,18 +205,26 @@ class WelcomeScreen(BaseScreen):
         Clock.schedule_once(lambda _dt: _sync_cta_size(cta), 0)
         hero.add_widget(btn_anchor)
 
-        hero.add_widget(Widget(size_hint=(1, None), height=18))
+        hero.add_widget(Widget(size_hint=(1, None), height=16))
 
-        footer = BoxLayout(
+        # Security line: Unicode shield + text — both are Labels, no image overlap
+        security_row = BoxLayout(
             orientation='horizontal',
             size_hint=(1, None),
-            height=30,
-            spacing=8,
+            height=26,
+            spacing=6,
         )
-        footer.add_widget(Widget(size_hint=(1, 1)))
-        icon = _make_security_icon_image()
-        if icon:
-            footer.add_widget(icon)
+        security_row.add_widget(Widget(size_hint=(1, 1)))
+        shield_icon = Label(
+            text='🛡',
+            font_size=14,
+            color=COLORS['gray_500'],
+            size_hint=(None, 1),
+            width=20,
+            halign='center',
+            valign='middle',
+        )
+        security_row.add_widget(shield_icon)
         security_lbl = Label(
             text='Enterprise-grade security included',
             font_size=FONT_SIZES['small'],
@@ -262,12 +233,10 @@ class WelcomeScreen(BaseScreen):
             valign='middle',
             size_hint=(None, 1),
         )
-        security_lbl.bind(
-            texture_size=lambda inst, ts: setattr(inst, 'size', (ts[0], max(ts[1], 22))),
-        )
-        footer.add_widget(security_lbl)
-        footer.add_widget(Widget(size_hint=(1, 1)))
-        hero.add_widget(footer)
+        security_lbl.bind(texture_size=lambda inst, ts: setattr(inst, 'width', ts[0]))
+        security_row.add_widget(security_lbl)
+        security_row.add_widget(Widget(size_hint=(1, 1)))
+        hero.add_widget(security_row)
 
         root.add_widget(hero)
         self.add_widget(root)
