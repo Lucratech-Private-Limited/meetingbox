@@ -2,7 +2,7 @@
 Welcome Screen – First-time setup introduction
 
 Trigger : Follows splash on first boot
-Content : Logo, "MeetingBox AI" hero, CTA button, security footer
+Content : Logo, "MeetingBox AI" hero, text CTA, security footer
 Action  : Tap button → Name room → WiFi Setup
 
 Design ref: UI_Ref_for_cursor/Welcome_Screen/Frame 1.png
@@ -16,16 +16,14 @@ from kivy.uix.anchorlayout import AnchorLayout
 from kivy.uix.label import Label
 from kivy.uix.widget import Widget
 from kivy.uix.image import Image
-from kivy.uix.behaviors import ButtonBehavior
 from kivy.graphics import Color, Rectangle
 
 from screens.base_screen import BaseScreen
+from components.button import PrimaryButton
 from config import COLORS, FONT_SIZES, ASSETS_DIR
 
 WELCOME_DIR = ASSETS_DIR / 'welcome'
 LOGO_PATH = str(WELCOME_DIR / 'LOGO.png')
-BUTTON_PATH = str(WELCOME_DIR / 'Button.png')
-SHIELD_PATH = str(WELCOME_DIR / 'shield.png')
 ELLIPSE_PATHS = [
     str(WELCOME_DIR / 'Ellipse 1.png'),
     str(WELCOME_DIR / 'Ellipse 2.png'),
@@ -34,11 +32,6 @@ ELLIPSE_PATHS = [
 
 # #0B0D11 — same near-black navy as the Figma design
 WELCOME_BG = (0.043, 0.051, 0.067, 1)
-
-
-class _ImageButton(ButtonBehavior, Image):
-    """Tappable image acting as a button."""
-    pass
 
 
 class WelcomeScreen(BaseScreen):
@@ -118,8 +111,8 @@ class WelcomeScreen(BaseScreen):
 
         # ── Layer 3: hero content block (vertically centred) ───────────────
         # Heights:  title(78) + gap(14) + subtitle(28) + gap(32) +
-        #           button(56) + gap(18) + shield(26)  = 252 px
-        HERO_H = 252
+        #           button(56) + gap(18) + footer text(28)  = 254 px
+        HERO_H = 254
 
         hero = BoxLayout(
             orientation='vertical',
@@ -161,19 +154,18 @@ class WelcomeScreen(BaseScreen):
 
         hero.add_widget(Widget(size_hint=(1, None), height=32))
 
-        # CTA button — centred, ~360 × 56 px using Button.png asset
+        # CTA — text label on PrimaryButton (fixed 400×56, no stretched bitmap)
         btn_anchor = AnchorLayout(
             anchor_x='center',
             anchor_y='center',
             size_hint=(1, None),
             height=56,
         )
-        cta = _ImageButton(
-            source=BUTTON_PATH,
+        cta = PrimaryButton(
+            text='Start Your First Meeting',
+            font_size=FONT_SIZES['large'],
             size_hint=(None, None),
-            size=(366, 56),
-            allow_stretch=True,
-            keep_ratio=False,
+            size=(400, 56),
         )
         cta.bind(on_press=self._on_continue)
         btn_anchor.add_widget(cta)
@@ -181,22 +173,17 @@ class WelcomeScreen(BaseScreen):
 
         hero.add_widget(Widget(size_hint=(1, None), height=18))
 
-        # "Enterprise-grade security included" (combined shield + text asset)
-        shield_anchor = AnchorLayout(
-            anchor_x='center',
-            anchor_y='center',
+        security_lbl = Label(
+            text='Enterprise-grade security included',
+            font_size=FONT_SIZES['small'],
+            color=COLORS['gray_500'],
+            halign='center',
+            valign='middle',
             size_hint=(1, None),
-            height=26,
+            height=28,
         )
-        if Path(SHIELD_PATH).exists():
-            shield_anchor.add_widget(Image(
-                source=SHIELD_PATH,
-                size_hint=(None, None),
-                size=(290, 26),
-                allow_stretch=True,
-                keep_ratio=True,
-            ))
-        hero.add_widget(shield_anchor)
+        security_lbl.bind(size=security_lbl.setter('text_size'))
+        hero.add_widget(security_lbl)
 
         root.add_widget(hero)
         self.add_widget(root)
