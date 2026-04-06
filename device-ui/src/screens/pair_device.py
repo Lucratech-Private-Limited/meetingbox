@@ -1,13 +1,15 @@
 """
-Link device — name the appliance and enter a pairing code from the web app
-(Settings → Devices, while signed in with Google).
+Link device — pairing code only; room/device name comes from the Name this room step.
+Shows a QR code for the web dashboard.
 """
 
+from io import BytesIO
 from pathlib import Path
 
 import httpx
 from kivy.clock import Clock
 from kivy.graphics import Color, Rectangle
+from kivy.uix.anchorlayout import AnchorLayout
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.image import Image
 from kivy.uix.label import Label
@@ -18,8 +20,16 @@ from kivy.uix.widget import Widget
 from async_helper import run_async
 from components.button import PrimaryButton, SecondaryButton
 from components.modal_dialog import ModalDialog
-from config import ASSETS_DIR, COLORS, FONT_SIZES
+from config import ASSETS_DIR, COLORS, FONT_SIZES, DASHBOARD_URL
 from screens.base_screen import BaseScreen
+
+try:
+    import qrcode
+    from kivy.core.image import Image as CoreImage
+
+    HAS_QRCODE = True
+except ImportError:
+    HAS_QRCODE = False
 
 WELCOME_DIR = ASSETS_DIR / "welcome"
 LOGO_PATH = str(WELCOME_DIR / "LOGO.png")
@@ -59,10 +69,38 @@ def _text_input(**kwargs) -> TextInput:
     return TextInput(**defaults)
 
 
+def _make_qr_image_widget(url: str, px: int = 116):
+    """Return a Kivy Image with a QR for ``url``, or a placeholder label."""
+    if HAS_QRCODE:
+        try:
+            qr = qrcode.QRCode(version=1, box_size=3, border=2)
+            qr.add_data(url)
+            qr.make(fit=True)
+            img = qr.make_image(fill_color="white", back_color="black")
+            buf = BytesIO()
+            img.save(buf, format="PNG")
+            buf.seek(0)
+            core_img = CoreImage(buf, ext="png")
+            return Image(
+                texture=core_img.texture,
+                size=(px, px),
+                size_hint=(None, None),
+            )
+        except Exception:
+            pass
+    return Label(
+        text="[QR]",
+        font_size=FONT_SIZES["small"],
+        color=COLORS["gray_500"],
+        size_hint=(None, None),
+        size=(px, px),
+    )
+
+
 class PairDeviceScreen(BaseScreen):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self._name_input = None
+        self._room_name_label = None
         self._code_input = None
         self._link_btn = None
         self._build_ui()
@@ -130,25 +168,78 @@ class PairDeviceScreen(BaseScreen):
 
         sub = Label(
             text=(
-                "On your computer, open MeetingBox while signed in with Google.\n"
-                "Go to Settings → Devices → Generate code, then enter that code here."
+                "Sign in on the dashboard (scan the QR code), open Settings → Devices, "
+                "and generate a pairing code. Enter only the code below — your room "
+                "name from setup is used as the device name."
             ),
             font_size=FONT_SIZES["small"],
             color=COLORS["gray_400"],
             halign="center",
             valign="middle",
             size_hint=(1, None),
-            height=52,
+            height=56,
         )
         sub.bind(size=sub.setter("text_size"))
         body.add_widget(sub)
 
-        body.add_widget(Widget(size_hint=(1, None), height=4))
-        body.add_widget(_field_label("Device name"))
-        self._name_input = _text_input(hint_text="e.g. Conference Room A")
-        body.add_widget(self._name_input)
+        body.add_widget(Widget(size_hint=(1, None), height=8))
 
-        body.add_widget(Widget(size_hint=(1, None), height=4))
+        qr_caption = Label(
+            text="Web dashboard",
+            font_size=FONT_SIZES["small"],
+            bold=True,
+            color=COLORS["gray_500"],
+            halign="center",
+            size_hint=(1, None),
+            height=22,
+        )
+        qr_caption.bind(size=qr_caption.setter("text_size"))
+        body.add_widget(qr_caption)
+
+        dash_http = f"http://{DASHBOARD_URL}"
+        qr_row = AnchorLayout(size_hint=(1, None), height=124)
+        qr_row.add_widget(_make_qr_image_widget(dash_http, 116))
+        body.add_widget(qr_row)
+
+        url_lbl = Label(
+            text=dash_http,
+            font_size=FONT_SIZES["tiny"],
+            color=COLORS["gray_600"],
+            halign="center",
+            valign="middle",
+            size_hint=(1, None),
+            height=20,
+        )
+        url_lbl.bind(size=url_lbl.setter("text_size"))
+        body.add_widget(url_lbl)
+
+        body.add_widget(Widget(size_hint=(1, None), height=12))
+        body.add_widget(_field_label("Room / device name (from setup)"))
+        self._room_name_label = Label(
+            text="",
+            font_size=FONT_SIZES["medium"],
+            color=COLORS["white"],
+            halign="left",
+            valign="middle",
+            size_hint=(1, None),
+            height=44,
+            padding=[14, 10],
+        )
+        self._room_name_label.bind(size=self._room_name_label.setter("text_size"))
+        with self._room_name_label.canvas.before:
+            Color(*COLORS["surface_light"])
+            self._room_name_bg = Rectangle(
+                pos=self._room_name_label.pos, size=self._room_name_label.size
+            )
+
+        def _sync_room_bg(inst, *args):
+            self._room_name_bg.pos = inst.pos
+            self._room_name_bg.size = inst.size
+
+        self._room_name_label.bind(pos=_sync_room_bg, size=_sync_room_bg)
+        body.add_widget(self._room_name_label)
+
+        body.add_widget(Widget(size_hint=(1, None), height=8))
         body.add_widget(_field_label("Pairing code"))
         self._code_input = _text_input(hint_text="6-digit code from web")
         body.add_widget(self._code_input)
@@ -184,25 +275,25 @@ class PairDeviceScreen(BaseScreen):
         self.add_widget(root)
 
     def on_enter(self):
-        if self._name_input:
-            self._name_input.text = ""
         if self._code_input:
             self._code_input.text = ""
+        name = (getattr(self.app, "device_name", None) or "").strip() or "MeetingBox"
+        if self._room_name_label:
+            self._room_name_label.text = name
 
     def _on_link(self, _inst):
-        name = (self._name_input.text or "").strip()
-        code = (self._code_input.text or "").replace(" ", "").strip()
-
+        name = (getattr(self.app, "device_name", None) or "").strip()
         if not name:
             self.add_widget(
                 ModalDialog(
-                    title="Device name",
-                    message="Please enter a name for this device.",
+                    title="Room name",
+                    message="Go back in setup and choose a room name first.",
                     confirm_text="OK",
                     cancel_text="",
                 )
             )
             return
+        code = (self._code_input.text or "").replace(" ", "").strip()
         if len(code) < 6 or len(code) > 8:
             self.add_widget(
                 ModalDialog(

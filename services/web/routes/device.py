@@ -80,6 +80,7 @@ DEVICE_MODEL = "MeetingBox v1.0"
 _BOOT_TIME = time.time()
 
 _DEFAULT_REBOOT_HELPER = "/usr/local/bin/meetingbox-host-reboot"
+_DEFAULT_POWEROFF_HELPER = "/usr/local/bin/meetingbox-host-poweroff"
 
 
 def _trigger_system_reboot() -> bool:
@@ -126,6 +127,56 @@ def _trigger_system_reboot() -> bool:
         "System reboot was not started: configure MEETINGBOX_REBOOT_HELPER in "
         "Docker, set MEETINGBOX_REBOOT_CMD, or grant passwordless sudo reboot "
         "on the host."
+    )
+    return False
+
+
+def _trigger_system_poweroff() -> bool:
+    """
+    Power off the appliance. Same deployment notes as reboot: use a host helper
+    from Docker (MEETINGBOX_POWEROFF_HELPER) or MEETINGBOX_POWEROFF_CMD / sudo.
+    """
+    env_cmd = (os.environ.get("MEETINGBOX_POWEROFF_CMD") or "").strip()
+    if env_cmd:
+        try:
+            subprocess.Popen(env_cmd, shell=True, close_fds=True)
+            return True
+        except Exception as e:
+            logger.error("MEETINGBOX_POWEROFF_CMD failed: %s", e)
+
+    helper = (os.environ.get("MEETINGBOX_POWEROFF_HELPER") or "").strip()
+    for path in {h for h in (helper, _DEFAULT_POWEROFF_HELPER) if h}:
+        p = Path(path)
+        if p.is_file():
+            try:
+                subprocess.Popen(["/bin/sh", str(p)], close_fds=True)
+                return True
+            except Exception as e:
+                logger.error("poweroff helper %s failed: %s", path, e)
+
+    sudo = shutil.which("sudo")
+    if sudo:
+        for args in (
+            ["sudo", "-n", "poweroff"],
+            ["sudo", "-n", "shutdown", "-h", "now"],
+        ):
+            try:
+                subprocess.Popen(args, close_fds=True)
+                return True
+            except Exception as e:
+                logger.debug("poweroff attempt %s: %s", args, e)
+
+    if os.geteuid() == 0:
+        po = shutil.which("poweroff") or "/sbin/poweroff"
+        try:
+            subprocess.Popen([po], close_fds=True)
+            return True
+        except Exception as e:
+            logger.error("poweroff as root failed: %s", e)
+
+    logger.warning(
+        "System poweroff was not started: configure MEETINGBOX_POWEROFF_HELPER, "
+        "MEETINGBOX_POWEROFF_CMD, or passwordless sudo poweroff on the host."
     )
     return False
 
@@ -466,7 +517,7 @@ class SettingsUpdate(BaseModel):
     privacy_mode: Optional[bool] = None
     auto_record: Optional[bool] = None
     auto_summarize: Optional[bool] = None
-    action: Optional[str] = None  # restart / factory_reset
+    action: Optional[str] = None  # restart / poweroff / factory_reset
 
 
 @router.patch("/settings")
@@ -478,8 +529,12 @@ async def update_settings(body: SettingsUpdate, current_user: Optional[dict] = D
     # Handle special actions
     action = updates.pop("action", None)
     if action == "restart":
-        _trigger_system_reboot()
-        return {"status": "restarting"}
+        ok = _trigger_system_reboot()
+        return {"status": "restarting", "host_reboot_initiated": ok}
+
+    if action == "poweroff":
+        ok = _trigger_system_poweroff()
+        return {"status": "powering_off", "host_poweroff_initiated": ok}
 
     if action == "factory_reset":
         # Delete settings, profiles, pairing token, every setup marker, then reboot
@@ -494,8 +549,8 @@ async def update_settings(body: SettingsUpdate, current_user: Optional[dict] = D
                     logger.warning("factory_reset: could not remove %s: %s", p, err)
         except Exception as e:
             logger.error("factory_reset file cleanup: %s", e)
-        _trigger_system_reboot()
-        return {"status": "resetting"}
+        ok = _trigger_system_reboot()
+        return {"status": "resetting", "host_reboot_initiated": ok}
 
     current.update(updates)
     _save_settings(current)

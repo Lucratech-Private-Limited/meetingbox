@@ -193,8 +193,16 @@ class MockBackendClient:
 
     async def update_settings(self, settings: Dict) -> Dict:
         await asyncio.sleep(0.3)
-        self._settings.update(settings)
-        logger.info(f"[MOCK] Updated settings: {settings}")
+        payload = dict(settings)
+        action = payload.pop('action', None)
+        self._settings.update(payload)
+        logger.info("[MOCK] Updated settings: %s (action=%s)", payload, action)
+        if action == "restart":
+            return {**self._settings, "status": "restarting", "host_reboot_initiated": True}
+        if action == "poweroff":
+            return {**self._settings, "status": "powering_off", "host_poweroff_initiated": True}
+        if action == "factory_reset":
+            return {**self._settings, "status": "resetting", "host_reboot_initiated": True}
         return self._settings
 
     async def post_setup_complete(

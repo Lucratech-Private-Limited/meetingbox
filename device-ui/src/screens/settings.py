@@ -5,6 +5,8 @@ PRD §5.11 – Sections: DEVICE, NETWORK, STORAGE, SYSTEM,
 PRIVACY, DISPLAY, AUDIO, INTEGRATIONS, MAINTENANCE, SUPPORT.
 """
 
+import logging
+
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.scrollview import ScrollView
 from kivy.uix.gridlayout import GridLayout
@@ -19,6 +21,9 @@ from components.settings_item import SettingsItem
 from components.modal_dialog import ModalDialog
 from config import (COLORS, FONT_SIZES, SPACING, DEVICE_MODEL,
                     DASHBOARD_URL)
+from hardware import request_system_poweroff, request_system_reboot
+
+logger = logging.getLogger(__name__)
 
 
 def _section_header(text):
@@ -228,6 +233,14 @@ class SettingsScreen(BaseScreen):
             on_press=lambda _: self._show_restart_dialog(),
         )
         self.container.add_widget(self.restart_item)
+
+        self.poweroff_item = SettingsItem(
+            title='Power Off',
+            subtitle='',
+            mode='arrow',
+            on_press=lambda _: self._show_poweroff_dialog(),
+        )
+        self.container.add_widget(self.poweroff_item)
 
         self.reset_item = SettingsItem(
             title='Factory Reset',
@@ -443,12 +456,69 @@ class SettingsScreen(BaseScreen):
         self.add_widget(dialog)
 
     def _do_restart(self):
+        """Prefer host reboot from this process; API is fallback (e.g. web has nsenter helper)."""
+        local_ok = request_system_reboot()
+
         async def _restart():
+            api_ok = False
             try:
-                await self.backend.update_settings({'action': 'restart'})
-            except Exception:
-                pass
+                resp = await self.backend.update_settings({'action': 'restart'})
+                api_ok = bool(resp.get('host_reboot_initiated'))
+            except Exception as e:
+                logger.debug('restart API: %s', e)
+            if not local_ok and not api_ok:
+                Clock.schedule_once(lambda *_: self._show_power_error('restart'), 0)
+
         run_async(_restart())
+
+    def _show_power_error(self, op: str):
+        if op == 'restart':
+            title = 'Restart failed'
+            message = (
+                'This device could not restart automatically. Power-cycle it or '
+                'ask your admin to allow systemctl reboot or passwordless sudo '
+                'for the MeetingBox user.'
+            )
+        else:
+            title = 'Power off failed'
+            message = (
+                'Could not shut down automatically. Hold the power button or '
+                'unplug the device. Your admin may need to allow systemctl '
+                'poweroff or passwordless sudo.'
+            )
+        self.add_widget(ModalDialog(
+            title=title,
+            message=message,
+            confirm_text='OK',
+            cancel_text='',
+        ))
+
+    def _show_poweroff_dialog(self):
+        dialog = ModalDialog(
+            title='Power Off?',
+            message='The device will turn off completely.\nUnplug to start again if it does not wake on LAN.',
+            confirm_text='POWER OFF',
+            cancel_text='CANCEL',
+            danger=True,
+            border_color=COLORS['red'],
+            on_confirm=self._do_poweroff,
+        )
+        self.add_widget(dialog)
+
+    def _do_poweroff(self):
+        local_ok = request_system_poweroff()
+
+        async def _off():
+            api_ok = False
+            try:
+                resp = await self.backend.update_settings({'action': 'poweroff'})
+                api_ok = bool(resp.get('host_poweroff_initiated'))
+            except Exception as e:
+                logger.debug('poweroff API: %s', e)
+            if not local_ok and not api_ok:
+                Clock.schedule_once(lambda *_: self._show_power_error('poweroff'), 0)
+
+        run_async(_off())
 
     # ------------------------------------------------------------------
     # Factory reset dialog
@@ -485,6 +555,7 @@ class SettingsScreen(BaseScreen):
         async def _reset():
             try:
                 await self.backend.update_settings({'action': 'factory_reset'})
+                request_system_reboot()
                 Clock.schedule_once(
                     lambda _dt: self.app.reenter_onboarding_after_remote_reset(), 0)
             except Exception:

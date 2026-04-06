@@ -115,7 +115,7 @@ class RoomNameScreen(BaseScreen):
         inner.add_widget(title)
 
         subtitle = Label(
-            text='This name will appear on the device and label your recordings.',
+            text='This is your device name (home screen, link device, recordings).',
             font_size=FONT_SIZES['body'],
             color=COLORS['gray_400'],
             halign='left',
@@ -143,6 +143,7 @@ class RoomNameScreen(BaseScreen):
             cursor_color=COLORS['white'],
         )
         inner.add_widget(self._text_input)
+        self._text_input.bind(text=self._on_name_text_changed)
 
         inner.add_widget(Widget(size_hint=(1, None), height=16))
 
@@ -223,23 +224,15 @@ class RoomNameScreen(BaseScreen):
 
         footer.add_widget(Widget(size_hint=(1, 1)))
 
-        skip_btn = SecondaryButton(
-            text='Skip for now',
-            size_hint=(None, 1),
-            width=150,
-            font_size=FONT_SIZES['medium'],
-        )
-        skip_btn.bind(on_press=self._on_skip)
-        footer.add_widget(skip_btn)
-
-        next_btn = PrimaryButton(
+        self._next_btn = PrimaryButton(
             text='Next Step',
             size_hint=(None, 1),
             width=140,
             font_size=FONT_SIZES['medium'],
         )
-        next_btn.bind(on_press=self._on_next)
-        footer.add_widget(next_btn)
+        self._next_btn.bind(on_press=self._on_next)
+        self._next_btn.disabled = True
+        footer.add_widget(self._next_btn)
 
         root.add_widget(footer)
         self.add_widget(root)
@@ -251,19 +244,22 @@ class RoomNameScreen(BaseScreen):
     def _apply_chip(self, name: str):
         self._text_input.text = name
 
+    def _on_name_text_changed(self, _instance, _value):
+        self._sync_next_enabled()
+
+    def _sync_next_enabled(self):
+        if getattr(self, '_next_btn', None):
+            self._next_btn.disabled = not bool((self._text_input.text or '').strip())
+
     def _on_back(self, _inst):
         self.go_back()
-
-    def _on_skip(self, _inst):
-        self.app.device_name = 'MeetingBox'
-        self.goto('network_choice', transition='slide_left')
 
     def _on_next(self, _inst):
         name = (self._text_input.text or '').strip()
         if not name:
             self.add_widget(ModalDialog(
                 title='Room name',
-                message='Enter a name or use Skip.',
+                message='Enter a name or pick a suggestion to continue.',
                 confirm_text='OK',
                 cancel_text='',
             ))
@@ -289,3 +285,4 @@ class RoomNameScreen(BaseScreen):
 
     def on_enter(self):
         self._text_input.text = ''
+        self._sync_next_enabled()

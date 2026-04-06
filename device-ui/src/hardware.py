@@ -7,7 +7,9 @@ falls back to X11 DPMS commands for screen power control.
 
 import logging
 import os
+import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -128,3 +130,102 @@ def screen_on(level: str = "high") -> None:
         except Exception:
             pass
     set_brightness(level)
+
+
+def _local_power_skip() -> bool:
+    """Skip host power commands (e.g. desktop dev on Windows, or tests)."""
+    if sys.platform.startswith("win"):
+        return True
+    v = os.environ.get("MEETINGBOX_SKIP_LOCAL_POWER", "").strip().lower()
+    return v in ("1", "true", "yes")
+
+
+def request_system_reboot() -> bool:
+    """
+    Reboot the machine that runs this UI (mini-PC / kiosk host).
+
+    The web API often runs in Docker without permission to reboot the host; the
+    appliance UI process runs on the host and can invoke systemd/sudo the same
+    way brightness uses sudo tee.
+    """
+    if _local_power_skip():
+        logger.debug("Local reboot skipped (Windows or MEETINGBOX_SKIP_LOCAL_POWER)")
+        return False
+
+    env_cmd = (os.environ.get("MEETINGBOX_LOCAL_REBOOT_CMD") or "").strip()
+    if env_cmd:
+        try:
+            subprocess.Popen(env_cmd, shell=True, close_fds=True, start_new_session=True)
+            logger.info("Reboot requested via MEETINGBOX_LOCAL_REBOOT_CMD")
+            return True
+        except Exception as e:
+            logger.warning("MEETINGBOX_LOCAL_REBOOT_CMD failed: %s", e)
+
+    candidates: list[list[str]] = []
+    if os.geteuid() == 0:
+        rb = shutil.which("reboot") or "/sbin/reboot"
+        candidates.append([rb])
+    candidates.extend(
+        [
+            ["systemctl", "reboot"],
+            ["sudo", "-n", "systemctl", "reboot"],
+            ["sudo", "-n", "reboot"],
+            ["sudo", "-n", "shutdown", "-r", "now"],
+        ]
+    )
+    for args in candidates:
+        try:
+            subprocess.Popen(args, close_fds=True, start_new_session=True)
+            logger.info("Reboot requested via %s", args)
+            return True
+        except FileNotFoundError:
+            continue
+        except Exception as e:
+            logger.debug("reboot %s: %s", args, e)
+    logger.warning(
+        "Local reboot not started — allow systemctl reboot or passwordless sudo "
+        "for this user (see sudoers / polkit)."
+    )
+    return False
+
+
+def request_system_poweroff() -> bool:
+    """Power off the machine that runs this UI."""
+    if _local_power_skip():
+        logger.debug("Local poweroff skipped (Windows or MEETINGBOX_SKIP_LOCAL_POWER)")
+        return False
+
+    env_cmd = (os.environ.get("MEETINGBOX_LOCAL_POWEROFF_CMD") or "").strip()
+    if env_cmd:
+        try:
+            subprocess.Popen(env_cmd, shell=True, close_fds=True, start_new_session=True)
+            logger.info("Poweroff requested via MEETINGBOX_LOCAL_POWEROFF_CMD")
+            return True
+        except Exception as e:
+            logger.warning("MEETINGBOX_LOCAL_POWEROFF_CMD failed: %s", e)
+
+    candidates: list[list[str]] = []
+    if os.geteuid() == 0:
+        po = shutil.which("poweroff") or "/sbin/poweroff"
+        candidates.append([po])
+    candidates.extend(
+        [
+            ["systemctl", "poweroff"],
+            ["sudo", "-n", "systemctl", "poweroff"],
+            ["sudo", "-n", "poweroff"],
+            ["sudo", "-n", "shutdown", "-h", "now"],
+        ]
+    )
+    for args in candidates:
+        try:
+            subprocess.Popen(args, close_fds=True, start_new_session=True)
+            logger.info("Poweroff requested via %s", args)
+            return True
+        except FileNotFoundError:
+            continue
+        except Exception as e:
+            logger.debug("poweroff %s: %s", args, e)
+    logger.warning(
+        "Local poweroff not started — allow systemctl poweroff or passwordless sudo."
+    )
+    return False

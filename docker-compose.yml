@@ -133,6 +133,7 @@ services:
       - PYTHONUNBUFFERED=1
       - REDIS_HOST=redis
       - MEETINGBOX_REBOOT_HELPER=/usr/local/bin/meetingbox-host-reboot
+      - MEETINGBOX_POWEROFF_HELPER=/usr/local/bin/meetingbox-host-poweroff
       - MEETINGBOX_DB_PATH=/data/transcripts/meetings.db
       - RECORDINGS_DIR=/data/audio/recordings
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
@@ -154,6 +155,7 @@ services:
       - ./data/config:/data/config
       - ./frontend/dist:/app/static
       - ./scripts/host_reboot.sh:/usr/local/bin/meetingbox-host-reboot:ro
+      - ./scripts/host_poweroff.sh:/usr/local/bin/meetingbox-host-poweroff:ro
     networks:
       - meetingbox-net
 
