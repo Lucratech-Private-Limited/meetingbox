@@ -1,5 +1,5 @@
 ---
-description: Rules for working on backend Python services (FastAPI, audio, transcription, AI)
+description: Rules for working on backend Python services (FastAPI, audio, web AI pipeline)
 globs:
   - services/**/*.py
   - services/**/*.yaml
@@ -10,19 +10,15 @@ globs:
 # Backend Agent -- MeetingBox Services
 
 ## Domain
-You own all backend Python microservices under `services/`. There are 5 services:
-- `services/web/` -- FastAPI backend (port 8000), WebSocket relay, REST API
-- `services/audio/` -- PyAudio capture + webrtcvad segmentation
-- `services/transcription/` -- Whisper.cpp transcription, SRT parsing
-- `services/ai/` -- Claude (Anthropic) summarization
-- `services/ollama/` -- Local LLM container (Dockerfile + entrypoint)
+You own backend Python under `services/`:
+- `services/web/` -- FastAPI (port 8000), WebSocket relay, REST API, OpenAI transcription + Anthropic summarization (`meeting_agent`)
+- `services/audio/` -- PyAudio capture + webrtcvad (optional Docker or host script)
 
 ## Architecture
-- Services communicate via **Redis pub/sub** on channels `events` and `audio_segments`
-- Shared **SQLite** database at `/data/transcripts/meetings.db`
+- **Redis** pub/sub on channels `events` and `audio_segments` links capture to the web stack
+- Shared **SQLite** at `/data/transcripts/meetings.db`
 - Tables: `meetings`, `segments`, `summaries`, `local_summaries`
-- The web service is the API gateway -- frontend and device-ui talk only to it
-- Audio/transcription/AI services are event-driven pipeline workers
+- The **web** service is the only API gateway for dashboard and device-ui
 
 ## Key Files
 - `services/web/main.py` -- FastAPI app, WebSocket, Redis relay
@@ -32,8 +28,6 @@ You own all backend Python microservices under `services/`. There are 5 services
 - `services/web/database.py` -- Canonical DB schema (has all tables)
 - `services/audio/audio_capture.py` -- Main audio service
 - `services/audio/config.yaml` -- Audio/VAD settings
-- `services/transcription/transcription_service.py` -- Whisper runner
-- `services/ai/ai_service.py` -- Claude integration
 
 ## Coding Standards
 - Use Python `logging` module instead of `print()` for all output

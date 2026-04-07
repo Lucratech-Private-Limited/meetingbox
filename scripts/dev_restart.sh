@@ -104,7 +104,7 @@ fi
 
 if [ ! -f "$MARKER" ]; then
     echo "[5/8] Starting backend services (onboarding mode — nginx skipped)..."
-    docker compose up -d redis audio transcription ai ollama web
+    docker compose up -d redis audio web
 else
     echo "[5/8] Starting backend services..."
     docker compose up -d

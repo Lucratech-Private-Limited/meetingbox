@@ -35,10 +35,6 @@ def _get_anthropic_client():
     _anthropic_client = Anthropic(api_key=api_key)
   return _anthropic_client
 
-# Ollama configuration for local summarization
-OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://ollama:11434")
-LOCAL_LLM_MODEL = os.getenv("LOCAL_LLM_MODEL", "phi3:mini")
-
 # OpenAI (Whisper) transcription for upload-audio pipeline
 _openai_client = None
 
@@ -964,12 +960,6 @@ async def summarize_meeting(meeting_id: str, current_actor: Optional[dict] = Dep
     "open_questions": data.get("open_questions", []),
     "risks_or_concerns": data.get("risks_or_concerns", []),
   }
-
-
-@router.post("/{meeting_id}/summarize-local")
-async def summarize_meeting_local(meeting_id: str, current_actor: Optional[dict] = Depends(get_optional_actor)):
-  """Compatibility route: force Anthropic summary instead of local LLM."""
-  return await summarize_meeting(meeting_id, current_actor)
 
 
 class EmailRequest(BaseModel):

@@ -183,10 +183,6 @@ cd "$INSTALL_DIR"
 # Stop anything running from a previous install
 docker compose down 2>/dev/null || true
 
-# Remove old Ollama volume to clear stale models (e.g. llama3.1:8b)
-echo "   Removing old Ollama data volume (if any)..."
-docker volume rm meetingbox_ollama-data 2>/dev/null || true
-
 # Build all images
 echo "   Building images (this may take a few minutes on first run)..."
 docker compose build
@@ -212,14 +208,6 @@ if docker ps --format '{{.Names}}' | grep -q meetingbox-ui; then
 else
     echo "   ⚠ Device UI container not running"
     echo "     Check with: docker logs meetingbox-ui"
-fi
-
-if docker ps --format '{{.Names}}' | grep -q meetingbox-ollama; then
-    echo "   ✓ Ollama container is running (model will auto-download)"
-    echo "     Watch progress: docker logs meetingbox-ollama -f"
-else
-    echo "   ⚠ Ollama container not running"
-    echo "     Check with: docker logs meetingbox-ollama"
 fi
 
 # -------------------------------------------------------
@@ -250,15 +238,11 @@ echo "Commands:"
 echo "  docker compose ps              # Container status"
 echo "  docker compose logs -f         # All logs"
 echo "  docker logs meetingbox-ui -f   # Device UI logs"
-echo "  docker logs meetingbox-ollama -f  # Ollama model download progress"
 echo "  docker compose restart         # Restart everything"
 echo "  docker compose down            # Stop everything"
 echo "  docker compose up -d --build   # Rebuild & restart"
 echo ""
-echo "NOTE: The Ollama model (phi3:mini, ~2.3GB) downloads in the"
-echo "background on first run. Local summarization won't work until"
-echo "the download finishes. Check progress with:"
-echo "  docker logs meetingbox-ollama -f"
+echo "Transcription and summaries use OpenAI + Anthropic APIs (configure API keys in .env)."
 echo ""
 echo "The screen UI will appear after reboot (X11 auto-starts)."
 echo "Reboot now?  sudo reboot"

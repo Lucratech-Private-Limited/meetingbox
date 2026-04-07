@@ -8,7 +8,7 @@ This is the single source of truth for any new agent or engineer picking up this
 
 ## Executive Summary
 
-MeetingBox is an on-prem AI meeting appliance. It captures room audio, transcribes it with Whisper.cpp, generates summaries with a local LLM (Ollama/phi3:mini) or Anthropic Claude, stores results in SQLite, and exposes a React web dashboard and a Kivy-based device UI.
+MeetingBox is an on-prem AI meeting appliance. It captures room audio, transcribes with the **OpenAI** API and summarizes with **Anthropic** Claude inside `services/web`, stores results in SQLite, and exposes a React dashboard and Kivy device UI. Legacy local Ollama / whisper.cpp worker services have been removed from the repo.
 
 The project was originally built for a Raspberry Pi 5 with a 3.5-inch OLED touchscreen. It has now been migrated to run on a **Linux mini PC with Ubuntu Desktop and a standard monitor** connected via HDMI.
 
@@ -18,6 +18,7 @@ The project was originally built for a Raspberry Pi 5 with a 3.5-inch OLED touch
 
 This section is the latest validated state and overrides older details below when there is a conflict.
 
+- **Cloud-only AI:** Removed `services/ai`, `services/transcription`, and `services/ollama`. OpenAI (Whisper) + Anthropic run in `services/web` only. Removed `POST .../summarize-local`; device-ui uses `/summarize` only. Compose no longer sets Ollama / `USE_LOCAL_LLM` env vars.
 - Device pairing persistence was debugged and tightened in `device-ui/src/config.py` and `device-ui/src/main.py`.
 - `get_device_auth_token()` now prefers persisted token files before `DEVICE_AUTH_TOKEN` env fallback.
 - Persisted token reads now use `utf-8-sig` to tolerate BOM-prefixed token files.

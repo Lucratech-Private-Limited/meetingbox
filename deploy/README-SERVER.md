@@ -14,7 +14,7 @@ docker compose -f docker-compose.server.yml up -d --build
 | `web`    | FastAPI (`services/web`) |
 | `nginx`  | Serves `frontend/dist` and proxies `/api`, `/ws` to `web` |
 
-Not started: **device-ui**, **Docker audio**, **transcription/ollama** profiles — those belong on the mini PC or are optional elsewhere.
+Not started: **device-ui**, **Docker audio** — those belong on the mini PC (or use host audio).
 
 ## One-time setup
 

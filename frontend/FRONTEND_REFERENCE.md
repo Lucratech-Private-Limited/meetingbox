@@ -80,7 +80,6 @@
 | Delete button | `setShowDeleteConfirm(true)` | None (opens modal) | N/A | Working |
 | Delete confirm | `handleDeleteMeeting` | `DELETE /api/meetings/{id}` | `routes/meetings.py` | Working |
 | Summarize with API | `handleSummarize` | `POST /api/meetings/{id}/summarize` (also auto-sets title from summary) | `routes/meetings.py` | Working |
-| Summarize Locally | `handleSummarizeLocal` | `POST /api/meetings/{id}/summarize-local` (also auto-sets title from summary) | `routes/meetings.py` | Working |
 | Tab navigation | `setActiveTab` | None (local state) | N/A | Working |
 | Recording tab (audio player) | HTML5 `<audio>` | `GET /api/meetings/{id}/audio` | `routes/meetings.py` | Working |
 | Action dismiss | `ActionCard.handleDismiss` | `POST /api/actions/{id}/dismiss` | `routes/actions.py` | Working |
@@ -167,7 +166,6 @@
 | `meetings.ts` | `update` | PATCH | `/api/meetings/{id}` | Yes | Not yet |
 | `meetings.ts` | `delete` | DELETE | `/api/meetings/{id}` | Yes | MeetingDetail, Dashboard |
 | `meetings.ts` | `summarize` | POST | `/api/meetings/{id}/summarize` | Yes | MeetingDetail |
-| `meetings.ts` | `summarizeLocal` | POST | `/api/meetings/{id}/summarize-local` | Yes | MeetingDetail |
 | `meetings.ts` | `getAudioUrl` | GET | `/api/meetings/{id}/audio` | Yes | MeetingDetail (Recording tab) |
 | `meetings.ts` | `export` | GET | `/api/meetings/{id}/export/{format}` | Yes | MeetingDetail |
 | `meetings.ts` | `emailSummary` | POST | `/api/meetings/{id}/email` | Yes | Not yet |

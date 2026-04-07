@@ -278,19 +278,6 @@ class BackendClient:
             logger.error(f"Failed to summarize meeting {meeting_id}: {e}")
             raise
 
-    async def summarize_meeting_local(self, meeting_id: str) -> Dict:
-        """POST /api/meetings/{meeting_id}/summarize-local (Ollama)"""
-        try:
-            resp = await self.client.post(
-                f"{self.base_url}/api/meetings/{meeting_id}/summarize-local",
-                timeout=300.0,
-            )
-            resp.raise_for_status()
-            return resp.json()
-        except Exception as e:
-            logger.error(f"Failed to locally summarize meeting {meeting_id}: {e}")
-            raise
-
     # ==================================================================
     # ACTIONS API
     # ==================================================================

@@ -7,7 +7,7 @@ Deploy the full MeetingBox stack on a VirtualBox Ubuntu VM (or any Linux host) w
 - **VirtualBox 7+** with Extension Pack (for USB passthrough)
 - **Ubuntu Server 24.04 LTS** ISO
 - A **USB microphone** (e.g. ReSpeaker Mic Array)
-- An **Anthropic API key** for Claude
+- **Anthropic** and **OpenAI** API keys (cloud transcription + summarization; local Whisper workers were removed)
 
 ## Phase 1: Create and Configure the VM
 
@@ -95,7 +95,7 @@ cd ..
 docker compose up --build -d
 ```
 
-First build takes a while (Whisper model download ~1.5 GB, whisper.cpp compilation).
+First build pulls base images and installs Python deps in `web` (no local Whisper compile).
 
 Monitor progress:
 
@@ -103,13 +103,13 @@ Monitor progress:
 docker compose logs -f
 ```
 
-Verify all 5 containers are running:
+Verify containers are running:
 
 ```bash
 docker compose ps
 ```
 
-Expected containers: `meetingbox-redis`, `meetingbox-audio`, `meetingbox-transcription`, `meetingbox-ai`, `meetingbox-web`.
+Expected by default: `meetingbox-redis`, `meetingbox-web`, `meetingbox-nginx` (and optionally `meetingbox-audio` if you use the `docker-audio` profile).
 
 ## Phase 3: Validation Tests
 

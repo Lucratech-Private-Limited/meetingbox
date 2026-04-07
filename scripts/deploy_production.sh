@@ -445,12 +445,6 @@ else
     echo "   --  Device UI not running (X11 may not be active yet — will work after reboot)"
 fi
 
-if docker ps --format '{{.Names}}' | grep -q meetingbox-ollama; then
-    echo "   OK  Ollama container is running"
-else
-    echo "   --  Ollama not running"
-fi
-
 CONTAINER_COUNT=$(docker compose -f docker-compose.yml -f docker-compose.prod.yml --profile screen ps -q 2>/dev/null | wc -l)
 echo "   --  $CONTAINER_COUNT containers running"
 

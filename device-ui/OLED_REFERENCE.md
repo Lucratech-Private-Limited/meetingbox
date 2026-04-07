@@ -295,7 +295,7 @@ Audited all 18 settings items. **Before**: 6 functional, 2 partial, 10 non-funct
 | Auto-delete | Backend now runs a background thread every 6h that deletes meetings older than the configured threshold | `services/web/main.py` |
 | Screen Brightness | New `hardware.py` module writes to `/sys/class/backlight/*/brightness`. Applied on picker save + app startup | `hardware.py`, `brightness_picker.py`, `main.py` |
 | Screen Timeout | Idle timer in `main.py` resets on touch, blanks screen after N minutes, restores on next touch. Skipped during active recording | `main.py`, `timeout_picker.py` |
-| Privacy Mode | Already enforced in `_auto_summarize()` (calls `summarize-local` when active). Now also loads from backend settings on startup | `main.py` |
+| Privacy Mode | UI labels + optional reduced cloud use; `_auto_summarize()` calls `/api/meetings/{id}/summarize` (Claude) | `main.py` |
 | Microphone Test | Replaced `random.randint()` fake bars with real `sounddevice` audio capture. Shows RMS levels, "Good/Low/No Sound" indicator | `mic_test.py`, `requirements.txt` |
 | Gmail/Calendar | Fetches integration status from `GET /api/device/integrations`. Shows "Connected (email)" or "Not connected" | `settings.py` |
 | All Pickers | Added `on_enter` to `PickerBaseScreen` that fetches current saved value and pre-selects it | `picker_base.py` |

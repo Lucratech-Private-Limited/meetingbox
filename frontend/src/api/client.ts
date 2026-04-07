@@ -5,7 +5,7 @@ import toast from 'react-hot-toast'
 
 const client = axios.create({
   baseURL: import.meta.env.VITE_API_URL || '',
-  timeout: 300000, // 5 minutes — local LLM inference can be slow on edge devices
+  timeout: 300000, // 5 minutes — upload-audio + cloud transcription/summary can be slow
   headers: {
     'Content-Type': 'application/json',
   },

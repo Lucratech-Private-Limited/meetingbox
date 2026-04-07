@@ -1,6 +1,8 @@
 # MeetingBox Native Ubuntu Mini-PC Deployment
 
-This is the non-Docker appliance path for the Intel mini-PC / old DDR3 mini-PC build.
+> **Deprecated:** The native Ollama + whisper.cpp + systemd transcription/ai path is no longer in the repo. Use **Docker** (`docker compose`) and cloud APIs (OpenAI + Anthropic). This file is historical context only.
+
+This was the non-Docker appliance path for the Intel mini-PC / old DDR3 mini-PC build.
 It now supports two layers:
 
 - `native runtime`: host services instead of Docker

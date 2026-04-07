@@ -4,25 +4,23 @@ MeetingBox Core Software MVP
 This repository contains the core software stack for **MeetingBox**, a conference-room AI appliance that:
 
 - Captures in-room audio
-- Transcribes meetings with Whisper
-- Generates AI summaries with Claude
-- Serves a local web dashboard at `meetingbox.local`
+- Transcribes meetings with the **OpenAI** speech API (Whisper)
+- Generates AI summaries with **Anthropic** Claude
+- Serves a web dashboard (nginx + React) alongside the API
 
 This MVP focuses on a **single-device pipeline**, with optional Gmail/Google Calendar integrations for action delivery:
 
 1. Start/stop a meeting recording
 2. Capture audio from a USB mic array
-3. Transcribe audio to text on-device
-4. Generate an AI summary + action items
+3. Transcribe audio via **OpenAI** (in `services/web` after upload)
+4. Generate an AI summary + action items via **Anthropic**
 5. Store everything in SQLite
 6. View meetings and summaries in a React dashboard
 
 ## Repository layout
 
 - `services/audio` – Audio capture & VAD-based segmentation (PyAudio + webrtcvad)
-- `services/transcription` – Whisper.cpp-based transcription service writing into SQLite
-- `services/ai` – Claude integration for summaries + analysis
-- `services/web` – FastAPI backend + WebSocket relay for events
+- `services/web` – FastAPI backend (transcription + summarization + WebSocket relay)
 - `frontend` – React + TypeScript + Tailwind dashboard
 - `data` – Local data volume (audio, transcripts, exports, SQLite DB)
 - `logs` – Service logs (optional, per-service)

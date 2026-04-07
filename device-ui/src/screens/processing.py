@@ -187,7 +187,7 @@ class ProcessingScreen(BaseScreen):
         self.status_bar.device_label.text = getattr(self.app, "device_name", "MeetingBox")
         privacy = getattr(self.app, "privacy_mode", False)
         if privacy:
-            self.status_bar.status_text = "PROCESSING (Local)"
+            self.status_bar.status_text = "PROCESSING (Privacy)"
 
         self._eta_seconds = None
         self.status_label.text = "Transcribing audio…"

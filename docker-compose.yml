@@ -14,11 +14,8 @@ services:
     networks:
       - meetingbox-net
 
-  # Default stack (`docker compose up -d`): redis, web, nginx — cloud transcription (OpenAI)
-  # + summarization (Anthropic) inside web. Optional profiles:
-  #   docker-audio      → container mic capture + upload to web
-  #   screen            → Kivy device-ui
-  #   local-workers     → legacy local Whisper + Ollama + ai worker (not needed for API-only)
+  # Default stack: redis, web, nginx — OpenAI (Whisper) + Anthropic (Claude) inside web.
+  # Optional: --profile docker-audio for container mic capture.
 
   # ================================================================
   # Audio capture in Docker (optional — not recommended on mini-PC)
@@ -60,69 +57,6 @@ services:
     networks:
       - meetingbox-net
 
-  # transcription:
-  #   profiles:
-  #     - local-workers
-  #   build:
-  #     context: ./services/transcription
-  #   container_name: meetingbox-transcription
-  #   restart: unless-stopped
-  #   depends_on:
-  #     - redis
-  #   user: "1000:1000"            # Run as host meetingbox user so data volume writes succeed
-  #   environment:
-  #     - PYTHONUNBUFFERED=1
-  #     # Allow runtime tuning on mini-PC without rebuilding images.
-  #     - WHISPER_MODEL_PATH=${WHISPER_MODEL_PATH:-/app/whisper.cpp/models/ggml-tiny.bin}
-  #     - WHISPER_THREADS=${WHISPER_THREADS:-4}
-  #   volumes:
-  #     - ./data/audio:/data/audio
-  #     - ./data/transcripts:/data/transcripts
-  #   networks:
-  #     - meetingbox-net
-
-  # ai:
-  #   profiles:
-  #     - local-workers
-  #   build:
-  #     context: ./services/ai
-  #   container_name: meetingbox-ai
-  #   restart: unless-stopped
-  #   depends_on:
-  #     - redis
-  #     - ollama
-  #   user: "1000:1000"            # Run as host meetingbox user so data volume writes succeed
-  #   environment:
-  #     - PYTHONUNBUFFERED=1
-  #     - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
-  #     - OLLAMA_HOST=http://ollama:11434
-  #     - LOCAL_LLM_MODEL=${LOCAL_LLM_MODEL:-phi3:mini}
-  #     - USE_LOCAL_LLM=${USE_LOCAL_LLM:-true}
-  #   volumes:
-  #     - ./data/transcripts:/data/transcripts
-  #   networks:
-  #     - meetingbox-net
-
-  # ollama:
-  #   profiles:
-  #     - local-workers
-  #   build:
-  #     context: ./services/ollama
-  #   container_name: meetingbox-ollama
-  #   restart: unless-stopped
-  #   environment:
-  #     - LOCAL_LLM_MODEL=${LOCAL_LLM_MODEL:-phi3:mini}
-  #   volumes:
-  #     - ollama-data:/root/.ollama
-  #   healthcheck:
-  #     test: ["CMD", "ollama", "list"]
-  #     interval: 15s
-  #     timeout: 10s
-  #     retries: 10
-  #     start_period: 60s
-  #   networks:
-  #     - meetingbox-net
-
   web:
     build:
       context: ./services/web
@@ -143,9 +77,6 @@ services:
       - OPENAI_TRANSCRIBE_MODEL=${OPENAI_TRANSCRIBE_MODEL:-whisper-1}
       - AI_MODEL=${AI_MODEL:-claude-sonnet-4-20250514}
       - AI_REPORT_MAX_TOKENS=${AI_REPORT_MAX_TOKENS:-16384}
-      - USE_LOCAL_LLM=${USE_LOCAL_LLM:-false}
-      - OLLAMA_HOST=http://ollama:11434
-      - LOCAL_LLM_MODEL=${LOCAL_LLM_MODEL:-phi3:mini}
       - JWT_SECRET_KEY=${JWT_SECRET_KEY}
       - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:-}
       - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET:-}
@@ -194,7 +125,7 @@ services:
   #   build:
   #     context: ./device-ui
   #   container_name: meetingbox-ui
-  #   # Match web/audio/transcription (UID 1000) so ./data/config is writable.
+  #   # Match web/audio (UID 1000) so ./data/config is writable.
   #   user: "1000:1000"
   #   restart: unless-stopped
   #   depends_on:
@@ -245,7 +176,6 @@ services:
 
 volumes:
   redis-data:
-  ollama-data:
 
 networks:
   meetingbox-net:

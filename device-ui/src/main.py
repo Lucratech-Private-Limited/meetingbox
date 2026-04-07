@@ -744,7 +744,7 @@ class MeetingBoxApp(App):
                         )
 
                 Clock.schedule_once(_status_actions, 0)
-                summary = await self.backend.summarize_meeting_local(meeting_id)
+                summary = await self.backend.summarize_meeting(meeting_id)
 
                 def _show(_dt):
                     screen = self.screen_manager.get_screen('summary_review')

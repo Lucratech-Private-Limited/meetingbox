@@ -15,7 +15,7 @@ globs:
 You own Docker orchestration, deployment scripts, and infrastructure configuration.
 
 ## Architecture
-- **Docker Compose** orchestrates 7 services: redis, audio, transcription, ai, ollama, web, device-ui
+- **Docker Compose** orchestrates redis, web, nginx by default; optional `docker-audio`; device-ui behind a profile
 - All services on `meetingbox-net` bridge network
 - Data persists in `./data/` (audio, transcripts/SQLite, config)
 - Frontend built separately, mounted as static files into web container
