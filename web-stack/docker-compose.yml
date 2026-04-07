@@ -1,0 +1,84 @@
+# MeetingBox — API stack for AWS (or any server): Redis + FastAPI + nginx.
+# Mini PC runs host audio + device-ui; SPA is built with VITE_API_URL and uploaded to S3.
+#
+# From this directory:
+#   cp .env.example .env
+#   # ensure ../frontend/dist exists (npm run build in frontend/)
+#   docker compose up -d --build
+#
+# Paths are relative to the monorepo: ../services/web, ../data, ../frontend/dist
+
+name: meetingbox-web-stack
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: meetingbox-redis
+    restart: unless-stopped
+    # Mini PC audio must reach this Redis. Prefer VPN into the VPC; lab-only: 0.0.0.0:6379:6379
+    ports:
+      - ${REDIS_PORT_MAPPING:-127.0.0.1:6379:6379}
+    volumes:
+      - redis-data:/data
+    networks:
+      - meetingbox-net
+
+  web:
+    build:
+      context: ../services/web
+    container_name: meetingbox-web
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_started
+    environment:
+      - PYTHONUNBUFFERED=1
+      - REDIS_HOST=redis
+      - MEETINGBOX_REBOOT_HELPER=/usr/local/bin/meetingbox-host-reboot
+      - MEETINGBOX_POWEROFF_HELPER=/usr/local/bin/meetingbox-host-poweroff
+      - MEETINGBOX_DB_PATH=/data/transcripts/meetings.db
+      - RECORDINGS_DIR=/data/audio/recordings
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OPENAI_TRANSCRIBE_MODEL=${OPENAI_TRANSCRIBE_MODEL:-whisper-1}
+      - AI_MODEL=${AI_MODEL:-claude-sonnet-4-20250514}
+      - AI_REPORT_MAX_TOKENS=${AI_REPORT_MAX_TOKENS:-16384}
+      - USE_LOCAL_LLM=${USE_LOCAL_LLM:-false}
+      - OLLAMA_HOST=http://ollama:11434
+      - LOCAL_LLM_MODEL=${LOCAL_LLM_MODEL:-phi3:mini}
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY:?Set JWT_SECRET_KEY in .env}
+      - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:-}
+      - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET:-}
+      - APP_BASE_URL=${APP_BASE_URL:-http://localhost:8000}
+      - FRONTEND_BASE_URL=${FRONTEND_BASE_URL:-}
+    volumes:
+      - ../data/transcripts:/data/transcripts
+      - ../data/audio:/data/audio
+      - ../data/config:/data/config
+      - ../frontend/dist:/app/static
+      - ../scripts/host_reboot.sh:/usr/local/bin/meetingbox-host-reboot:ro
+      - ../scripts/host_poweroff.sh:/usr/local/bin/meetingbox-host-poweroff:ro
+    networks:
+      - meetingbox-net
+
+  nginx:
+    image: nginx:alpine
+    container_name: meetingbox-nginx
+    restart: unless-stopped
+    depends_on:
+      - web
+    ports:
+      - "${WEB_HTTP_PORT:-80}:80"
+      - "${WEB_ALT_PORT:-8000}:8000"
+    volumes:
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+      - ../frontend/dist:/usr/share/nginx/html:ro
+    networks:
+      - meetingbox-net
+
+volumes:
+  redis-data:
+
+networks:
+  meetingbox-net:
+    driver: bridge

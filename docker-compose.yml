@@ -1,3 +1,5 @@
+# Cloud/server only (git pull on AWS/VPS): docker compose -f docker-compose.server.yml up -d
+# Same stack also in web-stack/docker-compose.yml (paths relative to that folder).
 services:
   redis:
     image: redis:7-alpine

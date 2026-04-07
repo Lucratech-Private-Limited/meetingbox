@@ -19,6 +19,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelna
 logger = logging.getLogger("meetingbox.audio")
 
 REDIS_HOST = os.getenv("REDIS_HOST", "redis")
+REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
 
 
 class AudioCaptureService:
@@ -48,7 +49,7 @@ class AudioCaptureService:
     self._last_level_emit_at = 0.0
     self.vad = webrtcvad.Vad(self.config["vad"]["aggressiveness"])
 
-    self.redis_client = redis.Redis(host=REDIS_HOST, port=6379, decode_responses=True)
+    self.redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
 
     storage_cfg = self.config.get("storage", {})
     self.temp_dir = Path(os.getenv("TEMP_SEGMENTS_DIR", storage_cfg.get("temp_dir", "/data/audio/temp")))

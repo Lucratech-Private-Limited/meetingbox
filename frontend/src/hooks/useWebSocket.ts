@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, useCallback } from 'react'
+import { getWebSocketUrl } from '../config/publicUrls'
 
 const MIN_RECONNECT_DELAY = 1000
 const MAX_RECONNECT_DELAY = 30000
@@ -17,8 +18,7 @@ export function useWebSocket() {
     const connect = () => {
       if (unmounted.current) return
 
-      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-      const wsUrl = `${protocol}//${window.location.host}/ws`
+      const wsUrl = getWebSocketUrl()
       ws.current = new WebSocket(wsUrl)
 
       ws.current.onopen = () => {
