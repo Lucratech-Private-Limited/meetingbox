@@ -56,4 +56,33 @@ export const actionsApi = {
     const response = await client.patch(`/api/actions/${actionId}`, update)
     return response.data
   },
+
+  /** User-created pending action (no AI); requires connected Gmail or Calendar. */
+  createManual: async (
+    meetingId: string,
+    body:
+      | {
+          connector: 'calendar'
+          title: string
+          description?: string
+          event_title?: string
+          suggested_date: string
+          suggested_time: string
+          duration_minutes?: number
+          timezone?: string
+          attendees?: string[]
+        }
+      | {
+          connector: 'gmail'
+          title: string
+          description?: string
+          to: string[]
+          cc?: string[]
+          subject: string
+          email_body: string
+        },
+  ): Promise<AgenticAction> => {
+    const response = await client.post(`/api/meetings/${meetingId}/actions/manual`, body)
+    return response.data
+  },
 }

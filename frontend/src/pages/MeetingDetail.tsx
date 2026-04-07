@@ -21,6 +21,7 @@ import Button from '../components/ui/Button'
 import TranscriptView from '../components/meeting/TranscriptView'
 import SummaryCard from '../components/meeting/SummaryCard'
 import ActionCard from '../components/actions/ActionCard'
+import CreateManualActions from '../components/actions/CreateManualActions'
 import toast from 'react-hot-toast'
 
 type Tab = 'summary' | 'transcript' | 'actions' | 'recording'
@@ -392,22 +393,25 @@ export default function MeetingDetailPage() {
 
         {activeTab === 'actions' && (
           <div className="space-y-4">
-            <div className="flex items-center justify-between rounded-2xl border border-gray-200 bg-white px-5 py-4">
-              <div>
+            <div className="flex flex-col gap-4 rounded-2xl border border-gray-200 bg-white px-5 py-4 sm:flex-row sm:items-start sm:justify-between">
+              <div className="min-w-0 flex-1">
                 <h3 className="text-sm font-semibold text-gray-900">Calendar &amp; email</h3>
                 <p className="text-sm text-gray-600">
                   Suggested follow-ups load automatically when this meeting has a summary or transcript and your
                   accounts are connected. Use Refresh when you want new suggestions; connect accounts under Settings →
-                  Integrations.
+                  Integrations. You can also add your own calendar event or Gmail message below.
                 </p>
               </div>
-              <button
-                onClick={() => void handleGenerateActions()}
-                disabled={isGeneratingActions}
-                className="rounded-lg border border-primary-200 bg-primary-50 px-4 py-2 text-sm font-medium text-primary-700 hover:bg-primary-100 disabled:opacity-50"
-              >
-                {isGeneratingActions ? 'Refreshing...' : 'Refresh Suggestions'}
-              </button>
+              <div className="flex shrink-0 flex-col items-stretch gap-3 sm:items-end">
+                {id ? <CreateManualActions meetingId={id} onCreated={handleActionApproved} /> : null}
+                <button
+                  onClick={() => void handleGenerateActions()}
+                  disabled={isGeneratingActions}
+                  className="rounded-lg border border-primary-200 bg-primary-50 px-4 py-2 text-sm font-medium text-primary-700 hover:bg-primary-100 disabled:opacity-50"
+                >
+                  {isGeneratingActions ? 'Refreshing...' : 'Refresh Suggestions'}
+                </button>
+              </div>
             </div>
             {actions.length === 0 ? (
               <div className="text-center py-12 bg-white rounded-lg border border-gray-200">

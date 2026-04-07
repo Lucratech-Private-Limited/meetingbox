@@ -2,14 +2,15 @@
 Agentic actions routes: generation, listing, editing, execution, and dismissal.
 """
 
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, model_validator
 
 from auth import get_optional_actor
 from database import get_connection
 from services.action_engine import (
+    create_manual_action_record,
     dismiss_action_record,
     execute_action_record,
     generate_actions_for_meeting,
@@ -98,8 +99,41 @@ class ExecuteActionRequest(BaseModel):
     payload: Optional[dict[str, Any]] = None
     #: If true and connector is Gmail, create a draft only (does not send). Ignored for Calendar.
     create_draft: Optional[bool] = False
-    #: If true, run Gmail/Calendar again even when status is already executed (new draft/event).
+    #: If true, run Gmail/Calendar again when status is already executed (new draft/event).
     repeat_execution: Optional[bool] = False
+
+
+class CreateManualActionBody(BaseModel):
+    """Create a pending Calendar or Gmail action without AI suggestions."""
+
+    connector: Literal["calendar", "gmail"]
+    title: str = Field(..., min_length=1, description="Label shown on the action card in MeetingBox")
+    description: str = ""
+    # Calendar
+    event_title: Optional[str] = None
+    suggested_date: Optional[str] = None
+    suggested_time: Optional[str] = None
+    duration_minutes: int = Field(default=30, ge=1, le=24 * 60)
+    timezone: Optional[str] = None
+    attendees: list[str] = Field(default_factory=list)
+    # Gmail
+    to: Optional[list[str]] = None
+    cc: list[str] = Field(default_factory=list)
+    subject: Optional[str] = None
+    email_body: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _require_connector_fields(self) -> "CreateManualActionBody":
+        if self.connector == "calendar":
+            if not (self.suggested_date or "").strip() or not (self.suggested_time or "").strip():
+                raise ValueError("Calendar actions require suggested_date and suggested_time.")
+        elif self.connector == "gmail":
+            to_list = self.to or []
+            if not any(str(x).strip() for x in to_list):
+                raise ValueError("Gmail actions require at least one address in to.")
+            if not (self.subject or "").strip() or not (self.email_body or "").strip():
+                raise ValueError("Gmail actions require subject and email_body.")
+        return self
 
 
 @router.get("/meetings/{meeting_id}/actions", response_model=list[ActionResponse])
@@ -113,6 +147,35 @@ async def generate_actions(meeting_id: str, current_actor: Optional[dict] = Depe
     _assert_meeting_access(meeting_id, current_actor)
     user_id = current_actor["user"]["id"] if current_actor else None
     return generate_actions_for_meeting(meeting_id, user_id)
+
+
+@router.post("/meetings/{meeting_id}/actions/manual", response_model=ActionResponse)
+async def create_manual_action(
+    meeting_id: str,
+    body: CreateManualActionBody,
+    current_actor: Optional[dict] = Depends(get_optional_actor),
+):
+    if not current_actor:
+        raise HTTPException(status_code=401, detail="Authentication required.")
+    _assert_meeting_access(meeting_id, current_actor)
+    user_id = current_actor["user"]["id"]
+    return create_manual_action_record(
+        meeting_id,
+        user_id,
+        body.connector,
+        title=body.title,
+        description=body.description or "",
+        event_title=body.event_title,
+        suggested_date=body.suggested_date,
+        suggested_time=body.suggested_time,
+        duration_minutes=body.duration_minutes,
+        timezone=body.timezone,
+        attendees=body.attendees,
+        to=body.to,
+        cc=body.cc,
+        subject=body.subject,
+        email_body=body.email_body,
+    )
 
 
 @router.patch("/actions/{action_id}", response_model=ActionResponse)

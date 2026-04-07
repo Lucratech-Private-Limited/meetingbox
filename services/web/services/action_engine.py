@@ -468,6 +468,138 @@ def generate_actions_for_meeting(meeting_id: str, user_id: str | None) -> list[d
         conn.close()
 
 
+def create_manual_action_record(
+    meeting_id: str,
+    user_id: str,
+    connector: str,
+    *,
+    title: str,
+    description: str = "",
+    event_title: str | None = None,
+    suggested_date: str | None = None,
+    suggested_time: str | None = None,
+    duration_minutes: int = 30,
+    timezone: str | None = None,
+    attendees: list[str] | None = None,
+    to: list[str] | None = None,
+    cc: list[str] | None = None,
+    subject: str | None = None,
+    email_body: str | None = None,
+) -> dict[str, Any]:
+    """
+    Insert a pending Gmail or Calendar action without LLM generation (dashboard “manual” create).
+    """
+    ct = (connector or "").strip().lower()
+    if ct not in ("gmail", "calendar"):
+        raise HTTPException(status_code=400, detail="connector must be gmail or calendar.")
+
+    capabilities = _capabilities_gmail_calendar_only(get_action_capabilities(user_id))
+    allowed = {c["connector_target"] for c in capabilities}
+    if ct not in allowed:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Connect {'Gmail' if ct == 'gmail' else 'Google Calendar'} under Settings → Integrations first.",
+        )
+
+    if ct == "calendar":
+        kind = "schedule_followup"
+        spec = ACTION_KIND_SPECS[kind]
+        tz_use = (timezone or "").strip() or default_calendar_tz_name()
+        start_date = (suggested_date or "").strip()
+        start_time = (suggested_time or "").strip()
+        if start_time.count(":") == 2:
+            start_time = ":".join(start_time.split(":")[:2])
+        evt_title = (event_title or "").strip() or title.strip()
+        atts = _coerce_email_list(attendees)
+        payload: dict[str, Any] = {
+            "title": evt_title,
+            "description": (description or "").strip(),
+            "suggested_date": start_date,
+            "suggested_time": start_time,
+            "duration_minutes": int(duration_minutes),
+            "timezone": tz_use,
+            "attendees": atts,
+        }
+        if not _has_meaningful_calendar_draft(payload):
+            raise HTTPException(
+                status_code=400,
+                detail="Calendar action needs a title, date (YYYY-MM-DD), and time (HH:MM).",
+            )
+        action_row = {
+            "kind": kind,
+            "type": kind,
+            "connector_target": "calendar",
+            "execution_mode": spec["execution_mode"],
+            "title": title.strip(),
+            "description": (description or "").strip(),
+            "confidence": 1.0,
+            "payload": payload,
+            "draft": {"why_this_matters": "", "source_signals": ["manual"]},
+        }
+    else:
+        kind = "followup_email"
+        spec = ACTION_KIND_SPECS[kind]
+        to_list = _coerce_email_list(to)
+        cc_list = _coerce_email_list(cc)
+        sub_s = (subject or "").strip()
+        body_s = (email_body or "").strip()
+        payload = {
+            "to": to_list,
+            "cc": cc_list,
+            "subject": sub_s,
+            "body": body_s,
+        }
+        if not _has_meaningful_gmail_draft(payload) or not to_list:
+            raise HTTPException(
+                status_code=400,
+                detail="Gmail action needs at least one recipient, subject, and email body.",
+            )
+        action_row = {
+            "kind": kind,
+            "type": kind,
+            "connector_target": "gmail",
+            "execution_mode": spec["execution_mode"],
+            "title": title.strip(),
+            "description": (description or "").strip(),
+            "confidence": 1.0,
+            "payload": payload,
+            "draft": {"why_this_matters": "", "source_signals": ["manual"]},
+        }
+
+    action_id = str(uuid.uuid4())
+    now = datetime.utcnow().isoformat()
+    conn = get_connection()
+    conn.row_factory = _row_factory
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO actions
+              (id, meeting_id, type, kind, connector_target, execution_mode, title, description, confidence, draft, payload, status, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+            """,
+            (
+                action_id,
+                meeting_id,
+                action_row["type"],
+                action_row["kind"],
+                action_row["connector_target"],
+                action_row["execution_mode"],
+                action_row["title"],
+                action_row["description"],
+                action_row["confidence"],
+                json.dumps(action_row["draft"]),
+                json.dumps(action_row["payload"]),
+                now,
+            ),
+        )
+        conn.commit()
+        cur.execute("SELECT * FROM actions WHERE id = ?", (action_id,))
+        return _normalize_action_record(cur.fetchone())
+    finally:
+        conn.close()
+
+
 def list_actions_for_meeting(meeting_id: str) -> list[dict[str, Any]]:
     conn = get_connection()
     conn.row_factory = _row_factory
