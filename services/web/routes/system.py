@@ -1,13 +1,14 @@
 import logging
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 import psutil  # type: ignore
 
-from auth import get_optional_user
+from auth import get_optional_actor
 from database import get_connection
+from routes.meetings import _meeting_access_filter
 
 logger = logging.getLogger(__name__)
 
@@ -79,17 +80,25 @@ async def device_info() -> dict:
 @router.post("/cleanup")
 async def cleanup_meetings(
   count: int = Query(default=5, ge=1, le=100, description="Number of oldest meetings to delete"),
-  current_user: Optional[dict] = Depends(get_optional_user),
+  current_actor: Optional[dict] = Depends(get_optional_actor),
 ):
-  """Delete the N oldest meetings to free up disk space."""
+  """Delete the N oldest meetings (for the signed-in user or device) to free up disk space."""
+  if not current_actor:
+    raise HTTPException(status_code=401, detail="Sign in to delete meetings from your account.")
+
   conn = get_connection()
   conn.execute("PRAGMA foreign_keys = ON")
   try:
     cur = conn.cursor()
-    cur.execute(
-      "SELECT id, audio_path FROM meetings ORDER BY created_at ASC LIMIT ?",
-      (count,),
-    )
+    query = "SELECT id, audio_path FROM meetings"
+    params: list[Any] = []
+    scope_sql, scope_params = _meeting_access_filter(current_actor, alias="meetings")
+    if scope_sql:
+      query += f" WHERE {scope_sql}"
+      params.extend(scope_params)
+    query += " ORDER BY created_at ASC LIMIT ?"
+    params.append(count)
+    cur.execute(query, params)
     rows = cur.fetchall()
     if not rows:
       return {"deleted": 0, "message": "No meetings to delete."}

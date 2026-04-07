@@ -91,7 +91,7 @@ export const meetingsApi = {
 
   // Delete the N oldest meetings to free up disk space
   cleanupOldest: async (count: number): Promise<{ deleted: number; ids: string[] }> => {
-    const response = await client.post('/api/system/cleanup', null, { params: { count } })
+    const response = await client.post(`/api/system/cleanup?count=${encodeURIComponent(String(count))}`)
     return response.data
   },
 }

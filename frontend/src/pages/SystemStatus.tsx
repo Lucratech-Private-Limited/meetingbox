@@ -40,7 +40,11 @@ export default function SystemStatus() {
     try {
       setIsCleaning(true)
       const result = await meetingsApi.cleanupOldest(cleanupCount)
-      toast.success(`Deleted ${result.deleted} oldest meeting${result.deleted !== 1 ? 's' : ''}`)
+      if (result.deleted === 0) {
+        toast.success('No meetings to delete for your account.')
+      } else {
+        toast.success(`Deleted ${result.deleted} oldest meeting${result.deleted !== 1 ? 's' : ''}`)
+      }
       setShowCleanup(false)
       load()
     } catch {
