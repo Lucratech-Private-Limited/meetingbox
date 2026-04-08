@@ -10,10 +10,12 @@ Env vars required:
   GOOGLE_CLIENT_ID      -- from Google Cloud Console (Web application type)
   GOOGLE_CLIENT_SECRET  -- from Google Cloud Console
   APP_BASE_URL          -- fallback base URL if Host cannot be determined (e.g. http://localhost:8000)
+  OAUTH_PUBLIC_BASE_URL -- optional; same as auth routes — forces redirect_uri / post-OAuth origin
+                           (e.g. http://meetingbox.example.com:8000). Must match Google Console exactly.
+  FRONTEND_BASE_URL     -- optional; if set, browser is sent here after OAuth (e.g. .../settings)
 
-OAuth redirect_uri is derived from the incoming request (X-Forwarded-Proto + Host) when
-possible so Google Console can match the same origin you use in the browser (LAN IP,
-meetingbox.local, etc.) without changing .env each time.
+OAuth redirect_uri uses OAUTH_PUBLIC_BASE_URL when set (aligned with /api/auth/google/callback).
+Otherwise it is derived from the incoming request (X-Forwarded-Proto + Host), then APP_BASE_URL.
 """
 
 import json
@@ -37,6 +39,8 @@ router = APIRouter()
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "")
 APP_BASE_URL = os.getenv("APP_BASE_URL", "http://localhost:8000").rstrip("/")
+OAUTH_PUBLIC_BASE_URL = os.getenv("OAUTH_PUBLIC_BASE_URL", "").strip().rstrip("/")
+FRONTEND_BASE_URL = os.getenv("FRONTEND_BASE_URL", "").strip().rstrip("/")
 
 GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 TOKEN_URL = "https://oauth2.googleapis.com/token"
@@ -80,14 +84,18 @@ def _check_google_configured():
 
 
 def _get_redirect_uri(provider: str) -> str:
-    return f"{APP_BASE_URL}/api/integrations/{provider}/callback"
+    base = OAUTH_PUBLIC_BASE_URL or APP_BASE_URL
+    return f"{base}/api/integrations/{provider}/callback"
 
 
 def infer_public_base_url(request: Request) -> str:
     """
     Public origin (scheme + host [+ port]) for OAuth redirect_uri and return redirects.
-    Uses proxy headers from nginx, then Host, then APP_BASE_URL.
+    Uses OAUTH_PUBLIC_BASE_URL when set; else proxy Host headers; else APP_BASE_URL.
     """
+    if OAUTH_PUBLIC_BASE_URL:
+        return OAUTH_PUBLIC_BASE_URL
+
     raw_host = (request.headers.get("x-forwarded-host") or request.headers.get("host") or "").strip()
     if raw_host:
         host = raw_host.split(",")[0].strip()
@@ -116,7 +124,9 @@ def _redirect_uri_for_request(request: Request, provider: str) -> str:
 
 
 def _post_oauth_browser_base(request: Request) -> str:
-    """Same public origin as redirect_uri so /settings opens on the host you used to connect."""
+    """Where to send the browser after OAuth (SPA /settings). Prefer FRONTEND_BASE_URL if set."""
+    if FRONTEND_BASE_URL:
+        return FRONTEND_BASE_URL
     return infer_public_base_url(request)
 
 

@@ -50,6 +50,7 @@ services:
       - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET:-}
       - APP_BASE_URL=${APP_BASE_URL:-http://localhost:8000}
       - FRONTEND_BASE_URL=${FRONTEND_BASE_URL:-}
+      - OAUTH_PUBLIC_BASE_URL=${OAUTH_PUBLIC_BASE_URL:-}
     volumes:
       - ./data/transcripts:/data/transcripts
       - ./data/audio:/data/audio
