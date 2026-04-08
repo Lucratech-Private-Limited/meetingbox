@@ -53,7 +53,7 @@ git subtree split --prefix=mini-pc -b mini-pc-release
 git push <your-appliance-remote> mini-pc-release:main
 ```
 
-On the device, clone that repo and use only this directory — no web/frontend checkout required.
+On the device, clone that repo and use only this directory — no `server/` or `frontend/` checkout required. (`run_device_ui.sh` / `run_audio_capture.sh` look for a sibling `server/docker-compose.yml` only to detect the full monorepo and load a parent `.env`; that path is absent in an appliance-only clone and scripts still work.)
 
 ## Monorepo usage
 

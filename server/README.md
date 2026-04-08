@@ -21,21 +21,22 @@ The meeting-room device code lives in **`mini-pc/`** in the full monorepo — us
 ```bash
 cd server
 cp .env.example .env
-nano .env   # JWT_SECRET_KEY, API keys, APP_BASE_URL, OAUTH_PUBLIC_BASE_URL, …
-cd frontend && npm ci && npm run build && cd ..
+nano .env   # JWT_SECRET_KEY, API keys, FRONTEND_DIST, DATA_ROOT, APP_BASE_URL, …
+# Build the SPA (pick one):
+#   cd frontend && npm ci && npm run build && cd ..   # if frontend/ exists under server/
+#   — or build in a separate frontend repo and set FRONTEND_DIST to that dist/
 docker compose up -d --build
 ```
 
-## Monorepo vs standalone
+## Monorepo vs standalone vs separate frontend repo
 
-If this tree still lives under `…/meetingbox/server/` with **`frontend/`** at `…/meetingbox/frontend/`, the default `.env.example` sets `FRONTEND_DIST=../frontend/dist` and `DATA_ROOT=../data`.
+| Layout | `FRONTEND_DIST` (example) | `DATA_ROOT` (example) |
+|--------|---------------------------|-------------------------|
+| Monorepo: `meetingbox/server` + `meetingbox/frontend` | `../frontend/dist` | `../data` |
+| Server repo with `frontend/` copied under `server/frontend/` | `./frontend/dist` | `./data` |
+| **Three repos:** server + frontend clones are **siblings** | `../meetingbox-frontend/dist` | `./data` |
 
-If this folder **is** the git root of your server-only repo, put `frontend/` inside it (or merge subtrees) and set:
-
-```env
-FRONTEND_DIST=./frontend/dist
-DATA_ROOT=./data
-```
+Use absolute paths if you prefer. Only `dist/` must exist before `docker compose up`; Node is not needed on the server at runtime.
 
 ## Split with `git subtree`
 
@@ -46,4 +47,4 @@ git subtree split --prefix=server -b server-release
 git push <your-server-remote> server-release:main
 ```
 
-On the VPS, clone that repository — no mini-pc checkout required.
+On the VPS, clone the **server** repository. Build the SPA in your **frontend** repository (or CI) and set `FRONTEND_DIST` accordingly — no `mini-pc/` checkout required.
