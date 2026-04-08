@@ -9,10 +9,10 @@ from pathlib import Path
 
 from typing import Optional
 
-# Load services/web/.env into os.environ before any local imports read env vars.
+# Load server/web/.env into os.environ before any local imports read env vars.
 try:
   from dotenv import load_dotenv
-  load_dotenv(Path(__file__).resolve().parent / ".env")
+  load_dotenv(Path(__file__).resolve().parent / ".env")  # server/web/.env
 except ImportError:
   pass
 

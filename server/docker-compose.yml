@@ -1,31 +1,38 @@
-# MeetingBox — API stack for AWS (or any server): Redis + FastAPI + nginx.
-# Mini PC runs host audio + device-ui; SPA is built with VITE_API_URL and uploaded to S3.
+# meetingbox-server (split-repo bundle) — cloud / VPS: Redis + FastAPI + nginx.
+# Intentionally not a line-for-line rename of legacy web-stack; paths use ./web and DATA_ROOT/FRONTEND_DIST.
+# MeetingBox — cloud / VPS stack: Redis + FastAPI + nginx.
+# Mini PC runs `mini-pc/` only.
 #
-# From this directory:
+# Standalone server repo (this folder is repo root): copy `.env.example` → `.env`
+#   defaults FRONTEND_DIST=./frontend/dist and DATA_ROOT=./data
+#
+# Full monorepo (frontend lives next to server/): in `server/.env` set:
+#   FRONTEND_DIST=../frontend/dist
+#   DATA_ROOT=../data
+#
+# Quick start:
+#   cd server
 #   cp .env.example .env
-#   # ensure ../frontend/dist exists (npm run build in frontend/)
+#   cd frontend && npm ci && npm run build && cd ..
 #   docker compose up -d --build
-#
-# Paths are relative to the monorepo: ../services/web, ../data, ../frontend/dist
 
-name: meetingbox-web-stack
+name: meetingbox-server
 
 services:
   redis:
     image: redis:7-alpine
     container_name: meetingbox-redis
     restart: unless-stopped
-    # Mini PC audio must reach this Redis. Prefer VPN into the VPC; lab-only: 0.0.0.0:6379:6379
     ports:
       - ${REDIS_PORT_MAPPING:-127.0.0.1:6379:6379}
     volumes:
-      - redis-data:/data
+      - server-redis-data:/data
     networks:
-      - meetingbox-net
+      - meetingbox-server-net
 
   web:
     build:
-      context: ../services/web
+      context: ./web
     container_name: meetingbox-web
     restart: unless-stopped
     depends_on:
@@ -50,14 +57,14 @@ services:
       - FRONTEND_BASE_URL=${FRONTEND_BASE_URL:-}
       - OAUTH_PUBLIC_BASE_URL=${OAUTH_PUBLIC_BASE_URL:-}
     volumes:
-      - ../data/transcripts:/data/transcripts
-      - ../data/audio:/data/audio
-      - ../data/config:/data/config
-      - ../frontend/dist:/app/static
-      - ../scripts/host_reboot.sh:/usr/local/bin/meetingbox-host-reboot:ro
-      - ../scripts/host_poweroff.sh:/usr/local/bin/meetingbox-host-poweroff:ro
+      - ${DATA_ROOT:-./data}/transcripts:/data/transcripts
+      - ${DATA_ROOT:-./data}/audio:/data/audio
+      - ${DATA_ROOT:-./data}/config:/data/config
+      - ${FRONTEND_DIST:-./frontend/dist}:/app/static
+      - ./scripts/host_reboot.sh:/usr/local/bin/meetingbox-host-reboot:ro
+      - ./scripts/host_poweroff.sh:/usr/local/bin/meetingbox-host-poweroff:ro
     networks:
-      - meetingbox-net
+      - meetingbox-server-net
 
   nginx:
     image: nginx:alpine
@@ -69,14 +76,14 @@ services:
       - "${WEB_HTTP_PORT:-80}:80"
       - "${WEB_ALT_PORT:-8000}:8000"
     volumes:
-      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
-      - ../frontend/dist:/usr/share/nginx/html:ro
+      - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ${FRONTEND_DIST:-./frontend/dist}:/usr/share/nginx/html:ro
     networks:
-      - meetingbox-net
+      - meetingbox-server-net
 
 volumes:
-  redis-data:
+  server-redis-data:
 
 networks:
-  meetingbox-net:
+  meetingbox-server-net:
     driver: bridge

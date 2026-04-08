@@ -1,0 +1,14 @@
+.env
+web/.venv/
+frontend/node_modules/
+frontend/dist/
+**/__pycache__/
+*.pyc
+data/transcripts/*
+!data/transcripts/.gitkeep
+data/audio/recordings/*
+!data/audio/recordings/.gitkeep
+data/audio/temp/*
+!data/audio/temp/.gitkeep
+data/config/*
+!data/config/.gitkeep

@@ -14,9 +14,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 MINI_PC_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-# When this tree lives under the full monorepo: mini-pc/../docker-compose.server.yml
+# Full monorepo: sibling server/docker-compose.yml
 MONOREPO_ROOT=""
-if [[ -f "$MINI_PC_ROOT/../docker-compose.server.yml" ]]; then
+if [[ -f "$MINI_PC_ROOT/../server/docker-compose.yml" ]]; then
   MONOREPO_ROOT="$(cd "$MINI_PC_ROOT/.." && pwd)"
 fi
 

@@ -477,7 +477,7 @@ it calls must use `get_optional_user` (returns `None` on missing token) and NOT
 `get_current_user` (raises 401 on missing token).
 
 **Routes that must use `get_optional_user`:**
-- All of `services/web/routes/device.py` (settings, WiFi, updates, integrations)
+- All of `server/web/routes/device.py` (settings, WiFi, updates, integrations)
 - Meeting list, detail, delete, summarize in `meetings.py`
 - Action list, update, approve, dismiss, execute in `actions.py`
 - Recording start/stop/pause/resume in `meetings.py` (already correct)

@@ -13,7 +13,8 @@ build/
 
 .env
 
-data/
+# Repo-root dev volume only (not server/data stubs).
+/data/
 logs/
 
 .DS_Store

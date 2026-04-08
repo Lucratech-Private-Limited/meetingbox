@@ -2,7 +2,7 @@
 
 ## Overview
 
-The MeetingBox device UI is a **Kivy 2.3+** touchscreen application running on a Raspberry Pi 5 with a 3.5" OLED display (480x320, landscape). It communicates with the FastAPI backend (`services/web/`) over HTTP REST and WebSocket.
+The MeetingBox device UI is a **Kivy 2.3+** touchscreen application running on a Raspberry Pi 5 with a 3.5" OLED display (480x320, landscape). It communicates with the FastAPI backend (`server/web/`) over HTTP REST and WebSocket.
 
 ## Architecture
 
@@ -52,7 +52,7 @@ Device UI (Kivy)  --HTTP-->  FastAPI backend (port 8000)  --Redis-->  Audio/Tran
 | `components/modal_dialog.py` | Centered modal dialog with confirm/cancel |
 | `components/toggle_switch.py` | iOS-style toggle switch |
 
-### Backend Routes (`services/web/routes/`)
+### Backend Routes (`server/web/routes/`)
 
 | File | Prefix | Purpose |
 |---|---|---|
@@ -67,9 +67,9 @@ Device UI (Kivy)  --HTTP-->  FastAPI backend (port 8000)  --Redis-->  Audio/Tran
 
 | File | Purpose |
 |---|---|
-| `services/web/main.py` | FastAPI app, WebSocket endpoint, Redis event relay |
-| `services/web/auth.py` | JWT auth: `get_current_user` (401) vs `get_optional_user` (None) |
-| `services/web/database.py` | SQLite schema (meetings, segments, summaries, users, actions, integrations) |
+| `server/web/main.py` | FastAPI app, WebSocket endpoint, Redis event relay |
+| `server/web/auth.py` | JWT auth: `get_current_user` (401) vs `get_optional_user` (None) |
+| `server/web/database.py` | SQLite schema (meetings, segments, summaries, users, actions, integrations) |
 | `docker-compose.yml` | Service orchestration (redis, audio, transcription, ai, web, device-ui) |
 
 ## Screen Flow
@@ -142,9 +142,9 @@ Routes that are NOT called by the device-ui (e.g., auth routes, upload-audio) ca
 **Fix**: Changed all device-facing routes in `device.py`, `meetings.py`, and `actions.py` to use `get_optional_user` instead of `get_current_user`.
 
 **Files changed**:
-- `services/web/routes/device.py` -- all endpoints to `get_optional_user`
-- `services/web/routes/meetings.py` -- list, detail, delete, summarize endpoints
-- `services/web/routes/actions.py` -- list, update, approve, dismiss, execute endpoints
+- `server/web/routes/device.py` -- all endpoints to `get_optional_user`
+- `server/web/routes/meetings.py` -- list, detail, delete, summarize endpoints
+- `server/web/routes/actions.py` -- list, update, approve, dismiss, execute endpoints
 
 ### 2026-02-24: Device Name Hardcoded as "Conference Room A" (FIXED)
 **Problem**: The status bar on home, recording, processing, complete, and settings screens all had "Conference Room A" hardcoded. The device name set via the web frontend was never pulled.
@@ -292,7 +292,7 @@ Audited all 18 settings items. **Before**: 6 functional, 2 partial, 10 non-funct
 | Device Name | Arrow now shows ModalDialog directing user to meetingbox.local | `settings.py` |
 | Model/Serial | Fetches real `serial_number` from `GET /api/system/device-info` | `settings.py` |
 | WiFi | Changed from info-only to arrow mode; navigates to existing WiFi screen | `settings.py` |
-| Auto-delete | Backend now runs a background thread every 6h that deletes meetings older than the configured threshold | `services/web/main.py` |
+| Auto-delete | Backend now runs a background thread every 6h that deletes meetings older than the configured threshold | `server/web/main.py` |
 | Screen Brightness | New `hardware.py` module writes to `/sys/class/backlight/*/brightness`. Applied on picker save + app startup | `hardware.py`, `brightness_picker.py`, `main.py` |
 | Screen Timeout | Idle timer in `main.py` resets on touch, blanks screen after N minutes, restores on next touch. Skipped during active recording | `main.py`, `timeout_picker.py` |
 | Privacy Mode | UI labels + optional reduced cloud use; `_auto_summarize()` calls `/api/meetings/{id}/summarize` (Claude) | `main.py` |

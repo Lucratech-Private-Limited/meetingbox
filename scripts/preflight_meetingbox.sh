@@ -35,22 +35,22 @@ else
 fi
 echo
 
-# --- services/web/.env (host uvicorn) ---
-WEB_ENV="$ROOT/services/web/.env"
+# --- server/web/.env (host uvicorn) ---
+WEB_ENV="$ROOT/server/web/.env"
 if [[ -f "$WEB_ENV" ]]; then
   if grep -qE '^RECORDINGS_DIR=/meetingbox/' "$WEB_ENV" 2>/dev/null; then
-    warn "services/web/.env RECORDINGS_DIR under /meetingbox/ — usually not creatable by normal user; use repo data/ paths."
+    warn "server/web/.env RECORDINGS_DIR under /meetingbox/ — usually not creatable by normal user; use repo data/ paths."
   fi
   if grep -qE '^REDIS_HOST=redis$' "$WEB_ENV" 2>/dev/null; then
-    warn "services/web/.env REDIS_HOST=redis — wrong for host-only web unless you have a host alias named redis."
+    warn "server/web/.env REDIS_HOST=redis — wrong for host-only web unless you have a host alias named redis."
   fi
   if grep -qE '^REDIS_HOST=' "$WEB_ENV" 2>/dev/null; then
-    ok "services/web/.env: REDIS_HOST set."
+    ok "server/web/.env: REDIS_HOST set."
   else
-    warn "services/web/.env: REDIS_HOST not set (default redis — use 127.0.0.1 on native host)."
+    warn "server/web/.env: REDIS_HOST not set (default redis — use 127.0.0.1 on native host)."
   fi
 else
-  warn "No services/web/.env — host-run web may miss OPENAI/ANTHROPIC/REDIS/RECORDINGS_DIR."
+  warn "No server/web/.env — host-run web may miss OPENAI/ANTHROPIC/REDIS/RECORDINGS_DIR."
 fi
 echo
 

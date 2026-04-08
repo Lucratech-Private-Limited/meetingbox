@@ -1,5 +1,5 @@
 """
-Load and validate agent descriptor JSON files under services/web/agents/.
+Load and validate agent descriptor JSON files under server/web/agents/.
 """
 
 from __future__ import annotations

@@ -2,7 +2,7 @@
 Backend API Client
 
 Handles all communication with the MeetingBox FastAPI backend.
-Aligned with the actual backend routes in services/web/.
+Aligned with the actual backend routes in server/web/.
 """
 
 import asyncio

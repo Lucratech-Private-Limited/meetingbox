@@ -11,7 +11,7 @@ globs:
 
 ## Domain
 You own backend Python under `services/`:
-- `services/web/` -- FastAPI (port 8000), WebSocket relay, REST API, OpenAI transcription + Anthropic summarization (`meeting_agent`)
+- `server/web/` -- FastAPI (port 8000), WebSocket relay, REST API, OpenAI transcription + Anthropic summarization (`meeting_agent`)
 - `services/audio/` -- PyAudio capture + webrtcvad (optional Docker or host script)
 
 ## Architecture
@@ -21,11 +21,11 @@ You own backend Python under `services/`:
 - The **web** service is the only API gateway for dashboard and device-ui
 
 ## Key Files
-- `services/web/main.py` -- FastAPI app, WebSocket, Redis relay
-- `services/web/routes/meetings.py` -- Meeting CRUD, recording control, summarization
-- `services/web/routes/system.py` -- System status
-- `services/web/routes/device.py` -- Device settings, WiFi, integrations
-- `services/web/database.py` -- Canonical DB schema (has all tables)
+- `server/web/main.py` -- FastAPI app, WebSocket, Redis relay
+- `server/web/routes/meetings.py` -- Meeting CRUD, recording control, summarization
+- `server/web/routes/system.py` -- System status
+- `server/web/routes/device.py` -- Device settings, WiFi, integrations
+- `server/web/database.py` -- Canonical DB schema (has all tables)
 - `services/audio/audio_capture.py` -- Main audio service
 - `services/audio/config.yaml` -- Audio/VAD settings
 

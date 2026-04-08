@@ -29,13 +29,13 @@
 
 | Component | Location |
 |-----------|----------|
-| FastAPI app | `services/web/main.py` |
-| Auth routes | `services/web/routes/auth.py` (prefix: `/api/auth`) |
-| Meeting routes | `services/web/routes/meetings.py` (prefix: `/api/meetings`) |
-| Action routes | `services/web/routes/actions.py` (prefix: `/api`) |
-| Integration routes | `services/web/routes/integrations.py` (prefix: `/api`) |
-| Device routes | `services/web/routes/device.py` (prefix: `/api/device`) |
-| System routes | `services/web/routes/system.py` (prefix: `/api/system`) |
+| FastAPI app | `server/web/main.py` |
+| Auth routes | `server/web/routes/auth.py` (prefix: `/api/auth`) |
+| Meeting routes | `server/web/routes/meetings.py` (prefix: `/api/meetings`) |
+| Action routes | `server/web/routes/actions.py` (prefix: `/api`) |
+| Integration routes | `server/web/routes/integrations.py` (prefix: `/api`) |
+| Device routes | `server/web/routes/device.py` (prefix: `/api/device`) |
+| System routes | `server/web/routes/system.py` (prefix: `/api/system`) |
 
 ---
 
@@ -188,7 +188,7 @@
 
 ---
 
-## Backend Settings Model (`services/web/routes/device.py`)
+## Backend Settings Model (`server/web/routes/device.py`)
 
 The `SettingsUpdate` Pydantic model accepts these fields:
 

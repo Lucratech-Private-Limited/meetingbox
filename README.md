@@ -1,87 +1,54 @@
 MeetingBox Core Software MVP
 ============================
 
-This repository contains the core software stack for **MeetingBox**, a conference-room AI appliance that:
+This repository can be used as a **monorepo** or split into **two packages**:
 
-- Captures in-room audio
-- Transcribes meetings with the **OpenAI** speech API (Whisper)
-- Generates AI summaries with **Anthropic** Claude
-- Serves a web dashboard (nginx + React) alongside the API
+| Package | Folder | Role |
+|---------|--------|------|
+| **Server** | [`server/`](server/README.md) | FastAPI (`web/`), React (`frontend/` at repo root for now), nginx, Redis — deploy on a VPS |
+| **Appliance** | [`mini-pc/`](mini-pc/README.md) | Kivy UI + mic capture — runs on the meeting-room device |
 
-This MVP focuses on a **single-device pipeline**, with optional Gmail/Google Calendar integrations for action delivery:
+**Cloud deploy:** `cd server && cp .env.example .env && … && docker compose up -d --build` (see `server/README.md`).
 
-1. Start/stop a meeting recording
-2. Capture audio from a USB mic array
-3. Transcribe audio via **OpenAI** (in `services/web` after upload)
-4. Generate an AI summary + action items via **Anthropic**
-5. Store everything in SQLite
-6. View meetings and summaries in a React dashboard
+MeetingBox captures room audio, transcribes with **OpenAI** (Whisper), summarizes with **Anthropic** Claude, and serves a React dashboard.
 
-## Repository layout
+## Repository layout (monorepo)
 
-- `mini-pc/` – Appliance stack: **device-ui** (Kivy) + **audio** capture (see `mini-pc/README.md`, `mini-pc/.env.example`)
-- `services/web` – FastAPI backend (transcription + summarization + WebSocket relay)
-- `frontend` – React + TypeScript + Tailwind dashboard
-- `data` – Local data volume (audio, transcripts, exports, SQLite DB)
-- `logs` – Service logs (optional, per-service)
-- `scripts` – Helper scripts for setup and deployment
-- `docker-compose.yml` – Mini PC / dev orchestration (builds `mini-pc/device-ui` + `mini-pc/audio`; cloud API uses `docker-compose.server.yml`)
-- `.env.example` – Example environment variables (API keys, config)
+- [`server/`](server/README.md) – **Cloud stack**: `web/` (FastAPI), nginx, scripts, `docker-compose.yml`; env template `server/.env.example`
+- `frontend/` – React SPA (built to `frontend/dist/`; used by root `docker-compose` and symlinked via `server/.env` as `../frontend/dist`)
+- [`mini-pc/`](mini-pc/README.md) – Device UI + audio; `mini-pc/.env.example`
+- `data/` – Shared volume for local all-in-one dev (transcripts, audio, SQLite)
+- `scripts/` – General installers (e.g. `install_device_ui.sh`); host helpers live in `server/scripts/`
+- `docker-compose.yml` – **Full dev stack** (server `web` + nginx + `mini-pc` profiles)
+- `.env.example` – Root dev compose env
 
-## Getting started (development)
+## Splitting into two git repositories
+
+```bash
+# Server (API + dashboard)
+git subtree split --prefix=server -b server-release
+
+# Appliance (device + mic)
+git subtree split --prefix=mini-pc -b mini-pc-release
+```
+
+For a **standalone `server` repo**, move or copy `frontend/` into `server/frontend/` (or adjust `FRONTEND_DIST` / `DATA_ROOT` in `server/.env`).
+
+## Getting started (development, full stack on one machine)
 
 1. Install Docker and Docker Compose.
-2. Copy `.env.example` to `.env` and fill in secrets (e.g. `ANTHROPIC_API_KEY`, `JWT_SECRET_KEY`).  
-   `COMPOSE_PROFILES=backend,frontend` starts redis + web + nginx on this machine (see comments in `docker-compose.yml` for mini-PC–only or cloud-API setups).
-3. Run:
-
-```bash
-docker compose up --build -d
-```
-
-4. **Build the frontend** (so the web container can serve it):
-
-```bash
-cd frontend && npm install && npm run build && cd ..
-```
-
-5. Open `http://localhost:8000` (or `http://meetingbox.local` on-device) to access the dashboard.
+2. Copy `.env.example` to `.env` and set `JWT_SECRET_KEY`, API keys, and `COMPOSE_PROFILES=backend,frontend`.
+3. `cd frontend && npm install && npm run build && cd ..`
+4. `docker compose up --build -d`
+5. Open `http://localhost:8000`.
 
 ## Start / Stop meeting and test WAV
 
-- **From the dashboard**: use "Start meeting" to begin recording (audio service); "Stop & process" to stop and run transcription + summary.
-- **Without a mic**: use the test WAV ingest to run the full pipeline (transcription → summary) from a file:
+- **From the dashboard**: start/stop recording (with audio service / host capture).
+- **Test file:** `python scripts/ingest_test_wav.py path/to/your.wav`
 
-```bash
-pip install requests
-python scripts/ingest_test_wav.py path/to/your.wav
-# Optional: --base http://localhost:8000  (default)
-```
+## Linux / on-device deployment
 
-Then open the returned `session_id` in the dashboard (e.g. `http://localhost:8000/meeting/20250211_123456`) once processing has finished.
+See **[DEPLOY_LINUX.md](DEPLOY_LINUX.md)**. Server-only deploy: **[server/README.md](server/README.md)**.
 
-## Linux / On-device Deployment
-
-See **[DEPLOY_LINUX.md](DEPLOY_LINUX.md)** for the full deployment guide covering:
-
-- VirtualBox Ubuntu VM setup (or any Linux host)
-- USB microphone passthrough and ALSA configuration
-- Docker stack deployment with real mic access
-- End-to-end validation test plan
-- Performance benchmarking for Pi 5 vs mini PC decisions
-
-Quick start on any Ubuntu 24.04 host:
-
-```bash
-cd /opt/meetingbox
-sudo ./scripts/setup_vm.sh   # installs Docker, Node.js, ALSA utils, mDNS
-cp .env.example .env && nano .env   # set ANTHROPIC_API_KEY
-cd frontend && npm install && npm run build && cd ..
-docker compose up --build -d
-```
-
-(`docker compose` reads `COMPOSE_PROFILES` from `.env`; default in `.env.example` is `backend,frontend`.)
-
-> **Note:** The `docker-audio` profile adds `devices: ["/dev/snd"]` and `group_add: [audio]` on the audio service for Linux mic access. Omit that profile on Windows Docker Desktop.
-
-
+> **Note:** The `docker-audio` profile adds ALSA device access for the audio **container**. On Windows Docker Desktop, omit that profile.

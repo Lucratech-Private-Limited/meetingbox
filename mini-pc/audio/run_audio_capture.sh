@@ -26,7 +26,7 @@ cd "$SCRIPT_DIR"
 
 MINI_PC_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 MONOREPO_ROOT=""
-if [[ -f "$MINI_PC_ROOT/../docker-compose.server.yml" ]]; then
+if [[ -f "$MINI_PC_ROOT/../server/docker-compose.yml" ]]; then
   MONOREPO_ROOT="$(cd "$MINI_PC_ROOT/.." && pwd)"
 fi
 
@@ -43,7 +43,7 @@ _load_env_file() {
 _load_env_file "$MINI_PC_ROOT/.env"
 
 # Recordings: monorepo shares meetingbox/data/audio; standalone appliance uses mini-pc/data/audio
-if [[ -n "$MONOREPO_ROOT" ]] && [[ -d "$MONOREPO_ROOT/services/web" ]]; then
+if [[ -n "$MONOREPO_ROOT" ]] && [[ -d "$MONOREPO_ROOT/server/web" ]]; then
   DATA_ROOT="$MONOREPO_ROOT"
 else
   DATA_ROOT="$MINI_PC_ROOT"

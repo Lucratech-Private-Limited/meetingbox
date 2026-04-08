@@ -8,7 +8,7 @@ This is the single source of truth for any new agent or engineer picking up this
 
 ## Executive Summary
 
-MeetingBox is an on-prem AI meeting appliance. It captures room audio, transcribes with the **OpenAI** API and summarizes with **Anthropic** Claude inside `services/web`, stores results in SQLite, and exposes a React dashboard and Kivy device UI. Legacy local Ollama / whisper.cpp worker services have been removed from the repo.
+MeetingBox is an on-prem AI meeting appliance. It captures room audio, transcribes with the **OpenAI** API and summarizes with **Anthropic** Claude inside `server/web`, stores results in SQLite, and exposes a React dashboard and Kivy device UI. Legacy local Ollama / whisper.cpp worker services have been removed from the repo.
 
 The project was originally built for a Raspberry Pi 5 with a 3.5-inch OLED touchscreen. It has now been migrated to run on a **Linux mini PC with Ubuntu Desktop and a standard monitor** connected via HDMI.
 
@@ -18,7 +18,7 @@ The project was originally built for a Raspberry Pi 5 with a 3.5-inch OLED touch
 
 This section is the latest validated state and overrides older details below when there is a conflict.
 
-- **Cloud-only AI:** Removed `services/ai`, `services/transcription`, and `services/ollama`. OpenAI (Whisper) + Anthropic run in `services/web` only. Removed `POST .../summarize-local`; device-ui uses `/summarize` only. Compose no longer sets Ollama / `USE_LOCAL_LLM` env vars.
+- **Cloud-only AI:** Removed `services/ai`, `services/transcription`, and `services/ollama`. OpenAI (Whisper) + Anthropic run in `server/web` only. Removed `POST .../summarize-local`; device-ui uses `/summarize` only. Compose no longer sets Ollama / `USE_LOCAL_LLM` env vars.
 - Device pairing persistence was debugged and tightened in `device-ui/src/config.py` and `device-ui/src/main.py`.
 - `get_device_auth_token()` now prefers persisted token files before `DEVICE_AUTH_TOKEN` env fallback.
 - Persisted token reads now use `utf-8-sig` to tolerate BOM-prefixed token files.
@@ -30,7 +30,7 @@ This section is the latest validated state and overrides older details below whe
   - "Restart Device" now attempts a local host reboot path first, then backend fallback.
   - "Power Off" was added with the same local-first then backend-fallback behavior.
   - Factory reset now also triggers reboot behavior after reset completes.
-- Backend device settings API in `services/web/routes/device.py` now supports `poweroff` and reports whether host reboot / poweroff initiation was attempted.
+- Backend device settings API in `server/web/routes/device.py` now supports `poweroff` and reports whether host reboot / poweroff initiation was attempted.
 - Added `scripts/host_poweroff.sh` and corresponding compose wiring so the web service can request host shutdown when running inside Docker.
 - Setup flow updates:
   - `device-ui/src/screens/room_name.py`: removed "Skip for now".
@@ -55,7 +55,7 @@ This section is the latest validated state and overrides older details below whe
 - Transcription now runs once after recording_stopped (single Whisper pass on full meeting WAV), then stores transcript segments in SQLite and emits transcription_complete.
 - services/transcription/Dockerfile currently downloads ggml-tiny.bin by default; compose default is WHISPER_MODEL_PATH=/app/whisper.cpp/models/ggml-tiny.bin unless overridden.
 - To switch Whisper size, change model file in services/transcription/Dockerfile and WHISPER_MODEL_PATH, then rebuild only transcription: docker compose build --no-cache transcription && docker compose up -d transcription.
-- Actions tab behavior: action generation and Execute in services/web/services/action_engine.py call Anthropic (_call_claude_json) when ANTHROPIC_API_KEY is set. This path is not using Ollama.
+- Actions tab behavior: action generation and Execute in server/web/services/action_engine.py call Anthropic (_call_claude_json) when ANTHROPIC_API_KEY is set. This path is not using Ollama.
 - services/ai/ai_service.py summarization prompt usage: _build_prompt is used for first/full summary; _build_update_prompt is only used when an existing local summary is incrementally updated.
 - Audio capture is no longer part of the default Docker stack. The `audio` service is now behind profile `docker-audio`.
 - Default audio operation on the mini PC is host-side capture via `services/audio/run_audio_capture.sh`.
@@ -152,10 +152,10 @@ All data lives under `./data/` relative to the compose working directory. On the
 | `services/audio/run_audio_capture.sh` | Host-side audio capture runner (preferred on mini PC) |
 | `services/transcription/transcription_service.py` | Post-stop Whisper runner, SQLite persistence, Redis events |
 | `services/ai/ai_service.py` | Ollama/Claude summary generation |
-| `services/web/main.py` | FastAPI app, WebSocket relay, Redis listener |
-| `services/web/routes/meetings.py` | Recording control, meeting CRUD, summarization endpoints |
-| `services/web/routes/device.py` | Device settings, WiFi, system info (used by device UI) |
-| `services/web/database.py` | SQLite schema (meetings, segments, summaries, actions) |
+| `server/web/main.py` | FastAPI app, WebSocket relay, Redis listener |
+| `server/web/routes/meetings.py` | Recording control, meeting CRUD, summarization endpoints |
+| `server/web/routes/device.py` | Device settings, WiFi, system info (used by device UI) |
+| `server/web/database.py` | SQLite schema (meetings, segments, summaries, actions) |
 | `services/ollama/Dockerfile` | Ollama container (no curl needed, uses `ollama list` for health) |
 | `services/ollama/entrypoint.sh` | Starts Ollama, waits for ready, pulls configured model |
 | `device-ui/src/main.py` | Kivy app entry point, screen manager, WebSocket listener |
@@ -423,7 +423,7 @@ See `.env.example` for all available variables.
 3. `services/audio/audio_capture.py` — mic detection and recording pipeline
 4. `services/transcription/transcription_service.py` — Whisper integration and event handling
 5. `services/ai/ai_service.py` — summary generation logic
-6. `services/web/routes/meetings.py` — recording control and meeting API
+6. `server/web/routes/meetings.py` — recording control and meeting API
 7. `device-ui/src/main.py` — Kivy app entry point and event handling
 8. `device-ui/src/config.py` — display and UI configuration
 9. `frontend/FRONTEND_REFERENCE.md` — dashboard feature inventory

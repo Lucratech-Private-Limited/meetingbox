@@ -15,7 +15,7 @@ router = APIRouter()
 async def list_agent_definitions(
   _current_user: Optional[dict] = Depends(get_optional_user),
 ) -> dict:
-  """Return registered agent metadata (from services/web/agents/*.json)."""
+  """Return registered agent metadata (from server/web/agents/*.json)."""
   return {"agents": list_agents()}
 
 

@@ -1,6 +1,6 @@
 # MeetingBox mini PC (appliance)
 
-This folder contains everything that normally runs on the **meeting room device**: the **Kivy device UI** and the **audio capture** stack. The FastAPI dashboard lives elsewhere (`docker-compose.server.yml` in the main repo, or your VPS).
+This folder contains everything that normally runs on the **meeting room device**: the **Kivy device UI** and the **audio capture** stack. The FastAPI dashboard lives in **`server/`** in the main repo (or your VPS uses a server-only clone).
 
 ## Contents
 
