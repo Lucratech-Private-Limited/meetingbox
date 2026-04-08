@@ -14,7 +14,7 @@ from kivy.animation import Animation
 from kivy.clock import Clock
 
 from screens.base_screen import BaseScreen
-from config import COLORS, FONT_SIZES, DASHBOARD_URL, ALL_SET_DURATION
+from config import COLORS, FONT_SIZES, DASHBOARD_PUBLIC_URL, ALL_SET_DURATION
 
 try:
     import qrcode
@@ -77,7 +77,7 @@ class AllSetScreen(BaseScreen):
         root.add_widget(self.url_prompt)
 
         self.url_label = Label(
-            text=DASHBOARD_URL,
+            text=DASHBOARD_PUBLIC_URL,
             font_size=FONT_SIZES['medium'],
             bold=True,
             color=COLORS['blue'],
@@ -96,7 +96,7 @@ class AllSetScreen(BaseScreen):
             size=(100, 100),
             pos_hint={'center_x': 0.5},
         )
-        qr_widget = self._generate_qr(f'http://{DASHBOARD_URL}')
+        qr_widget = self._generate_qr(DASHBOARD_PUBLIC_URL)
         qr_container.add_widget(qr_widget)
         self.qr_container = qr_container
         self.qr_container.opacity = 0

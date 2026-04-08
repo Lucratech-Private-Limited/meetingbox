@@ -46,12 +46,18 @@ MOCK_BACKEND=1 python3 src/main.py
 
 ## Configuration
 
-Edit `src/config.py` to configure:
+**Cloud / remote server** — set environment variables before starting the UI (e.g. systemd `Environment=`):
 
-- Backend API URL (default: http://localhost:8000)
-- Display resolution
-- Touch calibration
-- UI theme colors
+| Variable | Example | Purpose |
+|----------|---------|---------|
+| `BACKEND_URL` | `http://your-host:8000` | REST API base (no trailing slash) |
+| `BACKEND_WS_URL` | `ws://your-host:8000/ws` | Real-time captions (optional; derived from `BACKEND_URL` if unset) |
+| `DASHBOARD_URL` | `http://your-host:8000` or `your-host:8000` | Dashboard link/QR; full URL or host:port (trailing `/` ok) |
+| `MOCK_BACKEND` | `1` | Local testing without a server |
+
+**Host audio recorder** (separate process): same API host as `UPLOAD_AUDIO_API_URL`, and `REDIS_HOST`/`REDIS_PORT` must reach the **same Redis** the cloud `web` container uses (usually VPN or private network; default server compose binds Redis to localhost only).
+
+You can still edit `src/config.py` for display resolution, touch, and theme.
 
 ## Running
 

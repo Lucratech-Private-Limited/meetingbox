@@ -222,7 +222,38 @@ DEVICE_MODEL = 'MeetingBox v1.0'
 HOTSPOT_SSID_PREFIX = 'MeetingBox-'
 HOTSPOT_IP = '192.168.4.1'
 SETUP_URL = f'http://{HOTSPOT_IP}'
-DASHBOARD_URL = 'meetingbox.local'
+
+
+def _normalize_dashboard_config(raw: str) -> tuple[str, str]:
+    """
+    Parse DASHBOARD_URL env: accepts host:port or full URL (with optional trailing slash).
+    Returns (short_label, public_url) — public_url has no trailing slash.
+    """
+    s = (raw or "").strip().rstrip("/")
+    if not s:
+        s = "meetingbox.local"
+    low = s.lower()
+    if low.startswith("https://"):
+        rest = s[8:]
+        hostport = rest.split("/")[0]
+        if not hostport:
+            hostport = "meetingbox.local"
+        return hostport, f"https://{hostport}"
+    if low.startswith("http://"):
+        rest = s[7:]
+        hostport = rest.split("/")[0]
+        if not hostport:
+            hostport = "meetingbox.local"
+        return hostport, f"http://{hostport}"
+    hostport = s.split("/")[0]
+    return hostport, f"http://{hostport}"
+
+
+_d_label, _d_public = _normalize_dashboard_config(os.getenv("DASHBOARD_URL", "meetingbox.local"))
+# Compact host:port for subtitles (e.g. Configure at …)
+DASHBOARD_URL = _d_label
+# Full URL for QR codes and links (matches what users should open in a browser)
+DASHBOARD_PUBLIC_URL = _d_public
 
 # ============================================================================
 # LOGGING

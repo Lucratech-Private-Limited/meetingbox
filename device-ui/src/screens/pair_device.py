@@ -19,7 +19,7 @@ from kivy.uix.widget import Widget
 from async_helper import run_async
 from components.button import PrimaryButton, SecondaryButton
 from components.modal_dialog import ModalDialog
-from config import ASSETS_DIR, COLORS, FONT_SIZES, DASHBOARD_URL
+from config import ASSETS_DIR, COLORS, FONT_SIZES, DASHBOARD_PUBLIC_URL
 from screens.base_screen import BaseScreen
 
 try:
@@ -193,7 +193,7 @@ class PairDeviceScreen(BaseScreen):
         qr_caption.bind(size=qr_caption.setter("text_size"))
         body.add_widget(qr_caption)
 
-        dash_http = f"http://{DASHBOARD_URL}"
+        dash_http = DASHBOARD_PUBLIC_URL
         qr_row = AnchorLayout(size_hint=(1, None), height=124)
         qr_row.add_widget(_make_qr_image_widget(dash_http, 116))
         body.add_widget(qr_row)

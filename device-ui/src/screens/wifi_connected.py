@@ -20,7 +20,7 @@ from config import (
     ASSETS_DIR,
     BORDER_RADIUS,
     COLORS,
-    DASHBOARD_URL,
+    DASHBOARD_PUBLIC_URL,
     FONT_SIZES,
 )
 from screens.base_screen import BaseScreen
@@ -206,7 +206,7 @@ class WiFiConnectedScreen(BaseScreen):
         )
         l2.bind(size=l2.setter("text_size"))
         self._url_value = Label(
-            text=f"http://{DASHBOARD_URL}",
+            text=DASHBOARD_PUBLIC_URL,
             font_size=FONT_SIZES["medium"],
             color=COLORS["blue"],
             halign="right",
