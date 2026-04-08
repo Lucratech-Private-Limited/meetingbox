@@ -155,7 +155,7 @@ Type=oneshot
 RemainAfterExit=yes
 WorkingDirectory=$INSTALL_DIR
 ExecStartPre=/bin/bash -c 'until docker info >/dev/null 2>&1; do sleep 2; done'
-ExecStart=/usr/bin/docker compose up -d
+ExecStart=/usr/bin/docker compose --profile backend --profile frontend up -d
 ExecStop=/usr/bin/docker compose down
 TimeoutStartSec=300
 
@@ -185,11 +185,11 @@ docker compose down 2>/dev/null || true
 
 # Build all images
 echo "   Building images (this may take a few minutes on first run)..."
-docker compose build
+docker compose --profile backend --profile frontend build
 
 # Start everything
 echo "   Starting containers..."
-docker compose up -d
+docker compose --profile backend --profile frontend up -d
 
 echo "   Waiting for services to start..."
 sleep 15

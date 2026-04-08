@@ -39,7 +39,7 @@ echo ""
 echo "[1/8] Stopping containers and services..."
 docker stop meetingbox-ui 2>/dev/null || true
 docker rm meetingbox-ui 2>/dev/null || true
-docker compose --profile screen down 2>/dev/null || true
+docker compose down 2>/dev/null || true
 pkill -f onboard_server 2>/dev/null || true
 bash scripts/hotspot.sh stop 2>/dev/null || true
 
@@ -90,7 +90,7 @@ fi
 # 4. Rebuild if needed
 if [ "$BUILD" = true ]; then
     echo "[4/8] Building Docker images..."
-    docker compose --profile screen build
+    docker compose --profile backend --profile frontend --profile screen build
 else
     echo "[4/8] Skipping build (--no-build)"
 fi
@@ -104,10 +104,10 @@ fi
 
 if [ ! -f "$MARKER" ]; then
     echo "[5/8] Starting backend services (onboarding mode — nginx skipped)..."
-    docker compose up -d redis audio web
+    docker compose --profile backend --profile docker-audio up -d
 else
     echo "[5/8] Starting backend services..."
-    docker compose up -d
+    docker compose --profile backend --profile frontend up -d
 fi
 echo "       Waiting for services to initialise..."
 sleep 5

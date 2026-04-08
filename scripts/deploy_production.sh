@@ -352,8 +352,8 @@ RemainAfterExit=yes
 User=$ACTUAL_USER
 WorkingDirectory=$INSTALL_DIR
 ExecStartPre=/bin/bash -c 'until docker info >/dev/null 2>&1; do sleep 2; done'
-ExecStart=/usr/bin/docker compose -f docker-compose.yml -f docker-compose.prod.yml --profile screen up -d
-ExecStop=/usr/bin/docker compose -f docker-compose.yml -f docker-compose.prod.yml --profile screen down
+ExecStart=/usr/bin/docker compose -f docker-compose.yml -f docker-compose.prod.yml --profile backend --profile frontend --profile screen up -d
+ExecStop=/usr/bin/docker compose -f docker-compose.yml -f docker-compose.prod.yml down
 TimeoutStartSec=300
 
 [Install]
@@ -405,20 +405,20 @@ echo "8/9  Building Docker images (this may take several minutes)..."
 cd "$INSTALL_DIR"
 
 # Stop any existing containers
-docker compose -f docker-compose.yml -f docker-compose.prod.yml --profile screen down 2>/dev/null || true
+docker compose -f docker-compose.yml -f docker-compose.prod.yml down 2>/dev/null || true
 
 # Optional: clean MeetingBox images/volumes before rebuilding.
 if [ "$CLEAN_BUILD" -eq 1 ]; then
     echo "   Performing clean Docker reset for MeetingBox..."
     if [ "$CLEAN_VOLUMES" -eq 1 ]; then
-        docker compose -f docker-compose.yml -f docker-compose.prod.yml --profile screen down --rmi all -v 2>/dev/null || true
+        docker compose -f docker-compose.yml -f docker-compose.prod.yml down --rmi all -v 2>/dev/null || true
     else
-        docker compose -f docker-compose.yml -f docker-compose.prod.yml --profile screen down --rmi all 2>/dev/null || true
+        docker compose -f docker-compose.yml -f docker-compose.prod.yml down --rmi all 2>/dev/null || true
     fi
 fi
 
 # Build all images including device-ui
-docker compose -f docker-compose.yml -f docker-compose.prod.yml --profile screen build
+docker compose -f docker-compose.yml -f docker-compose.prod.yml --profile backend --profile frontend --profile screen build
 
 echo "   Done"
 
@@ -429,7 +429,7 @@ echo ""
 echo "9/9  Quick verification..."
 
 # Start containers briefly to test
-docker compose -f docker-compose.yml -f docker-compose.prod.yml --profile screen up -d
+docker compose -f docker-compose.yml -f docker-compose.prod.yml --profile backend --profile frontend --profile screen up -d
 sleep 15
 
 echo ""
@@ -445,7 +445,7 @@ else
     echo "   --  Device UI not running (X11 may not be active yet — will work after reboot)"
 fi
 
-CONTAINER_COUNT=$(docker compose -f docker-compose.yml -f docker-compose.prod.yml --profile screen ps -q 2>/dev/null | wc -l)
+CONTAINER_COUNT=$(docker compose -f docker-compose.yml -f docker-compose.prod.yml ps -q 2>/dev/null | wc -l)
 echo "   --  $CONTAINER_COUNT containers running"
 
 # ==========================================================
@@ -471,7 +471,7 @@ echo ""
 echo "  Reboot now to test:  sudo reboot"
 echo ""
 echo "  Troubleshooting (via SSH if needed):"
-echo "    docker compose -f docker-compose.yml -f docker-compose.prod.yml --profile screen logs -f"
+echo "    docker compose -f docker-compose.yml -f docker-compose.prod.yml --profile backend --profile frontend --profile screen logs -f"
 echo "    docker logs meetingbox-ui"
 echo "    journalctl -u meetingbox.service"
 echo ""

@@ -1,21 +1,14 @@
-# Production overrides for MeetingBox
+# Production overrides for MeetingBox (use with docker-compose.yml on appliance)
 #
-# Audio: either host script (services/audio/run_audio_capture.sh) or Docker:
-#   docker compose -f docker-compose.yml -f docker-compose.prod.yml --profile docker-audio --profile screen up -d
+# Full appliance:
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml \
+#     --profile backend --profile frontend --profile screen up -d
 #
-# Optional device-ui profile; transcription/summary use OpenAI + Anthropic inside `web`.
+# Container mic + same host API:
+#   ... --profile backend --profile frontend --profile docker-audio --profile screen up -d
 #
-# Usage (systemd service applies this automatically):
-#   docker compose -f docker-compose.yml -f docker-compose.prod.yml --profile screen up -d
-#
-# NOTE: profiles: [] does NOT clear the "screen" profile from the base file.
-# The --profile screen flag in the systemd ExecStart command is what activates
-# device-ui in production. This file adds device passthrough only.
-# /dev/dri is intentionally omitted for portability; some Pi images/devices
-# do not expose it, and Docker fails hard if a configured device path is missing.
-#
-# Appliance-only: host reboot from Settings requires host PID ns + privileges.
-# Do NOT add this to default compose — it can prevent `web` from starting (nginx 502).
+# `screen` activates device-ui (alias profile `mini-pc`). Transcription/summary use
+# OpenAI + Anthropic inside `web`.
 
 services:
   web:

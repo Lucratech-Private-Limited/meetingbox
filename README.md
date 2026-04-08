@@ -25,17 +25,18 @@ This MVP focuses on a **single-device pipeline**, with optional Gmail/Google Cal
 - `data` – Local data volume (audio, transcripts, exports, SQLite DB)
 - `logs` – Service logs (optional, per-service)
 - `scripts` – Helper scripts for setup and deployment
-- `docker-compose.yml` – Local development / on-device orchestration
+- `docker-compose.yml` – Mini PC / dev orchestration (profiles: `backend`, `frontend`, `mini-pc`, `docker-audio`; cloud API uses `docker-compose.server.yml`)
 - `.env.example` – Example environment variables (API keys, config)
 
 ## Getting started (development)
 
 1. Install Docker and Docker Compose.
-2. Copy `.env.example` to `.env` and fill in secrets (e.g. `ANTHROPIC_API_KEY`).
+2. Copy `.env.example` to `.env` and fill in secrets (e.g. `ANTHROPIC_API_KEY`, `JWT_SECRET_KEY`).  
+   `COMPOSE_PROFILES=backend,frontend` starts redis + web + nginx on this machine (see comments in `docker-compose.yml` for mini-PC–only or cloud-API setups).
 3. Run:
 
 ```bash
-docker compose up --build
+docker compose up --build -d
 ```
 
 4. **Build the frontend** (so the web container can serve it):
@@ -79,6 +80,8 @@ cd frontend && npm install && npm run build && cd ..
 docker compose up --build -d
 ```
 
-> **Note:** The `docker-compose.yml` includes `devices: ["/dev/snd"]` and `group_add: [audio]` on the audio service for Linux mic access. Comment these out if running on Windows Docker Desktop.
+(`docker compose` reads `COMPOSE_PROFILES` from `.env`; default in `.env.example` is `backend,frontend`.)
+
+> **Note:** The `docker-audio` profile adds `devices: ["/dev/snd"]` and `group_add: [audio]` on the audio service for Linux mic access. Omit that profile on Windows Docker Desktop.
 
 
