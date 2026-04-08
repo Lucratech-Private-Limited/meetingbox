@@ -15,8 +15,8 @@
 # Docker device-ui is optional; many appliances use `device-ui/run_device_ui.sh`
 # instead. Legacy profile name `screen` = same as `mini-pc`.
 #
-# Host mic (recommended): `services/audio/run_audio_capture.sh` with
-# UPLOAD_AUDIO_API_URL pointing at your API.
+# Appliance code lives in `mini-pc/` (device-ui + audio). Host mic (recommended):
+# `mini-pc/audio/run_audio_capture.sh` with UPLOAD_AUDIO_API_URL pointing at your API.
 # =============================================================================
 
 services:
@@ -87,7 +87,7 @@ services:
 
   audio:
     build:
-      context: ./services/audio
+      context: ./mini-pc/audio
     container_name: meetingbox-audio
     restart: unless-stopped
     profiles: ["docker-audio"]
@@ -119,7 +119,7 @@ services:
 
   device-ui:
     build:
-      context: ./device-ui
+      context: ./mini-pc/device-ui
     container_name: meetingbox-ui
     user: "1000:1000"
     restart: unless-stopped

@@ -20,15 +20,15 @@ Device UI for MeetingBox hardware.
 
 ### Quick Install (Automated)
 
-From the main MeetingBox directory:
+From the main MeetingBox repo (full checkout):
 ```bash
 sudo ./scripts/install_device_ui.sh
 ```
 
 ### Manual Install
 ```bash
-# Navigate to device-ui directory
-cd device-ui/
+# Navigate to device-ui (standalone: clone mini-pc repo and cd device-ui)
+cd mini-pc/device-ui/
 
 # Create and activate a virtual environment (recommended for local dev)
 python3 -m venv .venv
@@ -46,7 +46,7 @@ MOCK_BACKEND=1 python3 src/main.py
 
 ## Configuration
 
-**Cloud / remote server** — easiest: `cd device-ui && cp .env.example .env`, edit `BACKEND_URL`, then `./run_device_ui.sh` (the script loads `device-ui/.env`). Or set environment variables in systemd `Environment=`:
+**Cloud / remote server** — easiest: copy `mini-pc/.env.example` → `mini-pc/.env` (or `.env` in this directory), edit `BACKEND_URL`, then `./run_device_ui.sh`. Or set environment variables in systemd `Environment=`:
 
 | Variable | Example | Purpose |
 |----------|---------|---------|
@@ -70,7 +70,7 @@ sudo systemctl enable meetingbox-ui  # Auto-start on boot
 ### Manual Run (Development)
 ```bash
 # Run locally without Docker (recommended during UI iteration)
-cd device-ui
+cd mini-pc/device-ui   # or ./device-ui when using mini-pc-only repo
 source .venv/bin/activate
 
 # Match Figma canvas scale
@@ -88,7 +88,7 @@ MOCK_BACKEND=1 python3 src/main.py
 
 ### Project Structure
 ```
-device-ui/
+mini-pc/device-ui/
 ├── src/
 │   ├── main.py              # Application entry point
 │   ├── config.py            # Configuration

@@ -50,7 +50,8 @@ Not started: **device-ui**, **Docker audio** — those belong on the mini PC (or
 
 ## Mini PC
 
-Host audio + device UI: see `mini-pc-aws-backend.env.example` — `REDIS_HOST`, `REDIS_PORT`, `UPLOAD_AUDIO_API_URL`, `BACKEND_URL`.
+Appliance bundle: **`mini-pc/`** (`mini-pc/.env.example`, `mini-pc/README.md`).  
+Legacy shell exports: `mini-pc-aws-backend.env.example` — `REDIS_HOST`, `UPLOAD_AUDIO_API_URL`, `BACKEND_URL`, etc.
 
 ## Alternative path
 

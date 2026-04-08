@@ -3,7 +3,7 @@
 
 echo "Testing MeetingBox Device UI with mock backend..."
 
-cd device-ui/
+cd mini-pc/device-ui/
 
 # Set mock backend environment variable
 export MOCK_BACKEND=1

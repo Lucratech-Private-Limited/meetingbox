@@ -1,0 +1,8 @@
+# Production-style overrides for the appliance stack.
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml --profile mini-pc up -d
+
+services:
+  device-ui:
+    devices:
+      - /dev/input:/dev/input

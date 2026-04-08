@@ -1,0 +1,94 @@
+# MeetingBox appliance — device-ui + audio (+ Redis for Docker audio only).
+# Use this folder as its own git repo on the mini PC, or as part of the monorepo.
+#
+# Copy .env.example → .env and set BACKEND_URL / UPLOAD_AUDIO_API_URL for your cloud API.
+#
+#   docker compose up -d --build
+#
+# Profiles (see .env.example → COMPOSE_PROFILES):
+#   mini-pc, screen  — Kivy container (needs X11)
+#   docker-audio      — mic container (needs Redis from this file)
+
+name: meetingbox-appliance
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: meetingbox-appliance-redis
+    restart: unless-stopped
+    profiles: ["docker-audio"]
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - appliance-redis-data:/data
+    networks:
+      - appliance-net
+
+  audio:
+    build:
+      context: ./audio
+    container_name: meetingbox-appliance-audio
+    restart: unless-stopped
+    profiles: ["docker-audio"]
+    depends_on:
+      redis:
+        condition: service_started
+    user: "1000:1000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - REDIS_HOST=redis
+      - RECORDINGS_DIR=/data/audio/recordings
+      - TEMP_SEGMENTS_DIR=/data/audio/temp
+      - AUDIO_INPUT_DEVICE_INDEX=${AUDIO_INPUT_DEVICE_INDEX:-}
+      - AUDIO_INPUT_DEVICE_NAME=${AUDIO_INPUT_DEVICE_NAME:-}
+      - UPLOAD_AUDIO_ON_STOP=${UPLOAD_AUDIO_ON_STOP:-1}
+      - UPLOAD_AUDIO_API_URL=${UPLOAD_AUDIO_API_URL:-http://host.docker.internal:8000/api/meetings/upload-audio}
+      - UPLOAD_AUDIO_TIMEOUT_SECONDS=${UPLOAD_AUDIO_TIMEOUT_SECONDS:-1200}
+      - DEVICE_AUTH_TOKEN=${DEVICE_AUTH_TOKEN:-}
+    volumes:
+      - ./data/audio:/data/audio
+    devices:
+      - /dev/snd:/dev/snd
+    group_add:
+      - audio
+    networks:
+      - appliance-net
+
+  device-ui:
+    build:
+      context: ./device-ui
+    container_name: meetingbox-appliance-ui
+    user: "1000:1000"
+    restart: unless-stopped
+    profiles: ["mini-pc", "screen"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - BACKEND_URL=${BACKEND_URL:-http://host.docker.internal:8000}
+      - BACKEND_WS_URL=${BACKEND_WS_URL:-}
+      - DASHBOARD_URL=${DASHBOARD_URL:-}
+      - DISPLAY=${DISPLAY:-:0}
+      - KIVY_WINDOW=sdl2
+      - KIVY_NO_CONSOLELOG=1
+      - FULLSCREEN=${FULLSCREEN:-0}
+      - MOCK_BACKEND=${MOCK_BACKEND:-0}
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      - ./data/config:/data/config
+    devices:
+      - /dev/dri:/dev/dri
+    group_add:
+      - "44"
+      - "109"
+    networks:
+      - appliance-net
+
+volumes:
+  appliance-redis-data:
+
+networks:
+  appliance-net:
+    driver: bridge

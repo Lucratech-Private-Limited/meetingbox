@@ -39,7 +39,7 @@ Audio publishes to the **same Redis** as `web`. Prefer **Site-to-Site VPN / Wire
 
 ## 2. Mini PC — audio
 
-See `../deploy/mini-pc-aws-backend.env.example`. Export variables before running `services/audio/run_audio_capture.sh` (or your systemd unit).
+See `../deploy/mini-pc-aws-backend.env.example` and `../mini-pc/.env.example`. Export variables before running `mini-pc/audio/run_audio_capture.sh` (or your systemd unit).
 
 ## 3. Mini PC — device UI
 

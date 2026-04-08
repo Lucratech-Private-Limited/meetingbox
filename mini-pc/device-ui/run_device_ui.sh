@@ -2,7 +2,7 @@
 # Run MeetingBox device UI from a local venv (Linux / mini PC).
 #
 # One-time setup:
-#   cd device-ui && python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt
+#   cd mini-pc/device-ui && python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt
 #
 # Usage:
 #   ./run_device_ui.sh
@@ -13,7 +13,12 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+MINI_PC_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# When this tree lives under the full monorepo: mini-pc/../docker-compose.server.yml
+MONOREPO_ROOT=""
+if [[ -f "$MINI_PC_ROOT/../docker-compose.server.yml" ]]; then
+  MONOREPO_ROOT="$(cd "$MINI_PC_ROOT/.." && pwd)"
+fi
 
 VENV_DIR="${VENV_DIR:-.venv}"
 ACTIVATE="$VENV_DIR/bin/activate"
@@ -24,27 +29,22 @@ if [[ ! -f "$ACTIVATE" ]]; then
   exit 1
 fi
 
+_load_env_file() {
+  local f="$1"
+  [[ -f "$f" ]] || return 0
+  set -a
+  # shellcheck source=/dev/null
+  source /dev/stdin <<<"$(tr -d '\r' < "$f")"
+  set +a
+}
+
 # shellcheck source=/dev/null
 source "$ACTIVATE"
 
-# Manual device-ui launches should inherit the same shared env as docker-audio
-# so paired-device auth and backend URLs stay aligned.
-if [[ -f "$REPO_ROOT/.env" ]]; then
-  set -a
-  # Root .env may be edited on Windows and contain CRLF line endings.
-  # Strip carriage returns so manual Linux launches still work.
-  # shellcheck source=/dev/null
-  source /dev/stdin <<<"$(tr -d '\r' < "$REPO_ROOT/.env")"
-  set +a
-fi
-
-# Mini PC: device-specific overrides (BACKEND_URL, DASHBOARD_URL, etc.)
-if [[ -f "$SCRIPT_DIR/.env" ]]; then
-  set -a
-  # shellcheck source=/dev/null
-  source /dev/stdin <<<"$(tr -d '\r' < "$SCRIPT_DIR/.env")"
-  set +a
-fi
+# Order: monorepo shared secrets → appliance package → per-app overrides
+[[ -n "$MONOREPO_ROOT" ]] && _load_env_file "$MONOREPO_ROOT/.env"
+_load_env_file "$MINI_PC_ROOT/.env"
+_load_env_file "$SCRIPT_DIR/.env"
 
 # Server compose uses APP_BASE_URL; device UI expects BACKEND_URL.
 if [[ -z "${BACKEND_URL:-}" ]] && [[ -n "${APP_BASE_URL:-}" ]]; then
@@ -88,7 +88,7 @@ fi
 
 if [[ -z "${BACKEND_URL:-}" ]] && [[ "${MOCK_BACKEND:-0}" != "1" ]]; then
   echo "[MeetingBox] BACKEND_URL is not set — the UI will use http://localhost:8000 (no server on this machine)." >&2
-  echo "[MeetingBox] Fix: set BACKEND_URL in $SCRIPT_DIR/.env (see .env.example) or repo root .env, or export before running." >&2
+  echo "[MeetingBox] Fix: set BACKEND_URL in $MINI_PC_ROOT/.env (see .env.example), monorepo .env, or $SCRIPT_DIR/.env" >&2
 fi
 
 exec python3 src/main.py "$@"

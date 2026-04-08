@@ -1,0 +1,12 @@
+.env
+.venv/
+device-ui/.venv/
+audio/.venv/
+__pycache__/
+*.pyc
+data/audio/recordings/*
+!data/audio/recordings/.gitkeep
+data/audio/temp/*
+!data/audio/temp/.gitkeep
+data/config/*
+!data/config/.gitkeep

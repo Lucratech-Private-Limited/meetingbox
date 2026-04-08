@@ -19,13 +19,13 @@ This MVP focuses on a **single-device pipeline**, with optional Gmail/Google Cal
 
 ## Repository layout
 
-- `services/audio` – Audio capture & VAD-based segmentation (PyAudio + webrtcvad)
+- `mini-pc/` – Appliance stack: **device-ui** (Kivy) + **audio** capture (see `mini-pc/README.md`, `mini-pc/.env.example`)
 - `services/web` – FastAPI backend (transcription + summarization + WebSocket relay)
 - `frontend` – React + TypeScript + Tailwind dashboard
 - `data` – Local data volume (audio, transcripts, exports, SQLite DB)
 - `logs` – Service logs (optional, per-service)
 - `scripts` – Helper scripts for setup and deployment
-- `docker-compose.yml` – Mini PC / dev orchestration (profiles: `backend`, `frontend`, `mini-pc`, `docker-audio`; cloud API uses `docker-compose.server.yml`)
+- `docker-compose.yml` – Mini PC / dev orchestration (builds `mini-pc/device-ui` + `mini-pc/audio`; cloud API uses `docker-compose.server.yml`)
 - `.env.example` – Example environment variables (API keys, config)
 
 ## Getting started (development)

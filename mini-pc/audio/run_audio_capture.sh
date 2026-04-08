@@ -1,39 +1,56 @@
 #!/usr/bin/env bash
 # Run MeetingBox audio capture on the HOST (recommended — direct ALSA/Pulse access).
 #
-# Docker: the `audio` service is behind profile `docker-audio` only; default
-# `docker compose up` does not start audio in a container.
+# Docker: use `docker compose --profile docker-audio` from mini-pc/ or monorepo root.
 #
 # One-time setup (Debian/Ubuntu):
 #   sudo apt install -y portaudio19-dev libasound2-dev python3-dev build-essential python3-venv
-#   cd services/audio && python3 -m venv .venv
+#   cd mini-pc/audio && python3 -m venv .venv
 #   .venv/bin/python3 -m pip install -U pip setuptools
 #   .venv/bin/python3 -m pip install -r requirements.txt
 #
 # If you see "No module named 'pkg_resources'" (webrtcvad needs setuptools):
-#   cd services/audio && .venv/bin/python3 -m pip install -U "setuptools>=69"
+#   .venv/bin/python3 -m pip install -U "setuptools>=69"
 #
-# Prerequisites:
-#   - Redis reachable from the host. Compose publishes Redis on 127.0.0.1:6379.
-#   - Stack up: docker compose up -d   (redis, web, transcription, …)
+# Env: copy mini-pc/.env.example → mini-pc/.env (REDIS_HOST, UPLOAD_AUDIO_API_URL, …).
 #
 # Usage:
 #   ./run_audio_capture.sh
 #   MEETINGBOX_USE_VENV=0 ./run_audio_capture.sh
-#   PYTHON=/usr/bin/python3.12 ./run_audio_capture.sh
 #   REDIS_HOST=127.0.0.1 ./run_audio_capture.sh
-#   AUDIO_INPUT_DEVICE_INDEX=2 ./run_audio_capture.sh
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+MINI_PC_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+MONOREPO_ROOT=""
+if [[ -f "$MINI_PC_ROOT/../docker-compose.server.yml" ]]; then
+  MONOREPO_ROOT="$(cd "$MINI_PC_ROOT/.." && pwd)"
+fi
+
+_load_env_file() {
+  local f="$1"
+  [[ -f "$f" ]] || return 0
+  set -a
+  # shellcheck source=/dev/null
+  source /dev/stdin <<<"$(tr -d '\r' < "$f")"
+  set +a
+}
+
+[[ -n "$MONOREPO_ROOT" ]] && _load_env_file "$MONOREPO_ROOT/.env"
+_load_env_file "$MINI_PC_ROOT/.env"
+
+# Recordings: monorepo shares meetingbox/data/audio; standalone appliance uses mini-pc/data/audio
+if [[ -n "$MONOREPO_ROOT" ]] && [[ -d "$MONOREPO_ROOT/services/web" ]]; then
+  DATA_ROOT="$MONOREPO_ROOT"
+else
+  DATA_ROOT="$MINI_PC_ROOT"
+fi
+
 VENV_DIR="${VENV_DIR:-.venv}"
 ACTIVATE="$VENV_DIR/bin/activate"
-# Use an absolute interpreter for non-venv mode so a previously-activated
-# venv in PATH cannot hijack execution.
 if [[ -n "${PYTHON:-}" ]]; then
   PYTHON_CMD="$PYTHON"
 elif [[ "${MEETINGBOX_USE_VENV:-1}" == "0" ]] && [[ -x "/usr/bin/python3" ]]; then
@@ -45,7 +62,6 @@ fi
 if [[ "${MEETINGBOX_USE_VENV:-1}" != "0" ]] && [[ -f "$ACTIVATE" ]]; then
   # shellcheck source=/dev/null
   source "$ACTIVATE"
-  # Absolute venv python — avoids a stale/wrong `python3` on PATH (e.g. another venv).
   PYTHON_CMD="$SCRIPT_DIR/$VENV_DIR/bin/python3"
   echo "[MeetingBox audio] Using venv: $SCRIPT_DIR/$VENV_DIR" >&2
 elif [[ "${MEETINGBOX_USE_VENV:-1}" != "0" ]] && [[ ! -f "$ACTIVATE" ]]; then
@@ -55,7 +71,6 @@ else
   echo "[MeetingBox audio] MEETINGBOX_USE_VENV=0 — using system $PYTHON_CMD" >&2
 fi
 
-# webrtcvad imports pkg_resources — that module ships with setuptools.
 if ! "$PYTHON_CMD" -c "import pkg_resources" >/dev/null 2>&1; then
   echo "[MeetingBox audio] pkg_resources missing; installing setuptools..." >&2
   if ! "$PYTHON_CMD" -m pip --version >/dev/null 2>&1; then
@@ -71,8 +86,8 @@ if ! "$PYTHON_CMD" -c "import pkg_resources" >/dev/null 2>&1; then
 fi
 
 export REDIS_HOST="${REDIS_HOST:-127.0.0.1}"
-export TEMP_SEGMENTS_DIR="${TEMP_SEGMENTS_DIR:-$REPO_ROOT/data/audio/temp}"
-export RECORDINGS_DIR="${RECORDINGS_DIR:-$REPO_ROOT/data/audio/recordings}"
+export TEMP_SEGMENTS_DIR="${TEMP_SEGMENTS_DIR:-$DATA_ROOT/data/audio/temp}"
+export RECORDINGS_DIR="${RECORDINGS_DIR:-$DATA_ROOT/data/audio/recordings}"
 export AUDIO_INPUT_DEVICE_INDEX="${AUDIO_INPUT_DEVICE_INDEX:-}"
 export AUDIO_INPUT_DEVICE_NAME="${AUDIO_INPUT_DEVICE_NAME:-}"
 export UPLOAD_AUDIO_ON_STOP="${UPLOAD_AUDIO_ON_STOP:-1}"
@@ -81,6 +96,7 @@ export UPLOAD_AUDIO_TIMEOUT_SECONDS="${UPLOAD_AUDIO_TIMEOUT_SECONDS:-1200}"
 
 mkdir -p "$TEMP_SEGMENTS_DIR" "$RECORDINGS_DIR"
 
+echo "[MeetingBox audio] DATA_ROOT=$DATA_ROOT" >&2
 echo "[MeetingBox audio] REDIS_HOST=$REDIS_HOST" >&2
 echo "[MeetingBox audio] TEMP_SEGMENTS_DIR=$TEMP_SEGMENTS_DIR" >&2
 echo "[MeetingBox audio] RECORDINGS_DIR=$RECORDINGS_DIR" >&2
