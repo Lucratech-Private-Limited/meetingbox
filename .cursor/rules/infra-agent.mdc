@@ -25,8 +25,7 @@ You own Docker orchestration, deployment scripts, and infrastructure configurati
 - `docker-compose.yml` -- Service definitions, volumes, networks
 - `.env.example` -- Environment variable template
 - `server/web/Dockerfile` / `mini-pc/*/Dockerfile` -- Container builds
-- `scripts/setup_vm.sh` -- Ubuntu VM setup (Docker, Node, ALSA, mDNS)
-- `scripts/setup_pi5.sh` -- Raspberry Pi 5 setup
+- `scripts/setup_vm.sh` -- Ubuntu VM / mini-PC prep (Docker, ALSA, mDNS)
 - `scripts/install_device_ui.sh` -- Device UI installation
 - `scripts/dev_restart.sh` -- Development restart helper
 - `DEPLOY_LINUX.md` -- Full deployment guide

@@ -164,8 +164,7 @@ All data lives under `./data/` relative to the compose working directory. On the
 | `device-ui/Dockerfile` | Kivy/SDL2 build (Debian Bookworm compatible packages) |
 | `frontend/` | React + TypeScript dashboard |
 | `nginx/nginx.conf` | Reverse proxy config |
-| `scripts/deploy_production.sh` | Full production setup (systemd, X11, Docker, boot) |
-| `scripts/install_native_minipc.sh` | Non-Docker native install path (systemd services) |
+| `scripts/install_device_ui.sh` | Appliance: rsync to `/opt/meetingbox`, systemd + Docker Compose (backend, frontend, screen) |
 
 ### Authentication Model
 
@@ -178,7 +177,7 @@ All data lives under `./data/` relative to the compose working directory. On the
 
 - `scripts/setup_display.sh` — Pi-only Xorg config that forced 480x320 resolution
 - Pi-specific backlight sysfs paths (`rpi_backlight`, `10-0045`) from `hardware.py`
-- Pi rainbow splash disable from `deploy_production.sh`
+- Pi rainbow splash disable from an older production installer (removed)
 - `libegl1-mesa-dev` and `libmtdev1` from device-ui Dockerfile (renamed/removed in Debian Bookworm)
 - `curl` installation from Ollama Dockerfile (broken packages in `ollama/ollama:latest`)
 - Default always-on Docker audio capture
@@ -197,8 +196,7 @@ All data lives under `./data/` relative to the compose working directory. On the
 | `services/ollama/entrypoint.sh` | Readiness check: `curl` → `ollama list` |
 | `services/transcription/transcription_service.py` | Default Whisper path: `/opt/meetingbox/runtime/whisper.cpp` → `/app/whisper.cpp` |
 | `docker-compose.yml` | Redis published on `127.0.0.1:6379`; `audio` moved behind `docker-audio` profile; `user: "1000:1000"` on audio/transcription/ai; Ollama healthcheck uses `ollama list`; device-ui gets `/dev/dri`, `LIBGL_ALWAYS_SOFTWARE=1`, `FULLSCREEN=0`; Whisper model/threads configurable via env |
-| `scripts/deploy_production.sh` | Generalized from Pi to Linux; removed Pi boot config; disabled onboarding; disabled `meetingbox-x.service` |
-| `scripts/install_native_minipc.sh` | Default display: 480x320 → 1280x720 |
+| `scripts/install_device_ui.sh` | Docker-first appliance install to `/opt/meetingbox` |
 
 ### Added
 
