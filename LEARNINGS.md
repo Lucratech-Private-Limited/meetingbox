@@ -513,8 +513,5 @@ container restarts until it can connect. This is expected behavior.
 | `scripts/deploy_production.sh` | Single-shot production installer for Pi |
 | `docker-compose.prod.yml` | Production overrides: `/dev/input` passthrough only |
 | `systemd/meetingbox.service` | Starts Docker Compose on boot (rewritten by deploy script) |
-| `systemd/meetingbox-onboard.service` | First-boot hotspot + WiFi setup (rewritten by deploy script) |
 | `scripts/meetingbox-x.service` | X server service (written by deploy script, no repo file) |
-| `scripts/hotspot.sh` | NetworkManager-based WiFi AP manager |
-| `scripts/onboard_server.py` | Lightweight HTTP server for first-boot WiFi config portal |
 | `scripts/dev_restart.sh` | Dev cycle: pull, build, start stack (supports `--fresh`) |

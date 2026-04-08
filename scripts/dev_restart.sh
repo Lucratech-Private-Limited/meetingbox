@@ -3,7 +3,7 @@
 # MeetingBox Dev Restart
 #
 # Single command to pull latest code, rebuild, and start everything fresh
-# including the OLED screen UI and onboarding hotspot.
+# including the OLED screen UI. Device setup uses the web dashboard (no hotspot).
 #
 # Usage:
 #   cd ~/meetingbox && sudo bash scripts/dev_restart.sh
@@ -40,24 +40,6 @@ echo "[1/8] Stopping containers and services..."
 docker stop meetingbox-ui 2>/dev/null || true
 docker rm meetingbox-ui 2>/dev/null || true
 docker compose down 2>/dev/null || true
-pkill -f onboard_server 2>/dev/null || true
-bash scripts/hotspot.sh stop 2>/dev/null || true
-
-# Kill anything on port 80 and WAIT until it's actually free
-if ss -tlnp 2>/dev/null | grep -q ':80 '; then
-    echo "       Killing process on port 80..."
-    fuser -k 80/tcp 2>/dev/null || true
-    for i in 1 2 3 4 5; do
-        sleep 1
-        ss -tlnp 2>/dev/null | grep -q ':80 ' || break
-    done
-    if ss -tlnp 2>/dev/null | grep -q ':80 '; then
-        echo "       WARNING: port 80 still in use after 5 retries"
-    else
-        echo "       Port 80 is free"
-    fi
-fi
-
 # 2. Pull latest code
 echo "[2/8] Pulling latest code..."
 ACTUAL_USER=${SUDO_USER:-$USER}
@@ -102,13 +84,8 @@ if [ ! -f "$MARKER" ] && [ "$FRESH" = false ] && [ "$WIFI_CONNECTED" = true ]; t
     touch "$MARKER"
 fi
 
-if [ ! -f "$MARKER" ]; then
-    echo "[5/8] Starting backend services (onboarding mode — nginx skipped)..."
-    docker compose --profile backend --profile docker-audio up -d
-else
-    echo "[5/8] Starting backend services..."
-    docker compose --profile backend --profile frontend up -d
-fi
+echo "[5/8] Starting backend + frontend..."
+docker compose --profile backend --profile frontend up -d
 echo "       Waiting for services to initialise..."
 sleep 5
 
@@ -120,22 +97,11 @@ DISPLAY=:0 xhost +local: 2>/dev/null || echo "   (xhost not available — run st
 echo "[7/8] Starting device UI..."
 docker compose --profile screen up -d device-ui
 
-# 8. Start onboarding if setup not complete
+# 8. Remind to finish setup via dashboard if needed
 if [ ! -f "$MARKER" ]; then
-    echo "[8/8] Starting onboarding (hotspot only)..."
-
-    # nginx was intentionally not started in step 5, so port 80 is free
-
-    # Start the hotspot so phones can connect
-    echo "       Starting WiFi hotspot..."
-    bash scripts/hotspot.sh start
-
-    echo ""
-    echo "  >>> Run the onboard server manually:"
-    echo "  >>> sudo python3 $PROJECT_DIR/scripts/onboard_server.py &"
-    echo ""
+    echo "[8/8] Setup not marked complete — open the web dashboard to finish device profile / Wi‑Fi."
 else
-    echo "[8/8] Setup already complete — skipping onboarding"
+    echo "[8/8] Setup already complete"
 fi
 
 echo ""
@@ -148,7 +114,6 @@ echo "  All logs:    docker compose logs -f"
 echo "  Stop all:    docker compose --profile screen down"
 echo ""
 if [ ! -f "$MARKER" ]; then
-    echo "  ONBOARDING: Connect phone to MeetingBox hotspot"
-    echo "              Open http://192.168.4.1 in browser"
+    echo "  SETUP: Use the web dashboard (e.g. http://meetingbox.local) to finish configuration."
 fi
 echo ""

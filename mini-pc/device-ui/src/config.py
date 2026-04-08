@@ -218,10 +218,6 @@ DEFAULT_AUTO_DELETE = 'never'       # never, 30, 60, 90
 # ============================================================================
 
 DEVICE_MODEL = 'MeetingBox v1.0'
-# Legacy hotspot onboarding (unused in current Wi‑Fi-to-LAN flow; kept for old scripts)
-HOTSPOT_SSID_PREFIX = 'MeetingBox-'
-HOTSPOT_IP = '192.168.4.1'
-SETUP_URL = f'http://{HOTSPOT_IP}'
 
 
 def _normalize_dashboard_config(raw: str) -> tuple[str, str]:

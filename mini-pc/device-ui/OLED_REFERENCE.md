@@ -252,8 +252,10 @@ User taps STOP  -> POST /api/meetings/stop  -> Audio service stops
 
 ## WiFi Onboarding – Wrong Password Handling (Feb 2026)
 
+> **Legacy:** The MeetingBox AP + `scripts/onboard_server.py` path has been **removed** from the repo; first-time setup uses the **web dashboard**. This section remains as historical debugging notes.
+
 ### Problem
-During the onboarding flow, if the user entered the wrong WiFi password:
+During the old captive-portal onboarding flow, if the user entered the wrong WiFi password:
 1. The onboard server (`scripts/onboard_server.py`) responded `"saved"` immediately (before verifying connection)
 2. The web page showed "WiFi Configured!" even though the connection hadn't been tested
 3. The background `nmcli connection up` failed, leaving wlan0 in a broken state

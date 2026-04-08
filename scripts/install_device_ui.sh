@@ -163,14 +163,13 @@ TimeoutStartSec=300
 WantedBy=multi-user.target
 EOF
 
-## Onboarding service (hotspot + setup portal for first boot)
-cp "$INSTALL_DIR/systemd/meetingbox-onboard.service" /etc/systemd/system/
-chmod +x "$INSTALL_DIR/scripts/hotspot.sh"
-chmod +x "$INSTALL_DIR/scripts/onboard_server.py"
+## Drop legacy first-boot hotspot / captive portal (setup is via web dashboard)
+systemctl stop meetingbox-onboard.service 2>/dev/null || true
+systemctl disable meetingbox-onboard.service 2>/dev/null || true
+rm -f /etc/systemd/system/meetingbox-onboard.service
 
 systemctl daemon-reload
 systemctl enable meetingbox.service
-systemctl enable meetingbox-onboard.service
 echo "   Done"
 
 # -------------------------------------------------------

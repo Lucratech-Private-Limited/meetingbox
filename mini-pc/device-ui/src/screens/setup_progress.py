@@ -4,7 +4,7 @@ Setup In Progress Screen
 Waiting state while user completes web-based setup.
 Exit conditions (whichever fires first):
   1. Backend sends setup_complete WebSocket event
-  2. .setup_complete marker file appears on disk (written by onboard_server.py)
+  2. .setup_complete marker file appears on disk (written when setup finishes via dashboard / API)
 """
 
 from kivy.uix.boxlayout import BoxLayout

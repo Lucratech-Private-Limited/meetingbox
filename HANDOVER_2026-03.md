@@ -166,7 +166,6 @@ All data lives under `./data/` relative to the compose working directory. On the
 | `nginx/nginx.conf` | Reverse proxy config |
 | `scripts/deploy_production.sh` | Full production setup (systemd, X11, Docker, boot) |
 | `scripts/install_native_minipc.sh` | Non-Docker native install path (systemd services) |
-| `scripts/hotspot.sh` | WiFi hotspot manager (auto-detects interface, needs adapter) |
 
 ### Authentication Model
 
@@ -199,7 +198,6 @@ All data lives under `./data/` relative to the compose working directory. On the
 | `services/transcription/transcription_service.py` | Default Whisper path: `/opt/meetingbox/runtime/whisper.cpp` → `/app/whisper.cpp` |
 | `docker-compose.yml` | Redis published on `127.0.0.1:6379`; `audio` moved behind `docker-audio` profile; `user: "1000:1000"` on audio/transcription/ai; Ollama healthcheck uses `ollama list`; device-ui gets `/dev/dri`, `LIBGL_ALWAYS_SOFTWARE=1`, `FULLSCREEN=0`; Whisper model/threads configurable via env |
 | `scripts/deploy_production.sh` | Generalized from Pi to Linux; removed Pi boot config; disabled onboarding; disabled `meetingbox-x.service` |
-| `scripts/hotspot.sh` | Auto-detects WiFi interface name instead of hardcoding `wlan0` |
 | `scripts/install_native_minipc.sh` | Default display: 480x320 → 1280x720 |
 
 ### Added
@@ -228,7 +226,7 @@ All data lives under `./data/` relative to the compose working directory. On the
 |---|---|---|
 | `meetingbox.service` | **enabled** | Starts Docker Compose on boot |
 | `meetingbox-x.service` | **masked** | Old kiosk X server (not needed with GDM3 desktop) |
-| `meetingbox-onboard.service` | **masked** | WiFi hotspot onboarding (no WiFi adapter currently) |
+| `meetingbox-onboard.service` | **removed** | First-boot hotspot + captive portal retired; use web dashboard |
 | `gdm3.service` | **enabled** | Ubuntu desktop display manager |
 | `avahi-daemon` | **enabled** | mDNS for `meetingbox.local` |
 | `redis-server` (native) | **disabled** | Conflicts with Docker Redis on port 6379 |
@@ -289,14 +287,9 @@ Relative volume mounts (`./data/audio`) resolve to the current working directory
 
 The first time `meetingbox-ollama` starts, it downloads `phi3:mini` (~2.3GB). Until that finishes and the healthcheck passes, `meetingbox-web` will not start (it depends on `ollama: condition: service_healthy`). This can take 10-15 minutes on first boot.
 
-### 6. WiFi adapter not yet installed
+### 6. WiFi / first-time setup
 
-The mini PC currently has no WiFi adapter. The hotspot onboarding flow (`scripts/hotspot.sh`) is disabled and the `.setup_complete` marker bypasses the onboarding screen. When a USB WiFi adapter is added:
-
-1. `hotspot.sh` will auto-detect the interface (no `wlan0` hardcoding)
-2. Remove the marker: `rm /home/meetingbox/meetingbox/data/config/.setup_complete`
-3. Unmask the service: `sudo systemctl unmask meetingbox-onboard.service && sudo systemctl enable meetingbox-onboard.service`
-4. Restart device-ui: `docker restart meetingbox-ui`
+First-time Wi‑Fi and device profile setup use the **web dashboard** (and on-device flows where applicable). The legacy **MeetingBox hotspot + `onboard_server.py`** path has been removed from the repo. Use `.setup_complete` and dashboard auth/onboarding as documented in deploy scripts; for a clean re-run, remove the marker and restart the stack per `scripts/dev_restart.sh`.
 
 ### 7. Some frontend API client methods are not yet surfaced in UI
 
@@ -440,8 +433,8 @@ The simulated progress bar (caps at 68%) is misleading. Options:
 - Add backend failure event handling so UI shows error instead of hanging
 - Send real progress events from the transcription service
 
-### Priority 3: Add USB WiFi adapter and re-enable onboarding
-When a WiFi adapter is available, the hotspot flow can be tested. `hotspot.sh` already auto-detects the interface name.
+### Priority 3: Add USB WiFi adapter (if needed)
+When a USB WiFi adapter is added, configure networking with NetworkManager / the device UI; there is no captive-portal hotspot in-repo anymore.
 
 ### Priority 4: Consolidate the working directory
 Currently compose runs from `/home/meetingbox/meetingbox/`. The production deploy script copies to `/opt/meetingbox/`. Pick one and stick with it. Recommendation: use `/home/meetingbox/meetingbox/` for everything since that's where the git repo lives.
