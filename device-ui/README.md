@@ -46,7 +46,7 @@ MOCK_BACKEND=1 python3 src/main.py
 
 ## Configuration
 
-**Cloud / remote server** — set environment variables before starting the UI (e.g. systemd `Environment=`):
+**Cloud / remote server** — easiest: `cd device-ui && cp .env.example .env`, edit `BACKEND_URL`, then `./run_device_ui.sh` (the script loads `device-ui/.env`). Or set environment variables in systemd `Environment=`:
 
 | Variable | Example | Purpose |
 |----------|---------|---------|

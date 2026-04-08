@@ -38,6 +38,19 @@ if [[ -f "$REPO_ROOT/.env" ]]; then
   set +a
 fi
 
+# Mini PC: device-specific overrides (BACKEND_URL, DASHBOARD_URL, etc.)
+if [[ -f "$SCRIPT_DIR/.env" ]]; then
+  set -a
+  # shellcheck source=/dev/null
+  source /dev/stdin <<<"$(tr -d '\r' < "$SCRIPT_DIR/.env")"
+  set +a
+fi
+
+# Server compose uses APP_BASE_URL; device UI expects BACKEND_URL.
+if [[ -z "${BACKEND_URL:-}" ]] && [[ -n "${APP_BASE_URL:-}" ]]; then
+  export BACKEND_URL="${APP_BASE_URL%/}"
+fi
+
 export DISPLAY_WIDTH="${DISPLAY_WIDTH:-1024}"
 export DISPLAY_HEIGHT="${DISPLAY_HEIGHT:-600}"
 
@@ -71,6 +84,11 @@ fi
 # GUI needs a real local display for kiosk hardware (not broken SSH X11).
 if [[ "$(uname -s)" == "Linux" ]] && [[ -z "${DISPLAY:-}" ]]; then
   echo "[MeetingBox] DISPLAY is not set. On the device console try: export DISPLAY=:0" >&2
+fi
+
+if [[ -z "${BACKEND_URL:-}" ]] && [[ "${MOCK_BACKEND:-0}" != "1" ]]; then
+  echo "[MeetingBox] BACKEND_URL is not set — the UI will use http://localhost:8000 (no server on this machine)." >&2
+  echo "[MeetingBox] Fix: set BACKEND_URL in $SCRIPT_DIR/.env (see .env.example) or repo root .env, or export before running." >&2
 fi
 
 exec python3 src/main.py "$@"
