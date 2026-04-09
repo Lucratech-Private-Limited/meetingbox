@@ -260,6 +260,22 @@ def _actor_device_id(actor: Optional[dict]) -> Optional[str]:
   return actor["device"]["id"]
 
 
+def emit_audio_command(actor: Optional[dict], payload: dict) -> None:
+  """
+  Tell audio capture to run an action.
+
+  - Publishes to Redis channel ``commands`` (same-host / SSH-tunnel subscribers).
+  - Also pushes to per-user list ``audio:http:{user_id}`` for HTTP long-poll on
+    appliances that cannot reach server Redis (cloud API + mini PC).
+  """
+  body = json.dumps(payload)
+  r = _get_redis()
+  r.publish("commands", body)
+  uid = _actor_user_id(actor)
+  if uid:
+    r.rpush(f"audio:http:{uid}", body)
+
+
 def _session_owner_key(session_id: str) -> str:
   return f"meeting_session_owner:{session_id}"
 
@@ -307,7 +323,7 @@ async def start_meeting(current_actor: Optional[dict] = Depends(get_optional_act
   """Start a new recording. Sends command to audio service via Redis."""
   session_id = _generate_session_id()
   _store_session_owner(session_id, current_actor)
-  _get_redis().publish("commands", json.dumps({"action": "start_recording", "session_id": session_id}))
+  emit_audio_command(current_actor, {"action": "start_recording", "session_id": session_id})
   _get_redis().set("current_meeting_id", session_id)
   _get_redis().set("recording_state", "recording")
   return {"session_id": session_id, "status": "recording_started"}
@@ -317,9 +333,9 @@ async def start_meeting(current_actor: Optional[dict] = Depends(get_optional_act
 async def stop_meeting(current_actor: Optional[dict] = Depends(get_optional_actor)):
   """Stop the current recording. Sends command to audio service via Redis."""
   session_id = _get_redis().get("current_meeting_id")
-  _get_redis().publish(
-    "commands",
-    json.dumps({"action": "stop_recording", "session_id": session_id}),
+  emit_audio_command(
+    current_actor,
+    {"action": "stop_recording", "session_id": session_id},
   )
   _get_redis().set("recording_state", "processing")
   if session_id:
@@ -350,9 +366,9 @@ async def pause_meeting(current_actor: Optional[dict] = Depends(get_optional_act
   if state != "recording":
     raise HTTPException(status_code=400, detail="No active recording to pause")
   session_id = _get_redis().get("current_meeting_id")
-  _get_redis().publish(
-    "commands",
-    json.dumps({"action": "pause_recording", "session_id": session_id}),
+  emit_audio_command(
+    current_actor,
+    {"action": "pause_recording", "session_id": session_id},
   )
   _get_redis().set("recording_state", "paused")
   return {"status": "paused", "session_id": session_id}
@@ -365,9 +381,9 @@ async def resume_meeting(current_actor: Optional[dict] = Depends(get_optional_ac
   if state != "paused":
     raise HTTPException(status_code=400, detail="No paused recording to resume")
   session_id = _get_redis().get("current_meeting_id")
-  _get_redis().publish(
-    "commands",
-    json.dumps({"action": "resume_recording", "session_id": session_id}),
+  emit_audio_command(
+    current_actor,
+    {"action": "resume_recording", "session_id": session_id},
   )
   _get_redis().set("recording_state", "recording")
   return {"status": "recording", "session_id": session_id}

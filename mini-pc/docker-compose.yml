@@ -39,6 +39,8 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
       - REDIS_HOST=redis
+      - AUDIO_COMMAND_SOURCE=${AUDIO_COMMAND_SOURCE:-redis}
+      - AUDIO_POLL_BASE_URL=${AUDIO_POLL_BASE_URL:-}
       - RECORDINGS_DIR=/data/audio/recordings
       - TEMP_SEGMENTS_DIR=/data/audio/temp
       - AUDIO_INPUT_DEVICE_INDEX=${AUDIO_INPUT_DEVICE_INDEX:-}

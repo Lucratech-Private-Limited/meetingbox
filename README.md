@@ -45,6 +45,8 @@ git push <mini-pc-remote> mini-pc-release:main
 
 **Wiring:** In `server/.env`, set `FRONTEND_DIST` to the built SPA (for example `./frontend/dist` if you copied `frontend` under `server/`, or `../<frontend-repo-name>/dist` for sibling clones). See `server/.env.example` and `frontend/README.md`.
 
+**If `git subtree split` fails** with `Could not read <hash>` or `revision walk setup failed`, your `.git/objects` tree is damaged (common after disk/antivirus issues). Confirm with `git fsck --no-reflogs`. **Fix:** clone the repo fresh from GitHub into a new folder, or copy all files from the donor clone’s `.git/objects/pack/` into yours (same folder), then run `git fsck` again and retry the subtree command.
+
 ## Getting started (development, full stack on one machine)
 
 1. Install Docker and Docker Compose.
