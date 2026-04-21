@@ -1,4 +1,6 @@
 .env
+# Refreshed at boot by scripts/kiosk-compose-up.sh for Docker X11 bind mount
+.meetingbox-docker.xauth
 .venv/
 device-ui/.venv/
 audio/.venv/

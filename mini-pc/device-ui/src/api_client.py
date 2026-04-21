@@ -509,6 +509,18 @@ class BackendClient:
             logger.error(f"Failed to fetch system info: {e}")
             raise
 
+    async def post_appliance_system_metrics(self, metrics: Dict) -> None:
+        """POST /api/device/system-metrics — appliance CPU/RAM/disk for web dashboard."""
+        try:
+            resp = await self.client.post(
+                f"{self.base_url}/api/device/system-metrics",
+                json=metrics,
+            )
+            resp.raise_for_status()
+        except Exception as e:
+            logger.debug("post appliance system-metrics: %s", e)
+            raise
+
     async def check_for_updates(self) -> Dict:
         """GET /api/device/check-updates"""
         try:

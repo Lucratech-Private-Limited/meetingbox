@@ -13,7 +13,12 @@ from kivy.clock import Clock
 from async_helper import run_async
 from screens.base_screen import BaseScreen
 from components.status_bar import StatusBar
-from config import COLORS, FONT_SIZES
+from config import (
+    AUDIO_INPUT_DEVICE_INDEX,
+    AUDIO_INPUT_DEVICE_NAME,
+    COLORS,
+    FONT_SIZES,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -93,7 +98,7 @@ class MicTestScreen(BaseScreen):
 
         instr = Label(
             text='Speak to test your microphone',
-            font_size=FONT_SIZES['medium'],
+            font_size=self.suf(FONT_SIZES['medium']),
             color=COLORS['white'],
             halign='center',
             size_hint=(1, None), height=28,
@@ -110,7 +115,7 @@ class MicTestScreen(BaseScreen):
 
         self.level_label = Label(
             text='Detecting…',
-            font_size=FONT_SIZES['small'] + 2,
+            font_size=self.suf(FONT_SIZES['small'] + 2),
             bold=True,
             color=COLORS['gray_500'],
             halign='center',
@@ -125,13 +130,56 @@ class MicTestScreen(BaseScreen):
 
         self.add_widget(root)
 
+    def _resolve_sounddevice_input_device(self):
+        """PortAudio device index, or None for host default."""
+        if sd is None:
+            return None
+        idx_s = (AUDIO_INPUT_DEVICE_INDEX or "").strip()
+        if idx_s.isdigit():
+            return int(idx_s)
+        name_sub = (AUDIO_INPUT_DEVICE_NAME or "").strip()
+        if name_sub:
+            low = name_sub.lower()
+            for i, dev in enumerate(sd.query_devices()):
+                if int(dev.get("max_input_channels") or 0) > 0 and low in (
+                    dev.get("name") or ""
+                ).lower():
+                    return i
+        return None
+
+    def _samplerates_to_try(self, device_id):
+        out = []
+        if device_id is not None:
+            try:
+                info = sd.query_devices(device_id)
+                dflt = int(float(info.get("default_samplerate") or 0))
+                if dflt > 0:
+                    out.append(dflt)
+            except Exception:
+                pass
+        for sr in (48000, 44100, 32000, 22050, 16000, 8000):
+            if sr not in out:
+                out.append(sr)
+        return out
+
+    def _show_mic_error(self, message: str):
+        self.level_label.text = message
+        self.level_label.color = COLORS["red"]
+
     def on_enter(self):
         self._enter_ts = time()
         self._got_level = False
         self._last_level_ts = 0.0
         self.level_label.text = 'Starting microphone test...'
         self.level_label.color = COLORS['gray_400']
-        Clock.schedule_once(lambda _dt: self._open_local_input_stream(), 0)
+
+        if sd is not None and np is not None:
+            Clock.schedule_once(lambda _dt: self._open_local_input_stream(), 0)
+        else:
+            logger.warning("Mic test: sounddevice/numpy unavailable — using backend WS levels only")
+
+        # Always start backend mic test + tick timer so bars work via
+        # WebSocket mic_test_level events even without local sounddevice.
         run_async(self._notify_backend_start())
         if self._wave_event:
             self._wave_event.cancel()
@@ -146,37 +194,60 @@ class MicTestScreen(BaseScreen):
 
     def _open_local_input_stream(self):
         if sd is None or np is None:
-            logger.debug("sounddevice/numpy not available — mic test will rely on backend WS only")
             return
         self._close_local_stream()
-        try:
+        device_id = self._resolve_sounddevice_input_device()
 
-            def callback(indata, frames, t_info, status):
-                if status and str(status):
-                    logger.debug("sounddevice status: %s", status)
-                try:
-                    block = np.asarray(indata, dtype=np.float64).reshape(-1)
-                    if block.size == 0:
-                        return
-                    rms = float(np.sqrt(np.mean(np.square(block))))
-                    # sounddevice float32 samples are ~[-1, 1]; scale to ~same gates as int16/5000 path
-                    level = min(1.0, rms * 18.0)
-                    Clock.schedule_once(lambda dt, lv=level: self._apply_level(lv), 0)
-                except Exception:
-                    pass
+        def callback(indata, frames, t_info, status):
+            if status and str(status):
+                logger.debug("sounddevice status: %s", status)
+            try:
+                block = np.asarray(indata, dtype=np.float64).reshape(-1)
+                if block.size == 0:
+                    return
+                rms = float(np.sqrt(np.mean(np.square(block))))
+                # float32 ~[-1,1]; gain bumped slightly for quiet USB mics
+                level = min(1.0, rms * 24.0)
+                Clock.schedule_once(lambda dt, lv=level: self._apply_level(lv), 0)
+            except Exception:
+                logger.exception("Mic test: callback error")
 
-            self._local_stream = sd.InputStream(
-                channels=1,
-                samplerate=16000,
-                blocksize=1024,
-                dtype='float32',
-                callback=callback,
-            )
-            self._local_stream.start()
-            logger.info("Mic test: local capture stream started")
-        except Exception as e:
-            logger.warning("Mic test: local capture failed (%s) — using backend/WS if available", e)
-            self._local_stream = None
+        last_err = None
+        for sr in self._samplerates_to_try(device_id):
+            try:
+                kwargs = dict(
+                    channels=1,
+                    samplerate=sr,
+                    blocksize=1024,
+                    dtype="float32",
+                    callback=callback,
+                )
+                if device_id is not None:
+                    kwargs["device"] = device_id
+                self._local_stream = sd.InputStream(**kwargs)
+                self._local_stream.start()
+                logger.info(
+                    "Mic test: local stream started (device=%s samplerate=%s)",
+                    device_id,
+                    sr,
+                )
+                return
+            except Exception as e:
+                last_err = e
+                self._close_local_stream()
+                continue
+
+        logger.warning(
+            "Mic test: local capture failed (%s) — check /dev/snd, audio group, AUDIO_INPUT_DEVICE_*",
+            last_err,
+        )
+        Clock.schedule_once(
+            lambda *_: self._show_mic_error(
+                f"Cannot open microphone ({last_err}). "
+                "Rebuild UI with /dev/snd and retry."
+            ),
+            0,
+        )
 
     def _close_local_stream(self):
         if self._local_stream is not None:
@@ -203,7 +274,7 @@ class MicTestScreen(BaseScreen):
         self.on_mic_test_level(level)
 
     def on_mic_test_level(self, level: float):
-        gated = 0.0 if level < 0.015 else min(1.0, float(level))
+        gated = 0.0 if level < 0.006 else min(1.0, float(level))
         self._rms_history.append(gated)
         self._last_level_ts = time()
         self._got_level = True

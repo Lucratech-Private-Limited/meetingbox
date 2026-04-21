@@ -46,7 +46,7 @@ class SystemScreen(BaseScreen):
         scroll = ScrollView(size_hint=(0.65, 1), do_scroll_x=False)
         self.info_label = Label(
             text='Loading…',
-            font_size=FONT_SIZES['small'],
+            font_size=self.suf(FONT_SIZES['small']),
             size_hint_y=None,
             color=COLORS['gray_400'],
             halign='left', valign='top',

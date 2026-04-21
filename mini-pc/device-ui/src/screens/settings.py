@@ -5,11 +5,13 @@ PRD §5.11 – Sections: DEVICE, NETWORK, STORAGE, SYSTEM,
 PRIVACY, DISPLAY, AUDIO, INTEGRATIONS, MAINTENANCE, SUPPORT.
 """
 
+import asyncio
 import logging
 
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.scrollview import ScrollView
 from kivy.uix.gridlayout import GridLayout
+from kivy.effects.scroll import ScrollEffect
 from kivy.uix.label import Label
 from kivy.uix.widget import Widget
 from kivy.clock import Clock
@@ -22,25 +24,9 @@ from components.modal_dialog import ModalDialog
 from config import (COLORS, FONT_SIZES, SPACING, DEVICE_MODEL,
                     DASHBOARD_URL)
 from hardware import request_system_poweroff, request_system_reboot
+from network_util import linux_ethernet_ready
 
 logger = logging.getLogger(__name__)
-
-
-def _section_header(text):
-    """Create an uppercase gray section header label."""
-    lbl = Label(
-        text=text,
-        font_size=FONT_SIZES['small'],
-        bold=True,
-        color=COLORS['gray_500'],
-        halign='left',
-        valign='bottom',
-        size_hint_y=None,
-        height=28,
-        padding=[16, 0],
-    )
-    lbl.bind(size=lbl.setter('text_size'))
-    return lbl
 
 
 class SettingsScreen(BaseScreen):
@@ -49,6 +35,22 @@ class SettingsScreen(BaseScreen):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self._build_ui()
+
+    def _section_header(self, text):
+        """Create an uppercase gray section header label."""
+        lbl = Label(
+            text=text,
+            font_size=self.suf(FONT_SIZES['small']),
+            bold=True,
+            color=COLORS['gray_500'],
+            halign='left',
+            valign='bottom',
+            size_hint_y=None,
+            height=self.suv(28),
+            padding=[self.suh(16), 0],
+        )
+        lbl.bind(size=lbl.setter('text_size'))
+        return lbl
 
     def _build_ui(self):
         root = BoxLayout(orientation='vertical')
@@ -65,17 +67,24 @@ class SettingsScreen(BaseScreen):
         root.add_widget(self.status_bar)
 
         # Scrollable items
-        scroll = ScrollView(do_scroll_x=False)
+        scroll = ScrollView(
+            do_scroll_x=False,
+            scroll_distance=12,
+            effect_cls=ScrollEffect,
+            smooth_scroll_end=0,
+            always_overscroll=False,
+        )
         self.container = GridLayout(
             cols=1,
-            spacing=SPACING['list_item_spacing'],
-            padding=[SPACING['screen_padding'], 8],
+            size_hint_x=1,
+            spacing=self.suv(SPACING['list_item_spacing']),
+            padding=[self.suh(SPACING['screen_padding']), self.suv(8)],
             size_hint_y=None,
         )
         self.container.bind(minimum_height=self.container.setter('height'))
 
         # ---- DEVICE ----
-        self.container.add_widget(_section_header('DEVICE'))
+        self.container.add_widget(self._section_header('DEVICE'))
 
         self.device_name_item = SettingsItem(
             title='Device Name',
@@ -90,11 +99,11 @@ class SettingsScreen(BaseScreen):
             subtitle=f'{DEVICE_MODEL}\nSerial: Loading…',
             mode='info',
         )
-        self.model_item.height = 70
+        self.model_item.height = self.suv(70)
         self.container.add_widget(self.model_item)
 
         # ---- NETWORK ----
-        self.container.add_widget(_section_header('NETWORK'))
+        self.container.add_widget(self._section_header('NETWORK'))
 
         self.wifi_item = SettingsItem(
             title='WiFi',
@@ -105,7 +114,7 @@ class SettingsScreen(BaseScreen):
         self.container.add_widget(self.wifi_item)
 
         # ---- STORAGE ----
-        self.container.add_widget(_section_header('STORAGE'))
+        self.container.add_widget(self._section_header('STORAGE'))
 
         self.storage_item = SettingsItem(
             title='Storage',
@@ -123,7 +132,7 @@ class SettingsScreen(BaseScreen):
         self.container.add_widget(self.auto_delete_item)
 
         # ---- SYSTEM ----
-        self.container.add_widget(_section_header('SYSTEM'))
+        self.container.add_widget(self._section_header('SYSTEM'))
 
         self.firmware_item = SettingsItem(
             title='Firmware Version',
@@ -148,7 +157,7 @@ class SettingsScreen(BaseScreen):
         self.container.add_widget(self.uptime_item)
 
         # ---- PRIVACY ----
-        self.container.add_widget(_section_header('PRIVACY'))
+        self.container.add_widget(self._section_header('PRIVACY'))
 
         self.privacy_item = SettingsItem(
             title='Privacy Mode',
@@ -169,7 +178,7 @@ class SettingsScreen(BaseScreen):
         self.container.add_widget(self.auto_record_item)
 
         # ---- DISPLAY ----
-        self.container.add_widget(_section_header('DISPLAY'))
+        self.container.add_widget(self._section_header('DISPLAY'))
 
         self.brightness_item = SettingsItem(
             title='Screen Brightness',
@@ -188,7 +197,7 @@ class SettingsScreen(BaseScreen):
         self.container.add_widget(self.timeout_item)
 
         # ---- AUDIO ----
-        self.container.add_widget(_section_header('AUDIO'))
+        self.container.add_widget(self._section_header('AUDIO'))
 
         self.mic_test_item = SettingsItem(
             title='Microphone Test',
@@ -199,7 +208,7 @@ class SettingsScreen(BaseScreen):
         self.container.add_widget(self.mic_test_item)
 
         # ---- INTEGRATIONS ----
-        self.container.add_widget(_section_header('INTEGRATIONS'))
+        self.container.add_widget(self._section_header('INTEGRATIONS'))
 
         self.gmail_item = SettingsItem(
             title='Gmail',
@@ -216,7 +225,7 @@ class SettingsScreen(BaseScreen):
         self.container.add_widget(self.calendar_item)
 
         # ---- MAINTENANCE ----
-        self.container.add_widget(_section_header('MAINTENANCE'))
+        self.container.add_widget(self._section_header('MAINTENANCE'))
 
         self.unpair_account_item = SettingsItem(
             title='Unpair from account',
@@ -251,7 +260,7 @@ class SettingsScreen(BaseScreen):
         self.container.add_widget(self.reset_item)
 
         # ---- SUPPORT ----
-        self.container.add_widget(_section_header('SUPPORT'))
+        self.container.add_widget(self._section_header('SUPPORT'))
 
         self.support_item = SettingsItem(
             title='Help',
@@ -261,7 +270,7 @@ class SettingsScreen(BaseScreen):
         self.container.add_widget(self.support_item)
 
         # Bottom padding
-        self.container.add_widget(Widget(size_hint_y=None, height=20))
+        self.container.add_widget(Widget(size_hint_y=None, height=self.suv(20)))
 
         scroll.add_widget(self.container)
         root.add_widget(scroll)
@@ -289,13 +298,24 @@ class SettingsScreen(BaseScreen):
     def _load_system_info(self):
         async def _fetch():
             try:
-                info = await self.backend.get_system_info()
+                results = await asyncio.gather(
+                    self.backend.get_system_info(),
+                    self.backend.get_settings(),
+                    self.backend.get_integrations(),
+                    return_exceptions=True,
+                )
+                info = results[0] if not isinstance(results[0], Exception) else {}
+                settings = (
+                    results[1] if not isinstance(results[1], Exception) else {}
+                )
+                integrations = (
+                    results[2] if not isinstance(results[2], Exception) else []
+                )
 
                 wifi_ssid = info.get('wifi_ssid', 'N/A')
-                sig = info.get('wifi_signal', 0)
-                bars = '▂▄▆█'[:max(1, sig // 25)]
+                sig = int(info.get('wifi_signal', 0) or 0)
                 ip = info.get('ip_address', '?')
-                wifi_text = f'{wifi_ssid}  {bars}\nIP: {ip}'
+                wifi_text = f'{wifi_ssid}  ({sig}%)\nIP: {ip}'
 
                 su = info.get('storage_used', 0) / (1024 ** 3)
                 st = info.get('storage_total', 1) / (1024 ** 3)
@@ -309,7 +329,6 @@ class SettingsScreen(BaseScreen):
                 up_d = up_s // 86400
                 up_h = (up_s % 86400) // 3600
 
-                settings = await self.backend.get_settings()
                 ad = settings.get('auto_delete_days', 'never')
                 ad_labels = {'never': 'Never', '30': 'After 30 days',
                              '60': 'After 60 days', '90': 'After 90 days'}
@@ -318,6 +337,23 @@ class SettingsScreen(BaseScreen):
                 to = settings.get('screen_timeout', 'never')
                 to_labels = {'never': 'Never', '5': 'After 5 min',
                              '10': 'After 10 min'}
+
+                gmail_status = f'Configure at {DASHBOARD_URL}'
+                cal_status = f'Configure at {DASHBOARD_URL}'
+                for integ in integrations:
+                    iid = (integ.get('id') or '').lower()
+                    iname = (integ.get('name') or '').lower()
+                    connected = bool(integ.get('connected'))
+                    email = (integ.get('email') or '').strip()
+                    acct = f' · {email}' if email else ''
+                    if iid == 'gmail' or 'gmail' in iname or 'mail' in iname:
+                        gmail_status = (
+                            f'Connected{acct}' if connected else f'Not connected · use {DASHBOARD_URL}'
+                        )
+                    elif iid == 'calendar' or 'calendar' in iname:
+                        cal_status = (
+                            f'Connected{acct}' if connected else f'Not connected · use {DASHBOARD_URL}'
+                        )
 
                 def _update(_dt):
                     self.wifi_item.subtitle_label.text = wifi_text
@@ -338,17 +374,23 @@ class SettingsScreen(BaseScreen):
                     self.app.auto_record = auto_rec
                     self.auto_record_item.toggle.active = auto_rec
 
+                    self.gmail_item.subtitle_label.text = gmail_status
+                    self.calendar_item.subtitle_label.text = cal_status
+
                     wifi_ok = bool(info.get('wifi_ssid'))
                     privacy = getattr(self.app, 'privacy_mode', False)
-                    self.update_footer(wifi_ok=wifi_ok, free_gb=sf,
-                                       privacy_mode=privacy)
+                    self.update_footer(
+                        wifi_ok=wifi_ok,
+                        free_gb=sf,
+                        privacy_mode=privacy,
+                        wired_lan_ok=linux_ethernet_ready(),
+                    )
 
                 Clock.schedule_once(_update, 0)
             except Exception:
                 pass
 
         run_async(_fetch())
-        self._load_integrations()
 
     # ------------------------------------------------------------------
     # Device name info dialog
@@ -363,39 +405,6 @@ class SettingsScreen(BaseScreen):
             cancel_text='',
         )
         self.add_widget(dialog)
-
-    # ------------------------------------------------------------------
-    # Integrations
-    # ------------------------------------------------------------------
-    def _load_integrations(self):
-        async def _fetch():
-            try:
-                integrations = await self.backend.get_integrations()
-                gmail_status = f'Configure at {DASHBOARD_URL}'
-                cal_status = f'Configure at {DASHBOARD_URL}'
-                for integ in integrations:
-                    iid = (integ.get('id') or '').lower()
-                    name = (integ.get('name') or '').lower()
-                    connected = bool(integ.get('connected'))
-                    email = (integ.get('email') or '').strip()
-                    acct = f' · {email}' if email else ''
-                    if iid == 'gmail' or 'gmail' in name or 'mail' in name:
-                        gmail_status = (
-                            f'Connected{acct}' if connected else f'Not connected · use {DASHBOARD_URL}'
-                        )
-                    elif iid == 'calendar' or 'calendar' in name:
-                        cal_status = (
-                            f'Connected{acct}' if connected else f'Not connected · use {DASHBOARD_URL}'
-                        )
-
-                def _update(_dt):
-                    self.gmail_item.subtitle_label.text = gmail_status
-                    self.calendar_item.subtitle_label.text = cal_status
-
-                Clock.schedule_once(_update, 0)
-            except Exception:
-                pass
-        run_async(_fetch())
 
     # ------------------------------------------------------------------
     # Privacy toggle
@@ -456,20 +465,23 @@ class SettingsScreen(BaseScreen):
         self.add_widget(dialog)
 
     def _do_restart(self):
-        """Prefer host reboot from this process; API is fallback (e.g. web has nsenter helper)."""
-        local_ok = request_system_reboot()
+        """Local reboot first (nsenter helper in Docker, systemctl on bare metal); API as fallback."""
 
         async def _restart():
+            local_ok = request_system_reboot()
             api_ok = False
-            try:
-                resp = await self.backend.update_settings({'action': 'restart'})
-                api_ok = bool(resp.get('host_reboot_initiated'))
-            except Exception as e:
-                logger.debug('restart API: %s', e)
+            if not local_ok:
+                try:
+                    resp = await self.backend.update_settings({'action': 'restart'})
+                    api_ok = bool(resp.get('host_reboot_initiated'))
+                except Exception as e:
+                    logger.warning('restart API fallback failed: %s', e)
             if not local_ok and not api_ok:
                 Clock.schedule_once(lambda *_: self._show_power_error('restart'), 0)
 
-        run_async(_restart())
+        fut = run_async(_restart())
+        if fut is None:
+            Clock.schedule_once(lambda *_: self._show_power_error('restart'), 0)
 
     def _show_power_error(self, op: str):
         if op == 'restart':
@@ -506,19 +518,21 @@ class SettingsScreen(BaseScreen):
         self.add_widget(dialog)
 
     def _do_poweroff(self):
-        local_ok = request_system_poweroff()
-
         async def _off():
+            local_ok = request_system_poweroff()
             api_ok = False
-            try:
-                resp = await self.backend.update_settings({'action': 'poweroff'})
-                api_ok = bool(resp.get('host_poweroff_initiated'))
-            except Exception as e:
-                logger.debug('poweroff API: %s', e)
+            if not local_ok:
+                try:
+                    resp = await self.backend.update_settings({'action': 'poweroff'})
+                    api_ok = bool(resp.get('host_poweroff_initiated'))
+                except Exception as e:
+                    logger.warning('poweroff API fallback failed: %s', e)
             if not local_ok and not api_ok:
                 Clock.schedule_once(lambda *_: self._show_power_error('poweroff'), 0)
 
-        run_async(_off())
+        fut = run_async(_off())
+        if fut is None:
+            Clock.schedule_once(lambda *_: self._show_power_error('poweroff'), 0)
 
     # ------------------------------------------------------------------
     # Factory reset dialog

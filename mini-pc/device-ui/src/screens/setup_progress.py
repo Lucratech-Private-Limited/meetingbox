@@ -33,7 +33,7 @@ class SetupProgressScreen(BaseScreen):
 
         msg1 = Label(
             text='Setting up your MeetingBox...',
-            font_size=FONT_SIZES['medium'],
+            font_size=self.suf(FONT_SIZES['medium']),
             color=COLORS['white'],
             halign='center',
             size_hint=(1, None), height=28,
@@ -43,7 +43,7 @@ class SetupProgressScreen(BaseScreen):
 
         self.status_label = Label(
             text='Waiting for WiFi configuration',
-            font_size=FONT_SIZES['body'],
+            font_size=self.suf(FONT_SIZES['body']),
             color=COLORS['gray_400'],
             halign='center',
             size_hint=(1, None), height=28,
@@ -55,7 +55,7 @@ class SetupProgressScreen(BaseScreen):
 
         self.dots_label = Label(
             text='●  ○  ○',
-            font_size=FONT_SIZES['large'],
+            font_size=self.suf(FONT_SIZES['large']),
             color=COLORS['gray_500'],
             halign='center',
             size_hint=(1, None), height=30,

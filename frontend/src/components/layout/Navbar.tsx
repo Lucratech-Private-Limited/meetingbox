@@ -3,6 +3,7 @@
 import { Link, useLocation } from 'react-router-dom'
 import { APP_NAME } from '../../utils/constants'
 import { useAuthStore } from '../../store/authStore'
+import { useTutorialStore } from '../../store/tutorialStore'
 
 const navigation = [
   { name: 'Dashboard', href: '/dashboard' },
@@ -15,9 +16,10 @@ export default function Navbar() {
   const location = useLocation()
   const logout = useAuthStore((s) => s.logout)
   const user = useAuthStore((s) => s.user)
+  const startTutorial = useTutorialStore((s) => s.start)
 
   return (
-    <nav className="bg-white shadow-sm">
+    <nav className="bg-white shadow-sm" data-tutorial="nav-main">
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
         <div className="flex justify-between h-16">
           <div className="flex">
@@ -52,6 +54,14 @@ export default function Navbar() {
 
           {/* Right side: user + logout */}
           <div className="hidden sm:flex sm:items-center sm:space-x-4">
+            <button
+              type="button"
+              onClick={startTutorial}
+              className="text-sm font-medium text-primary-600 hover:text-primary-800"
+              data-tutorial="nav-tour"
+            >
+              Tour
+            </button>
             {user && (
               <span className="text-sm text-gray-500">{user.display_name}</span>
             )}
@@ -65,7 +75,7 @@ export default function Navbar() {
 
           {/* Mobile menu (simplified) */}
           <div className="flex items-center sm:hidden">
-            <div className="flex space-x-4">
+            <div className="flex flex-wrap gap-x-4 gap-y-2">
               {navigation.map((item) => (
                 <Link
                   key={item.name}
@@ -75,6 +85,13 @@ export default function Navbar() {
                   {item.name}
                 </Link>
               ))}
+              <button
+                type="button"
+                onClick={startTutorial}
+                className="text-sm font-medium text-primary-600 hover:text-primary-800"
+              >
+                Tour
+              </button>
               <button
                 onClick={logout}
                 className="text-sm font-medium text-gray-500 hover:text-gray-700"

@@ -268,12 +268,34 @@ def emit_audio_command(actor: Optional[dict], payload: dict) -> None:
   - Also pushes to per-user list ``audio:http:{user_id}`` for HTTP long-poll on
     appliances that cannot reach server Redis (cloud API + mini PC).
   """
+  payload.setdefault("ts", datetime.now().timestamp())
   body = json.dumps(payload)
   r = _get_redis()
   r.publish("commands", body)
   uid = _actor_user_id(actor)
   if uid:
-    r.rpush(f"audio:http:{uid}", body)
+    uid_key = str(uid).strip()
+    if uid_key:
+      r.rpush(f"audio:http:{uid_key}", body)
+
+
+def _publish_recording_ws_event(event_type: str, session_id: Optional[str] = None) -> None:
+  """
+  Mirror audio_capture lifecycle publishes on the API host Redis ``events`` channel.
+
+  WebSocket clients (dashboard + device-ui) subscribe via server Redis. The appliance
+  audio service only publishes to its *local* Redis, so dashboard-initiated
+  start/stop never reached the device UI until this relay existed.
+  """
+  payload: dict = {
+    "type": event_type,
+    "timestamp": datetime.now().isoformat(),
+  }
+  if session_id:
+    payload["session_id"] = session_id
+  if event_type == "recording_stopped":
+    payload["path"] = None
+  _get_redis().publish("events", json.dumps(payload))
 
 
 def _session_owner_key(session_id: str) -> str:
@@ -326,6 +348,7 @@ async def start_meeting(current_actor: Optional[dict] = Depends(get_optional_act
   emit_audio_command(current_actor, {"action": "start_recording", "session_id": session_id})
   _get_redis().set("current_meeting_id", session_id)
   _get_redis().set("recording_state", "recording")
+  _publish_recording_ws_event("recording_started", session_id)
   return {"session_id": session_id, "status": "recording_started"}
 
 
@@ -338,6 +361,7 @@ async def stop_meeting(current_actor: Optional[dict] = Depends(get_optional_acto
     {"action": "stop_recording", "session_id": session_id},
   )
   _get_redis().set("recording_state", "processing")
+  _publish_recording_ws_event("recording_stopped", session_id)
   if session_id:
     _get_redis().delete("current_meeting_id")
   return {"session_id": session_id, "status": "recording_stopped"}
@@ -371,6 +395,7 @@ async def pause_meeting(current_actor: Optional[dict] = Depends(get_optional_act
     {"action": "pause_recording", "session_id": session_id},
   )
   _get_redis().set("recording_state", "paused")
+  _publish_recording_ws_event("recording_paused", session_id)
   return {"status": "paused", "session_id": session_id}
 
 
@@ -386,6 +411,7 @@ async def resume_meeting(current_actor: Optional[dict] = Depends(get_optional_ac
     {"action": "resume_recording", "session_id": session_id},
   )
   _get_redis().set("recording_state", "recording")
+  _publish_recording_ws_event("recording_resumed", session_id)
   return {"status": "recording", "session_id": session_id}
 
 

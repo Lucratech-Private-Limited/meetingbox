@@ -38,7 +38,7 @@ SCREEN_BG = (0.043, 0.051, 0.067, 1)
 def _field_label(text: str) -> Label:
     lb = Label(
         text=text,
-        font_size=FONT_SIZES["small"],
+        font_size=BaseScreen.suf(FONT_SIZES["small"]),
         bold=True,
         color=COLORS["white"],
         halign="left",
@@ -55,7 +55,7 @@ def _text_input(**kwargs) -> TextInput:
         multiline=False,
         size_hint=(1, None),
         height=48,
-        font_size=FONT_SIZES["medium"],
+        font_size=BaseScreen.suf(FONT_SIZES["medium"]),
         padding=[14, 12],
         background_normal="",
         background_active="",
@@ -89,7 +89,7 @@ def _make_qr_image_widget(url: str, px: int = 116):
             pass
     return Label(
         text="[QR]",
-        font_size=FONT_SIZES["small"],
+        font_size=BaseScreen.suf(FONT_SIZES["small"]),
         color=COLORS["gray_500"],
         size_hint=(None, None),
         size=(px, px),
@@ -127,7 +127,7 @@ class PairDeviceScreen(BaseScreen):
             header.add_widget(Widget(size_hint=(None, 1), width=8))
         brand = Label(
             text="MeetingBox",
-            font_size=FONT_SIZES["title"],
+            font_size=self.suf(FONT_SIZES["title"]),
             bold=True,
             color=COLORS["white"],
             halign="left",
@@ -153,7 +153,7 @@ class PairDeviceScreen(BaseScreen):
 
         title = Label(
             text="Link this device",
-            font_size=FONT_SIZES["huge"],
+            font_size=self.suf(FONT_SIZES["huge"]),
             bold=True,
             color=COLORS["white"],
             halign="center",
@@ -169,7 +169,7 @@ class PairDeviceScreen(BaseScreen):
                 "Sign in on the dashboard (scan the QR code), open Settings → Devices, "
                 "and generate a pairing code. Enter it below."
             ),
-            font_size=FONT_SIZES["small"],
+            font_size=self.suf(FONT_SIZES["small"]),
             color=COLORS["gray_400"],
             halign="center",
             valign="middle",
@@ -183,7 +183,7 @@ class PairDeviceScreen(BaseScreen):
 
         qr_caption = Label(
             text="Web dashboard",
-            font_size=FONT_SIZES["small"],
+            font_size=self.suf(FONT_SIZES["small"]),
             bold=True,
             color=COLORS["gray_500"],
             halign="center",
@@ -200,7 +200,7 @@ class PairDeviceScreen(BaseScreen):
 
         url_lbl = Label(
             text=dash_http,
-            font_size=FONT_SIZES["tiny"],
+            font_size=self.suf(FONT_SIZES["tiny"]),
             color=COLORS["gray_600"],
             halign="center",
             valign="middle",
@@ -221,7 +221,7 @@ class PairDeviceScreen(BaseScreen):
             text="Link device",
             size_hint=(1, None),
             height=52,
-            font_size=FONT_SIZES["medium"],
+            font_size=self.suf(FONT_SIZES["medium"]),
         )
         self._link_btn.bind(on_press=self._on_link)
         body.add_widget(self._link_btn)
@@ -236,7 +236,7 @@ class PairDeviceScreen(BaseScreen):
             text="Back",
             size_hint=(None, 1),
             width=100,
-            font_size=FONT_SIZES["medium"],
+            font_size=self.suf(FONT_SIZES["medium"]),
         )
         back_btn.bind(on_press=lambda *_: self.go_back())
         footer.add_widget(back_btn)

@@ -2,6 +2,7 @@
 
 import { Outlet } from 'react-router-dom'
 import Navbar from './Navbar'
+import InteractiveTutorial from '../tutorial/InteractiveTutorial'
 
 export default function Layout() {
   return (
@@ -10,6 +11,7 @@ export default function Layout() {
       <main>
         <Outlet />
       </main>
+      <InteractiveTutorial />
     </div>
   )
 }

@@ -84,7 +84,7 @@ export default function LiveRecording() {
     <div className="max-w-4xl mx-auto px-4 py-8">
 
       {/* Status bar */}
-      <div className="bg-red-50 border-2 border-red-500 rounded-lg p-6 mb-8">
+      <div className="bg-red-50 border-2 border-red-500 rounded-lg p-6 mb-8" data-tutorial="tutorial-live-panel">
         <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
           <div className="flex items-center space-x-4">
             <div className="flex items-center">

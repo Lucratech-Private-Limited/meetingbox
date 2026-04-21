@@ -1,0 +1,32 @@
+#!/bin/sh
+# Reboot the mini-PC from inside device-ui.
+#
+# Runs as root (via sudo -n from uiuser). This is NOT the same as ``sudo reboot`` on the
+# host desktop — the device-ui image ships a sudoers rule: NOPASSWD only for this path and
+# meetingbox-host-poweroff.
+#
+# Requires: docker-compose ``pid: host``, ``privileged: true``, rebuilt image with sudo+sudoers.
+# Fallback: MEETINGBOX_LOCAL_REBOOT_CMD in .env.
+
+set -e
+SELF=/usr/local/bin/meetingbox-host-reboot
+if [ "$(id -u)" -ne 0 ]; then
+  if ! command -v sudo >/dev/null 2>&1; then
+    echo "meetingbox-host-reboot: need root but sudo is missing — rebuild device-ui image" >&2
+    exit 1
+  fi
+  # Do not use ``exec sudo`` — if sudo fails we must exit with a clear code.
+  sudo -n "$SELF" "$@" || {
+    echo "meetingbox-host-reboot: sudo -n failed. Rebuild device-ui (sudo+sudoers) or check NOPASSWD for $SELF" >&2
+    exit 1
+  }
+  exit 0
+fi
+
+if ! command -v nsenter >/dev/null 2>&1; then
+  echo "meetingbox-host-reboot: nsenter not found (install util-linux in the image)" >&2
+  exit 1
+fi
+
+exec nsenter -t 1 -m -u -i -n -p -- /bin/sh -c \
+  '/usr/bin/systemctl reboot 2>/dev/null || /bin/systemctl reboot 2>/dev/null || /sbin/reboot -f'

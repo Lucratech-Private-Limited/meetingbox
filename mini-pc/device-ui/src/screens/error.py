@@ -43,21 +43,21 @@ class ErrorScreen(BaseScreen):
         # Warning icon
         icon = Label(
             text='⚠',
-            font_size=52,
+            font_size=self.suf(52),
             color=COLORS['yellow'],
             halign='center',
-            size_hint=(1, None), height=60,
+            size_hint=(1, None), height=self.suv(60),
         )
         root.add_widget(icon)
 
         # Error title
         self.type_label = Label(
             text=self.error_type,
-            font_size=FONT_SIZES['large'],
+            font_size=self.suf(FONT_SIZES['large']),
             bold=True,
             color=COLORS['white'],
             halign='center',
-            size_hint=(1, None), height=30,
+            size_hint=(1, None), height=self.suv(30),
         )
         self.type_label.bind(size=self.type_label.setter('text_size'))
         root.add_widget(self.type_label)
@@ -65,37 +65,37 @@ class ErrorScreen(BaseScreen):
         # Error message
         self.message_label = Label(
             text=self.error_message,
-            font_size=FONT_SIZES['small'] + 2,
+            font_size=self.suf(FONT_SIZES['small'] + 2),
             color=COLORS['gray_500'],
             halign='center',
             valign='top',
-            size_hint=(1, None), height=50,
+            size_hint=(1, None), height=self.suv(50),
         )
         self.message_label.bind(size=self.message_label.setter('text_size'))
         root.add_widget(self.message_label)
 
-        root.add_widget(Widget(size_hint=(1, None), height=8))
+        root.add_widget(Widget(size_hint=(1, None), height=self.suv(8)))
 
         # Recovery button (conditionally visible)
         btn_col = BoxLayout(
             orientation='vertical',
-            size_hint=(1, None), height=130,
-            padding=[80, 0],
-            spacing=SPACING['button_spacing'],
+            size_hint=(1, None), height=self.suv(130),
+            padding=[self.suh(80), 0],
+            spacing=self.suv(SPACING['button_spacing']),
         )
 
         self.recovery_btn = PrimaryButton(
             text='TRY AGAIN',
-            font_size=FONT_SIZES['medium'],
-            size_hint=(1, None), height=55,
+            font_size=self.suf(FONT_SIZES['medium']),
+            size_hint=(1, None), height=self.suv(55),
         )
         self.recovery_btn.bind(on_press=self._on_recovery)
         btn_col.add_widget(self.recovery_btn)
 
         self.home_btn = SecondaryButton(
             text='GO HOME',
-            font_size=FONT_SIZES['medium'],
-            size_hint=(1, None), height=55,
+            font_size=self.suf(FONT_SIZES['medium']),
+            size_hint=(1, None), height=self.suv(55),
         )
         self.home_btn.bind(on_press=lambda _: self.goto('home'))
         btn_col.add_widget(self.home_btn)

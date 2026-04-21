@@ -14,7 +14,15 @@ from kivy.uix.label import Label
 from kivy.graphics import Color, Rectangle
 from kivy.app import App
 
-from config import COLORS, FONT_SIZES, SPACING, FOOTER_HEIGHT, DISPLAY_WIDTH
+from config import (
+    COLORS,
+    DISPLAY_WIDTH,
+    FONT_SIZES,
+    FOOTER_HEIGHT,
+    SPACING,
+    other_screen_horizontal_scale,
+    other_screen_vertical_scale,
+)
 
 
 class BaseScreen(Screen):
@@ -31,6 +39,22 @@ class BaseScreen(Screen):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+
+    # --- Display-relative sizing (20% larger than home; see config OTHER_CONTENT_SCALE) ---
+    @staticmethod
+    def suv(px):
+        v = other_screen_vertical_scale()
+        return max(1, int(round(float(px) * v)))
+
+    @staticmethod
+    def suh(px):
+        h = other_screen_horizontal_scale()
+        return max(1, int(round(float(px) * h)))
+
+    @staticmethod
+    def suf(fs):
+        v = other_screen_vertical_scale()
+        return max(6, int(round(float(fs) * v)))
 
     @property
     def app(self):
@@ -77,8 +101,8 @@ class BaseScreen(Screen):
         footer = BoxLayout(
             orientation='horizontal',
             size_hint=(1, None),
-            height=FOOTER_HEIGHT,
-            padding=[SPACING['screen_padding'], 0],
+            height=self.suv(FOOTER_HEIGHT),
+            padding=[self.suh(SPACING['screen_padding']), 0],
         )
         with footer.canvas.before:
             Color(*COLORS['background'])
@@ -90,7 +114,7 @@ class BaseScreen(Screen):
 
         self._footer_left = Label(
             text='WiFi: ✓   Storage: …GB free',
-            font_size=FONT_SIZES['tiny'],
+            font_size=self.suf(FONT_SIZES['tiny']),
             color=COLORS['gray_500'],
             halign='left',
             valign='middle',
@@ -101,16 +125,16 @@ class BaseScreen(Screen):
 
         sep = Label(
             text='|',
-            font_size=FONT_SIZES['tiny'],
+            font_size=self.suf(FONT_SIZES['tiny']),
             color=COLORS['gray_700'],
             size_hint=(None, 1),
-            width=16,
+            width=self.suh(16),
         )
         footer.add_widget(sep)
 
         self._footer_right = Label(
             text='Dashboard: meetingbox.local',
-            font_size=FONT_SIZES['tiny'],
+            font_size=self.suf(FONT_SIZES['tiny']),
             color=COLORS['gray_500'],
             halign='right',
             valign='middle',
@@ -121,15 +145,26 @@ class BaseScreen(Screen):
 
         return footer
 
-    def update_footer(self, wifi_ok=True, free_gb=0, privacy_mode=False):
+    def update_footer(
+        self,
+        wifi_ok=True,
+        free_gb=0,
+        privacy_mode=False,
+        wired_lan_ok=False,
+    ):
         """Update footer labels if footer exists."""
         if not hasattr(self, '_footer_left'):
             return
-        wifi = '✓' if wifi_ok else '✗'
         if privacy_mode:
             self._footer_left.text = f'Local Mode   Storage: {free_gb:.0f}GB free'
+            return
+        if wifi_ok:
+            link = 'WiFi: ✓'
+        elif wired_lan_ok:
+            link = 'LAN: ✓'
         else:
-            self._footer_left.text = f'WiFi: {wifi}   Storage: {free_gb:.0f}GB free'
+            link = 'WiFi: ✗'
+        self._footer_left.text = f'{link}   Storage: {free_gb:.0f}GB free'
 
     # ------------------------------------------------------------------
     # Lifecycle hooks (override in subclasses)

@@ -11,7 +11,9 @@ import json
 import logging
 import os
 import shutil
+import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -51,8 +53,42 @@ from kivy.config import Config
 # Setting position/size/fullscreen after Window exists only partially works and
 # causes the window to render at the wrong position (top-left or bottom-left).
 _FULLSCREEN = os.getenv('FULLSCREEN', '0') == '1'
-_W = int(os.getenv('DISPLAY_WIDTH', '1024'))
-_H = int(os.getenv('DISPLAY_HEIGHT', '600'))
+
+
+def _env_display_int(name: str, default: int) -> int:
+    """Same rules as config._parse_display_px — must not raise; runs before config import."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    s = str(raw).strip()
+    if not s:
+        print(
+            f"[MeetingBox] WARNING: {name} is set but empty; using default {default}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return default
+    try:
+        v = int(s)
+    except ValueError:
+        print(
+            f"[MeetingBox] WARNING: {name}={raw!r} is not an integer; using default {default}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return default
+    if v < 32 or v > 32768:
+        print(
+            f"[MeetingBox] WARNING: {name}={v} out of range [32,32768]; using default {default}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return default
+    return v
+
+
+_W = _env_display_int("DISPLAY_WIDTH", 1024)
+_H = _env_display_int("DISPLAY_HEIGHT", 600)
 
 Config.set('graphics', 'window_state', 'visible')
 Config.set('graphics', 'position', 'custom')
@@ -80,6 +116,8 @@ from config import (
     SHOW_FPS,
     TRANSITION_DURATION,
     DEFAULT_PRIVACY_MODE,
+    LOCAL_REDIS_HOST,
+    LOCAL_REDIS_PORT,
     setup_complete_marker_paths_for_read,
     get_device_auth_token,
     clear_stored_device_auth_token,
@@ -148,6 +186,15 @@ def setup_logging():
 setup_logging()
 logger = logging.getLogger(__name__)
 
+if _FULLSCREEN and _W == 1024 and _H == 600:
+    logger.warning(
+        "Kivy window size is default 1024×600 (DISPLAY_WIDTH/DISPLAY_HEIGHT). "
+        "The home UI scales from that baseline, so on a large or ultrawide panel everything "
+        "will look small until you set DISPLAY_WIDTH and DISPLAY_HEIGHT in mini-pc/.env to match "
+        "`xrandr`, then `docker compose up -d --build device-ui` (or set "
+        "MEETINGBOX_SYNC_DISPLAY_FROM_XRANDR=1 in .env to auto-detect via xrandr)."
+    )
+
 # Import async helper (starts background loop on import)
 from async_helper import run_async, get_async_loop
 
@@ -159,6 +206,129 @@ _PAIRING_UNPAIR_DEFER_SCREENS = frozenset({
     'summary_review',
     'complete',
 })
+
+
+def _recording_start_transient_network(exc: BaseException) -> bool:
+    """True when a short wait and retry may succeed (e.g. after Wi‑Fi handover)."""
+    if isinstance(
+        exc,
+        (
+            httpx.ConnectError,
+            httpx.ConnectTimeout,
+            httpx.ReadTimeout,
+            httpx.WriteTimeout,
+            httpx.PoolTimeout,
+        ),
+    ):
+        return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code in (502, 503, 504)
+    return False
+
+
+def _recording_start_error_screen_args(exc: BaseException) -> tuple[str, str]:
+    """(title, message) for show_error_screen after start_recording failure."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        code = exc.response.status_code
+        if code == 401:
+            return (
+                "Sign-in required",
+                "This device could not authorize with the server. Pair the device again "
+                "or check BACKEND_URL.",
+            )
+        if code >= 500:
+            return (
+                "Server error",
+                f"The backend returned HTTP {code}. Confirm the API is running and "
+                "reachable from this network.",
+            )
+        body = (exc.response.text or "").strip()
+        snippet = body[:240] + ("…" if len(body) > 240 else "")
+        return ("Recording failed", snippet or f"Server returned HTTP {code}.")
+    if _recording_start_transient_network(exc):
+        return (
+            "Cannot reach server",
+            "Could not connect to the MeetingBox backend. After switching networks (for "
+            "example unplugging Ethernet and using Wi‑Fi), wait a few seconds, confirm this "
+            "device can reach the server URL, then tap TRY AGAIN. If it keeps failing, check "
+            "BACKEND_URL in the appliance configuration.",
+        )
+    msg = (str(exc) or "Unknown error").strip()
+    if len(msg) > 400:
+        msg = msg[:397] + "…"
+    return ("Recording failed", msg)
+
+
+def _xauthority_has_display_zero(cookie_text: str) -> bool:
+    """True if xauth list output likely includes authority for local display :0."""
+    low = cookie_text.lower()
+    if "unix:0" in low:
+        return True
+    for line in cookie_text.splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        fam = parts[0].lower()
+        if fam.endswith(":0") and ":10" not in fam and ":11" not in fam:
+            return True
+    return False
+
+
+def _diagnose_xauthority_for_docker():
+    """Log hints when the mounted cookie cannot authorize DISPLAY=:0 (Docker + local X11)."""
+    if not sys.platform.startswith("linux"):
+        return
+    path = (os.environ.get("XAUTHORITY") or "").strip()
+    disp = (os.environ.get("DISPLAY") or "").strip()
+    if not path:
+        print("[MeetingBox] WARNING: XAUTHORITY is unset — X11 will usually reject the UI.", flush=True)
+        return
+    p = Path(path)
+    if p.is_dir():
+        print(
+            f"[MeetingBox] FATAL: XAUTHORITY is a directory (bad bind). Remove it on the host and use "
+            f"a real cookie file; path was: {path}",
+            flush=True,
+        )
+        return
+    if not p.is_file():
+        return
+    xauth_bin = shutil.which("xauth")
+    if not xauth_bin:
+        return
+    try:
+        r = subprocess.run(
+            [xauth_bin, "-f", path, "list"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        out = (r.stdout or "").strip()
+        err = (r.stderr or "").strip()
+        if r.returncode != 0:
+            print(
+                f"[MeetingBox] xauth list failed (exit {r.returncode}): {err or out[:400]}",
+                flush=True,
+            )
+            return
+        if not out:
+            print(
+                "[MeetingBox] WARNING: mounted Xauthority file has zero entries — "
+                "mount the desktop user's cookie (see XAUTHORITY_HOST in .env).",
+                flush=True,
+            )
+            return
+        if disp.endswith(":0") and not _xauthority_has_display_zero(out):
+            print(
+                "[MeetingBox] WARNING: this Xauthority file has no :0 / unix:0 entry but "
+                "DISPLAY is :0 (SSH or wrong file often only has :10). "
+                "Fix: from a terminal ON THE BUILT-IN SCREEN run:  xauth list $DISPLAY\n"
+                "then set XAUTHORITY_HOST in .env to that user's ~/.Xauthority or "
+                "/run/user/$(id -u)/gdm/Xauthority",
+                flush=True,
+            )
+    except Exception as ex:
+        logger.debug("xauthority diagnose: %s", ex)
 
 
 # ==================================================================
@@ -195,6 +365,10 @@ class MeetingBoxApp(App):
             'elapsed': 0,
             'speaker_count': 0,
         }
+        # Set when WS `transcription_complete` fires; cleared on new recording.
+        # Lets the processing screen enable the summary CTA even if that event
+        # arrived before navigation to `processing`.
+        self._transcription_done_for_session = None
         self.privacy_mode = DEFAULT_PRIVACY_MODE
         self.device_name = 'MeetingBox'
         self.auto_record = False
@@ -209,9 +383,23 @@ class MeetingBoxApp(App):
         self.screen_manager = None
         self._nav_stack = []
 
+        # Summary-ready fallback poll state (used when the `summary_complete` WS
+        # event is missed while the processing screen is shown).
+        self._summary_poll_meeting_id = None
+        self._summary_poll_done = False
+
+        # Transcript CTA fallback: enable "View Meeting Summary" when segments
+        # exist in the API even if `transcription_complete` never hits the WS.
+        self._transcript_cta_poll_meeting_id = None
+        self._transcript_cta_satisfied_meeting_id = None
+
         # WebSocket
         self.ws_task = None
         self._pairing_poll = None
+
+        # Local Redis subscriber (audio_level / mic_test_level from audio container)
+        self._local_redis_thread = None
+        self._local_redis_stop = threading.Event()
 
         # Screen timeout
         self._screen_timeout_minutes = 0  # 0 = never
@@ -232,7 +420,16 @@ class MeetingBoxApp(App):
 
         # Show cursor in windowed mode (mouse/desktop).
         # Hide it only in fullscreen kiosk mode (touchscreen, no mouse).
-        Window.show_cursor = (not FULLSCREEN) or SHOW_FPS
+        # If X11 auth failed, SDL never creates a window — show_cursor crashes internally.
+        try:
+            Window.show_cursor = (not FULLSCREEN) or SHOW_FPS
+        except (AttributeError, TypeError) as e:
+            # Do not crash the process: Docker restart loops look like a flickering panel with no UI.
+            logger.error(
+                "Kivy window not ready for show_cursor (X11/auth?). Continuing. "
+                "Fix: xhost +local:docker and correct XAUTHORITY mount. Detail: %s",
+                e,
+            )
 
         # Screen manager – default to fade transition
         self.screen_manager = ScreenManager(
@@ -276,6 +473,10 @@ class MeetingBoxApp(App):
         # Start WebSocket listener
         self.start_websocket_listener()
 
+        # Start local Redis listener for real-time audio levels from the audio
+        # container (both on the same Docker network).
+        self._start_local_redis_listener()
+
         if SHOW_FPS:
             Clock.schedule_interval(self._log_fps, 1.0)
 
@@ -285,30 +486,6 @@ class MeetingBoxApp(App):
         # combinations leave it hidden until raised).
         Clock.schedule_once(lambda *_: self._ensure_window_visible(), 0)
         Clock.schedule_once(lambda *_: self._ensure_window_visible(), 0.3)
-
-        # region agent log
-        def _dbg_window(_dt):
-            try:
-                _debug_ndjson(
-                    "H2",
-                    "main.py:MeetingBoxApp.build",
-                    "window_after_build",
-                    {
-                        "size": [float(Window.size[0]), float(Window.size[1])],
-                        "pos": [float(Window.pos[0]), float(Window.pos[1])],
-                        "fullscreen": bool(Window.fullscreen),
-                    },
-                )
-            except Exception as ex:
-                _debug_ndjson(
-                    "H2",
-                    "main.py:MeetingBoxApp.build",
-                    "window_probe_failed",
-                    {"error": str(ex)},
-                )
-
-        Clock.schedule_once(_dbg_window, 0.5)
-        # endregion
 
         logger.info("UI built – starting on splash screen")
         return self.screen_manager
@@ -432,6 +609,27 @@ class MeetingBoxApp(App):
         if not USE_MOCK_BACKEND:
             self._pairing_poll = Clock.schedule_interval(
                 self._pairing_watchdog, 45.0)
+            self._metrics_push = Clock.schedule_interval(
+                self._push_appliance_metrics_tick, 30.0)
+            Clock.schedule_once(lambda _dt: self._push_appliance_metrics_tick(0), 6.0)
+        else:
+            self._metrics_push = None
+
+    def _push_appliance_metrics_tick(self, _dt):
+        if USE_MOCK_BACKEND:
+            return
+        if not get_device_auth_token().strip():
+            return
+        run_async(self._push_appliance_metrics_async())
+
+    async def _push_appliance_metrics_async(self):
+        try:
+            from appliance_metrics import collect_appliance_metrics
+
+            data = collect_appliance_metrics()
+            await self.backend.post_appliance_system_metrics(data)
+        except Exception as e:
+            logger.debug("Appliance metrics push skipped: %s", e)
 
     def _global_setup_check(self, _dt):
         """Global poll for setup_complete marker -- fires from any screen."""
@@ -450,11 +648,15 @@ class MeetingBoxApp(App):
 
     def on_stop(self):
         logger.info("MeetingBox UI stopping")
+        self._local_redis_stop.set()
         if getattr(self, '_setup_poll', None):
             self._setup_poll.cancel()
         if getattr(self, '_pairing_poll', None):
             self._pairing_poll.cancel()
             self._pairing_poll = None
+        if getattr(self, '_metrics_push', None):
+            self._metrics_push.cancel()
+            self._metrics_push = None
         if self.ws_task and not self.ws_task.done():
             self.ws_task.cancel()
         run_async(self.backend.close())
@@ -604,16 +806,103 @@ class MeetingBoxApp(App):
             Clock.schedule_once(lambda _: self.start_websocket_listener(), 0)
 
     # ==================================================================
+    # LOCAL REDIS LISTENER (audio_level / mic_test_level from audio container)
+    # ==================================================================
+
+    _LOCAL_REDIS_EVENT_TYPES = frozenset({
+        'audio_level', 'mic_test_level',
+        'recording_started', 'recording_stopped',
+        'recording_paused', 'recording_resumed',
+    })
+
+    def _start_local_redis_listener(self):
+        if self._local_redis_thread and self._local_redis_thread.is_alive():
+            return
+        self._local_redis_stop.clear()
+        t = threading.Thread(
+            target=self._local_redis_subscriber_loop, daemon=True,
+            name="local-redis-events",
+        )
+        t.start()
+        self._local_redis_thread = t
+
+    def _local_redis_subscriber_loop(self):
+        try:
+            import redis as _redis_mod
+        except ImportError:
+            logger.warning("redis package not installed — local audio levels unavailable")
+            return
+
+        backoff = 1
+        while not self._local_redis_stop.is_set():
+            try:
+                rc = _redis_mod.Redis(
+                    host=LOCAL_REDIS_HOST, port=LOCAL_REDIS_PORT,
+                    decode_responses=True, socket_connect_timeout=5,
+                )
+                rc.ping()
+                logger.info("Local Redis connected (%s:%s) — subscribing to 'events'",
+                            LOCAL_REDIS_HOST, LOCAL_REDIS_PORT)
+                backoff = 1
+                pubsub = rc.pubsub()
+                pubsub.subscribe("events")
+                for msg in pubsub.listen():
+                    if self._local_redis_stop.is_set():
+                        break
+                    if msg["type"] != "message":
+                        continue
+                    try:
+                        event = json.loads(msg["data"])
+                    except (json.JSONDecodeError, TypeError):
+                        continue
+                    etype = event.get("type")
+                    if etype not in self._LOCAL_REDIS_EVENT_TYPES:
+                        continue
+                    data = event.get("data") or event
+                    handler = {
+                        'audio_level': self.on_audio_level,
+                        'mic_test_level': self.on_mic_test_level,
+                        'recording_started': self.on_recording_started,
+                        'recording_stopped': self.on_recording_stopped,
+                        'recording_paused': self.on_recording_paused,
+                        'recording_resumed': self.on_recording_resumed,
+                    }.get(etype)
+                    if handler:
+                        handler(data)
+            except Exception as e:
+                if not self._local_redis_stop.is_set():
+                    logger.warning("Local Redis error (%s:%s): %s — retrying in %ss",
+                                   LOCAL_REDIS_HOST, LOCAL_REDIS_PORT, e, backoff)
+                    self._local_redis_stop.wait(backoff)
+                    backoff = min(backoff * 2, 30)
+
+    # ==================================================================
     # EVENT HANDLERS
     # ==================================================================
 
     def on_recording_started(self, data):
-        self.current_session_id = data.get('session_id')
+        sid = data.get('session_id')
+        # API + local audio may both publish recording_started when Redis is shared.
+        if sid and self.current_session_id == sid and self.recording_state.get('active'):
+            return
+        self.current_session_id = sid
+        self._transcription_done_for_session = None
+        self._transcript_cta_satisfied_meeting_id = None
+        self._transcript_cta_poll_meeting_id = None
         self.recording_state.update(active=True, paused=False, elapsed=0)
         Clock.schedule_once(lambda _: self.goto_screen('recording', 'fade'), 0)
 
+    def _kick_post_stop_meeting_polls(self, sid):
+        """HTTP fallbacks so processing screen gets transcript + summary without relying on WS."""
+        if not sid:
+            return
+        Clock.schedule_once(lambda _dt, mid=sid: self._start_transcript_cta_poll(mid), 0)
+        Clock.schedule_once(lambda _dt, mid=sid: self._start_summary_poll(mid), 0)
+
     def on_recording_stopped(self, data):
         self.recording_state['active'] = False
+        sid = data.get('session_id') or self.current_session_id
+        self._kick_post_stop_meeting_polls(sid)
         Clock.schedule_once(lambda _: self.goto_screen('processing', 'fade'), 0)
 
     def on_recording_paused(self, data):
@@ -669,7 +958,7 @@ class MeetingBoxApp(App):
                 lambda _: screen.on_backend_progress(progress, status, eta), 0)
 
     def on_transcription_complete(self, data):
-        meeting_id = data.get('meeting_id')
+        meeting_id = data.get('meeting_id') or data.get('session_id')
         logger.info("Transcription complete for meeting %s", meeting_id)
 
         def _update_status(_dt):
@@ -678,6 +967,22 @@ class MeetingBoxApp(App):
                 screen.set_processing_status('Transcription done. Building meeting report…')
 
         Clock.schedule_once(_update_status, 0)
+
+        if meeting_id:
+            self._transcription_done_for_session = meeting_id
+
+            def _enable_processing_cta(_dt):
+                screen = self.screen_manager.get_screen("processing")
+                if hasattr(screen, "on_transcription_ready"):
+                    screen.on_transcription_ready(meeting_id)
+
+            Clock.schedule_once(_enable_processing_cta, 0)
+
+        # Safety net: if `summary_complete` WS packet never arrives (network
+        # hiccup, WS disconnected during the window, server emit dropped), we
+        # still need to reveal the CTA. Start a bounded HTTP poll.
+        if meeting_id:
+            self._start_summary_poll(meeting_id)
 
     def on_summary_progress(self, data):
         def _update_status(_dt):
@@ -725,12 +1030,136 @@ class MeetingBoxApp(App):
         """Handle summary_complete event from AI service (if it fires separately)."""
         meeting_id = data.get('meeting_id')
         summary = data.get('summary', {})
-        if meeting_id and self.screen_manager.current == 'processing':
-            def _show(_dt):
-                screen = self.screen_manager.get_screen('summary_review')
-                screen.set_meeting_data(meeting_id, summary)
-                self.goto_screen('summary_review', 'fade')
-            Clock.schedule_once(_show, 0)
+        if meeting_id:
+            Clock.schedule_once(
+                lambda _dt: self._show_processing_summary_ready(meeting_id, summary),
+                0,
+            )
+
+    def _show_processing_summary_ready(self, meeting_id: str, summary: dict):
+        """Keep user on processing screen and enable CTA once summary is ready."""
+        # Any path reaching here is the authoritative "summary ready" signal —
+        # silence the fallback poll so we don't duplicate work.
+        if self._summary_poll_meeting_id == meeting_id:
+            self._summary_poll_done = True
+        try:
+            processing = self.screen_manager.get_screen('processing')
+        except Exception as e:
+            logger.debug("Processing screen unavailable for summary-ready update: %s", e)
+            return
+        if hasattr(processing, 'on_summary_ready'):
+            processing.on_summary_ready(meeting_id, summary or {})
+
+    def _start_summary_poll(self, meeting_id: str):
+        """Kick off the HTTP fallback poll that watches for a saved summary.
+
+        Safe to call multiple times — new meeting_id replaces the previous one,
+        and _show_processing_summary_ready() flips the done flag regardless of
+        which path delivered the summary first.
+        """
+        if not meeting_id:
+            return
+        self._summary_poll_meeting_id = meeting_id
+        self._summary_poll_done = False
+        run_async(self._poll_summary_until_ready(meeting_id))
+
+    async def _poll_summary_until_ready(self, meeting_id: str):
+        """Poll GET /api/meetings/{id} every 5s for up to ~5 minutes. If a
+        summary appears, deliver it via _show_processing_summary_ready."""
+        logger.info("Summary poll starting for meeting %s", meeting_id)
+        for attempt in range(60):  # 60 * 5s = 5 minutes
+            if self._summary_poll_done or self._summary_poll_meeting_id != meeting_id:
+                return
+            await asyncio.sleep(5.0)
+            if self._summary_poll_done or self._summary_poll_meeting_id != meeting_id:
+                return
+            try:
+                detail = await self.backend.get_meeting_detail(meeting_id)
+            except Exception as e:
+                logger.debug(
+                    "Summary poll attempt %d failed for %s: %s",
+                    attempt + 1, meeting_id, e,
+                )
+                continue
+            summary = (detail or {}).get('summary') or {}
+            if summary:
+                logger.info(
+                    "Summary poll found summary for %s after %d attempt(s)",
+                    meeting_id, attempt + 1,
+                )
+                Clock.schedule_once(
+                    lambda _dt, _mid=meeting_id, _s=summary:
+                        self._show_processing_summary_ready(_mid, _s),
+                    0,
+                )
+                return
+        logger.warning(
+            "Summary poll gave up for meeting %s (no summary within 5 min)",
+            meeting_id,
+        )
+
+    def _start_transcript_cta_poll(self, meeting_id: str):
+        if not meeting_id:
+            return
+        self._transcript_cta_poll_meeting_id = meeting_id
+        run_async(self._poll_transcript_cta_until_ready(meeting_id))
+
+    def _deliver_transcript_cta_from_poll(self, meeting_id: str):
+        """Main-thread: reveal CTA once HTTP confirms transcript (or summary) rows exist."""
+        if self._transcript_cta_satisfied_meeting_id == meeting_id:
+            return
+        self._transcript_cta_satisfied_meeting_id = meeting_id
+        self._transcription_done_for_session = meeting_id
+        try:
+            proc = self.screen_manager.get_screen('processing')
+        except Exception as e:
+            logger.debug("Processing screen missing for transcript CTA poll: %s", e)
+            return
+        if hasattr(proc, 'on_transcription_ready'):
+            proc.on_transcription_ready(meeting_id)
+
+    async def _poll_transcript_cta_until_ready(self, meeting_id: str):
+        """Poll GET /api/meetings/{id} until segments or summary exist (WS fallback)."""
+        logger.info("Transcript CTA poll starting for meeting %s", meeting_id)
+        for attempt in range(120):
+            if self._transcript_cta_poll_meeting_id != meeting_id:
+                return
+            if self._transcript_cta_satisfied_meeting_id == meeting_id:
+                return
+            if attempt > 0:
+                await asyncio.sleep(3.0)
+            if self._transcript_cta_poll_meeting_id != meeting_id:
+                return
+            if self._transcript_cta_satisfied_meeting_id == meeting_id:
+                return
+            try:
+                detail = await self.backend.get_meeting_detail(meeting_id)
+            except Exception as e:
+                logger.debug(
+                    "Transcript CTA poll attempt %d failed for %s: %s",
+                    attempt + 1, meeting_id, e,
+                )
+                continue
+            segments = (detail or {}).get('segments') or []
+            summary_blob = (detail or {}).get('summary') or {}
+            has_segments = len(segments) > 0
+            has_summary = isinstance(summary_blob, dict) and bool(summary_blob)
+            if has_segments or has_summary:
+                logger.info(
+                    "Transcript CTA poll: content ready for %s (segments=%d summary=%s)",
+                    meeting_id,
+                    len(segments),
+                    has_summary,
+                )
+                Clock.schedule_once(
+                    lambda _dt, _mid=meeting_id: self._deliver_transcript_cta_from_poll(_mid),
+                    0,
+                )
+                return
+        logger.warning(
+            "Transcript CTA poll gave up for meeting %s (no segments within ~6 min)",
+            meeting_id,
+        )
 
     def _auto_summarize(self, meeting_id: str):
         """After transcription completes, auto-trigger summarization then show review screen."""
@@ -746,12 +1175,10 @@ class MeetingBoxApp(App):
                 Clock.schedule_once(_status_actions, 0)
                 summary = await self.backend.summarize_meeting(meeting_id)
 
-                def _show(_dt):
-                    screen = self.screen_manager.get_screen('summary_review')
-                    screen.set_meeting_data(meeting_id, summary)
-                    self.goto_screen('summary_review', 'fade')
-
-                Clock.schedule_once(_show, 0)
+                Clock.schedule_once(
+                    lambda _dt: self._show_processing_summary_ready(meeting_id, summary),
+                    0,
+                )
             except Exception as e:
                 logger.error(f"Auto-summarize failed: {e}")
                 def _fallback(_dt):
@@ -786,30 +1213,60 @@ class MeetingBoxApp(App):
 
     def start_recording(self):
         async def _start():
-            try:
-                result = await self.backend.start_recording()
-                self.current_session_id = result['session_id']
-                self.recording_state.update(active=True, paused=False, elapsed=0)
-                Clock.schedule_once(
-                    lambda _: self.goto_screen('recording', 'fade'), 0)
-            except Exception as e:
-                logger.error(f"Failed to start recording: {e}")
-                Clock.schedule_once(
-                    lambda _: self.show_error_screen(
-                        'Recording Failed',
-                        'Microphone error detected. The microphone may be '
-                        'disconnected or in use by another application.',
-                        recovery_text='TRY AGAIN',
-                        recovery_action=self.start_recording), 0)
+            last_exc: BaseException | None = None
+            max_attempts = 3
+            for attempt in range(max_attempts):
+                if attempt > 0:
+                    delay = 2.0 * attempt
+                    logger.info(
+                        "Retrying start_recording after %.1fs (attempt %s/%s)",
+                        delay,
+                        attempt + 1,
+                        max_attempts,
+                    )
+                    await asyncio.sleep(delay)
+                try:
+                    result = await self.backend.start_recording()
+                    self.current_session_id = result['session_id']
+                    self.recording_state.update(active=True, paused=False, elapsed=0)
+                    Clock.schedule_once(
+                        lambda _: self.goto_screen('recording', 'fade'), 0)
+                    return
+                except Exception as e:
+                    last_exc = e
+                    logger.error(
+                        "Failed to start recording (attempt %s/%s): %s",
+                        attempt + 1,
+                        max_attempts,
+                        e,
+                    )
+                    if (
+                        attempt < max_attempts - 1
+                        and _recording_start_transient_network(e)
+                    ):
+                        continue
+                    break
+            title, message = _recording_start_error_screen_args(
+                last_exc or RuntimeError("Unknown error")
+            )
+            Clock.schedule_once(
+                lambda _: self.show_error_screen(
+                    title,
+                    message,
+                    recovery_text='TRY AGAIN',
+                    recovery_action=self.start_recording), 0)
         run_async(_start())
 
     def stop_recording(self):
         logger.info("stop_recording called, session_id=%s", self.current_session_id)
         async def _stop():
             try:
-                await self.backend.stop_recording(self.current_session_id)
+                sid = self.current_session_id
+                await self.backend.stop_recording(sid)
                 self.recording_state['active'] = False
                 logger.info("Recording stopped successfully")
+                # Device-initiated stop never goes through on_recording_stopped (Redis/WS).
+                self._kick_post_stop_meeting_polls(sid)
                 Clock.schedule_once(
                     lambda _: self.goto_screen('processing', 'fade'), 0)
             except Exception as e:
@@ -915,27 +1372,6 @@ class MeetingBoxApp(App):
 # ENTRY POINT
 # ==================================================================
 
-# region agent log
-_DEBUG_LOG_PATH = Path(__file__).resolve().parent.parent.parent / "debug-422319.log"
-
-
-def _debug_ndjson(hypothesis_id: str, location: str, message: str, data=None):
-    try:
-        rec = {
-            "sessionId": "422319",
-            "hypothesisId": hypothesis_id,
-            "location": location,
-            "message": message,
-            "data": data or {},
-            "timestamp": int(time.time() * 1000),
-        }
-        with open(_DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(json.dumps(rec, default=str) + "\n")
-    except Exception:
-        pass
-# endregion
-
-
 def main():
     print(f"[MeetingBox] Starting Device UI", flush=True)
     disp = os.environ.get('DISPLAY', '(not set)')
@@ -945,6 +1381,15 @@ def main():
     print(f"[MeetingBox] MOCK_BACKEND={os.environ.get('MOCK_BACKEND', '(not set)')}", flush=True)
 
     if sys.platform.startswith('linux'):
+        xauth = os.environ.get("XAUTHORITY", "")
+        if xauth:
+            p = Path(xauth)
+            if not p.is_file():
+                print(
+                    f"[MeetingBox] WARNING: XAUTHORITY={xauth!r} is not a readable file — "
+                    "set XAUTHORITY_HOST in .env to the host cookie (see mini-pc/.env.example).",
+                    flush=True,
+                )
         if not shutil.which('xclip') and not shutil.which('xsel'):
             print(
                 '[MeetingBox] Tip: sudo apt install xclip  '
@@ -959,8 +1404,15 @@ def main():
                 'local session e.g. DISPLAY=:0',
                 flush=True,
             )
+        x0 = Path("/tmp/.X11-unix/X0")
+        if not x0.exists():
+            print(
+                "[MeetingBox] WARNING: no /tmp/.X11-unix/X0 — no X server on :0 inside this "
+                "environment. On the mini PC: log in on the built-in screen (local graphical "
+                "session), or use Xorg not Wayland-only, or set DISPLAY=:1 if X uses that.",
+                flush=True,
+            )
 
-    import subprocess
     try:
         result = subprocess.run(
             ['ls', '-la', '/tmp/.X11-unix/'],
@@ -969,19 +1421,7 @@ def main():
     except Exception as e:
         print(f"[MeetingBox] X11 socket check failed: {e}", flush=True)
 
-    # region agent log
-    _debug_ndjson(
-        "H1",
-        "main.py:main",
-        "startup_env",
-        {
-            "DISPLAY": os.environ.get("DISPLAY"),
-            "WAYLAND_DISPLAY": os.environ.get("WAYLAND_DISPLAY"),
-            "XDG_SESSION_TYPE": os.environ.get("XDG_SESSION_TYPE"),
-            "X0_exists": Path("/tmp/.X11-unix/X0").exists(),
-        },
-    )
-    # endregion
+    _diagnose_xauthority_for_docker()
 
     logger.info("Starting MeetingBox Device UI")
     try:

@@ -42,9 +42,9 @@ class MeetingsScreen(BaseScreen):
         scroll = ScrollView(do_scroll_x=False)
         self.meetings_container = GridLayout(
             cols=1,
-            spacing=SPACING['list_item_spacing'],
+            spacing=self.suv(SPACING['list_item_spacing']),
             size_hint_y=None,
-            padding=SPACING['screen_padding'],
+            padding=self.suh(SPACING['screen_padding']),
         )
         self.meetings_container.bind(
             minimum_height=self.meetings_container.setter('height'))
@@ -75,7 +75,7 @@ class MeetingsScreen(BaseScreen):
         if not self.meetings:
             empty = Label(
                 text='No meetings yet',
-                font_size=FONT_SIZES['medium'],
+                font_size=self.suf(FONT_SIZES['medium']),
                 color=COLORS['gray_500'],
                 halign='center',
             )

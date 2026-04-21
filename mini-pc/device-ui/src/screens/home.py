@@ -16,8 +16,21 @@ from kivy.uix.widget import Widget
 
 from async_helper import run_async
 from components.button import PrimaryButton
-from config import ASSETS_DIR, COLORS, FONT_SIZES, SPACING
+from config import (
+    ASSETS_DIR,
+    COLORS,
+    DISPLAY_WIDTH,
+    FONT_SIZES,
+    HOME_CONTENT_SCALE,
+    SPACING,
+    display_now,
+    home_center_column_width,
+    home_layout_horizontal_scale,
+    home_layout_vertical_scale,
+    to_display_local,
+)
 from screens.base_screen import BaseScreen
+from network_util import linux_ethernet_ready
 
 _CHIP_SIZE = 34
 _ICON_SIZE = 16
@@ -60,7 +73,7 @@ def _format_home_next_meeting(next_meeting) -> str:
     try:
         if "T" in start:
             dt = datetime.fromisoformat(start.replace("Z", "+00:00"))
-            line = dt.strftime("%a %b %d · %I:%M %p")
+            line = to_display_local(dt).strftime("%a %b %d · %I:%M %p")
         else:
             d = datetime.strptime(start[:10], "%Y-%m-%d")
             line = d.strftime("%a %b %d (all day)")
@@ -77,6 +90,7 @@ class _IconChip(ButtonBehavior, FloatLayout):
     """Fixed-size circle chip with a centered tintable icon."""
 
     def __init__(self, icon_source: Path, **kwargs):
+        icon_inner = int(kwargs.pop("icon_inner", _ICON_SIZE))
         kwargs.setdefault("size_hint", (None, None))
         kwargs.setdefault("size", (_CHIP_SIZE, _CHIP_SIZE))
         super().__init__(**kwargs)
@@ -90,7 +104,7 @@ class _IconChip(ButtonBehavior, FloatLayout):
             source=str(icon_source),
             color=COLORS["white"],
             size_hint=(None, None),
-            size=(_ICON_SIZE, _ICON_SIZE),
+            size=(icon_inner, icon_inner),
             allow_stretch=True,
             keep_ratio=True,
         )
@@ -114,6 +128,7 @@ class _RoundTextChip(ButtonBehavior, FloatLayout):
     """Circular chip with a text symbol (matches Wi‑Fi / mic chrome)."""
 
     def __init__(self, symbol: str, **kwargs):
+        sym_fs = int(kwargs.pop("symbol_font_size", FONT_SIZES["title"]))
         kwargs.setdefault("size_hint", (None, None))
         kwargs.setdefault("size", (_CHIP_SIZE, _CHIP_SIZE))
         super().__init__(**kwargs)
@@ -123,7 +138,7 @@ class _RoundTextChip(ButtonBehavior, FloatLayout):
         self.bind(pos=self._sync_bg, size=self._sync_bg)
         self._lbl = Label(
             text=symbol,
-            font_size=FONT_SIZES["title"],
+            font_size=sym_fs,
             color=COLORS["white"],
             halign="center",
             valign="middle",
@@ -160,6 +175,46 @@ class HomeScreen(BaseScreen):
         self._build_ui()
 
     def _build_ui(self):
+        # Layout scales from 1024×600; home uses HOME_CONTENT_SCALE vs raw display scale.
+        sv = home_layout_vertical_scale()
+        sh = home_layout_horizontal_scale()
+        col_w = max(
+            160,
+            min(DISPLAY_WIDTH - 24, int(home_center_column_width() * HOME_CONTENT_SCALE)),
+        )
+        chip_sz = max(_CHIP_SIZE, int(_CHIP_SIZE * sv))
+        icon_in = max(_ICON_SIZE, int(_ICON_SIZE * sv))
+        top_h = max(50, int(62 * sv))
+        top_pad_v = max(8, int(12 * sv))
+        room_icon_px = max(22, int(26 * sv))
+        icon_holder_w = max(32, int(38 * sv))
+        room_fs = int(FONT_SIZES["medium"] * sv)
+        bfs = int(104 * sv)
+        self._big_ampm_font = max(16, int(bfs * 0.38))
+        # Clock line needs headroom so glyphs do not collide with the row below.
+        bfh = max(96, int(124 * sv), int(bfs * 1.22))
+        dfs = int(FONT_SIZES["body"] * sv)
+        dfh = max(22, int(26 * sv), int(dfs * 1.35))
+        ufs = int(FONT_SIZES["medium"] * sv)
+        # Upcoming is two lines; fixed height must fit both at ufs.
+        ufh = max(44, int(52 * sv), int(ufs * 2.85))
+        stats_spacing = max(6, int(8 * sv))
+        stat_row_h = max(24, int(28 * sv))
+        # Stats BoxLayout height must equal two rows + spacing or inner layout overlaps.
+        stats_col_h = max(58, stat_row_h * 2 + stats_spacing)
+        # Button: fit column; on narrow portrait (600-wide) avoid a 400px minimum.
+        btn_w = min(
+            max(240, col_w - 40),
+            int(440 * sh),
+            max(200, DISPLAY_WIDTH - 32),
+        )
+        btn_h = max(56, int(70 * sv))
+        btn_pad_b = max(14, int(22 * sv))
+        # Row height minus bottom padding is the slot for the button; btn_h must fit inside.
+        btn_row_h = max(72, int(88 * sv), btn_h + btn_pad_b + 8)
+        start_fs = int(FONT_SIZES["large"] * sv)
+        sym_fs = int(FONT_SIZES["title"] * sv)
+
         root = BoxLayout(orientation="vertical")
         with root.canvas.before:
             Color(0.04, 0.06, 0.10, 1)
@@ -172,16 +227,16 @@ class HomeScreen(BaseScreen):
         top = BoxLayout(
             orientation="horizontal",
             size_hint=(1, None),
-            height=62,
-            padding=[SPACING["screen_padding"], 12],
+            height=top_h,
+            padding=[SPACING["screen_padding"], top_pad_v],
             spacing=10,
         )
         left = BoxLayout(orientation="horizontal", size_hint=(0.50, 1), spacing=6)
-        icon_holder = AnchorLayout(size_hint=(None, 1), width=38)
+        icon_holder = AnchorLayout(size_hint=(None, 1), width=icon_holder_w)
         self.room_icon = Image(
             source=str(self._room_icon),
             size_hint=(None, None),
-            size=(26, 26),
+            size=(room_icon_px, room_icon_px),
             allow_stretch=True,
             keep_ratio=True,
         )
@@ -189,7 +244,7 @@ class HomeScreen(BaseScreen):
         left.add_widget(icon_holder)
         self.room_label = Label(
             text="MeetingBox",
-            font_size=FONT_SIZES["medium"],
+            font_size=room_fs,
             color=COLORS["white"],
             bold=True,
             halign="left",
@@ -202,106 +257,144 @@ class HomeScreen(BaseScreen):
         right = BoxLayout(orientation="horizontal", size_hint=(0.50, 1), spacing=10)
         right.add_widget(Widget())
 
-        self.top_time_label = Label(
-            text="--:--",
-            font_size=FONT_SIZES["body"],
-            color=COLORS["white"],
-            size_hint=(None, None),
-            size=(86, 34),
-            halign="center",
-            valign="middle",
+        self.wifi_chip = _IconChip(
+            self._wifi_icon, size=(chip_sz, chip_sz), icon_inner=icon_in
         )
-        self.top_time_label.bind(size=self.top_time_label.setter("text_size"))
-        with self.top_time_label.canvas.before:
-            Color(*COLORS["surface"])
-            self._time_bg = RoundedRectangle(
-                pos=self.top_time_label.pos, size=self.top_time_label.size, radius=[14]
-            )
-        self.top_time_label.bind(
-            pos=lambda w, _: setattr(self._time_bg, "pos", w.pos),
-            size=lambda w, _: setattr(self._time_bg, "size", w.size),
-        )
-        right.add_widget(self.top_time_label)
-
-        self.wifi_chip = _IconChip(self._wifi_icon)
         self.wifi_chip.bind(on_press=lambda *_: self.goto("wifi", transition="slide_left"))
         right.add_widget(self.wifi_chip)
 
-        self.mic_chip = _IconChip(self._mic_icon)
+        self.mic_chip = _IconChip(
+            self._mic_icon, size=(chip_sz, chip_sz), icon_inner=icon_in
+        )
         self.mic_chip.bind(on_press=lambda *_: self.goto("mic_test", transition="slide_left"))
         right.add_widget(self.mic_chip)
 
         gear_path = ASSETS_DIR / "recording" / "setteing gear icon.png"
         if gear_path.exists():
-            self.settings_btn = _IconChip(gear_path)
+            self.settings_btn = _IconChip(
+                gear_path, size=(chip_sz, chip_sz), icon_inner=icon_in
+            )
         else:
-            self.settings_btn = _RoundTextChip("⚙")
+            self.settings_btn = _RoundTextChip(
+                "⚙",
+                size=(chip_sz, chip_sz),
+                symbol_font_size=sym_fs,
+            )
         self.settings_btn.bind(on_press=lambda *_: self.goto("settings", transition="slide_left"))
         right.add_widget(self.settings_btn)
         top.add_widget(right)
         root.add_widget(top)
 
-        root.add_widget(Widget(size_hint=(1, None), height=18))
+        root.add_widget(Widget(size_hint=(1, None), height=max(12, int(18 * sv))))
 
-        self.big_time_label = Label(
+        # AnchorLayout keeps the fixed-width column truly centered (BoxLayout + two spacers
+        # can leave the block visually shifted on some aspect ratios / Kivy versions).
+        mid_anchor = AnchorLayout(
+            size_hint=(1, 1),
+            anchor_x="center",
+            anchor_y="top",
+        )
+        inner = BoxLayout(orientation="vertical", size_hint=(None, 1), width=col_w)
+
+        inner.add_widget(Widget())
+
+        big_time_spacing = max(4, int(6 * sh))
+        big_time_wrap = AnchorLayout(
+            size_hint=(1, None),
+            height=bfh,
+            anchor_x="center",
+            anchor_y="center",
+        )
+        big_time_row = BoxLayout(
+            orientation="horizontal",
+            size_hint=(None, None),
+            height=bfh,
+            spacing=big_time_spacing,
+        )
+        self._big_clock_hm = Label(
             text="--:--",
-            font_size=104,
+            font_size=bfs,
             bold=True,
             color=COLORS["white"],
-            size_hint=(1, None),
-            height=124,
-            halign="center",
+            size_hint=(None, 1),
+            halign="right",
             valign="middle",
         )
-        self.big_time_label.bind(size=self.big_time_label.setter("text_size"))
-        root.add_widget(self.big_time_label)
+        self._big_clock_ap = Label(
+            text="",
+            font_size=self._big_ampm_font,
+            bold=True,
+            color=COLORS["white"],
+            size_hint=(None, 1),
+            halign="left",
+            valign="middle",
+        )
+
+        def _sync_big_clock_row(*_a):
+            self._big_clock_hm.width = max(int(self._big_clock_hm.texture_size[0]), 1)
+            self._big_clock_ap.width = max(int(self._big_clock_ap.texture_size[0]), 1)
+            big_time_row.width = (
+                self._big_clock_hm.width
+                + self._big_clock_ap.width
+                + big_time_row.spacing
+            )
+
+        self._big_clock_hm.bind(texture_size=_sync_big_clock_row)
+        self._big_clock_ap.bind(texture_size=_sync_big_clock_row)
+        big_time_row.add_widget(self._big_clock_hm)
+        big_time_row.add_widget(self._big_clock_ap)
+        big_time_wrap.add_widget(big_time_row)
+        inner.add_widget(big_time_wrap)
 
         self.date_label = Label(
             text="",
-            font_size=FONT_SIZES["body"],
+            font_size=dfs,
             color=COLORS["gray_400"],
             size_hint=(1, None),
-            height=26,
+            height=dfh,
             halign="center",
             valign="middle",
         )
         self.date_label.bind(size=self.date_label.setter("text_size"))
-        root.add_widget(self.date_label)
+        inner.add_widget(self.date_label)
 
         self.upcoming_label = Label(
             text="Loading next meeting…",
-            font_size=FONT_SIZES["medium"],
+            font_size=ufs,
             color=COLORS["gray_400"],
             size_hint=(1, None),
-            height=52,
+            height=ufh,
             halign="center",
             valign="middle",
         )
         self.upcoming_label.bind(size=self.upcoming_label.setter("text_size"))
-        root.add_widget(self.upcoming_label)
-        root.add_widget(Widget(size_hint=(1, None), height=4))
+        inner.add_widget(self.upcoming_label)
+        inner.add_widget(Widget(size_hint=(1, None), height=max(2, int(4 * sv))))
 
         stats_col = BoxLayout(
             orientation="vertical",
             size_hint=(1, None),
-            height=66,
-            spacing=8,
+            height=stats_col_h,
+            spacing=stats_spacing,
             padding=[0, 0],
         )
 
         def _stat_row(dot_color, initial_text, attr_prefix):
+            row_h = stat_row_h
+            badge_w = min(max(280, col_w - 160), int(280 * sh))
+            small_fs = int(FONT_SIZES["small"] * sv)
             row = BoxLayout(
                 orientation="horizontal",
                 size_hint=(1, None),
-                height=28,
+                height=row_h,
                 padding=[SPACING["screen_padding"], 0],
             )
             row.add_widget(Widget())
             badge = BoxLayout(
                 orientation="horizontal",
                 size_hint=(None, None),
-                width=280,
-                height=28,
+                width=badge_w,
+                height=row_h,
                 spacing=6,
                 padding=[10, 0],
             )
@@ -320,15 +413,15 @@ class HomeScreen(BaseScreen):
                 Label(
                     text="●",
                     color=dot_color,
-                    font_size=FONT_SIZES["small"],
+                    font_size=small_fs,
                     size_hint=(None, 1),
-                    width=10,
+                    width=max(8, int(10 * sv)),
                 )
             )
             lbl = Label(
                 text=initial_text,
                 color=COLORS["gray_500"],
-                font_size=FONT_SIZES["small"],
+                font_size=small_fs,
                 halign="left",
                 valign="middle",
             )
@@ -341,15 +434,15 @@ class HomeScreen(BaseScreen):
 
         _stat_row(COLORS["yellow"], "Today: — pending", "today")
         _stat_row(COLORS["gray_600"], "All open: — pending", "total")
-        root.add_widget(stats_col)
+        inner.add_widget(stats_col)
 
-        root.add_widget(Widget())
+        inner.add_widget(Widget())
 
         btn_row = BoxLayout(
             orientation="horizontal",
             size_hint=(1, None),
-            height=88,
-            padding=[0, 0, 0, 22],
+            height=btn_row_h,
+            padding=[0, 0, 0, btn_pad_b],
         )
         btn_row.add_widget(Widget())
         if self._start_button_asset.exists():
@@ -358,24 +451,27 @@ class HomeScreen(BaseScreen):
                 allow_stretch=True,
                 keep_ratio=True,
                 size_hint=(None, None),
-                height=70,
-                width=440,
+                height=btn_h,
+                width=btn_w,
             )
         else:
             self.start_btn = PrimaryButton(
                 text="Start Meeting",
-                font_size=FONT_SIZES["large"],
+                font_size=start_fs,
                 halign="center",
                 size_hint=(None, None),
-                height=70,
-                width=440,
+                height=btn_h,
+                width=btn_w,
             )
         self.start_btn.bind(on_press=self._on_start_recording)
         btn_row.add_widget(self.start_btn)
         btn_row.add_widget(Widget())
-        root.add_widget(btn_row)
+        inner.add_widget(btn_row)
 
-        root.add_widget(Widget(size_hint=(1, None), height=10))
+        mid_anchor.add_widget(inner)
+        root.add_widget(mid_anchor)
+
+        root.add_widget(Widget(size_hint=(1, None), height=max(8, int(10 * min(sv, 1.35)))))
         root.add_widget(self.build_footer())
 
         self.add_widget(root)
@@ -398,9 +494,11 @@ class HomeScreen(BaseScreen):
         self.app.start_recording()
 
     def _update_clock_labels(self):
-        now = datetime.now()
-        self.top_time_label.text = now.strftime("%H:%M")
-        self.big_time_label.text = now.strftime("%H:%M")
+        now = display_now()
+        hm = now.strftime("%I:%M")
+        ap = now.strftime("%p")
+        self._big_clock_hm.text = hm
+        self._big_clock_ap.text = ap
         self.date_label.text = f"{now.strftime('%A, %B')} {now.day}"
 
     def _load_system_status(self):
@@ -409,6 +507,7 @@ class HomeScreen(BaseScreen):
                 info = await self.backend.get_system_info()
                 free_gb = (info["storage_total"] - info["storage_used"]) / (1024 ** 3)
                 wifi_ok = bool(info.get("wifi_ssid"))
+                wired_ok = linux_ethernet_ready()
                 mic_connected = bool(
                     info.get(
                         "microphone_connected",
@@ -418,11 +517,18 @@ class HomeScreen(BaseScreen):
                 privacy = getattr(self.app, "privacy_mode", False)
 
                 def _apply(_dt):
-                    self._wifi_ok = wifi_ok
+                    self._wifi_ok = wifi_ok or wired_ok
                     self._mic_connected = mic_connected
-                    self.wifi_chip.set_icon_color(COLORS["white"] if wifi_ok else COLORS["gray_500"])
+                    self.wifi_chip.set_icon_color(
+                        COLORS["white"] if (wifi_ok or wired_ok) else COLORS["gray_500"]
+                    )
                     self.mic_chip.set_icon_color(COLORS["green"] if mic_connected else COLORS["red"])
-                    self.update_footer(wifi_ok=wifi_ok, free_gb=free_gb, privacy_mode=privacy)
+                    self.update_footer(
+                        wifi_ok=wifi_ok,
+                        free_gb=free_gb,
+                        privacy_mode=privacy,
+                        wired_lan_ok=wired_ok,
+                    )
 
                 Clock.schedule_once(_apply, 0)
             except Exception:

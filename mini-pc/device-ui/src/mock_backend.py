@@ -299,6 +299,9 @@ class MockBackendClient:
             "meetings_count": len(self.meetings),
         }
 
+    async def post_appliance_system_metrics(self, metrics: Dict) -> None:
+        await asyncio.sleep(0.05)
+
     async def check_for_updates(self) -> Dict:
         await asyncio.sleep(1.5)
         return {

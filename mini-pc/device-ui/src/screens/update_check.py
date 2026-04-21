@@ -43,44 +43,44 @@ class UpdateCheckScreen(BaseScreen):
         # Icon / status area
         self.icon_label = Label(
             text='',
-            font_size=48,
+            font_size=self.suf(48),
             color=COLORS['green'],
             halign='center',
-            size_hint=(1, None), height=60,
+            size_hint=(1, None), height=self.suv(60),
         )
         root.add_widget(self.icon_label)
 
         # Title
         self.title_label = Label(
             text='Checking for updates…',
-            font_size=FONT_SIZES['large'],
+            font_size=self.suf(FONT_SIZES['large']),
             bold=True,
             color=COLORS['white'],
             halign='center',
-            size_hint=(1, None), height=30,
+            size_hint=(1, None), height=self.suv(30),
         )
         root.add_widget(self.title_label)
 
         # Details
         self.detail_label = Label(
             text='',
-            font_size=FONT_SIZES['small'] + 2,
+            font_size=self.suf(FONT_SIZES['small'] + 2),
             color=COLORS['gray_500'],
             halign='center',
             valign='top',
-            size_hint=(1, None), height=60,
+            size_hint=(1, None), height=self.suv(60),
         )
         self.detail_label.bind(size=self.detail_label.setter('text_size'))
         root.add_widget(self.detail_label)
 
         # Install button (hidden initially)
         btn_row = BoxLayout(
-            size_hint=(1, None), height=60,
-            padding=[100, 0],
+            size_hint=(1, None), height=self.suv(60),
+            padding=[self.suh(100), 0],
         )
         self.install_btn = PrimaryButton(
             text='INSTALL UPDATE',
-            font_size=FONT_SIZES['medium'],
+            font_size=self.suf(FONT_SIZES['medium']),
             opacity=0,
             disabled=True,
         )

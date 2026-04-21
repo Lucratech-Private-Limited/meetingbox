@@ -40,6 +40,34 @@ def _get_redis() -> redis.Redis:
         _redis_client = redis.Redis(host=REDIS_HOST, port=6379, decode_responses=True)
     return _redis_client
 
+
+APPLIANCE_METRICS_REDIS_KEY = "meetingbox:appliance_metrics:{}"
+
+
+def store_appliance_metrics(device_id: str, payload: dict) -> None:
+    """Cache last CPU/RAM/disk snapshot from a paired mini-PC (short TTL)."""
+    try:
+        r = _get_redis()
+        r.setex(
+            APPLIANCE_METRICS_REDIS_KEY.format(device_id),
+            150,
+            json.dumps(payload),
+        )
+    except Exception as e:
+        logger.debug("appliance metrics redis store: %s", e)
+
+
+def fetch_appliance_metrics(device_id: str) -> Optional[dict]:
+    try:
+        r = _get_redis()
+        raw = r.get(APPLIANCE_METRICS_REDIS_KEY.format(device_id))
+        if not raw:
+            return None
+        return json.loads(raw)
+    except Exception as e:
+        logger.debug("appliance metrics redis read: %s", e)
+        return None
+
 # Persistent settings file on disk
 SETTINGS_FILE = Path(os.getenv("DEVICE_SETTINGS_PATH", "/data/config/device_settings.json"))
 SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -350,6 +378,43 @@ async def device_unpair_self(device: dict = Depends(get_current_device_row)):
     return {"status": "unpaired", "device_id": device_id}
 
 
+class ApplianceMetricsBody(BaseModel):
+    """CPU / memory / disk as reported by the on-device UI (mini-PC)."""
+
+    cpu_percent: float = 0.0
+    memory_percent: float = 0.0
+    memory_used_gb: float = 0.0
+    memory_total_gb: float = 0.0
+    disk_percent: float = 0.0
+    disk_used_gb: float = 0.0
+    disk_total_gb: float = 0.0
+
+
+@router.post("/system-metrics")
+async def post_appliance_system_metrics(
+    body: ApplianceMetricsBody,
+    device: dict = Depends(get_current_device_row),
+):
+    """
+    Mini-PC pushes resource usage so the web dashboard System page can show
+    appliance health instead of the API server host.
+    """
+    store_appliance_metrics(
+        device["id"],
+        {
+            "cpu_percent": float(body.cpu_percent),
+            "memory_percent": float(body.memory_percent),
+            "memory_used_gb": float(body.memory_used_gb),
+            "memory_total_gb": float(body.memory_total_gb),
+            "disk_percent": float(body.disk_percent),
+            "disk_used_gb": float(body.disk_used_gb),
+            "disk_total_gb": float(body.disk_total_gb),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+    return {"status": "ok"}
+
+
 def _normalize_hhmmss(time_raw: str) -> str:
     s = (time_raw or "10:00").strip()
     if s.count(":") == 2:
@@ -555,7 +620,11 @@ class SettingsUpdate(BaseModel):
 async def update_settings(body: SettingsUpdate, current_user: Optional[dict] = Depends(get_optional_user)):
     """Update one or more device settings."""
     current = _load_settings()
-    updates = body.dict(exclude_none=True)
+    updates = (
+        body.model_dump(exclude_none=True)
+        if hasattr(body, "model_dump")
+        else body.dict(exclude_none=True)
+    )
 
     # Handle special actions
     action = updates.pop("action", None)

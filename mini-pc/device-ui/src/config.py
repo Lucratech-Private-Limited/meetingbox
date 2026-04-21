@@ -44,13 +44,68 @@ WS_RECONNECT_DELAY = 3  # seconds
 WS_MAX_RECONNECT_ATTEMPTS = 10
 
 # ============================================================================
+# LOCAL REDIS (receive audio_level / mic_test_level from audio container)
+# ============================================================================
+
+LOCAL_REDIS_HOST = (os.getenv("LOCAL_REDIS_HOST", "") or "").strip() or "redis"
+LOCAL_REDIS_PORT = int(os.getenv("LOCAL_REDIS_PORT", "6379"))
+
+# ============================================================================
+# MICROPHONE (mic test + should match mini-pc/audio capture device)
+# ============================================================================
+
+AUDIO_INPUT_DEVICE_INDEX = (os.getenv("AUDIO_INPUT_DEVICE_INDEX", "") or "").strip()
+AUDIO_INPUT_DEVICE_NAME = (os.getenv("AUDIO_INPUT_DEVICE_NAME", "") or "").strip()
+
+# ============================================================================
 # DISPLAY SETTINGS
 # ============================================================================
 
+
+def _parse_display_px(name: str, default: int) -> int:
+    """Env may be unset, empty, or non-numeric (e.g. DISPLAY_WIDTH= in .env) — avoid crashing."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    s = str(raw).strip()
+    if not s:
+        logger.warning("%s is set but empty; using default %s", name, default)
+        return default
+    try:
+        v = int(s)
+    except ValueError:
+        logger.warning("%s=%r is not an integer; using default %s", name, raw, default)
+        return default
+    if v < 32 or v > 32768:
+        logger.warning("%s=%s out of range [32,32768]; using default %s", name, v, default)
+        return default
+    return v
+
+
+def _parse_unit_scale(name: str, default: float) -> float:
+    """Multiplier vs 1024×600 layout baseline (see MEETINGBOX_HOME_CONTENT_SCALE)."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    s = str(raw).strip()
+    if not s:
+        logger.warning("%s is set but empty; using default %s", name, default)
+        return default
+    try:
+        v = float(s)
+    except ValueError:
+        logger.warning("%s=%r is not a float; using default %s", name, raw, default)
+        return default
+    if v < 0.5 or v > 1.5:
+        logger.warning("%s=%s out of range [0.5,1.5]; using default %s", name, v, default)
+        return default
+    return v
+
+
 # Display resolution
 # Figma-aligned default is 1024x600; override via env vars as needed.
-DISPLAY_WIDTH = int(os.getenv('DISPLAY_WIDTH', '1024'))
-DISPLAY_HEIGHT = int(os.getenv('DISPLAY_HEIGHT', '600'))
+DISPLAY_WIDTH = _parse_display_px("DISPLAY_WIDTH", 1024)
+DISPLAY_HEIGHT = _parse_display_px("DISPLAY_HEIGHT", 600)
 
 # Display orientation
 DISPLAY_ORIENTATION = os.getenv('DISPLAY_ORIENTATION', 'landscape')
@@ -60,6 +115,48 @@ TARGET_FPS = int(os.getenv('TARGET_FPS', '30'))
 
 # Fullscreen mode (set FULLSCREEN=0 for windowed dev mode)
 FULLSCREEN = os.getenv('FULLSCREEN', '0') == '1'
+
+# ============================================================================
+# DISPLAY CLOCK (wall time in UI — default India Standard Time)
+# ============================================================================
+# Set DISPLAY_TIMEZONE to an IANA name (e.g. Europe/London) if needed.
+# If zoneinfo data is missing, falls back to fixed UTC+5:30.
+
+
+def _load_display_tzinfo():
+    from datetime import timedelta, timezone
+
+    name = (os.getenv("DISPLAY_TIMEZONE") or "Asia/Kolkata").strip() or "Asia/Kolkata"
+    try:
+        from zoneinfo import ZoneInfo
+
+        return ZoneInfo(name)
+    except Exception:
+        logger.warning(
+            "DISPLAY_TIMEZONE %r unavailable (install tzdata on this OS); using UTC+5:30",
+            name,
+        )
+        return timezone(timedelta(hours=5, minutes=30))
+
+
+DISPLAY_TZINFO = _load_display_tzinfo()
+
+
+def display_now():
+    """Current time in the configured display timezone (default IST)."""
+    from datetime import datetime
+
+    return datetime.now(DISPLAY_TZINFO)
+
+
+def to_display_local(dt):
+    """Convert an aware datetime to the display timezone; naive values treated as UTC."""
+    from datetime import datetime, timezone
+
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(DISPLAY_TZINFO)
+
 
 # ============================================================================
 # TOUCH SETTINGS
@@ -139,6 +236,54 @@ SPACING = {
     'section_spacing': 20,
     'list_item_spacing': 8,
 }
+
+
+def display_vertical_scale_raw() -> float:
+    """Height vs 600px design baseline (capped)."""
+    return min(max(DISPLAY_HEIGHT / 600.0, 0.72), 2.35)
+
+
+def display_horizontal_scale_raw() -> float:
+    """Width vs 1024px design baseline (capped)."""
+    ratio = DISPLAY_WIDTH / 1024.0
+    # Panels narrower than the 1024 design width (e.g. portrait 600×1024) must scale
+    # down; the old 0.85 floor made everything oversized horizontally.
+    if DISPLAY_WIDTH < 1024:
+        return min(max(ratio, 0.48), 3.2)
+    return min(max(ratio, 0.85), 3.2)
+
+
+# Home uses this factor on top of display scale; other screens use OTHER (20% larger than home).
+# Default 1.0 matches the Figma 1024×600 baseline; use MEETINGBOX_HOME_CONTENT_SCALE=0.75 on tight 7" panels.
+HOME_CONTENT_SCALE = _parse_unit_scale("MEETINGBOX_HOME_CONTENT_SCALE", 1.0)
+OTHER_CONTENT_SCALE = HOME_CONTENT_SCALE * 1.2
+
+
+def home_layout_vertical_scale() -> float:
+    return min(display_vertical_scale_raw(), 2.25) * HOME_CONTENT_SCALE
+
+
+def home_layout_horizontal_scale() -> float:
+    return display_horizontal_scale_raw() * HOME_CONTENT_SCALE
+
+
+def other_screen_vertical_scale() -> float:
+    return min(display_vertical_scale_raw(), 2.25) * OTHER_CONTENT_SCALE
+
+
+def other_screen_horizontal_scale() -> float:
+    return display_horizontal_scale_raw() * OTHER_CONTENT_SCALE
+
+
+def home_center_column_width() -> int:
+    """Wide panels: wide centered column; small panels: nearly full width (before HOME_CONTENT_SCALE)."""
+    side = SPACING["screen_padding"] * 4
+    usable = max(1, DISPLAY_WIDTH - side)
+    if DISPLAY_WIDTH <= 1440:
+        # Never wider than the display (old max(360, …) could exceed narrow widths).
+        return max(160, usable)
+    return min(2200, max(720, int(DISPLAY_WIDTH * 0.56)))
+
 
 # More rounded corners (Apple style)
 BORDER_RADIUS = 14

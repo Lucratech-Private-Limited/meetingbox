@@ -16,11 +16,31 @@ from kivy.graphics import Color, Rectangle, Line
 from kivy.animation import Animation
 from kivy.app import App
 
-from kivy.metrics import dp
-
-from config import ASSETS_DIR, COLORS, FONT_SIZES, STATUS_BAR_HEIGHT
+from config import (
+    ASSETS_DIR,
+    COLORS,
+    FONT_SIZES,
+    STATUS_BAR_HEIGHT,
+    other_screen_horizontal_scale,
+    other_screen_vertical_scale,
+)
 
 _GEAR_ICON = ASSETS_DIR / "recording" / "setteing gear icon.png"
+
+
+def _suv(px):
+    v = other_screen_vertical_scale()
+    return max(1, int(round(float(px) * v)))
+
+
+def _suh(px):
+    h = other_screen_horizontal_scale()
+    return max(1, int(round(float(px) * h)))
+
+
+def _suf(fs):
+    v = other_screen_vertical_scale()
+    return max(6, int(round(float(fs) * v)))
 
 
 class _GearButton(ButtonBehavior, Label):
@@ -54,10 +74,10 @@ class StatusBar(BoxLayout):
                  **kwargs):
 
         kwargs.setdefault('size_hint', (1, None))
-        kwargs.setdefault('height', max(STATUS_BAR_HEIGHT, int(dp(48))))
+        kwargs.setdefault('height', max(_suv(STATUS_BAR_HEIGHT), _suv(48)))
         kwargs.setdefault('orientation', 'horizontal')
-        kwargs.setdefault('padding', [12, 6, 12, 6])
-        kwargs.setdefault('spacing', 8)
+        kwargs.setdefault('padding', [_suh(12), _suv(6), _suh(12), _suv(6)])
+        kwargs.setdefault('spacing', _suh(8))
 
         super().__init__(**kwargs)
 
@@ -79,13 +99,13 @@ class StatusBar(BoxLayout):
         if back_button:
             back_label = _GearButton(
                 text='<  BACK',
-                font_size=FONT_SIZES['medium'],
+                font_size=_suf(FONT_SIZES['medium']),
                 color=COLORS['white'],
                 bold=True,
                 halign='left',
                 valign='middle',
                 size_hint=(None, 1),
-                width=int(dp(108)),
+                width=_suh(108),
             )
             back_label.bind(size=back_label.setter('text_size'))
             if on_back:
@@ -95,7 +115,7 @@ class StatusBar(BoxLayout):
             # centre title
             self.device_label = Label(
                 text=device_name,
-                font_size=FONT_SIZES['title'],
+                font_size=_suf(FONT_SIZES['title']),
                 color=COLORS['white'],
                 bold=True,
                 halign='center',
@@ -110,28 +130,28 @@ class StatusBar(BoxLayout):
                 gear = self._make_gear()
                 self.add_widget(gear)
             else:
-                self.add_widget(Widget(size_hint=(None, 1), width=int(dp(8))))
+                self.add_widget(Widget(size_hint=(None, 1), width=_suh(8)))
 
         else:
             # dot + status text
             status_container = BoxLayout(
                 orientation='horizontal',
                 size_hint=(0.35, 1),
-                spacing=8,
+                spacing=_suh(8),
             )
 
             self.status_dot = Label(
                 text='●',
-                font_size=FONT_SIZES['small'],
+                font_size=_suf(FONT_SIZES['small']),
                 color=self._status_color,
                 size_hint=(None, 1),
-                width=20,
+                width=_suh(20),
             )
             status_container.add_widget(self.status_dot)
 
             self.status_label = Label(
                 text=status_text,
-                font_size=FONT_SIZES['medium'],
+                font_size=_suf(FONT_SIZES['medium']),
                 color=COLORS['white'],
                 bold=True,
                 halign='left',
@@ -145,7 +165,7 @@ class StatusBar(BoxLayout):
             # centre: device name
             self.device_label = Label(
                 text=device_name,
-                font_size=FONT_SIZES['small'],
+                font_size=_suf(FONT_SIZES['small']),
                 color=COLORS['gray_400'],
                 halign='center',
                 size_hint=(0.4, 1),
@@ -170,17 +190,17 @@ class StatusBar(BoxLayout):
             gear = _GearImageButton(
                 source=str(_GEAR_ICON),
                 size_hint=(None, None),
-                size=(int(dp(28)), int(dp(28))),
+                size=(_suv(28), _suv(28)),
                 allow_stretch=True,
                 keep_ratio=True,
             )
         else:
             gear = _GearButton(
                 text='⚙',
-                font_size=FONT_SIZES['title'],
+                font_size=_suf(FONT_SIZES['title']),
                 color=COLORS['gray_500'],
                 size_hint=(None, 1),
-                width=int(dp(36)),
+                width=_suh(36),
                 halign='center',
                 valign='middle',
             )

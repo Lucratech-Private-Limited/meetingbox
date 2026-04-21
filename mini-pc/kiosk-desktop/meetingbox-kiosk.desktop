@@ -1,0 +1,7 @@
+[Desktop Entry]
+Name=MeetingBox Kiosk
+Comment=MeetingBox only — no Ubuntu desktop (Docker UI fullscreen)
+TryExec=/usr/local/bin/meetingbox-gdm-kiosk-session
+Exec=/usr/local/bin/meetingbox-gdm-kiosk-session
+Type=XSession
+DesktopNames=MeetingBoxKiosk

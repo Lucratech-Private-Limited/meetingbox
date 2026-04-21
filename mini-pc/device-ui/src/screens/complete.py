@@ -44,11 +44,11 @@ class CompleteScreen(BaseScreen):
         # Checkmark
         self.check_label = Label(
             text='✓',
-            font_size=60,
+            font_size=self.suf(60),
             bold=True,
             color=COLORS['green'],
             halign='center',
-            size_hint=(1, None), height=70,
+            size_hint=(1, None), height=self.suv(70),
             opacity=0,
         )
         root.add_widget(self.check_label)
@@ -56,35 +56,35 @@ class CompleteScreen(BaseScreen):
         # Meeting Saved!
         self.title_label = Label(
             text='Meeting Saved!',
-            font_size=FONT_SIZES['large'],
+            font_size=self.suf(FONT_SIZES['large']),
             bold=True,
             color=COLORS['white'],
             halign='center',
-            size_hint=(1, None), height=30,
+            size_hint=(1, None), height=self.suv(30),
         )
         root.add_widget(self.title_label)
 
         # Meeting info
         self.info_label = Label(
             text='',
-            font_size=FONT_SIZES['medium'],
+            font_size=self.suf(FONT_SIZES['medium']),
             bold=True,
             color=COLORS['white'],
             halign='center',
-            size_hint=(1, None), height=24,
+            size_hint=(1, None), height=self.suv(24),
         )
         root.add_widget(self.info_label)
 
-        root.add_widget(Widget(size_hint=(1, None), height=8))
+        root.add_widget(Widget(size_hint=(1, None), height=self.suv(8)))
 
         # Quick stats
         self.stats_label = Label(
             text='',
-            font_size=FONT_SIZES['small'] + 2,
+            font_size=self.suf(FONT_SIZES['small'] + 2),
             color=COLORS['gray_500'],
             halign='center',
             valign='top',
-            size_hint=(1, None), height=60,
+            size_hint=(1, None), height=self.suv(60),
         )
         self.stats_label.bind(size=self.stats_label.setter('text_size'))
         root.add_widget(self.stats_label)

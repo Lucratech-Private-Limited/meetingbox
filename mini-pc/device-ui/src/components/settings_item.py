@@ -11,9 +11,31 @@ Supports three modes:
 from kivy.uix.behaviors import ButtonBehavior
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.label import Label
+from kivy.uix.widget import Widget
 from kivy.graphics import Color, RoundedRectangle
-from config import COLORS, FONT_SIZES, SPACING, BORDER_RADIUS
+from config import (
+    BORDER_RADIUS,
+    COLORS,
+    FONT_SIZES,
+    other_screen_horizontal_scale,
+    other_screen_vertical_scale,
+)
 from components.toggle_switch import ToggleSwitch
+
+
+def _si_suv(px):
+    v = other_screen_vertical_scale()
+    return max(1, int(round(float(px) * v)))
+
+
+def _si_suh(px):
+    h = other_screen_horizontal_scale()
+    return max(1, int(round(float(px) * h)))
+
+
+def _si_suf(fs):
+    v = other_screen_vertical_scale()
+    return max(6, int(round(float(fs) * v)))
 
 
 class SettingsItem(ButtonBehavior, BoxLayout):
@@ -36,9 +58,9 @@ class SettingsItem(ButtonBehavior, BoxLayout):
 
         kwargs.setdefault('orientation', 'horizontal')
         kwargs.setdefault('size_hint_y', None)
-        kwargs.setdefault('height', 60)
-        kwargs.setdefault('padding', [16, 8])
-        kwargs.setdefault('spacing', 8)
+        kwargs.setdefault('height', _si_suv(60))
+        kwargs.setdefault('padding', [_si_suh(16), _si_suv(8)])
+        kwargs.setdefault('spacing', _si_suh(8))
 
         super().__init__(**kwargs)
 
@@ -46,9 +68,9 @@ class SettingsItem(ButtonBehavior, BoxLayout):
         if on_press and mode == 'arrow':
             self.bind(on_press=on_press)
 
-        # Card background
+        # Card background (keep Color + rect; update rgba on press — avoid clear()+rebuild)
         with self.canvas.before:
-            Color(*COLORS['surface'])
+            self._bg_color = Color(*COLORS['surface'])
             self._bg = RoundedRectangle(
                 pos=self.pos, size=self.size, radius=[BORDER_RADIUS])
         self.bind(
@@ -60,12 +82,12 @@ class SettingsItem(ButtonBehavior, BoxLayout):
         text_box = BoxLayout(
             orientation='vertical',
             size_hint=(0.75, 1),
-            spacing=2,
+            spacing=_si_suv(2),
         )
 
         self.title_label = Label(
             text=title,
-            font_size=FONT_SIZES['small'] + 2,
+            font_size=_si_suf(FONT_SIZES['small'] + 2),
             color=COLORS['white'],
             halign='left',
             valign='bottom',
@@ -76,7 +98,7 @@ class SettingsItem(ButtonBehavior, BoxLayout):
 
         self.subtitle_label = Label(
             text=subtitle,
-            font_size=FONT_SIZES['small'],
+            font_size=_si_suf(FONT_SIZES['small']),
             color=COLORS['gray_500'],
             halign='left',
             valign='top',
@@ -87,41 +109,27 @@ class SettingsItem(ButtonBehavior, BoxLayout):
 
         self.add_widget(text_box)
 
-        # Right widget
+        # Right widget (no Unicode chevron — many embedded fonts render it as tofu)
         if mode == 'arrow':
-            arrow = Label(
-                text='→',
-                font_size=FONT_SIZES['large'],
-                color=COLORS['gray_500'],
-                size_hint=(0.15, 1),
-            )
-            self.add_widget(arrow)
+            self.add_widget(Widget(size_hint=(None, 1), width=_si_suh(8)))
         elif mode == 'toggle':
             self.toggle = ToggleSwitch(
                 active=active,
                 on_toggle=on_toggle,
                 size_hint=(None, None),
-                size=(52, 30),
+                size=(_si_suh(52), _si_suv(30)),
                 pos_hint={'center_y': 0.5},
             )
             self.add_widget(self.toggle)
         else:
             # info – no indicator
-            from kivy.uix.widget import Widget
             self.add_widget(Widget(size_hint=(0.1, 1)))
 
     # Press feedback
     def on_press(self):
         if self._mode == 'arrow':
-            with self.canvas.before:
-                self.canvas.before.clear()
-                Color(*COLORS['surface_light'])
-                self._bg = RoundedRectangle(
-                    pos=self.pos, size=self.size, radius=[BORDER_RADIUS])
+            self._bg_color.rgba = COLORS['surface_light']
 
     def on_release(self):
-        self.canvas.before.clear()
-        with self.canvas.before:
-            Color(*COLORS['surface'])
-            self._bg = RoundedRectangle(
-                pos=self.pos, size=self.size, radius=[BORDER_RADIUS])
+        if self._mode == 'arrow':
+            self._bg_color.rgba = COLORS['surface']

@@ -69,7 +69,7 @@ class WiFiConnectedScreen(BaseScreen):
 
         brand = Label(
             text="MeetingBox",
-            font_size=FONT_SIZES["title"],
+            font_size=self.suf(FONT_SIZES["title"]),
             bold=True,
             color=COLORS["white"],
             halign="left",
@@ -86,7 +86,7 @@ class WiFiConnectedScreen(BaseScreen):
 
         self._title_lbl = Label(
             text="You're connected",
-            font_size=FONT_SIZES["huge"],
+            font_size=self.suf(FONT_SIZES["huge"]),
             bold=True,
             color=COLORS["white"],
             halign="center",
@@ -98,7 +98,7 @@ class WiFiConnectedScreen(BaseScreen):
 
         self._subtitle_lbl = Label(
             text="Your MeetingBox is now connected and ready to use.",
-            font_size=FONT_SIZES["body"],
+            font_size=self.suf(FONT_SIZES["body"]),
             color=COLORS["gray_400"],
             halign="center",
             size_hint=(1, None),
@@ -117,7 +117,7 @@ class WiFiConnectedScreen(BaseScreen):
             text="Continue setup",
             size_hint=(None, 1),
             width=230,
-            font_size=FONT_SIZES["medium"],
+            font_size=self.suf(FONT_SIZES["medium"]),
         )
         self._continue_btn.bind(on_press=self._on_continue)
         footer.add_widget(self._continue_btn)
@@ -136,7 +136,7 @@ class WiFiConnectedScreen(BaseScreen):
         self._icon = Label(
             text="📶✓",
             color=COLORS["green"],
-            font_size=26,
+            font_size=self.suf(26),
             bold=True,
             size_hint=(None, None),
             size=(92, 92),
@@ -175,7 +175,7 @@ class WiFiConnectedScreen(BaseScreen):
         row1 = BoxLayout(orientation="horizontal", size_hint=(1, None), height=42)
         l1 = Label(
             text="Local IP Address",
-            font_size=FONT_SIZES["small"],
+            font_size=self.suf(FONT_SIZES["small"]),
             color=COLORS["gray_500"],
             halign="left",
             valign="middle",
@@ -184,7 +184,7 @@ class WiFiConnectedScreen(BaseScreen):
         l1.bind(size=l1.setter("text_size"))
         self._ip_value = Label(
             text=self._ip_address,
-            font_size=FONT_SIZES["medium"],
+            font_size=self.suf(FONT_SIZES["medium"]),
             color=COLORS["white"],
             halign="right",
             valign="middle",
@@ -198,7 +198,7 @@ class WiFiConnectedScreen(BaseScreen):
         row2 = BoxLayout(orientation="horizontal", size_hint=(1, None), height=42)
         l2 = Label(
             text="Access URL",
-            font_size=FONT_SIZES["small"],
+            font_size=self.suf(FONT_SIZES["small"]),
             color=COLORS["gray_500"],
             halign="left",
             valign="middle",
@@ -207,7 +207,7 @@ class WiFiConnectedScreen(BaseScreen):
         l2.bind(size=l2.setter("text_size"))
         self._url_value = Label(
             text=DASHBOARD_PUBLIC_URL,
-            font_size=FONT_SIZES["medium"],
+            font_size=self.suf(FONT_SIZES["medium"]),
             color=COLORS["blue"],
             halign="right",
             valign="middle",

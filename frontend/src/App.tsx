@@ -14,6 +14,8 @@ import LiveRecording from './pages/LiveRecording'
 import Settings from './pages/Settings'
 import SystemStatus from './pages/SystemStatus'
 import AssistantChat from './pages/AssistantChat'
+import Privacy from './pages/Privacy'
+import Terms from './pages/Terms'
 
 function AuthGate({ children }: { children: React.ReactNode }) {
   const token = useAuthStore((s) => s.token)
@@ -79,6 +81,8 @@ export default function App() {
             }
           />
           <Route path="/auth/callback" element={<AuthCallback />} />
+          <Route path="/privacy" element={<Privacy />} />
+          <Route path="/terms" element={<Terms />} />
 
           {/* Personal onboarding -- logged in but onboarding not complete */}
           <Route

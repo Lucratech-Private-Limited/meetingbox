@@ -36,4 +36,12 @@ export interface SystemInfo {
   disk_percent: number
   disk_used_gb: number
   disk_total_gb: number
+  /** ISO timestamp when the mini-PC last reported (dashboard only). */
+  updated_at?: string
+}
+
+export interface ApplianceStatusPayload {
+  system: SystemInfo | null
+  device: { id: string; device_name: string } | null
+  message: string | null
 }

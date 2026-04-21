@@ -56,7 +56,7 @@ class MeetingBoxReadyScreen(BaseScreen):
             header.add_widget(Widget(size_hint=(None, 1), width=8))
         brand = Label(
             text="MeetingBox",
-            font_size=FONT_SIZES["title"],
+            font_size=self.suf(FONT_SIZES["title"]),
             bold=True,
             color=COLORS["white"],
             halign="left",
@@ -73,7 +73,7 @@ class MeetingBoxReadyScreen(BaseScreen):
 
         title = Label(
             text="MeetingBox is ready.",
-            font_size=FONT_SIZES["huge"],
+            font_size=self.suf(FONT_SIZES["huge"]),
             bold=True,
             color=COLORS["white"],
             halign="center",
@@ -92,7 +92,7 @@ class MeetingBoxReadyScreen(BaseScreen):
             text="Back",
             size_hint=(None, 1),
             width=100,
-            font_size=FONT_SIZES["medium"],
+            font_size=self.suf(FONT_SIZES["medium"]),
         )
         back_btn.bind(on_press=lambda *_: self.go_back())
         foot.add_widget(back_btn)
@@ -101,7 +101,7 @@ class MeetingBoxReadyScreen(BaseScreen):
             text="Get started",
             size_hint=(None, 1),
             width=220,
-            font_size=FONT_SIZES["medium"],
+            font_size=self.suf(FONT_SIZES["medium"]),
         )
         self._start_btn.bind(on_press=self._on_get_started)
         foot.add_widget(self._start_btn)
@@ -117,7 +117,7 @@ class MeetingBoxReadyScreen(BaseScreen):
             self._glow = Ellipse(size=(88, 88), pos=(0, 0))
         self._check = Label(
             text="✓",
-            font_size=44,
+            font_size=self.suf(44),
             bold=True,
             color=COLORS["white"],
             size_hint=(None, None),
@@ -139,7 +139,7 @@ class MeetingBoxReadyScreen(BaseScreen):
         row = BoxLayout(orientation="horizontal", size_hint=(1, None), height=44)
         lb = Label(
             text=label,
-            font_size=FONT_SIZES["small"],
+            font_size=self.suf(FONT_SIZES["small"]),
             color=COLORS["gray_500"],
             halign="left",
             valign="middle",

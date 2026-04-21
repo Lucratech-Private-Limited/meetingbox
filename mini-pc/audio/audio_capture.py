@@ -21,6 +21,22 @@ logger = logging.getLogger("meetingbox.audio")
 
 REDIS_HOST = os.getenv("REDIS_HOST", "redis")
 REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
+DEVICE_AUTH_TOKEN_FILE = os.getenv("DEVICE_AUTH_TOKEN_FILE", "/data/config/device_auth_token").strip()
+
+
+def _load_device_auth_token() -> str:
+  """Prefer the persisted paired-device token file, then fall back to env."""
+  token_file = DEVICE_AUTH_TOKEN_FILE
+  if token_file:
+    path = Path(token_file)
+    try:
+      if path.is_file():
+        token = path.read_text(encoding="utf-8-sig").strip()
+        if token:
+          return token
+    except OSError as exc:
+      logger.warning("Could not read device auth token file %s: %s", path, exc)
+  return os.getenv("DEVICE_AUTH_TOKEN", "").strip()
 
 
 class AudioCaptureService:
@@ -62,8 +78,9 @@ class AudioCaptureService:
       self.upload_audio_timeout_seconds = max(60, int(os.getenv("UPLOAD_AUDIO_TIMEOUT_SECONDS", "1200")))
     except ValueError:
       self.upload_audio_timeout_seconds = 1200
-    # Same token as device-ui: paired device Bearer so uploads get user_id/device_id on the server.
-    self._upload_auth_token = os.getenv("DEVICE_AUTH_TOKEN", "").strip()
+    # Same token as device-ui: paired device Bearer so uploads/command polling
+    # keep working after pairing without copying the token into .env manually.
+    self._upload_auth_token = _load_device_auth_token()
 
     self.audio = pyaudio.PyAudio()
     self.stream: pyaudio.Stream | None = None
@@ -332,24 +349,33 @@ class AudioCaptureService:
     session_temp = self.temp_dir / session_id
     session_temp.mkdir(parents=True, exist_ok=True)
 
-    mic_index = self.find_mic_device()
-    self.stream = self.audio.open(
-      format=self.FORMAT,
-      channels=self.CAPTURE_CHANNELS,
-      rate=self.RATE,
-      input=True,
-      input_device_index=mic_index,
-      frames_per_buffer=self.CHUNK,
-    )
+    try:
+      mic_index = self.find_mic_device()
+      self.stream = self.audio.open(
+        format=self.FORMAT,
+        channels=self.CAPTURE_CHANNELS,
+        rate=self.RATE,
+        input=True,
+        input_device_index=mic_index,
+        frames_per_buffer=self.CHUNK,
+      )
 
-    output_path = self.recordings_dir / f"{session_id}.wav"
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    wav_writer = wave.open(str(output_path), "wb")
-    wav_writer.setnchannels(self.TARGET_CHANNELS)
-    wav_writer.setsampwidth(self.audio.get_sample_size(self.FORMAT))
-    wav_writer.setframerate(self.TARGET_RATE)
-    self._output_path = output_path
-    self._wav_writer = wav_writer
+      output_path = self.recordings_dir / f"{session_id}.wav"
+      output_path.parent.mkdir(parents=True, exist_ok=True)
+      wav_writer = wave.open(str(output_path), "wb")
+      wav_writer.setnchannels(self.TARGET_CHANNELS)
+      wav_writer.setsampwidth(self.audio.get_sample_size(self.FORMAT))
+      wav_writer.setframerate(self.TARGET_RATE)
+      self._output_path = output_path
+      self._wav_writer = wav_writer
+    except Exception:
+      self.is_recording = False
+      self.current_session_id = None
+      self.stream = None
+      self._output_path = None
+      self._wav_writer = None
+      logger.exception("Failed to open microphone / WAV for session %s", session_id)
+      return False
 
     self.redis_client.publish(
       "events",
@@ -790,7 +816,17 @@ class AudioCaptureService:
       return up.split(marker)[0].rstrip("/")
     return "http://127.0.0.1:8000"
 
+  MAX_COMMAND_AGE = 60  # seconds — discard commands older than this
+
   def _dispatch_command(self, command: dict) -> None:
+    ts = command.get("ts")
+    if ts is not None:
+      age = time.time() - float(ts)
+      if age > self.MAX_COMMAND_AGE:
+        logger.info(
+          "Skipping stale command %s (%.0fs old)", command.get("action"), age,
+        )
+        return
     action = command.get("action")
     if action == "start_recording":
       session_id = command.get("session_id")
@@ -812,6 +848,12 @@ class AudioCaptureService:
     elif action == "stop_mic_test":
       self.stop_mic_test()
 
+  def _refresh_auth_token(self) -> str:
+    """Re-read the token from file/env so pairing after container start works."""
+    token = _load_device_auth_token()
+    self._upload_auth_token = token
+    return token
+
   def run_redis(self) -> None:
     """Subscribe to Redis ``commands`` (same host or tunnel to server Redis)."""
     logger.info("Command: Redis channel 'commands' (host %s)", REDIS_HOST)
@@ -826,7 +868,10 @@ class AudioCaptureService:
       except json.JSONDecodeError:
         logger.warning("Invalid command payload: %s", message["data"])
         continue
-      self._dispatch_command(command)
+      try:
+        self._dispatch_command(command)
+      except Exception:
+        logger.exception("Error handling audio command from Redis")
 
   def run_http_poll(self) -> None:
     """
@@ -835,21 +880,38 @@ class AudioCaptureService:
     Requires DEVICE_AUTH_TOKEN and a reachable API; uses UPLOAD_AUDIO_API_URL or
     AUDIO_POLL_BASE_URL to find ``/api/device/audio-command/wait``.
     """
-    if not self._upload_auth_token:
-      logger.error("AUDIO_COMMAND_SOURCE=http requires DEVICE_AUTH_TOKEN (paired device token).")
-      return
+    # Wait for a token to appear (pairing may happen after container start)
+    while not self._upload_auth_token:
+      logger.info(
+        "Waiting for device auth token (pair this device from the dashboard). "
+        "Checking %s every 10s…",
+        DEVICE_AUTH_TOKEN_FILE,
+      )
+      time.sleep(10)
+      self._refresh_auth_token()
+
     base = self._poll_command_api_base()
     url = f"{base}/api/device/audio-command/wait"
-    logger.info("Command: HTTP long-poll %s", url)
+    logger.info("Command: HTTP long-poll %s (token=%s…)", url, self._upload_auth_token[:8])
 
     while True:
+      # Re-read token each iteration so a re-pair is picked up without restart
+      self._refresh_auth_token()
+      if not self._upload_auth_token:
+        logger.warning("Device auth token disappeared — waiting for re-pair…")
+        time.sleep(10)
+        continue
+
       try:
         req = urlrequest.Request(
           url,
           headers={"Authorization": f"Bearer {self._upload_auth_token}"},
         )
         with urlrequest.urlopen(req, timeout=90) as resp:
-          if resp.status == 204:
+          status = getattr(resp, "status", None)
+          if status is None:
+            status = resp.getcode()
+          if status == 204:
             continue
           raw = resp.read().decode("utf-8", errors="replace").strip()
           if not raw:
@@ -874,13 +936,59 @@ class AudioCaptureService:
         logger.warning("Invalid JSON from audio-command wait")
         continue
 
-      self._dispatch_command(command)
+      try:
+        self._dispatch_command(command)
+      except Exception:
+        logger.exception("Error handling audio command %s", command)
+
+  def _is_remote_api(self) -> bool:
+    """True when UPLOAD_AUDIO_API_URL points somewhere other than localhost."""
+    url = (self.upload_audio_api_url or "").lower()
+    for local in ("://localhost", "://127.0.0.1", "://host.docker.internal"):
+      if local in url:
+        return False
+    return "://" in url
 
   def run(self) -> None:
-    mode = os.getenv("AUDIO_COMMAND_SOURCE", "redis").strip().lower()
-    if mode in ("http", "api", "longpoll"):
+    # Re-read token right now (may have been written after __init__)
+    self._refresh_auth_token()
+
+    explicit_mode = os.getenv("AUDIO_COMMAND_SOURCE", "").strip().lower()
+    has_token = bool(self._upload_auth_token)
+    remote_api = self._is_remote_api()
+
+    # In a split deployment (mini PC + cloud API), the local Docker Redis
+    # never receives commands published by the remote server.  HTTP
+    # long-poll is the only mode that works.  run_http_poll() will wait
+    # for a token to appear if the device hasn't been paired yet, so we
+    # can safely enter it even before pairing.
+    if has_token:
+      if explicit_mode == "redis":
+        logger.warning(
+          "AUDIO_COMMAND_SOURCE=redis but DEVICE_AUTH_TOKEN is set. "
+          "Overriding to HTTP long-poll — local Redis cannot receive "
+          "commands from the remote API. Remove AUDIO_COMMAND_SOURCE "
+          "from .env to silence this warning.",
+        )
+      else:
+        logger.info("Using HTTP long-poll (DEVICE_AUTH_TOKEN found).")
+      self.run_http_poll()
+    elif explicit_mode in ("http", "api", "longpoll"):
+      self.run_http_poll()
+    elif remote_api and explicit_mode != "redis":
+      # Remote API but no token yet — wait for pairing in HTTP poll loop.
+      logger.info(
+        "No device token yet but UPLOAD_AUDIO_API_URL is remote (%s). "
+        "Waiting for pairing — will start HTTP long-poll once token appears.",
+        self.upload_audio_api_url,
+      )
       self.run_http_poll()
     else:
+      logger.info(
+        "Command: Redis channel 'commands' on %s. "
+        "For cloud API + mini PC, pair the device or set DEVICE_AUTH_TOKEN.",
+        REDIS_HOST,
+      )
       self.run_redis()
 
 

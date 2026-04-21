@@ -75,7 +75,7 @@ class RoomNameScreen(BaseScreen):
             header.add_widget(Widget(size_hint=(None, 1), width=8))
         brand = Label(
             text='MeetingBox',
-            font_size=FONT_SIZES['title'],
+            font_size=self.suf(FONT_SIZES['title']),
             bold=True,
             color=COLORS['white'],
             halign='left',
@@ -103,7 +103,7 @@ class RoomNameScreen(BaseScreen):
 
         title = Label(
             text='Name this room',
-            font_size=FONT_SIZES['huge'],
+            font_size=self.suf(FONT_SIZES['huge']),
             bold=True,
             color=COLORS['white'],
             halign='left',
@@ -116,7 +116,7 @@ class RoomNameScreen(BaseScreen):
 
         subtitle = Label(
             text='This is your device name (home screen, link device, recordings).',
-            font_size=FONT_SIZES['body'],
+            font_size=self.suf(FONT_SIZES['body']),
             color=COLORS['gray_400'],
             halign='left',
             valign='top',
@@ -133,7 +133,7 @@ class RoomNameScreen(BaseScreen):
             multiline=False,
             size_hint=(1, None),
             height=52,
-            font_size=FONT_SIZES['medium'],
+            font_size=self.suf(FONT_SIZES['medium']),
             padding=[16, 14],
             background_normal='',
             background_active='',
@@ -149,7 +149,7 @@ class RoomNameScreen(BaseScreen):
 
         sug_label = Label(
             text='SUGGESTED NAMES',
-            font_size=FONT_SIZES['small'],
+            font_size=self.suf(FONT_SIZES['small']),
             bold=True,
             color=COLORS['gray_500'],
             halign='left',
@@ -183,7 +183,7 @@ class RoomNameScreen(BaseScreen):
                 text=name,
                 size_hint=(None, None),
                 size=(w, 44),
-                font_size=FONT_SIZES['small'],
+                font_size=self.suf(FONT_SIZES['small']),
             )
             chip.bind(on_press=lambda inst, n=name: self._apply_chip(n))
             chips_row.add_widget(chip)
@@ -217,7 +217,7 @@ class RoomNameScreen(BaseScreen):
             text='Back',
             size_hint=(None, 1),
             width=100,
-            font_size=FONT_SIZES['medium'],
+            font_size=self.suf(FONT_SIZES['medium']),
         )
         back_btn.bind(on_press=self._on_back)
         footer.add_widget(back_btn)
@@ -228,7 +228,7 @@ class RoomNameScreen(BaseScreen):
             text='Next Step',
             size_hint=(None, 1),
             width=140,
-            font_size=FONT_SIZES['medium'],
+            font_size=self.suf(FONT_SIZES['medium']),
         )
         self._next_btn.bind(on_press=self._on_next)
         self._next_btn.disabled = True

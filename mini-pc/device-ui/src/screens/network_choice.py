@@ -67,7 +67,7 @@ class NetworkChoiceScreen(BaseScreen):
             header.add_widget(Widget(size_hint=(None, 1), width=8))
         brand = Label(
             text="MeetingBox",
-            font_size=FONT_SIZES["title"],
+            font_size=self.suf(FONT_SIZES["title"]),
             bold=True,
             color=COLORS["white"],
             halign="left",
@@ -89,7 +89,7 @@ class NetworkChoiceScreen(BaseScreen):
 
         title = Label(
             text="Connect to the internet",
-            font_size=FONT_SIZES["huge"],
+            font_size=self.suf(FONT_SIZES["huge"]),
             bold=True,
             color=COLORS["white"],
             halign="left",
@@ -102,7 +102,7 @@ class NetworkChoiceScreen(BaseScreen):
 
         subtitle = Label(
             text="Use Wi‑Fi, or skip if this device already has a working wired connection.",
-            font_size=FONT_SIZES["body"],
+            font_size=self.suf(FONT_SIZES["body"]),
             color=COLORS["gray_400"],
             halign="left",
             valign="top",
@@ -114,7 +114,7 @@ class NetworkChoiceScreen(BaseScreen):
 
         self._hint_label = Label(
             text="",
-            font_size=FONT_SIZES["small"],
+            font_size=self.suf(FONT_SIZES["small"]),
             color=COLORS["green"],
             halign="left",
             valign="top",
@@ -130,7 +130,7 @@ class NetworkChoiceScreen(BaseScreen):
             text="Set up Wi‑Fi",
             size_hint=(1, None),
             height=52,
-            font_size=FONT_SIZES["medium"],
+            font_size=self.suf(FONT_SIZES["medium"]),
         )
         wifi_btn.bind(on_press=self._on_wifi)
         inner.add_widget(wifi_btn)
@@ -141,7 +141,7 @@ class NetworkChoiceScreen(BaseScreen):
             text="Use wired Ethernet (skip Wi‑Fi)",
             size_hint=(1, None),
             height=52,
-            font_size=FONT_SIZES["medium"],
+            font_size=self.suf(FONT_SIZES["medium"]),
         )
         eth_btn.bind(on_press=self._on_ethernet)
         inner.add_widget(eth_btn)
@@ -159,7 +159,7 @@ class NetworkChoiceScreen(BaseScreen):
             text="Back",
             size_hint=(None, 1),
             width=120,
-            font_size=FONT_SIZES["medium"],
+            font_size=self.suf(FONT_SIZES["medium"]),
         )
         back_btn.bind(on_press=self._on_back)
         footer.add_widget(back_btn)

@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { apiClient } from '../api/client'
 import { meetingsApi } from '../api/meetings'
-import type { SystemInfo } from '../types/user'
+import type { ApplianceStatusPayload, SystemInfo } from '../types/user'
 import LoadingSpinner from '../components/ui/LoadingSpinner'
 import Modal from '../components/ui/Modal'
 import Button from '../components/ui/Button'
@@ -9,6 +9,8 @@ import toast from 'react-hot-toast'
 
 export default function SystemStatus() {
   const [info, setInfo] = useState<SystemInfo | null>(null)
+  const [applianceNote, setApplianceNote] = useState<string | null>(null)
+  const [pairedDeviceName, setPairedDeviceName] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
@@ -18,8 +20,10 @@ export default function SystemStatus() {
 
   const load = useCallback(async () => {
     try {
-      const res = await apiClient.get<{ system: SystemInfo }>('/api/system/status')
+      const res = await apiClient.get<ApplianceStatusPayload>('/api/system/appliance-status')
       setInfo(res.data.system)
+      setApplianceNote(res.data.message)
+      setPairedDeviceName(res.data.device?.device_name ?? null)
       setError(null)
     } catch {
       setError('Could not reach the backend. Make sure it is running.')
@@ -79,9 +83,8 @@ export default function SystemStatus() {
     )
   }
 
-  if (!info) return null
-
-  const stats = [
+  const stats = info
+    ? [
     {
       label: 'CPU',
       value: `${info.cpu_percent.toFixed(1)}%`,
@@ -100,12 +103,26 @@ export default function SystemStatus() {
       percent: info.disk_percent,
       color: info.disk_percent > 80 ? 'bg-red-500' : info.disk_percent > 50 ? 'bg-yellow-500' : 'bg-green-500',
     },
-  ]
+      ]
+    : []
 
   return (
-    <div className="max-w-4xl mx-auto px-4 py-8">
-      <h1 className="text-3xl font-bold text-gray-900 mb-8">System Status</h1>
+    <div className="max-w-4xl mx-auto px-4 py-8" data-tutorial="tutorial-system">
+      <h1 className="text-3xl font-bold text-gray-900 mb-2">System Status</h1>
+      <p className="text-sm text-gray-600 mb-4">
+        Metrics reflect your <strong>paired MeetingBox device</strong> (mini PC), not this web server.
+        {pairedDeviceName ? (
+          <span className="block mt-1 text-gray-800">Device: {pairedDeviceName}</span>
+        ) : null}
+      </p>
 
+      {applianceNote && (
+        <div className="mb-6 bg-amber-50 border border-amber-200 rounded-lg p-4 text-amber-900 text-sm">
+          {applianceNote}
+        </div>
+      )}
+
+      {stats.length > 0 ? (
       <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
         {stats.map((stat) => (
           <div key={stat.label} className="bg-white rounded-lg border border-gray-200 p-6">
@@ -124,11 +141,20 @@ export default function SystemStatus() {
           </div>
         ))}
       </div>
+      ) : !applianceNote ? (
+        <p className="text-gray-600 text-sm mb-6">No metrics to display yet.</p>
+      ) : null}
+
+      {info?.updated_at ? (
+        <p className="mt-3 text-xs text-gray-500">
+          Last updated from device: {new Date(info.updated_at).toLocaleString()}
+        </p>
+      ) : null}
 
       {/* Free up Space */}
       <div className="mt-8">
         <h2 className="text-xl font-bold text-gray-900 mb-4">Storage</h2>
-        {info.disk_percent > 80 && (
+        {info && info.disk_percent > 80 && (
           <div className="mb-4 bg-red-50 border border-red-200 rounded-lg p-4 flex items-start">
             <svg className="h-5 w-5 text-red-400 flex-shrink-0 mt-0.5" fill="currentColor" viewBox="0 0 20 20">
               <path fillRule="evenodd" d="M8.257 3.099c.765-1.36 2.722-1.36 3.486 0l5.58 9.92c.75 1.334-.213 2.98-1.742 2.98H4.42c-1.53 0-2.493-1.646-1.743-2.98l5.58-9.92zM11 13a1 1 0 11-2 0 1 1 0 012 0zm-1-8a1 1 0 00-1 1v3a1 1 0 002 0V6a1 1 0 00-1-1z" clipRule="evenodd" />
@@ -143,7 +169,8 @@ export default function SystemStatus() {
         )}
         <div className="bg-white rounded-lg border border-gray-200 p-6">
           <p className="text-sm text-gray-600 mb-4">
-            Delete old meeting recordings, transcripts, and summaries to reclaim disk space.
+            Delete old meeting recordings, transcripts, and summaries to reclaim disk space on the server
+            (your account). This does not change the appliance display above.
           </p>
           <div className="flex flex-wrap gap-3">
             <button

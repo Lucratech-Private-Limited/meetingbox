@@ -21,22 +21,24 @@ export default function Settings() {
       <h1 className="text-3xl font-bold text-gray-900 mb-8">Settings</h1>
 
       <Tab.Group defaultIndex={defaultTab}>
-        <Tab.List className="flex space-x-1 rounded-lg bg-primary-100 p-1 mb-8">
-          {tabs.map((tab) => (
-            <Tab
-              key={tab.name}
-              className={({ selected }) =>
-                `w-full rounded-lg py-2.5 text-sm font-medium leading-5 transition-colors ${
-                  selected
-                    ? 'bg-white text-primary-700 shadow'
-                    : 'text-primary-600 hover:bg-white/[0.12] hover:text-primary-800'
-                }`
-              }
-            >
-              {tab.name}
-            </Tab>
-          ))}
-        </Tab.List>
+        <div data-tutorial="tutorial-settings-tabs">
+          <Tab.List className="flex space-x-1 rounded-lg bg-primary-100 p-1 mb-8">
+            {tabs.map((tab) => (
+              <Tab
+                key={tab.name}
+                className={({ selected }) =>
+                  `w-full rounded-lg py-2.5 text-sm font-medium leading-5 transition-colors ${
+                    selected
+                      ? 'bg-white text-primary-700 shadow'
+                      : 'text-primary-600 hover:bg-white/[0.12] hover:text-primary-800'
+                  }`
+                }
+              >
+                {tab.name}
+              </Tab>
+            ))}
+          </Tab.List>
+        </div>
         <Tab.Panels>
           {tabs.map((tab, idx) => (
             <Tab.Panel key={idx}>

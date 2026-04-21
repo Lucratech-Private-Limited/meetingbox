@@ -30,6 +30,9 @@ logger = logging.getLogger(__name__)
 # Horizontal space for checkbox + per-row Execute + spacing (must fit on screen)
 _ACTION_ROW_RESERVED = 28 + 96 + 20
 
+# Prefix for transcript-only body until the AI report row exists in DB.
+_TRANSCRIPT_ONLY_PREFIX = "[i]Transcript[/i]"
+
 
 class SummaryReviewScreen(BaseScreen):
     """Post-recording screen with Report and Actions tabs."""
@@ -42,6 +45,7 @@ class SummaryReviewScreen(BaseScreen):
         self._selected_actions = set()
         self._auto_generate_attempted = False
         self._current_tab = 'summary'
+        self._detail_loading = False
         self._build_ui()
 
     def _build_ui(self):
@@ -67,7 +71,7 @@ class SummaryReviewScreen(BaseScreen):
 
         self.summary_tab_btn = SecondaryButton(
             text='Report',
-            font_size=FONT_SIZES['body'],
+            font_size=self.suf(FONT_SIZES['body']),
             size_hint=(0.5, 1),
         )
         self.summary_tab_btn.bind(on_press=lambda _: self._switch_tab('summary'))
@@ -75,7 +79,7 @@ class SummaryReviewScreen(BaseScreen):
 
         self.actions_tab_btn = SecondaryButton(
             text='Actions',
-            font_size=FONT_SIZES['body'],
+            font_size=self.suf(FONT_SIZES['body']),
             size_hint=(0.5, 1),
         )
         self.actions_tab_btn.bind(on_press=lambda _: self._switch_tab('actions'))
@@ -98,7 +102,7 @@ class SummaryReviewScreen(BaseScreen):
 
         self.close_btn = SecondaryButton(
             text='Close',
-            font_size=FONT_SIZES['body'],
+            font_size=self.suf(FONT_SIZES['body']),
             size_hint=(0.4, 1),
         )
         self.close_btn.bind(on_press=self._on_close)
@@ -106,7 +110,7 @@ class SummaryReviewScreen(BaseScreen):
 
         self.execute_btn = PrimaryButton(
             text='Execute Selected',
-            font_size=FONT_SIZES['body'],
+            font_size=self.suf(FONT_SIZES['body']),
             size_hint=(0.6, 1),
         )
         self.execute_btn.bind(on_press=self._on_execute)
@@ -123,7 +127,89 @@ class SummaryReviewScreen(BaseScreen):
         self._actions_data = []
         self._selected_actions = set()
         self._auto_generate_attempted = False
-        self._load_actions()
+        self._detail_loading = True
+        self._render_loading_tab()
+        self._fetch_and_merge_detail()
+
+    @staticmethod
+    def _segments_to_transcript_text(segments):
+        lines = []
+        for seg in segments or []:
+            if not isinstance(seg, dict):
+                continue
+            t = (seg.get("text") or "").strip()
+            if not t:
+                continue
+            st = float(seg.get("start_time") or 0.0)
+            mins, secs = divmod(int(st), 60)
+            spk = seg.get("speaker_id")
+            prefix = f"[{mins:02d}:{secs:02d}]"
+            if spk is not None and str(spk).strip() != "":
+                prefix += f" Speaker {spk}:"
+            lines.append(f"{prefix} {t}")
+        return "\n".join(lines)
+
+    def _apply_meeting_detail(self, detail: dict):
+        """Merge GET /api/meetings/{id} into _summary_data; fall back to transcript."""
+        if not detail:
+            self._summary_data = {"summary": "Could not load this meeting."}
+            return
+        block = detail.get("summary")
+        if not isinstance(block, dict):
+            block = {}
+        segments = detail.get("segments") or []
+        report = (block.get("summary") or "").strip()
+        if not report and segments:
+            report = (
+                f"{_TRANSCRIPT_ONLY_PREFIX} — the full AI report will appear here when "
+                "analysis finishes. You can read the transcript below.\n\n"
+                + self._segments_to_transcript_text(segments)
+            )
+        elif not report:
+            report = "No report or transcript is available yet."
+        merged = {**block, "summary": report}
+        self._summary_data = merged
+
+    def _render_loading_tab(self):
+        self._current_tab = "summary"
+        self.content_area.clear_widgets()
+        self.execute_btn.opacity = 0
+        self.execute_btn.disabled = True
+        hold = BoxLayout(orientation="vertical", padding=[SPACING["screen_padding"], 24])
+        hold.add_widget(
+            Label(
+                text="Loading meeting…",
+                font_size=self.suf(FONT_SIZES["body"]),
+                color=COLORS["gray_400"],
+                halign="center",
+                valign="middle",
+                size_hint=(1, 1),
+            )
+        )
+        self.content_area.add_widget(hold)
+
+    def _fetch_and_merge_detail(self):
+        if not self.meeting_id:
+            self._detail_loading = False
+            self._render_tab()
+            return
+
+        async def _run():
+            try:
+                detail = await self.backend.get_meeting_detail(self.meeting_id)
+            except Exception as e:
+                logger.error("get_meeting_detail failed: %s", e)
+                detail = {}
+
+            def _done(_dt):
+                self._detail_loading = False
+                self._apply_meeting_detail(detail)
+                self._load_actions()
+                self._render_tab()
+
+            Clock.schedule_once(_done, 0)
+
+        run_async(_run())
 
     def _load_actions(self):
         if not self.meeting_id:
@@ -133,8 +219,12 @@ class SummaryReviewScreen(BaseScreen):
             try:
                 actions = await self.backend.get_actions(self.meeting_id)
 
+                raw_s = (self._summary_data or {}).get("summary") or ""
+                tx_only = isinstance(raw_s, str) and raw_s.startswith(
+                    _TRANSCRIPT_ONLY_PREFIX
+                )
                 has_summary_content = bool(
-                    (self._summary_data or {}).get('summary')
+                    ((not tx_only) and str(raw_s).strip())
                     or (self._summary_data or {}).get('action_items')
                     or (self._summary_data or {}).get('decisions')
                 )
@@ -237,7 +327,7 @@ class SummaryReviewScreen(BaseScreen):
         summary_text = self._summary_data.get('summary', 'No report available.')
         lbl = Label(
             text=summary_text,
-            font_size=FONT_SIZES['body'],
+            font_size=self.suf(FONT_SIZES['body']),
             color=COLORS['white'],
             halign='left',
             valign='top',
@@ -252,7 +342,7 @@ class SummaryReviewScreen(BaseScreen):
         if decisions:
             hdr = Label(
                 text='Decisions',
-                font_size=FONT_SIZES['body'],
+                font_size=self.suf(FONT_SIZES['body']),
                 bold=True,
                 color=COLORS['blue'],
                 halign='left',
@@ -264,7 +354,7 @@ class SummaryReviewScreen(BaseScreen):
             for d in decisions:
                 dl = Label(
                     text=f"  - {d}",
-                    font_size=FONT_SIZES['small'],
+                    font_size=self.suf(FONT_SIZES['small']),
                     color=COLORS['gray_300'],
                     halign='left',
                     valign='top',
@@ -298,7 +388,7 @@ class SummaryReviewScreen(BaseScreen):
         if agentic:
             hdr = Label(
                 text='AI actions — tap Execute on any row, or select multiple and use Execute Selected',
-                font_size=FONT_SIZES['small'],
+                font_size=self.suf(FONT_SIZES['small']),
                 bold=True,
                 color=COLORS['blue'],
                 halign='left',
@@ -344,7 +434,7 @@ class SummaryReviewScreen(BaseScreen):
 
                 al = Label(
                     text=text,
-                    font_size=FONT_SIZES['small'] + 1,
+                    font_size=self.suf(FONT_SIZES['small'] + 1),
                     color=color,
                     halign='left',
                     valign='middle',
@@ -368,7 +458,7 @@ class SummaryReviewScreen(BaseScreen):
                 if eff in ('calendar', 'gmail'):
                     run_btn = SecondaryButton(
                         text='Execute',
-                        font_size=FONT_SIZES['small'],
+                        font_size=self.suf(FONT_SIZES['small']),
                         size_hint=(None, None),
                         width=96,
                         height=34,
@@ -389,7 +479,7 @@ class SummaryReviewScreen(BaseScreen):
         elif summary_items:
             hdr = Label(
                 text='Action items from report',
-                font_size=FONT_SIZES['body'],
+                font_size=self.suf(FONT_SIZES['body']),
                 bold=True,
                 color=COLORS['blue'],
                 halign='left',
@@ -406,7 +496,7 @@ class SummaryReviewScreen(BaseScreen):
                     'with the report when you are signed in and integrations are connected. '
                     'If the AI Actions list is still empty, connect accounts in the web app or reopen this screen.'
                 ),
-                font_size=FONT_SIZES['small'],
+                font_size=self.suf(FONT_SIZES['small']),
                 color=COLORS['gray_500'],
                 halign='left',
                 valign='top',
@@ -427,7 +517,7 @@ class SummaryReviewScreen(BaseScreen):
 
                 al = Label(
                     text=line,
-                    font_size=FONT_SIZES['small'] + 1,
+                    font_size=self.suf(FONT_SIZES['small'] + 1),
                     color=COLORS['gray_300'],
                     halign='left',
                     valign='top',
@@ -443,7 +533,7 @@ class SummaryReviewScreen(BaseScreen):
         else:
             empty = Label(
                 text='No action items found.',
-                font_size=FONT_SIZES['body'],
+                font_size=self.suf(FONT_SIZES['body']),
                 color=COLORS['gray_500'],
                 halign='center',
                 size_hint_y=None,
@@ -556,4 +646,11 @@ class SummaryReviewScreen(BaseScreen):
 
     def on_enter(self):
         self._current_tab = 'summary'
-        self._render_tab()
+        if self._detail_loading:
+            return
+        if self.meeting_id:
+            self._detail_loading = True
+            self._render_loading_tab()
+            self._fetch_and_merge_detail()
+        else:
+            self._render_tab()
