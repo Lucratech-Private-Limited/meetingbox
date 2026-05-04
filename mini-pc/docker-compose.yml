@@ -70,6 +70,10 @@ services:
     user: "1000:1000"
     restart: unless-stopped
     profiles: ["mini-pc", "screen"]
+    # Host network: ``ip`` / ``hostname -I`` / route source match the real LAN (enp1s0, DHCP
+    # renewals) — no wrong 172.18.x container address on the home-screen footer. ``redis``
+    # is not resolvable here; use 127.0.0.1 (Redis publishes 127.0.0.1:6379 on the host).
+    network_mode: host
     # Share host PID namespace so ``nsenter -t 1`` in meetingbox-host-reboot targets
     # the real systemd (PID 1 on the mini-PC). Without this, -t 1 is the container's
     # init and setns often fails with "reassociate to namespaces failed: Operation not permitted".
@@ -78,7 +82,8 @@ services:
       - "host.docker.internal:host-gateway"
     environment:
       - PYTHONUNBUFFERED=1
-      - BACKEND_URL=${BACKEND_URL:-http://host.docker.internal:8000}
+      # Local API on the mini PC: use loopback (host network). For cloud HTTPS, set BACKEND_URL in .env.
+      - BACKEND_URL=${BACKEND_URL:-http://127.0.0.1:8000}
       - BACKEND_WS_URL=${BACKEND_WS_URL:-}
       - DASHBOARD_URL=${DASHBOARD_URL:-}
       # Use DEVICE_UI_DISPLAY — not shell DISPLAY. SSH sets DISPLAY=localhost:10.0 which
@@ -92,6 +97,15 @@ services:
       - KIVY_NO_CONSOLELOG=1
       # Default 1 = kiosk / single-app panel (borderless fullscreen). Set FULLSCREEN=0 in .env for windowed dev.
       - FULLSCREEN=${FULLSCREEN:-1}
+      # 1 = show mouse pointer in fullscreen (USB mouse / trackball). Default 0 = pointer hidden (touch-only).
+      - SHOW_MOUSE_CURSOR=${SHOW_MOUSE_CURSOR:-0}
+      # Real LAN (e.g. 192.168.1.14 on enp1s0). In Docker, auto-detect is often
+      # the bridge (172.18.x); set this on the host or use data/config/lan_ip — see .env.example.
+      - MEETINGBOX_LAN_IP=${MEETINGBOX_LAN_IP:-}
+      - MEETINGBOX_LAN_IP_FILE=${MEETINGBOX_LAN_IP_FILE:-/data/config/lan_ip}
+      # With ``network_mode: host``, Redis is reached on the host loopback (see redis service ports).
+      - LOCAL_REDIS_HOST=${LOCAL_REDIS_HOST:-127.0.0.1}
+      - LOCAL_REDIS_PORT=${LOCAL_REDIS_PORT:-6379}
       - MOCK_BACKEND=${MOCK_BACKEND:-0}
       - AUDIO_INPUT_DEVICE_INDEX=${AUDIO_INPUT_DEVICE_INDEX:-}
       - AUDIO_INPUT_DEVICE_NAME=${AUDIO_INPUT_DEVICE_NAME:-}
@@ -136,8 +150,6 @@ services:
     cap_add:
       - SYS_ADMIN
       - SYS_PTRACE
-    networks:
-      - appliance-net
 
 volumes:
   appliance-redis-data:

@@ -86,6 +86,10 @@ else
   echo "kiosk-compose-up: xhost failed (continuing — cookie copy may still be enough)" >&2
 fi
 
+if [[ -d "$XAUTH_COPY" ]]; then
+  echo "kiosk-compose-up: removing bogus directory $XAUTH_COPY (usually a bad Docker bind when the cookie file was missing)" >&2
+  rm -rf "$XAUTH_COPY"
+fi
 cp "$src" "$XAUTH_COPY"
 chmod 600 "$XAUTH_COPY"
 

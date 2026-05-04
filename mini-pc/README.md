@@ -34,6 +34,15 @@ nano .env   # BACKEND_URL, BACKEND_WS_URL, UPLOAD_AUDIO_API_URL, DASHBOARD_URL
 mkdir -p data/audio/recordings data/audio/temp data/config
 ```
 
+**Production UI package (no source on device):**
+
+```bash
+cd mini-pc
+VERSION=1.0.0 bash scripts/build-device-ui-deb.sh
+```
+
+Copy `dist/meetingbox-ui_...deb` to the Raspberry Pi / mini PC, install it with `sudo apt install ./meetingbox-ui_...deb`, edit `/etc/meetingbox/device-ui.env`, then run `meetingbox-ui` or `MEETINGBOX_I_KNOW=1 sudo meetingbox-install-native-kiosk` for Ubuntu Server kiosk boot. See `device-ui/NATIVE_PACKAGE.md`.
+
 **UI (recommended native):**
 
 ```bash

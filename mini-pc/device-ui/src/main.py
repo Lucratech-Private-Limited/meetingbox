@@ -15,6 +15,7 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 
 import httpx
@@ -25,6 +26,8 @@ import httpx
 _src_dir = Path(__file__).resolve().parent
 if str(_src_dir) not in sys.path:
     sys.path.insert(0, str(_src_dir))
+
+from xauthority_util import display_refers_to_screen_zero, xauthority_list_has_display_zero
 
 # Before importing Kivy: stable clipboard provider on Linux (see kivy_options).
 if sys.platform.startswith("linux"):
@@ -47,6 +50,7 @@ from kivy.uix.screenmanager import (
 )
 from kivy.clock import Clock
 from kivy.config import Config
+from kivy.uix.floatlayout import FloatLayout
 
 # All graphics Config.set() calls must happen BEFORE 'from kivy.core.window import Window'
 # because Window is instantiated at import time in Kivy.
@@ -114,10 +118,12 @@ from config import (
     LOG_FILE,
     LOG_TO_CONSOLE,
     SHOW_FPS,
+    SHOW_MOUSE_CURSOR,
     TRANSITION_DURATION,
     DEFAULT_PRIVACY_MODE,
     LOCAL_REDIS_HOST,
     LOCAL_REDIS_PORT,
+    display_now,
     setup_complete_marker_paths_for_read,
     get_device_auth_token,
     clear_stored_device_auth_token,
@@ -125,8 +131,17 @@ from config import (
 
 from api_client import BackendClient
 from mock_backend import MockBackendClient
-from hardware import set_brightness, screen_off, screen_on
+from hardware import (
+    request_system_poweroff,
+    request_system_reboot,
+    set_brightness,
+    screen_off,
+    screen_on,
+)
+from network_util import linux_ethernet_ready
 from profile_store import get_active_profile, clear_active_profile_selection
+from components.voice_indicator import VoiceAssistantIndicator
+from voice_assistant import VoiceAssistant, VoiceIntent
 
 # Boot-flow screens
 from screens.splash import SplashScreen
@@ -259,17 +274,24 @@ def _recording_start_error_screen_args(exc: BaseException) -> tuple[str, str]:
     return ("Recording failed", msg)
 
 
-def _xauthority_has_display_zero(cookie_text: str) -> bool:
-    """True if xauth list output likely includes authority for local display :0."""
-    low = cookie_text.lower()
-    if "unix:0" in low:
-        return True
-    for line in cookie_text.splitlines():
-        parts = line.split()
-        if not parts:
-            continue
-        fam = parts[0].lower()
-        if fam.endswith(":0") and ":10" not in fam and ":11" not in fam:
+def _xauth_cookie_has_display(xauth_bin: str, auth_path: str, disp: str) -> bool:
+    """True if xauth reports a cookie for this DISPLAY (matches X11, not our string heuristics)."""
+    variants = [disp]
+    if disp == ":0":
+        variants.append(":0.0")
+    elif disp.startswith(":0.") and len(disp) > 3 and disp[3:].isdigit():
+        variants.append(":0")
+    for d in variants:
+        try:
+            r = subprocess.run(
+                [xauth_bin, "-f", auth_path, "list", d],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except Exception:
+            return False
+        if r.returncode == 0 and (r.stdout or "").strip():
             return True
     return False
 
@@ -318,7 +340,11 @@ def _diagnose_xauthority_for_docker():
                 flush=True,
             )
             return
-        if disp.endswith(":0") and not _xauthority_has_display_zero(out):
+        if display_refers_to_screen_zero(disp) and _xauth_cookie_has_display(
+            xauth_bin, path, disp
+        ):
+            return
+        if display_refers_to_screen_zero(disp) and not xauthority_list_has_display_zero(out):
             print(
                 "[MeetingBox] WARNING: this Xauthority file has no :0 / unix:0 entry but "
                 "DISPLAY is :0 (SSH or wrong file often only has :10). "
@@ -406,6 +432,30 @@ class MeetingBoxApp(App):
         self._idle_event = None
         self._screen_is_off = False
 
+        # Voice UI / feedback
+        self.root_layout = None
+        self.voice_indicator = None
+        self._voice_indicator_override = None
+        self._voice_indicator_reset_ev = None
+        self._voice_start_in_flight = False
+        self._voice_start_confirmation_pending = False
+        self._voice_pending_confirmation: VoiceIntent | None = None
+        self._voice_confirmation_reset_ev = None
+        self._voice_confirmation_timeout = 8.0
+        self._recording_elapsed_started_at = None
+        self._recording_elapsed_before_pause = 0.0
+        self.voice_confirmation_text = (
+            (os.getenv("VOICE_ASSISTANT_CONFIRMATION_TEXT") or "Meeting started").strip()
+            or "Meeting started"
+        )
+
+        # Local voice control (wake phrase + command).
+        self.voice_assistant = VoiceAssistant(
+            self._handle_voice_intent,
+            on_wake_phrase=self._handle_voice_wake_phrase,
+        )
+        self._voice_confirmation_timeout = self.voice_assistant.confirmation_timeout_seconds
+
     # ==================================================================
     # BUILD
     # ==================================================================
@@ -418,11 +468,11 @@ class MeetingBoxApp(App):
         # module load time (before Window was imported), so no runtime
         # Window.size / Window.fullscreen calls needed here.
 
-        # Show cursor in windowed mode (mouse/desktop).
-        # Hide it only in fullscreen kiosk mode (touchscreen, no mouse).
+        # Show cursor in windowed mode (mouse/desktop). In fullscreen, hide it unless
+        # SHOW_MOUSE_CURSOR=1 (USB mouse on a touch panel) or SHOW_FPS (dev overlay).
         # If X11 auth failed, SDL never creates a window — show_cursor crashes internally.
         try:
-            Window.show_cursor = (not FULLSCREEN) or SHOW_FPS
+            Window.show_cursor = (not FULLSCREEN) or SHOW_FPS or SHOW_MOUSE_CURSOR
         except (AttributeError, TypeError) as e:
             # Do not crash the process: Docker restart loops look like a flickering panel with no UI.
             logger.error(
@@ -431,9 +481,13 @@ class MeetingBoxApp(App):
                 e,
             )
 
+        self.root_layout = FloatLayout()
+
         # Screen manager – default to fade transition
         self.screen_manager = ScreenManager(
             transition=FadeTransition(duration=TRANSITION_DURATION['fade']))
+        self.screen_manager.size_hint = (1, 1)
+        self.root_layout.add_widget(self.screen_manager)
 
         # Register ALL screens
         self.screen_manager.add_widget(SplashScreen(name='splash'))
@@ -476,6 +530,12 @@ class MeetingBoxApp(App):
         # Start local Redis listener for real-time audio levels from the audio
         # container (both on the same Docker network).
         self._start_local_redis_listener()
+        self.voice_indicator = VoiceAssistantIndicator(
+            pos_hint={"right": 0.985, "y": 0.035},
+        )
+        self.root_layout.add_widget(self.voice_indicator)
+        self._sync_voice_assistant_state()
+        self._refresh_voice_indicator()
 
         if SHOW_FPS:
             Clock.schedule_interval(self._log_fps, 1.0)
@@ -488,7 +548,7 @@ class MeetingBoxApp(App):
         Clock.schedule_once(lambda *_: self._ensure_window_visible(), 0.3)
 
         logger.info("UI built – starting on splash screen")
-        return self.screen_manager
+        return self.root_layout
 
     def _ensure_window_visible(self):
         try:
@@ -596,6 +656,8 @@ class MeetingBoxApp(App):
 
     def on_start(self):
         logger.info("MeetingBox UI started")
+        self.voice_assistant.start()
+        self._sync_voice_assistant_state()
         if not USE_MOCK_BACKEND:
             # Always align the HTTP client Bearer with persisted token (file may differ from __init__).
             tok = get_device_auth_token().strip()
@@ -648,6 +710,7 @@ class MeetingBoxApp(App):
 
     def on_stop(self):
         logger.info("MeetingBox UI stopping")
+        self.voice_assistant.stop()
         self._local_redis_stop.set()
         if getattr(self, '_setup_poll', None):
             self._setup_poll.cancel()
@@ -719,6 +782,8 @@ class MeetingBoxApp(App):
         new_screen = self.screen_manager.current_screen
         if hasattr(new_screen, 'on_enter'):
             new_screen.on_enter()
+        self._sync_voice_assistant_state()
+        self._refresh_voice_indicator()
 
     def go_back(self):
         """Pop navigation stack and slide back."""
@@ -739,6 +804,8 @@ class MeetingBoxApp(App):
             new = self.screen_manager.current_screen
             if hasattr(new, 'on_enter'):
                 new.on_enter()
+            self._sync_voice_assistant_state()
+            self._refresh_voice_indicator()
         else:
             self.goto_screen('home', transition='fade')
 
@@ -880,6 +947,34 @@ class MeetingBoxApp(App):
     # EVENT HANDLERS
     # ==================================================================
 
+    def _reset_recording_elapsed_clock(self) -> None:
+        self._recording_elapsed_before_pause = 0.0
+        self._recording_elapsed_started_at = time.monotonic()
+
+    def _pause_recording_elapsed_clock(self) -> None:
+        if self._recording_elapsed_started_at is None:
+            return
+        self._recording_elapsed_before_pause += (
+            time.monotonic() - self._recording_elapsed_started_at
+        )
+        self._recording_elapsed_started_at = None
+
+    def _resume_recording_elapsed_clock(self) -> None:
+        if self._recording_elapsed_started_at is None:
+            self._recording_elapsed_started_at = time.monotonic()
+
+    def _clear_recording_elapsed_clock(self) -> None:
+        self._recording_elapsed_before_pause = 0.0
+        self._recording_elapsed_started_at = None
+
+    def _current_recording_elapsed_seconds(self) -> int:
+        if self._recording_elapsed_started_at is None:
+            return int(self._recording_elapsed_before_pause)
+        return int(
+            self._recording_elapsed_before_pause
+            + (time.monotonic() - self._recording_elapsed_started_at)
+        )
+
     def on_recording_started(self, data):
         sid = data.get('session_id')
         # API + local audio may both publish recording_started when Redis is shared.
@@ -890,6 +985,9 @@ class MeetingBoxApp(App):
         self._transcript_cta_satisfied_meeting_id = None
         self._transcript_cta_poll_meeting_id = None
         self.recording_state.update(active=True, paused=False, elapsed=0)
+        self._reset_recording_elapsed_clock()
+        self._announce_voice_start_success()
+        Clock.schedule_once(lambda _: self._sync_voice_assistant_state(), 0)
         Clock.schedule_once(lambda _: self.goto_screen('recording', 'fade'), 0)
 
     def _kick_post_stop_meeting_polls(self, sid):
@@ -903,16 +1001,25 @@ class MeetingBoxApp(App):
         self.recording_state['active'] = False
         sid = data.get('session_id') or self.current_session_id
         self._kick_post_stop_meeting_polls(sid)
+        self._voice_start_in_flight = False
+        self._clear_recording_elapsed_clock()
+        Clock.schedule_once(lambda _: self._sync_voice_assistant_state(), 0)
         Clock.schedule_once(lambda _: self.goto_screen('processing', 'fade'), 0)
 
     def on_recording_paused(self, data):
+        if self.recording_state.get('paused'):
+            return
         self.recording_state['paused'] = True
+        self._pause_recording_elapsed_clock()
         screen = self.screen_manager.get_screen('recording')
         if hasattr(screen, 'on_paused'):
             Clock.schedule_once(lambda _: screen.on_paused(), 0)
 
     def on_recording_resumed(self, data):
+        if not self.recording_state.get('paused'):
+            return
         self.recording_state['paused'] = False
+        self._resume_recording_elapsed_clock()
         screen = self.screen_manager.get_screen('recording')
         if hasattr(screen, 'on_resumed'):
             Clock.schedule_once(lambda _: screen.on_resumed(), 0)
@@ -1229,6 +1336,10 @@ class MeetingBoxApp(App):
                     result = await self.backend.start_recording()
                     self.current_session_id = result['session_id']
                     self.recording_state.update(active=True, paused=False, elapsed=0)
+                    self._voice_start_in_flight = False
+                    self._reset_recording_elapsed_clock()
+                    Clock.schedule_once(lambda _: self._announce_voice_start_success(), 0)
+                    Clock.schedule_once(lambda _: self._sync_voice_assistant_state(), 0)
                     Clock.schedule_once(
                         lambda _: self.goto_screen('recording', 'fade'), 0)
                     return
@@ -1246,6 +1357,10 @@ class MeetingBoxApp(App):
                     ):
                         continue
                     break
+            self._voice_start_in_flight = False
+            self._voice_start_confirmation_pending = False
+            Clock.schedule_once(lambda _: self._clear_voice_indicator_override(), 0)
+            Clock.schedule_once(lambda _: self._sync_voice_assistant_state(), 0)
             title, message = _recording_start_error_screen_args(
                 last_exc or RuntimeError("Unknown error")
             )
@@ -1264,6 +1379,9 @@ class MeetingBoxApp(App):
                 sid = self.current_session_id
                 await self.backend.stop_recording(sid)
                 self.recording_state['active'] = False
+                self._voice_start_in_flight = False
+                self._clear_recording_elapsed_clock()
+                Clock.schedule_once(lambda _: self._sync_voice_assistant_state(), 0)
                 logger.info("Recording stopped successfully")
                 # Device-initiated stop never goes through on_recording_stopped (Redis/WS).
                 self._kick_post_stop_meeting_polls(sid)
@@ -1281,6 +1399,7 @@ class MeetingBoxApp(App):
             try:
                 await self.backend.pause_recording(self.current_session_id)
                 self.recording_state['paused'] = True
+                self._pause_recording_elapsed_clock()
                 screen = self.screen_manager.get_screen('recording')
                 if hasattr(screen, 'on_paused'):
                     Clock.schedule_once(lambda _: screen.on_paused(), 0)
@@ -1295,6 +1414,7 @@ class MeetingBoxApp(App):
             try:
                 await self.backend.resume_recording(self.current_session_id)
                 self.recording_state['paused'] = False
+                self._resume_recording_elapsed_clock()
                 screen = self.screen_manager.get_screen('recording')
                 if hasattr(screen, 'on_resumed'):
                     Clock.schedule_once(lambda _: screen.on_resumed(), 0)
@@ -1360,6 +1480,797 @@ class MeetingBoxApp(App):
         self._screen_is_off = True
         screen_off()
 
+    def _voice_assistant_should_listen(self) -> bool:
+        if self.screen_manager is None:
+            return False
+        if self._voice_start_in_flight:
+            return False
+        blocked = {
+            'splash',
+            'welcome',
+            'room_name',
+            'network_choice',
+            'wifi_setup',
+            'wifi_connected',
+            'pair_device',
+            'meetingbox_ready',
+            'setup_progress',
+            'all_set',
+            'mic_test',
+        }
+        return self.screen_manager.current not in blocked
+
+    def _sync_voice_assistant_state(self) -> None:
+        if not getattr(self, 'voice_assistant', None):
+            return
+        self.voice_assistant.set_paused(not self._voice_assistant_should_listen())
+        self._refresh_voice_indicator()
+
+    def _refresh_voice_indicator(self) -> None:
+        if not self.voice_indicator:
+            return
+        if self._voice_indicator_override:
+            state, message = self._voice_indicator_override
+            self.voice_indicator.set_state(state, message)
+            return
+        if self.voice_assistant.available and self._voice_assistant_should_listen():
+            self.voice_indicator.set_state("idle", 'Say "Hey Tony"')
+            return
+        self.voice_indicator.set_state("hidden")
+
+    def _clear_voice_indicator_override(self, *_args) -> None:
+        if self._voice_indicator_reset_ev:
+            self._voice_indicator_reset_ev.cancel()
+            self._voice_indicator_reset_ev = None
+        self._voice_indicator_override = None
+        self._refresh_voice_indicator()
+
+    def _set_voice_indicator_override(
+        self,
+        state: str,
+        message: str | None = None,
+        duration: float | None = None,
+    ) -> None:
+        self._voice_indicator_override = (state, message)
+        if self._voice_indicator_reset_ev:
+            self._voice_indicator_reset_ev.cancel()
+            self._voice_indicator_reset_ev = None
+        self._refresh_voice_indicator()
+        if duration:
+            self._voice_indicator_reset_ev = Clock.schedule_once(
+                self._clear_voice_indicator_override, duration
+            )
+
+    def _handle_voice_wake_phrase(self, _text: str) -> None:
+        Clock.schedule_once(
+            lambda _dt: self._set_voice_indicator_override(
+                "wake",
+                'Heard "Hey Tony"',
+                max(2.0, self.voice_assistant.command_timeout_seconds),
+            ),
+            0,
+        )
+
+    def _speak_text_blocking(self, text: str) -> bool:
+        phrase = (text or "").strip()
+        if not phrase:
+            return False
+        for cmd in (
+            ["espeak-ng", "-s", "165", "-a", "180", phrase],
+            ["espeak", "-s", "165", "-a", "180", phrase],
+        ):
+            exe = shutil.which(cmd[0])
+            if not exe:
+                continue
+            try:
+                subprocess.run(
+                    [exe, *cmd[1:]],
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=15,
+                )
+                return True
+            except Exception as e:
+                logger.warning("Voice feedback via %s failed: %s", exe, e)
+        logger.warning("Voice feedback unavailable: no espeak command found")
+        return False
+
+    def _speak_text_async(self, text: str) -> None:
+        threading.Thread(
+            target=self._speak_text_blocking,
+            args=(text,),
+            name="voice-feedback",
+            daemon=True,
+        ).start()
+
+    @staticmethod
+    def _voice_duration_seconds(text: str) -> float:
+        words = max(1, len((text or "").split()))
+        return min(8.0, max(2.5, words * 0.42))
+
+    def _voice_reply(self, text: str, state: str = "speaking", duration: float | None = None) -> None:
+        if not text:
+            return
+        self._set_voice_indicator_override(
+            state,
+            text,
+            duration if duration is not None else self._voice_duration_seconds(text),
+        )
+        self._speak_text_async(text)
+
+    @staticmethod
+    def _format_voice_duration(seconds: int) -> str:
+        secs = max(0, int(seconds))
+        hours, rem = divmod(secs, 3600)
+        minutes, rem = divmod(rem, 60)
+        parts = []
+        if hours:
+            parts.append(f"{hours} hour" + ("s" if hours != 1 else ""))
+        if minutes:
+            parts.append(f"{minutes} minute" + ("s" if minutes != 1 else ""))
+        if rem or not parts:
+            parts.append(f"{rem} second" + ("s" if rem != 1 else ""))
+        return " ".join(parts[:2])
+
+    @staticmethod
+    def _trim_voice_text(text: str, max_chars: int = 220) -> str:
+        s = " ".join((text or "").split())
+        if len(s) <= max_chars:
+            return s
+        return s[: max_chars - 1].rstrip() + "…"
+
+    def _voice_selected_meeting_id(self) -> str | None:
+        current = self.screen_manager.current if self.screen_manager else ""
+        if current == "meeting_detail":
+            try:
+                return getattr(self.screen_manager.get_screen("meeting_detail"), "meeting_id", None)
+            except Exception:
+                return None
+        return None
+
+    def _clear_voice_confirmation_pending(self) -> None:
+        if self._voice_confirmation_reset_ev:
+            self._voice_confirmation_reset_ev.cancel()
+            self._voice_confirmation_reset_ev = None
+        self._voice_pending_confirmation = None
+        self.voice_assistant.clear_confirmation()
+
+    def _on_voice_confirmation_timeout(self, _dt) -> None:
+        self._clear_voice_confirmation_pending()
+        self._voice_reply("Confirmation timed out.", state="speaking", duration=3.0)
+
+    def _voice_begin_confirmation(self, intent: VoiceIntent, prompt: str) -> None:
+        self._clear_voice_confirmation_pending()
+        self._voice_pending_confirmation = intent
+        self.voice_assistant.begin_confirmation()
+        self._voice_confirmation_reset_ev = Clock.schedule_once(
+            self._on_voice_confirmation_timeout,
+            self._voice_confirmation_timeout,
+        )
+        self._voice_reply(prompt, state="wake", duration=self._voice_confirmation_timeout)
+
+    def _voice_cancel_confirmation(self, message: str = "Cancelled.") -> None:
+        self._clear_voice_confirmation_pending()
+        self._voice_reply(message, state="speaking", duration=3.0)
+
+    def _voice_requires_confirmation(self, intent: VoiceIntent) -> bool:
+        return intent.name in {
+            "restart_device",
+            "power_off",
+            "unpair_device",
+            "delete_this_meeting",
+            "delete_old_meetings",
+            "factory_reset",
+        }
+
+    def _voice_confirmation_prompt(self, intent: VoiceIntent) -> str:
+        return {
+            "restart_device": "Say confirm restart or cancel.",
+            "power_off": "Say confirm shutdown or cancel.",
+            "unpair_device": "Say confirm unpair or cancel.",
+            "delete_this_meeting": "Say confirm delete meeting or cancel.",
+            "delete_old_meetings": "Say confirm delete meetings or cancel.",
+            "factory_reset": "Say confirm factory reset or cancel.",
+        }.get(intent.name, "Say confirm or cancel.")
+
+    def _voice_unsupported_message(self, topic: str | None) -> str:
+        return {
+            "volume_up": "I can't change speaker volume yet.",
+            "volume_down": "I can't change speaker volume yet.",
+            "mute": "I can't mute the speaker yet.",
+            "unmute": "I can't unmute the speaker yet.",
+            "speaker_test": "I can't run a speaker test yet.",
+            "cpu_temperature": "I can't read CPU temperature yet.",
+        }.get(topic or "", "I can't do that yet.")
+
+    def _announce_voice_start_success(self) -> None:
+        if not self._voice_start_confirmation_pending:
+            return
+        self._voice_start_confirmation_pending = False
+        self._voice_reply(self.voice_confirmation_text, state="speaking", duration=3.0)
+
+    def _handle_voice_intent(self, intent: VoiceIntent) -> None:
+        Clock.schedule_once(lambda _dt, iv=intent: self._process_voice_intent(iv), 0)
+
+    def _process_voice_intent(self, intent: VoiceIntent) -> None:
+        if intent.name == "confirm":
+            if not self._voice_pending_confirmation:
+                self._voice_reply("There is nothing to confirm right now.", duration=3.0)
+                return
+            pending = self._voice_pending_confirmation
+            self._clear_voice_confirmation_pending()
+            self._execute_voice_intent(pending)
+            return
+
+        if intent.name == "cancel":
+            if not self._voice_pending_confirmation:
+                self._voice_reply("Nothing is pending.", duration=3.0)
+                return
+            self._voice_cancel_confirmation()
+            return
+
+        if self._voice_pending_confirmation:
+            self._voice_reply("Please say confirm or cancel first.", state="wake", duration=3.0)
+            return
+
+        if intent.name == "unsupported":
+            self._voice_reply(self._voice_unsupported_message(intent.value), duration=3.5)
+            return
+
+        if self._voice_requires_confirmation(intent):
+            self._voice_begin_confirmation(intent, self._voice_confirmation_prompt(intent))
+            return
+
+        self._execute_voice_intent(intent)
+
+    def _voice_open_meeting_detail(self, meeting_id: str) -> None:
+        detail = self.screen_manager.get_screen("meeting_detail")
+        detail.set_meeting_id(meeting_id)
+        self.goto_screen("meeting_detail", "slide_left")
+
+    def _voice_save_setting_async(self, payload: dict, failure_text: str | None = None) -> None:
+        async def _save():
+            try:
+                await self.backend.update_settings(payload)
+            except Exception as e:
+                logger.warning("voice settings update failed (%s): %s", payload, e)
+                if failure_text:
+                    Clock.schedule_once(
+                        lambda _dt, msg=failure_text: self._voice_reply(msg, state="error"),
+                        0,
+                    )
+
+        run_async(_save())
+
+    def _voice_report_recording_status(self) -> None:
+        if self.recording_state.get("active"):
+            elapsed = self._format_voice_duration(self._current_recording_elapsed_seconds())
+            if self.recording_state.get("paused"):
+                self._voice_reply(f"Recording is paused. Elapsed time is {elapsed}.")
+            else:
+                self._voice_reply(f"Meeting recording is active. Elapsed time is {elapsed}.")
+            return
+        self._voice_reply("No meeting is recording right now.")
+
+    def _voice_report_time(self) -> None:
+        now = display_now()
+        self._voice_reply(f"It is {now.strftime('%I:%M %p').lstrip('0')}.")
+
+    def _voice_report_wifi_status(self) -> None:
+        async def _run():
+            try:
+                info = await self.backend.get_system_info()
+                ssid = (info.get("wifi_ssid") or "").strip()
+                signal = int(info.get("wifi_signal") or 0)
+                ip = (info.get("ip_address") or "").strip()
+                if ssid:
+                    msg = f"WiFi is connected to {ssid}"
+                    if signal:
+                        msg += f" at {signal} percent signal"
+                    if ip:
+                        msg += f". IP address is {ip}"
+                    Clock.schedule_once(lambda _dt, m=msg + ".": self._voice_reply(m), 0)
+                    return
+                if linux_ethernet_ready():
+                    msg = "The device is using wired network"
+                    if ip:
+                        msg += f". IP address is {ip}"
+                    Clock.schedule_once(lambda _dt, m=msg + ".": self._voice_reply(m), 0)
+                    return
+                Clock.schedule_once(
+                    lambda _dt: self._voice_reply("The device is not connected to a network."),
+                    0,
+                )
+            except Exception:
+                Clock.schedule_once(
+                    lambda _dt: self._voice_reply("I couldn't check network status.", state="error"),
+                    0,
+                )
+
+        run_async(_run())
+
+    def _voice_report_storage_left(self) -> None:
+        async def _run():
+            try:
+                info = await self.backend.get_system_info()
+                total = float(info.get("storage_total") or 0) / (1024 ** 3)
+                used = float(info.get("storage_used") or 0) / (1024 ** 3)
+                free = max(0.0, total - used)
+                Clock.schedule_once(
+                    lambda _dt: self._voice_reply(
+                        f"The device has about {free:.0f} gigabytes free out of {total:.0f}."
+                    ),
+                    0,
+                )
+            except Exception:
+                Clock.schedule_once(
+                    lambda _dt: self._voice_reply("I couldn't check storage right now.", state="error"),
+                    0,
+                )
+
+        run_async(_run())
+
+    def _voice_report_version(self) -> None:
+        async def _run():
+            try:
+                info = await self.backend.get_system_info()
+                fw = (info.get("firmware_version") or "unknown").strip() or "unknown"
+                Clock.schedule_once(
+                    lambda _dt: self._voice_reply(f"The current firmware version is {fw}."),
+                    0,
+                )
+            except Exception:
+                Clock.schedule_once(
+                    lambda _dt: self._voice_reply("I couldn't check the version right now.", state="error"),
+                    0,
+                )
+
+        run_async(_run())
+
+    def _voice_report_next_calendar(self) -> None:
+        async def _run():
+            try:
+                data = await self.backend.get_home_summary()
+                next_meeting = data.get("next_meeting") or {}
+                title = (next_meeting.get("title") or "").strip()
+                start = (next_meeting.get("start") or "").strip()
+                if not title:
+                    Clock.schedule_once(
+                        lambda _dt: self._voice_reply("I don't have a next calendar meeting right now."),
+                        0,
+                    )
+                    return
+                line = title
+                if start:
+                    try:
+                        if "T" in start:
+                            dt = datetime.fromisoformat(start.replace("Z", "+00:00"))
+                            line += f", at {dt.astimezone(display_now().tzinfo).strftime('%I:%M %p').lstrip('0')}"
+                        else:
+                            line += f", on {start[:10]}"
+                    except Exception:
+                        pass
+                Clock.schedule_once(
+                    lambda _dt, m=f"Your next calendar meeting is {line}.": self._voice_reply(m),
+                    0,
+                )
+            except Exception:
+                Clock.schedule_once(
+                    lambda _dt: self._voice_reply("I couldn't read the calendar right now.", state="error"),
+                    0,
+                )
+
+        run_async(_run())
+
+    def _voice_report_system_status(self) -> None:
+        async def _run():
+            try:
+                info = await self.backend.get_system_info()
+                fw = (info.get("firmware_version") or "unknown").strip() or "unknown"
+                total = float(info.get("storage_total") or 0) / (1024 ** 3)
+                used = float(info.get("storage_used") or 0) / (1024 ** 3)
+                free = max(0.0, total - used)
+                ssid = (info.get("wifi_ssid") or "").strip()
+                if ssid:
+                    network = f"WiFi is connected to {ssid}"
+                elif linux_ethernet_ready():
+                    network = "wired network is connected"
+                else:
+                    network = "network is disconnected"
+                msg = f"{network}. About {free:.0f} gigabytes are free. Firmware version is {fw}."
+                Clock.schedule_once(lambda _dt, m=msg: self._voice_reply(m), 0)
+            except Exception:
+                Clock.schedule_once(
+                    lambda _dt: self._voice_reply("I couldn't read system status.", state="error"),
+                    0,
+                )
+
+        run_async(_run())
+
+    def _voice_show_last_meeting(self, speak_summary: bool = False, speak_actions: bool = False) -> None:
+        async def _run():
+            try:
+                meetings = await self.backend.get_meetings(limit=1)
+                if not meetings:
+                    Clock.schedule_once(
+                        lambda _dt: self._voice_reply("There are no meetings to show yet."),
+                        0,
+                    )
+                    return
+                meeting = meetings[0]
+                detail = await self.backend.get_meeting_detail(meeting["id"])
+
+                def _open(_dt):
+                    self._voice_open_meeting_detail(meeting["id"])
+                    title = (meeting.get("title") or "the last meeting").strip()
+                    if speak_summary:
+                        summary = self._trim_voice_text(
+                            ((detail.get("summary") or {}).get("summary") or "").strip() or "No summary is available yet."
+                        )
+                        self._voice_reply(f"Last meeting was {title}. {summary}")
+                    elif speak_actions:
+                        items = (detail.get("summary") or {}).get("action_items") or []
+                        if not items:
+                            self._voice_reply(f"{title} has no action items.")
+                        else:
+                            lines = []
+                            for item in items[:3]:
+                                task = (item.get("task") or item.get("title") or "").strip()
+                                if task:
+                                    lines.append(task)
+                            if not lines:
+                                self._voice_reply(f"{title} has action items, but I couldn't read them clearly.")
+                            else:
+                                joined = ". ".join(self._trim_voice_text(t, 90) for t in lines)
+                                self._voice_reply(f"Action items from {title}: {joined}.")
+                    else:
+                        self._voice_reply(f"Opening the last meeting, {title}.", duration=3.0)
+
+                Clock.schedule_once(_open, 0)
+            except Exception:
+                Clock.schedule_once(
+                    lambda _dt: self._voice_reply("I couldn't load the last meeting.", state="error"),
+                    0,
+                )
+
+        run_async(_run())
+
+    def _voice_disconnect_wifi(self) -> None:
+        async def _run():
+            try:
+                await self.backend.disconnect_wifi()
+                Clock.schedule_once(
+                    lambda _dt: self._voice_reply("WiFi disconnected."),
+                    0,
+                )
+            except Exception:
+                Clock.schedule_once(
+                    lambda _dt: self._voice_reply("I couldn't disconnect WiFi.", state="error"),
+                    0,
+                )
+
+        run_async(_run())
+
+    def _voice_restart_device(self) -> None:
+        self._voice_reply("Restarting device.", state="starting", duration=4.0)
+
+        async def _run():
+            local_ok = request_system_reboot()
+            api_ok = False
+            if not local_ok:
+                try:
+                    resp = await self.backend.update_settings({"action": "restart"})
+                    api_ok = bool(resp.get("host_reboot_initiated"))
+                except Exception as e:
+                    logger.warning("voice restart fallback failed: %s", e)
+            if not local_ok and not api_ok:
+                Clock.schedule_once(
+                    lambda _dt: self._voice_reply("I couldn't restart the device.", state="error"),
+                    0,
+                )
+
+        run_async(_run())
+
+    def _voice_power_off(self) -> None:
+        self._voice_reply("Shutting down the device.", state="starting", duration=4.0)
+
+        async def _run():
+            local_ok = request_system_poweroff()
+            api_ok = False
+            if not local_ok:
+                try:
+                    resp = await self.backend.update_settings({"action": "poweroff"})
+                    api_ok = bool(resp.get("host_poweroff_initiated"))
+                except Exception as e:
+                    logger.warning("voice poweroff fallback failed: %s", e)
+            if not local_ok and not api_ok:
+                Clock.schedule_once(
+                    lambda _dt: self._voice_reply("I couldn't power off the device.", state="error"),
+                    0,
+                )
+
+        run_async(_run())
+
+    def _voice_unpair_device(self) -> None:
+        self._voice_reply("Unpairing this device.", state="starting", duration=4.0)
+
+        async def _run():
+            try:
+                await self.backend.unpair_self()
+            except Exception:
+                pass
+            Clock.schedule_once(
+                    lambda _dt: self.on_account_unpaired(remote=False),
+                0,
+            )
+
+        run_async(_run())
+
+    def _voice_delete_meeting(self, meeting_id: str) -> None:
+        async def _run():
+            try:
+                await self.backend.delete_meeting(meeting_id)
+
+                def _after(_dt):
+                    if self.screen_manager.current == "meeting_detail":
+                        self.goto_screen("meetings", "fade")
+                    self._voice_reply("Meeting deleted.", state="speaking", duration=3.0)
+
+                Clock.schedule_once(_after, 0)
+            except Exception:
+                Clock.schedule_once(
+                    lambda _dt: self._voice_reply("I couldn't delete that meeting.", state="error"),
+                    0,
+                )
+
+        run_async(_run())
+
+    def _voice_delete_old_meetings(self) -> None:
+        async def _run():
+            try:
+                meetings = await self.backend.get_meetings(limit=100)
+                if not meetings:
+                    Clock.schedule_once(
+                        lambda _dt: self._voice_reply("There are no meetings to delete."),
+                        0,
+                    )
+                    return
+                deleted = 0
+                for meeting in meetings:
+                    try:
+                        await self.backend.delete_meeting(meeting["id"])
+                        deleted += 1
+                    except Exception:
+                        continue
+                Clock.schedule_once(
+                    lambda _dt, n=deleted: self._voice_reply(
+                        f"Deleted {n} meeting" + ("s." if n != 1 else "."),
+                        state="speaking",
+                    ),
+                    0,
+                )
+            except Exception:
+                Clock.schedule_once(
+                    lambda _dt: self._voice_reply("I couldn't delete the meetings.", state="error"),
+                    0,
+                )
+
+        run_async(_run())
+
+    def _voice_factory_reset(self) -> None:
+        self._voice_reply("Starting factory reset.", state="starting", duration=4.0)
+
+        async def _run():
+            try:
+                await self.backend.update_settings({"action": "factory_reset"})
+                request_system_reboot()
+                Clock.schedule_once(
+                    lambda _dt: self.reenter_onboarding_after_remote_reset(),
+                    0,
+                )
+            except Exception:
+                Clock.schedule_once(
+                    lambda _dt: self._voice_reply("I couldn't start factory reset.", state="error"),
+                    0,
+                )
+
+        run_async(_run())
+
+    def _execute_voice_intent(self, intent: VoiceIntent) -> None:
+        if intent.name == "start_meeting":
+            if self.recording_state.get("active"):
+                self._voice_reply("A meeting is already recording.", duration=3.0)
+                return
+            logger.info('Voice trigger accepted ("hey tony" -> "start meeting")')
+            self._voice_start_in_flight = True
+            self._voice_start_confirmation_pending = True
+            self._reset_idle_timer()
+            self._sync_voice_assistant_state()
+            self._set_voice_indicator_override("starting", "Starting meeting", 4.0)
+            self.start_recording()
+            return
+
+        if intent.name == "stop_meeting":
+            if not self.recording_state.get("active"):
+                self._voice_reply("No meeting is recording right now.")
+                return
+            self._voice_reply("Stopping meeting.", state="starting", duration=3.0)
+            self.stop_recording()
+            return
+
+        if intent.name == "pause_meeting":
+            if not self.recording_state.get("active"):
+                self._voice_reply("No meeting is recording right now.")
+                return
+            if self.recording_state.get("paused"):
+                self._voice_reply("Recording is already paused.")
+                return
+            self._voice_reply("Pausing meeting.", state="starting", duration=3.0)
+            self.pause_recording()
+            return
+
+        if intent.name == "resume_meeting":
+            if not self.recording_state.get("active"):
+                self._voice_reply("No meeting is recording right now.")
+                return
+            if not self.recording_state.get("paused"):
+                self._voice_reply("Recording is already running.")
+                return
+            self._voice_reply("Resuming meeting.", state="starting", duration=3.0)
+            self.resume_recording()
+            return
+
+        if intent.name == "recording_status":
+            self._voice_report_recording_status()
+            return
+
+        if intent.name == "recording_elapsed":
+            if not self.recording_state.get("active"):
+                self._voice_reply("No meeting is recording right now.")
+            else:
+                self._voice_reply(
+                    f"Elapsed recording time is {self._format_voice_duration(self._current_recording_elapsed_seconds())}."
+                )
+            return
+
+        if intent.name == "go_home":
+            self.goto_screen("home", "fade")
+            self._voice_reply("Going home.", duration=2.5)
+            return
+
+        if intent.name == "open_settings":
+            self.goto_screen("settings", "slide_left")
+            self._voice_reply("Opening settings.", duration=2.5)
+            return
+
+        if intent.name == "show_meetings":
+            self.goto_screen("meetings", "slide_left")
+            self._voice_reply("Opening meetings.", duration=2.5)
+            return
+
+        if intent.name == "show_last_meeting":
+            self._voice_show_last_meeting()
+            return
+
+        if intent.name == "summarize_last_meeting":
+            self._voice_show_last_meeting(speak_summary=True)
+            return
+
+        if intent.name == "read_action_items":
+            self._voice_show_last_meeting(speak_actions=True)
+            return
+
+        if intent.name == "test_microphone":
+            self.goto_screen("mic_test", "slide_left")
+            self._voice_reply("Opening microphone test.", duration=3.0)
+            return
+
+        if intent.name == "what_time":
+            self._voice_report_time()
+            return
+
+        if intent.name == "wifi_status":
+            self._voice_report_wifi_status()
+            return
+
+        if intent.name == "storage_left":
+            self._voice_report_storage_left()
+            return
+
+        if intent.name == "version_status":
+            self._voice_report_version()
+            return
+
+        if intent.name == "next_calendar":
+            self._voice_report_next_calendar()
+            return
+
+        if intent.name == "system_status":
+            self._voice_report_system_status()
+            return
+
+        if intent.name == "privacy_mode":
+            active = intent.value == "on"
+            self.privacy_mode = active
+            self._voice_save_setting_async(
+                {"privacy_mode": active},
+                failure_text="I couldn't save privacy mode.",
+            )
+            self._voice_reply(
+                "Privacy mode is on." if active else "Privacy mode is off.",
+                duration=3.0,
+            )
+            return
+
+        if intent.name == "brightness":
+            level = intent.value or "high"
+            set_brightness(level)
+            self._voice_save_setting_async(
+                {"brightness": level},
+                failure_text="I couldn't save brightness.",
+            )
+            self._voice_reply(f"Brightness set to {level}.", duration=3.0)
+            return
+
+        if intent.name == "screen_off":
+            self._voice_reply("Turning screen off.", duration=2.5)
+            self._screen_is_off = True
+            Clock.schedule_once(lambda _dt: screen_off(), 0.2)
+            return
+
+        if intent.name == "wake_screen":
+            self._screen_is_off = False
+            screen_on("high")
+            self._reset_idle_timer()
+            self._voice_reply("Waking the screen.", duration=2.5)
+            return
+
+        if intent.name == "disconnect_wifi":
+            self._voice_disconnect_wifi()
+            return
+
+        if intent.name == "pair_device":
+            self.goto_screen("pair_device", "slide_left")
+            self._voice_reply("Opening pairing screen.", duration=3.0)
+            return
+
+        if intent.name == "restart_device":
+            self._voice_restart_device()
+            return
+
+        if intent.name == "power_off":
+            self._voice_power_off()
+            return
+
+        if intent.name == "unpair_device":
+            self._voice_unpair_device()
+            return
+
+        if intent.name == "delete_this_meeting":
+            meeting_id = self._voice_selected_meeting_id()
+            if not meeting_id:
+                self._voice_reply("Open a meeting first so I know which one to delete.", duration=4.0)
+                return
+            self._voice_delete_meeting(meeting_id)
+            return
+
+        if intent.name == "delete_old_meetings":
+            self._voice_delete_old_meetings()
+            return
+
+        if intent.name == "factory_reset":
+            self._voice_factory_reset()
+            return
+
+        if intent.name == "help":
+            self._voice_reply(
+                "I can start, stop, pause or resume meetings, open settings or meetings, check time, WiFi, storage, version and calendar, change privacy or brightness, turn the screen off, and restart or shut down with confirmation."
+            )
+            return
+
+        self._voice_reply("I can't do that yet.")
+
     # ==================================================================
     # UTILITIES
     # ==================================================================
@@ -1377,6 +2288,10 @@ def main():
     disp = os.environ.get('DISPLAY', '(not set)')
     print(f"[MeetingBox] DISPLAY={disp}", flush=True)
     print(f"[MeetingBox] FULLSCREEN={os.environ.get('FULLSCREEN', '(not set)')}", flush=True)
+    print(
+        f"[MeetingBox] SHOW_MOUSE_CURSOR={os.environ.get('SHOW_MOUSE_CURSOR', '(not set)')}",
+        flush=True,
+    )
     print(f"[MeetingBox] BACKEND_URL={os.environ.get('BACKEND_URL', '(not set)')}", flush=True)
     print(f"[MeetingBox] MOCK_BACKEND={os.environ.get('MOCK_BACKEND', '(not set)')}", flush=True)
 

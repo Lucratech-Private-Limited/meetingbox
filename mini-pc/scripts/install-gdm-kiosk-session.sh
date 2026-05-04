@@ -72,7 +72,7 @@ install -m 0644 "$MINI_PC_ROOT/kiosk-desktop/meetingbox-kiosk.desktop" /usr/shar
 mkdir -p /etc/meetingbox
 if [[ ! -f /etc/meetingbox/panel-xrandr.env ]]; then
   install -m 0644 "$MINI_PC_ROOT/kiosk-desktop/panel-xrandr.env.example" /etc/meetingbox/panel-xrandr.env
-  echo "Installed /etc/meetingbox/panel-xrandr.env (DSI-1 800x1280 rotate right). Edit to change panel."
+  echo "Installed /etc/meetingbox/panel-xrandr.env (DSI-1 800x1280 rotate left). Edit to change panel."
 fi
 echo "$APPLIANCE_DIR" >/etc/meetingbox/release
 chmod 644 /etc/meetingbox/release

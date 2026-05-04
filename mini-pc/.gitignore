@@ -2,6 +2,8 @@
 # Refreshed at boot by scripts/kiosk-compose-up.sh for Docker X11 bind mount
 .meetingbox-docker.xauth
 .venv/
+dist/
+device-ui/.build-native-venv/
 device-ui/.venv/
 audio/.venv/
 __pycache__/

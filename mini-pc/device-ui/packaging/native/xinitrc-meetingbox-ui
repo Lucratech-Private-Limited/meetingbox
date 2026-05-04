@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Minimal X session for a native MeetingBox UI install.
+
+set -euo pipefail
+
+export PATH="/usr/sbin:/usr/bin:/usr/local/bin:$PATH"
+export DISPLAY="${DISPLAY:-:0}"
+
+if [[ -x /usr/local/bin/meetingbox-apply-kiosk-display-orientation ]]; then
+  /usr/local/bin/meetingbox-apply-kiosk-display-orientation || true
+fi
+
+xsetroot -solid '#000000' 2>/dev/null || true
+command -v openbox >/dev/null 2>&1 && openbox >/dev/null 2>&1 &
+sleep 0.25
+
+exec /usr/bin/meetingbox-ui 2>&1 | logger -t meetingbox-native-ui

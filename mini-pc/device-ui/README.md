@@ -18,6 +18,23 @@ Device UI for MeetingBox hardware.
 
 ## Installation
 
+### Native package for appliances
+
+For production devices, build a `.deb` on a build machine and install only that package on the Raspberry Pi / mini PC. This avoids cloning the source tree onto the device.
+
+```bash
+cd mini-pc
+VERSION=1.0.0 bash scripts/build-device-ui-deb.sh
+```
+
+Install the generated `dist/meetingbox-ui_...deb` on the device, edit `/etc/meetingbox/device-ui.env`, then run `meetingbox-ui` or configure kiosk boot with:
+
+```bash
+MEETINGBOX_I_KNOW=1 sudo meetingbox-install-native-kiosk
+```
+
+See `NATIVE_PACKAGE.md`.
+
 ### Quick Install (Automated)
 
 From the main MeetingBox repo (full checkout):

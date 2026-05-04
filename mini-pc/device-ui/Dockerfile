@@ -47,6 +47,8 @@ RUN set -eux; \
             xauth \
             x11-xserver-utils \
             util-linux \
+            iproute2 \
+            espeak-ng \
             network-manager \
             sudo \
         ; then \

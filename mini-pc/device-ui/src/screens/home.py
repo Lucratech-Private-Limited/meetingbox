@@ -16,6 +16,7 @@ from kivy.uix.widget import Widget
 
 from async_helper import run_async
 from components.button import PrimaryButton
+from local_network import get_primary_ipv4
 from config import (
     ASSETS_DIR,
     COLORS,
@@ -162,6 +163,8 @@ class HomeScreen(BaseScreen):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self._clock_event = None
+        self._footer_ip_event = None
+        self._footer_kwargs = {}
         self._wifi_ok = False
         self._mic_connected = True
 
@@ -482,6 +485,12 @@ class HomeScreen(BaseScreen):
         if self._clock_event:
             self._clock_event.cancel()
         self._clock_event = Clock.schedule_interval(lambda _dt: self._update_clock_labels(), 1.0)
+        if self._footer_ip_event:
+            self._footer_ip_event.cancel()
+        # Re-resolve host LAN IP when DHCP changes or the device moves to another network.
+        self._footer_ip_event = Clock.schedule_interval(self._refresh_footer_ip, 30.0)
+        # First full system fetch can finish after the first IP read; refresh soon after boot.
+        Clock.schedule_once(lambda _dt: self._refresh_footer_ip(_dt), 3.0)
         self._load_system_status()
         self._load_home_summary()
 
@@ -489,6 +498,21 @@ class HomeScreen(BaseScreen):
         if self._clock_event:
             self._clock_event.cancel()
             self._clock_event = None
+        if self._footer_ip_event:
+            self._footer_ip_event.cancel()
+            self._footer_ip_event = None
+
+    def _refresh_footer_ip(self, _dt):
+        if not self._footer_kwargs:
+            return
+        kw = self._footer_kwargs
+        self.update_footer(
+            wifi_ok=kw["wifi_ok"],
+            free_gb=kw["free_gb"],
+            privacy_mode=kw["privacy_mode"],
+            wired_lan_ok=kw["wired_lan_ok"],
+            local_ip=get_primary_ipv4(),
+        )
 
     def _on_start_recording(self, _inst):
         self.app.start_recording()
@@ -523,11 +547,18 @@ class HomeScreen(BaseScreen):
                         COLORS["white"] if (wifi_ok or wired_ok) else COLORS["gray_500"]
                     )
                     self.mic_chip.set_icon_color(COLORS["green"] if mic_connected else COLORS["red"])
+                    self._footer_kwargs = {
+                        "wifi_ok": wifi_ok,
+                        "free_gb": free_gb,
+                        "privacy_mode": privacy,
+                        "wired_lan_ok": wired_ok,
+                    }
                     self.update_footer(
                         wifi_ok=wifi_ok,
                         free_gb=free_gb,
                         privacy_mode=privacy,
                         wired_lan_ok=wired_ok,
+                        local_ip=get_primary_ipv4(),
                     )
 
                 Clock.schedule_once(_apply, 0)

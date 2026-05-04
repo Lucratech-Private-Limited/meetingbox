@@ -151,12 +151,25 @@ class BaseScreen(Screen):
         free_gb=0,
         privacy_mode=False,
         wired_lan_ok=False,
+        local_ip=None,
     ):
-        """Update footer labels if footer exists."""
+        """Update footer labels if footer exists.
+
+        *local_ip* — optional LAN IPv4 for the **host** (not the container
+        bridge), from :func:`local_network.get_primary_ipv4`; shown between
+        link and storage on the home screen.
+        """
         if not hasattr(self, '_footer_left'):
             return
+        ip = (local_ip or "").strip() if local_ip is not None else ""
+        if ip in ("", "—"):
+            ip = ""
+        ip_seg = f"   IP: {ip}" if ip else ""
+
         if privacy_mode:
-            self._footer_left.text = f'Local Mode   Storage: {free_gb:.0f}GB free'
+            self._footer_left.text = (
+                f'Local Mode{ip_seg}   Storage: {free_gb:.0f}GB free'
+            )
             return
         if wifi_ok:
             link = 'WiFi: ✓'
@@ -164,7 +177,9 @@ class BaseScreen(Screen):
             link = 'LAN: ✓'
         else:
             link = 'WiFi: ✗'
-        self._footer_left.text = f'{link}   Storage: {free_gb:.0f}GB free'
+        self._footer_left.text = (
+            f'{link}{ip_seg}   Storage: {free_gb:.0f}GB free'
+        )
 
     # ------------------------------------------------------------------
     # Lifecycle hooks (override in subclasses)
