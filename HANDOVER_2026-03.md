@@ -1,6 +1,6 @@
 # MeetingBox Handover
 
-Last updated: 2026-04-06
+Last updated: 2026-04-27
 
 ## Purpose
 
@@ -13,6 +13,24 @@ MeetingBox is an on-prem AI meeting appliance. It captures room audio, transcrib
 The project was originally built for a Raspberry Pi 5 with a 3.5-inch OLED touchscreen. It has now been migrated to run on a **Linux mini PC with Ubuntu Desktop and a standard monitor** connected via HDMI.
 
 **Current production target:** Intel mini PC, Ubuntu 24.04 Desktop, standard HDMI monitor, USB headset microphone, mouse/keyboard input, Docker Compose runtime.
+
+**Two compose layouts in-repo:** (1) **Monorepo root** `docker-compose.yml` — full stack (`meetingbox-ui`, web, nginx, etc.). (2) **`mini-pc/` appliance** — slim bundle (`mini-pc/docker-compose.yml`) for **device-ui** ± **docker-audio**; often shipped as `meetingbox-mini-pc-release` on the kiosk. LAN IP and Redis behavior below apply especially to the **mini-pc** layout.
+
+## Delta Update (2026-04-27)
+
+This section is the latest validated engineering note for the **mini-pc appliance** and overrides older networking assumptions when there is a conflict.
+
+- **Home screen footer “IP:” (LAN address for SSH / same-subnet access):** Implemented in `mini-pc/device-ui/src/screens/base_screen.py` (`update_footer`) and `mini-pc/device-ui/src/screens/home.py` (passes `local_ip=get_primary_ipv4()`, refreshes about **every 30 seconds** on the home screen so **DHCP renewals and moving to another network** can update the value without redeploying).
+- **Core logic:** `mini-pc/device-ui/src/local_network.py` — `get_primary_ipv4()` prefers a **usable host LAN IPv4** (Ethernet/Wi‑Fi), not Docker internal addresses.
+- **Problem that was biting production:** With `device-ui` attached only to the **compose bridge** (`appliance-net`), processes inside the container saw addresses like **`172.18.0.x`** (container on the bridge). That is **not** the `192.168.x.x` on **`enp1s0`** from `hostname -I` / `ip a` on the host, so the footer lied and **SSH from another PC failed** if users trusted the UI.
+- **Fix (automatic, follows the network):** In `mini-pc/docker-compose.yml`, **`device-ui` uses `network_mode: host`**. The UI process then shares the **host** network namespace; `get_primary_ipv4()` and the same probes you run in a host shell agree (e.g. **`192.168.1.10`** on **`enp1s0`**). **`pid: host`** and **`privileged: true`** remain for reboot/poweroff `nsenter` helpers; host networking is independent of those but is the right combo on the appliance images we ship.
+- **Compose deltas tied to host networking:**
+  - **`BACKEND_URL`** default when unset is **`http://127.0.0.1:8000`** (API on localhost). Cloud `.env` still sets HTTPS URLs as today.
+  - **`LOCAL_REDIS_HOST=127.0.0.1`** (and **`LOCAL_REDIS_PORT=6379`**) for `device-ui`, because **Docker DNS name `redis` does not resolve** on the host network stack. This matches **`redis` published as `127.0.0.1:6379:6379`** in the same compose file (docker-audio profile).
+  - **`networks: appliance-net` was removed from `device-ui`** — it cannot be combined with `network_mode: host`. **`audio` / `redis`** stay on **`appliance-net`**; only the UI is host-net.
+- **`mini-pc/.env.example`** documents footer IP behavior, optional **`MEETINGBOX_LAN_IP`** / **`MEETINGBOX_LAN_IP_FILE`**, and **`LOCAL_REDIS_*`**.
+- **Optional static overrides:** **`MEETINGBOX_LAN_IP`** or a one-line **`/data/config/lan_ip`** (via **`MEETINGBOX_LAN_IP_FILE`**) forces the footer text. They **do not auto-update** when DHCP changes unless a **host-side script** rewrites the file.
+- **Legacy / advanced:** `local_network.py` still implements **`nsenter -t 1 -n`** probes (`ip route get 8.8.8.8` parsing **`src`**, **`ip -4 addr show dev enp1s0`**, **`ip -4 -br addr`**) and skips **classic Docker NAT ranges** (**`172.17.0.0/16`**, **`172.18.0.0/16`**) in heuristics—relevant if someone runs `device-ui` **without** host networking (not the default appliance compose).
 
 ## Delta Update (2026-04-06)
 
@@ -88,7 +106,19 @@ This section is the latest validated state and overrides older details below whe
 
 ### Service Stack (Docker Compose)
 
-Most services run in Docker via a single compose file. The default production command is:
+**Two entrypoints:** the **monorepo root** full stack (`docker-compose.yml`) and the slim **`mini-pc/`** appliance (`mini-pc/docker-compose.yml`). LAN IP / Redis / `BACKEND_URL` defaults for the kiosk often follow the **mini-pc** file—see **Delta Update (2026-04-27)**.
+
+**`mini-pc/` appliance** (e.g. `meetingbox-mini-pc-release` on the device):
+
+```bash
+cd /home/meetingbox/meetingbox-mini-pc-release   # or your install path
+docker compose --profile mini-pc up -d --build
+# Optional Docker mic + Redis: set COMPOSE_PROFILES=mini-pc,docker-audio in .env
+```
+
+`device-ui` container name: **`meetingbox-appliance-ui`**. It uses **`network_mode: host`** so the home-screen **IP:** footer matches the host LAN (e.g. `enp1s0`).
+
+**Monorepo root — default full stack:**
 
 ```bash
 cd /home/meetingbox/meetingbox
@@ -117,7 +147,7 @@ Use Docker audio only when explicitly needed:
 
 ```bash
 cd /home/meetingbox/meetingbox
-docker compose --profile docker-audio up -d audio
+docker compose -f docker-compose.yml -f docker-compose.prod.yml --profile screen --profile docker-audio up -d audio
 ```
 
 ### Data Flow
@@ -165,6 +195,11 @@ All data lives under `./data/` relative to the compose working directory. On the
 | `frontend/` | React + TypeScript dashboard |
 | `nginx/nginx.conf` | Reverse proxy config |
 | `scripts/install_device_ui.sh` | Appliance: rsync to `/opt/meetingbox`, systemd + Docker Compose (backend, frontend, screen) |
+| `mini-pc/docker-compose.yml` | **Appliance** bundle: `device-ui` (`network_mode: host`), optional `redis` + `audio` profiles |
+| `mini-pc/.env.example` | Appliance env: `DEVICE_UI_DISPLAY`, `BACKEND_URL`, `LOCAL_REDIS_HOST`, footer overrides |
+| `mini-pc/device-ui/src/local_network.py` | **`get_primary_ipv4()`** — LAN IPv4 for home-screen footer (host net + fallbacks) |
+| `mini-pc/device-ui/src/screens/home.py` | Home screen; footer IP refresh ~30s via `get_primary_ipv4()` |
+| `mini-pc/device-ui/src/screens/base_screen.py` | **`update_footer`** — builds footer string including **`IP:`** segment |
 
 ### Authentication Model
 
@@ -317,6 +352,14 @@ The device UI has update screens but the backend endpoints don't do real update 
 
 If the audio service logs `SILENT AUDIO DETECTED (peak=…)`, the wrong device is being used.
 
+### 10. Mini-pc UI showed `172.18.x` instead of real LAN (resolved in current `mini-pc` compose)
+
+**Symptom:** Home screen **IP:** showed e.g. **`172.18.0.3`** while `ip a` on the host listed **`192.168.x.x`** on **`enp1s0`**. SSH from another PC using the footer address failed.
+
+**Cause:** `device-ui` was on the **Docker bridge** only; Python saw the **container** address.
+
+**Current fix:** **`network_mode: host`** for `device-ui` in **`mini-pc/docker-compose.yml`**, plus **`LOCAL_REDIS_HOST=127.0.0.1`** for pub/sub when using the docker-audio profile. See **Delta Update (2026-04-27)**. Fallback: set **`MEETINGBOX_LAN_IP`** or **`MEETINGBOX_LAN_IP_FILE`** (does not follow DHCP unless a host script updates the file).
+
 ## How to Operate
 
 ### Start default stack
@@ -367,6 +410,14 @@ docker compose -f docker-compose.yml -f docker-compose.prod.yml --profile screen
 docker compose -f docker-compose.yml -f docker-compose.prod.yml --profile screen up -d
 ```
 
+### Rebuild **mini-pc** appliance `device-ui` only
+
+```bash
+cd /home/meetingbox/meetingbox-mini-pc-release   # or path to mini-pc compose
+docker compose --profile mini-pc build device-ui
+docker compose --profile mini-pc up -d device-ui
+```
+
 ### Reset stuck recording state
 ```bash
 docker exec meetingbox-redis redis-cli set recording_state idle
@@ -385,13 +436,18 @@ sudo find /home/meetingbox/meetingbox/data -type f -exec chmod 664 {} \;
 - Network: `http://meetingbox.local` or `http://192.168.1.17`
 
 ### SSH access
+
+Use the **host Ethernet/Wi‑Fi** address (e.g. **`enp1s0`** from `ip a`), which should match the home-screen **IP:** line when **`mini-pc`** `device-ui` runs with **`network_mode: host`**:
+
 ```
-ssh meetingbox@192.168.1.17
+ssh meetingbox@192.168.1.10
 ```
+
+(Replace with your real LAN address.)
 
 ## .env File
 
-Must exist at the compose working directory (`/home/meetingbox/meetingbox/.env`). Minimum required:
+Must exist at the **compose working directory** (e.g. `/home/meetingbox/meetingbox/.env` for the full stack, or **`mini-pc/.env`** / your **`meetingbox-mini-pc-release/.env`** for the appliance). Minimum required for the **full** stack:
 
 ```env
 JWT_SECRET_KEY=<output of: openssl rand -hex 32>
@@ -410,15 +466,16 @@ See `.env.example` for all available variables.
 ## Recommended Reading Order for New Agents
 
 1. **This file** — current state and context
-2. `docker-compose.yml` — service definitions and runtime config
+2. `docker-compose.yml` (monorepo root) and **`mini-pc/docker-compose.yml`** (appliance) — service definitions and runtime config
 3. `services/audio/audio_capture.py` — mic detection and recording pipeline
 4. `services/transcription/transcription_service.py` — Whisper integration and event handling
 5. `services/ai/ai_service.py` — summary generation logic
 6. `server/web/routes/meetings.py` — recording control and meeting API
 7. `device-ui/src/main.py` — Kivy app entry point and event handling
-8. `device-ui/src/config.py` — display and UI configuration
-9. `frontend/FRONTEND_REFERENCE.md` — dashboard feature inventory
-10. `LEARNINGS.md` — historical Pi debugging lessons (still useful context)
+8. `device-ui/src/config.py` — display and UI configuration (**root** tree); for **mini-pc** image see `mini-pc/device-ui/src/config.py`
+9. `mini-pc/device-ui/src/local_network.py` — **appliance** LAN IP detection for footer / SSH hint (read if footer IP wrong)
+10. `frontend/FRONTEND_REFERENCE.md` — dashboard feature inventory
+11. `LEARNINGS.md` — historical Pi debugging lessons (still useful context)
 
 ## Suggested Next Steps
 
