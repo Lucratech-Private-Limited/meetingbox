@@ -16,7 +16,51 @@ logger = logging.getLogger(__name__)
 # BACKEND CONNECTION
 # ============================================================================
 
-BACKEND_URL = os.getenv('BACKEND_URL', 'http://localhost:8000')
+
+def _normalize_dashboard_config(raw: str) -> tuple[str, str]:
+    """
+    Parse DASHBOARD_URL env: accepts host:port or full URL (with optional trailing slash).
+    Returns (short_label, public_url) — public_url has no trailing slash.
+    """
+    s = (raw or "").strip().rstrip("/")
+    if not s:
+        s = "meetingbox.local"
+    low = s.lower()
+    if low.startswith("https://"):
+        rest = s[8:]
+        hostport = rest.split("/")[0]
+        if not hostport:
+            hostport = "meetingbox.local"
+        return hostport, f"https://{hostport}"
+    if low.startswith("http://"):
+        rest = s[7:]
+        hostport = rest.split("/")[0]
+        if not hostport:
+            hostport = "meetingbox.local"
+        return hostport, f"http://{hostport}"
+    hostport = s.split("/")[0]
+    return hostport, f"http://{hostport}"
+
+
+def _resolve_backend_url() -> str:
+    """
+    REST API base URL. Prefer explicit BACKEND_URL; if unset/empty and DASHBOARD_URL is set,
+    use the same scheme/host as the dashboard so pairing (claim) hits the same server that
+    issued the code (avoids claiming against localhost while the QR opened a cloud URL).
+    """
+    explicit = (os.getenv("BACKEND_URL") or "").strip().rstrip("/")
+    if explicit:
+        return explicit
+    dash_env = (os.getenv("DASHBOARD_URL") or "").strip()
+    if not dash_env:
+        return "http://localhost:8000"
+    _, pub = _normalize_dashboard_config(dash_env)
+    out = pub.strip().rstrip("/")
+    logger.info("BACKEND_URL not set; derived from DASHBOARD_URL: %s", out)
+    return out
+
+
+BACKEND_URL = _resolve_backend_url()
 
 
 def _default_ws_url(http_url: str) -> str:
@@ -363,32 +407,6 @@ DEFAULT_AUTO_DELETE = 'never'       # never, 30, 60, 90
 # ============================================================================
 
 DEVICE_MODEL = 'MeetingBox v1.0'
-
-
-def _normalize_dashboard_config(raw: str) -> tuple[str, str]:
-    """
-    Parse DASHBOARD_URL env: accepts host:port or full URL (with optional trailing slash).
-    Returns (short_label, public_url) — public_url has no trailing slash.
-    """
-    s = (raw or "").strip().rstrip("/")
-    if not s:
-        s = "meetingbox.local"
-    low = s.lower()
-    if low.startswith("https://"):
-        rest = s[8:]
-        hostport = rest.split("/")[0]
-        if not hostport:
-            hostport = "meetingbox.local"
-        return hostport, f"https://{hostport}"
-    if low.startswith("http://"):
-        rest = s[7:]
-        hostport = rest.split("/")[0]
-        if not hostport:
-            hostport = "meetingbox.local"
-        return hostport, f"http://{hostport}"
-    hostport = s.split("/")[0]
-    return hostport, f"http://{hostport}"
-
 
 _d_label, _d_public = _normalize_dashboard_config(os.getenv("DASHBOARD_URL", "meetingbox.local"))
 # Compact host:port for subtitles (e.g. Configure at …)

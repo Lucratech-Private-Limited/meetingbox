@@ -267,7 +267,12 @@ def _load_settings() -> dict:
         "timezone": "UTC",
         "auto_delete_days": "never",
         "brightness": "high",
+        # Legacy display-off timeout (kept for compat; no longer read by the
+        # device UI). The replacement is `idle_screen_timeout` below.
         "screen_timeout": "never",
+        # Idle-screen timeout: how long until the lock-screen idle UI takes
+        # over. Stored as seconds string ("30","60","120","300") or "never".
+        "idle_screen_timeout": "30",
         "privacy_mode": False,
         "auto_record": False,
     }
@@ -610,6 +615,9 @@ class SettingsUpdate(BaseModel):
     auto_delete_days: Optional[str] = None
     brightness: Optional[str] = None
     screen_timeout: Optional[str] = None
+    # Replaces screen_timeout for the new idle-screen flow on the device UI.
+    # Stored as a string of seconds ("30"/"60"/"120"/"300") or "never".
+    idle_screen_timeout: Optional[str] = None
     privacy_mode: Optional[bool] = None
     auto_record: Optional[bool] = None
     auto_summarize: Optional[bool] = None

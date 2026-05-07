@@ -46,6 +46,7 @@ RUN set -eux; \
             xclip \
             xauth \
             x11-xserver-utils \
+            fonts-dejavu-core \
             util-linux \
             iproute2 \
             espeak-ng \

@@ -12,7 +12,7 @@ from assistant_service import (
   reject_pending_action,
   update_pending_assistant_payload,
 )
-from auth import get_current_user, get_optional_user
+from auth import get_current_user, get_optional_actor
 
 router = APIRouter()
 
@@ -29,13 +29,13 @@ class PendingPayloadUpdate(BaseModel):
 @router.post("/intent")
 async def post_intent(
   body: IntentRequest,
-  current_user: Optional[dict] = Depends(get_optional_user),
+  current_actor: Optional[dict] = Depends(get_optional_actor),
 ):
   """
   Route the user message through the orchestrator, run safe read-only tools,
   and queue calendar/email writes as pending actions until approved.
   """
-  uid = current_user["id"] if current_user else None
+  uid = current_actor["user"]["id"] if current_actor and current_actor.get("user") else None
   return process_assistant_intent(
     message=body.message,
     user_id=uid,

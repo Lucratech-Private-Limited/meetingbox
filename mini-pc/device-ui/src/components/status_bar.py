@@ -12,7 +12,7 @@ from kivy.uix.image import Image
 from kivy.uix.label import Label
 from kivy.uix.behaviors import ButtonBehavior
 from kivy.uix.widget import Widget
-from kivy.graphics import Color, Rectangle, Line
+from kivy.graphics import Color, Rectangle, Line, RoundedRectangle
 from kivy.animation import Animation
 from kivy.app import App
 
@@ -74,10 +74,10 @@ class StatusBar(BoxLayout):
                  **kwargs):
 
         kwargs.setdefault('size_hint', (1, None))
-        kwargs.setdefault('height', max(_suv(STATUS_BAR_HEIGHT), _suv(48)))
+        kwargs.setdefault('height', max(_suv(STATUS_BAR_HEIGHT), _suv(54)))
         kwargs.setdefault('orientation', 'horizontal')
-        kwargs.setdefault('padding', [_suh(12), _suv(6), _suh(12), _suv(6)])
-        kwargs.setdefault('spacing', _suh(8))
+        kwargs.setdefault('padding', [_suh(16), _suv(8), _suh(16), _suv(8)])
+        kwargs.setdefault('spacing', _suh(10))
 
         super().__init__(**kwargs)
 
@@ -86,11 +86,11 @@ class StatusBar(BoxLayout):
         self._back_button = back_button
         self._on_back = on_back
 
-        # Dark background + bottom separator (all on canvas.before so nothing draws over children)
+        # Glass top bar — every screen gets the same premium chrome.
         with self.canvas.before:
-            Color(*COLORS['background'])
+            Color(0.06, 0.08, 0.13, 0.88)
             self.bg_rect = Rectangle(pos=self.pos, size=self.size)
-            Color(*COLORS['gray_800'])
+            Color(1, 1, 1, 0.08)
             self.border_line = Line(width=1)
 
         self.bind(pos=self._update_bg, size=self._update_bg)
@@ -98,14 +98,14 @@ class StatusBar(BoxLayout):
         # --- LEFT: back button OR dot + status ---
         if back_button:
             back_label = _GearButton(
-                text='<  BACK',
-                font_size=_suf(FONT_SIZES['medium']),
-                color=COLORS['white'],
+                text='‹  BACK',
+                font_size=_suf(FONT_SIZES['small'] + 1),
+                color=COLORS['gray_300'],
                 bold=True,
                 halign='left',
                 valign='middle',
                 size_hint=(None, 1),
-                width=_suh(108),
+                width=_suh(118),
             )
             back_label.bind(size=back_label.setter('text_size'))
             if on_back:

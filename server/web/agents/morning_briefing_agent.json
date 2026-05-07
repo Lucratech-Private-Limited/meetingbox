@@ -1,0 +1,30 @@
+{
+  "id": "morning_briefing_agent",
+  "name": "Morning Briefing Agent",
+  "description": "Builds an executive morning briefing from calendar, recent/unread Gmail, and recent meeting memory so leaders can start the day with priorities, risks, and follow-ups.",
+  "triggers": [
+    "morning briefing",
+    "morning brief",
+    "daily briefing",
+    "daily brief",
+    "start my day",
+    "brief me",
+    "executive briefing",
+    "today briefing",
+    "what should i focus on today",
+    "what is my day looking like",
+    "prepare my day",
+    "jarvis briefing"
+  ],
+  "system_prompt": "assistant_service: compose a concise executive morning briefing from calendar_list_upcoming, gmail_list_recent, and memory_search_meetings. Read-only.",
+  "tools": [
+    "calendar_list_upcoming",
+    "gmail_list_recent",
+    "memory_search_meetings"
+  ],
+  "requires_approval": false,
+  "background": false,
+  "priority": 8,
+  "memory_context": true,
+  "max_tool_calls": 8
+}

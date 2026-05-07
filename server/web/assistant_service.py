@@ -420,6 +420,130 @@ def _memory_fallback_reply(tool_results: list[dict[str, Any]]) -> str:
   return "\n\n".join(parts) if parts else "No meeting data was found."
 
 
+
+def _briefing_context_blob(tool_results: list[dict[str, Any]]) -> str:
+  """Compact, readable source data for morning briefing synthesis."""
+  sections: list[str] = []
+  for item in tool_results:
+    tool = item.get("tool")
+    if item.get("error"):
+      sections.append(f"{tool} error: {item.get('error')}")
+      continue
+    result = item.get("result")
+    if not isinstance(result, dict):
+      continue
+
+    if tool == TOOL_CAL_LIST:
+      lines = ["Calendar:"]
+      for ev in (result.get("events") or [])[:10]:
+        start = ev.get("start") if isinstance(ev.get("start"), dict) else {}
+        end = ev.get("end") if isinstance(ev.get("end"), dict) else {}
+        when = start.get("dateTime") or start.get("date") or "time unknown"
+        until = end.get("dateTime") or end.get("date") or ""
+        title = ev.get("summary") or "(untitled event)"
+        lines.append(f"- {title} | start={when} end={until}")
+      if len(lines) == 1:
+        lines.append("- No upcoming events returned.")
+      sections.append("\n".join(lines))
+
+    elif tool == TOOL_GMAIL_LIST:
+      lines = ["Gmail:"]
+      for msg in (result.get("messages") or [])[:10]:
+        sender = msg.get("from") or msg.get("sender") or "unknown sender"
+        subject = msg.get("subject") or "(no subject)"
+        snippet = (msg.get("snippet") or "").replace("\n", " ").strip()
+        date = msg.get("date") or msg.get("internalDate") or ""
+        lines.append(f"- {subject} | from={sender} date={date} snippet={snippet[:240]}")
+      if len(lines) == 1:
+        lines.append("- No messages returned.")
+      sections.append("\n".join(lines))
+
+    elif tool == TOOL_MEMORY_SEARCH:
+      lines = ["Recent meetings:"]
+      for mtg in (result.get("meetings") or [])[:8]:
+        title = mtg.get("title") or "(untitled meeting)"
+        when = mtg.get("created_at") or mtg.get("start_time") or ""
+        status = mtg.get("status") or ""
+        lines.append(f"- {title} | when={when} status={status} id={mtg.get('id', '')}")
+      if len(lines) == 1:
+        lines.append("- No recent meeting records returned.")
+      sections.append("\n".join(lines))
+
+  return "\n\n".join(sections).strip()[:24000]
+
+
+def _synthesize_morning_briefing(tool_results: list[dict[str, Any]]) -> str | None:
+  client = _get_anthropic()
+  if not client:
+    return None
+  import os
+
+  blob = _briefing_context_blob(tool_results)
+  if not blob:
+    return None
+  model = os.getenv("AI_MODEL", "claude-sonnet-4-20250514")
+  try:
+    resp = client.messages.create(
+      model=model,
+      max_tokens=1400,
+      messages=[{
+        "role": "user",
+        "content": (
+          "You are MeetingBox's executive morning briefing agent for CEO/COO/CFO users. "
+          "Use ONLY the source data below. Be calm, polished, and concise. "
+          "Return a briefing with these sections:\n"
+          "1. Good morning line (one sentence)\n"
+          "2. Today's schedule (bullets, emphasize time-critical items)\n"
+          "3. Communications to notice (bullets)\n"
+          "4. Follow-ups from meeting memory (bullets)\n"
+          "5. Top priorities (max 3 bullets)\n"
+          "If a source is unavailable or not connected, mention it briefly without sounding alarming.\n\n"
+          f"Source data:\n{blob}"
+        ),
+      }],
+    )
+  except Exception:
+    logger.exception("morning briefing synthesis failed")
+    return None
+  return (getattr(resp.content[0], "text", "") or "").strip() or None
+
+
+def _fallback_morning_briefing(tool_results: list[dict[str, Any]]) -> str:
+  calendar_lines: list[str] = []
+  gmail_lines: list[str] = []
+  memory_lines: list[str] = []
+  notes: list[str] = []
+
+  for item in tool_results:
+    tool = item.get("tool")
+    if item.get("error"):
+      notes.append(str(item.get("error")))
+      continue
+    result = item.get("result")
+    if not isinstance(result, dict):
+      continue
+    if tool == TOOL_CAL_LIST:
+      for ev in (result.get("events") or [])[:5]:
+        start = ev.get("start") if isinstance(ev.get("start"), dict) else {}
+        when = start.get("dateTime") or start.get("date") or "time not set"
+        calendar_lines.append(f"• {ev.get('summary') or 'Calendar event'} — {when}")
+    elif tool == TOOL_GMAIL_LIST:
+      for msg in (result.get("messages") or [])[:5]:
+        gmail_lines.append(f"• {msg.get('subject') or '(no subject)'} — {msg.get('from') or 'unknown sender'}")
+    elif tool == TOOL_MEMORY_SEARCH:
+      for mtg in (result.get("meetings") or [])[:4]:
+        memory_lines.append(f"• {mtg.get('title') or '(untitled meeting)'} — {mtg.get('created_at') or mtg.get('start_time') or ''}")
+
+  parts = ["Good morning. Here is your MeetingBox briefing."]
+  parts.append("\nToday's schedule:\n" + ("\n".join(calendar_lines) if calendar_lines else "• No upcoming calendar events returned."))
+  parts.append("\nCommunications to notice:\n" + ("\n".join(gmail_lines) if gmail_lines else "• No recent Gmail messages returned."))
+  parts.append("\nRecent meeting memory:\n" + ("\n".join(memory_lines) if memory_lines else "• No recent meeting records returned."))
+  if notes:
+    parts.append("\nSetup notes:\n" + "\n".join(f"• {n}" for n in notes[:4]))
+  parts.append("\nTop priorities:\n• Review time-sensitive meetings.\n• Clear urgent email follow-ups.\n• Close open actions from recent meetings.")
+  return "\n".join(parts)
+
+
 def _row_factory(cursor, row):
   return {col[0]: row[idx] for idx, col in enumerate(cursor.description)}
 
@@ -663,6 +787,37 @@ def process_assistant_intent(
     if not assistant_lines:
       assistant_lines.append("Communication request processed. See tool_results for details.")
 
+  elif agent_id == "morning_briefing_agent":
+    if not user_id:
+      tool_results.append({
+        "tool": "morning_briefing",
+        "error": "Sign in is required to build a personal briefing from calendar and Gmail.",
+      })
+    else:
+      try:
+        res = calendar_list_upcoming(user_id, max_results=10)
+        tool_results.append({"tool": TOOL_CAL_LIST, "result": res})
+      except ToolError as e:
+        tool_results.append({"tool": TOOL_CAL_LIST, "error": str(e)})
+
+      try:
+        res = gmail_list_recent(user_id, max_results=10, q="is:unread newer_than:7d")
+        if not res.get("messages"):
+          res = gmail_list_recent(user_id, max_results=10, q="newer_than:7d")
+        tool_results.append({"tool": TOOL_GMAIL_LIST, "result": res})
+      except ToolError as e:
+        tool_results.append({"tool": TOOL_GMAIL_LIST, "error": str(e)})
+
+    try:
+      res = memory_search_meetings(user_id, "", max_results=6)
+      tool_results.append({"tool": TOOL_MEMORY_SEARCH, "result": res})
+    except Exception as e:
+      logger.exception("morning briefing memory search failed")
+      tool_results.append({"tool": TOOL_MEMORY_SEARCH, "error": str(e)})
+
+    briefing = _synthesize_morning_briefing(tool_results)
+    assistant_lines.append(briefing or _fallback_morning_briefing(tool_results))
+
   elif agent_id == "memory_agent":
     steps = plan_memory_steps(text)
     fetched_ids: set[str] = set()
@@ -737,7 +892,7 @@ def process_assistant_intent(
       f"Routed to **{agent_doc.get('name', agent_id)}** — specialized handling is not implemented yet."
     )
 
-  assistant_message = " ".join(assistant_lines) if assistant_lines else "Done."
+  assistant_message = "\n\n".join(line for line in assistant_lines if line) if assistant_lines else "Done."
 
   response_payload = {
     "assistant_message": assistant_message,

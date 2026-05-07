@@ -87,8 +87,12 @@ if [[ "$(uname -s)" == "Linux" ]] && [[ -z "${DISPLAY:-}" ]]; then
 fi
 
 if [[ -z "${BACKEND_URL:-}" ]] && [[ "${MOCK_BACKEND:-0}" != "1" ]]; then
-  echo "[MeetingBox] BACKEND_URL is not set — the UI will use http://localhost:8000 (no server on this machine)." >&2
-  echo "[MeetingBox] Fix: set BACKEND_URL in $MINI_PC_ROOT/.env (see .env.example), monorepo .env, or $SCRIPT_DIR/.env" >&2
+  if [[ -n "${DASHBOARD_URL:-}" ]]; then
+    echo "[MeetingBox] BACKEND_URL is not set — API base will be derived from DASHBOARD_URL (see config.py)." >&2
+  else
+    echo "[MeetingBox] BACKEND_URL is not set — the UI will use http://localhost:8000." >&2
+    echo "[MeetingBox] Fix: set BACKEND_URL or DASHBOARD_URL in $MINI_PC_ROOT/.env (see .env.example), monorepo .env, or $SCRIPT_DIR/.env" >&2
+  fi
 fi
 
 exec python3 src/main.py "$@"
