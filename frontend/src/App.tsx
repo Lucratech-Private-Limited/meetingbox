@@ -16,6 +16,7 @@ import SystemStatus from './pages/SystemStatus'
 import AssistantChat from './pages/AssistantChat'
 import Privacy from './pages/Privacy'
 import Terms from './pages/Terms'
+import KioskIdle from './pages/KioskIdle'
 
 function AuthGate({ children }: { children: React.ReactNode }) {
   const token = useAuthStore((s) => s.token)
@@ -83,6 +84,8 @@ export default function App() {
           <Route path="/auth/callback" element={<AuthCallback />} />
           <Route path="/privacy" element={<Privacy />} />
           <Route path="/terms" element={<Terms />} />
+          {/* Pixel-faithful kiosk/tablet idle preview (Figma #338:60) — fullscreen, no chrome */}
+          <Route path="/kiosk/idle" element={<KioskIdle />} />
 
           {/* Personal onboarding -- logged in but onboarding not complete */}
           <Route

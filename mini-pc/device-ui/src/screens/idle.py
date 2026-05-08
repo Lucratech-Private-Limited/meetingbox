@@ -1,15 +1,9 @@
-"""Idle screen — Figma `338:60` (yJqcY4KovVjJ11vjysW533).
+"""Idle screen — pixel-perfect Figma 338:60 (yJqcY4KovVjJ11vjysW533).
 
-Shown after the configurable inactivity period (default 30 s) when the device
-is on home/non-recording screens. Tapping anywhere returns to home; the Start
-Recording card on the lower-right starts a new meeting in place. Time, date,
-greeting, weather and "next up" all refresh live so the screen never looks
-stale.
-
-Layout: full-screen background; foreground is a vertical flex column (top band,
-stretch center, bottom band). Top band is a horizontal row (datetime | gap |
-weather). Bottom band is a horizontal row (schedule | gap | recording card) so
-the two bottom regions never overlap.
+Layout uses a FloatLayout with pos_hint / size_hint derived directly from
+Figma's absolute coordinates in a 892 × 573 design frame.  All element
+positions, sizes, font sizes, and colours come from the Figma spec.  Live
+data (clock, weather, next meeting) is still refreshed at runtime.
 """
 
 from __future__ import annotations
@@ -18,22 +12,18 @@ import logging
 from datetime import datetime
 
 from kivy.clock import Clock
-from kivy.graphics import Color, Line, Rectangle, RoundedRectangle
-from kivy.uix.anchorlayout import AnchorLayout
+from kivy.graphics import Color, Rectangle, RoundedRectangle
 from kivy.uix.behaviors import ButtonBehavior
-from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.floatlayout import FloatLayout
 from kivy.uix.image import Image
 from kivy.uix.label import Label
-from kivy.uix.widget import Widget
 
 from async_helper import run_async
 from config import (
     ASSETS_DIR,
-    COLORS,
+    DISPLAY_HEIGHT,
+    DISPLAY_WIDTH,
     display_now,
-    home_layout_horizontal_scale,
-    home_layout_vertical_scale,
     to_display_local,
 )
 from screens.base_screen import BaseScreen
@@ -41,80 +31,90 @@ from weather_client import get_weather_client
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Figma design constants (frame 338:60, 892 × 573 px)
+# ---------------------------------------------------------------------------
+_FW = 892.0
+_FH = 573.0
+
+# Asset directories
 _IDLE_DIR = ASSETS_DIR / "idle"
+_FIGMA_DIR = ASSETS_DIR / "home" / "figma"
+
+# Figma colour palette
+_WHITE = (1.0, 1.0, 1.0, 1.0)
+_MUTED = (0.714, 0.729, 0.949, 1.0)   # #B6BAF2
+_BLUE  = (0.0, 0.420, 0.976, 1.0)     # #006BF9
+
+# Font family names registered in main.py
+_FONT  = "42dot-Sans"    # Regular / Bold (bold=True)
+_FONT_SB  = "42dot-SB"   # SemiBold
+_FONT_MED = "42dot-Med"  # Medium
+
+
+# ---------------------------------------------------------------------------
+# Coordinate helpers  (Figma → Kivy FloatLayout fractions)
+# ---------------------------------------------------------------------------
+
+def _x(px: float) -> float:
+    """Figma X → pos_hint 'x' fraction (left edge)."""
+    return px / _FW
+
+
+def _y(figma_top: float, figma_h: float) -> float:
+    """Figma Y-from-top + element height → pos_hint 'y' fraction (bottom edge)."""
+    return max(0.0, (_FH - figma_top - figma_h) / _FH)
+
+
+def _sw(px: float) -> float:
+    """Figma width → size_hint_x."""
+    return px / _FW
+
+
+def _sh(px: float) -> float:
+    """Figma height → size_hint_y."""
+    return px / _FH
+
+
+def _ff(fs: float) -> int:
+    """Scale a Figma font size (px) proportionally to the physical display."""
+    scale = min(DISPLAY_WIDTH / _FW, DISPLAY_HEIGHT / _FH)
+    return max(6, round(fs * scale))
+
+
+# ---------------------------------------------------------------------------
+# Asset helpers
+# ---------------------------------------------------------------------------
+
+def _idle_asset(name: str) -> str:
+    p = _IDLE_DIR / name
+    return str(p) if p.is_file() else ""
+
+
+def _figma_asset(name: str) -> str:
+    p = _FIGMA_DIR / name
+    return str(p) if p.is_file() else ""
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-# Figma baseline 1024×600 (used for margin constants above).
-_IDLE_PAD_LEFT = 46
-_IDLE_PAD_TOP = 35
-_IDLE_PAD_RIGHT = 48
-_IDLE_PAD_BOTTOM = 43
-# Maximum width for left-column blocks so content stays readable.
-_ZONE_TOP_LEFT_W = 480
-# Schedule column ≈ 38% of 1024 design width; keeps center clear for background.
-_ZONE_SCHEDULE_W = 390
-
-
-def _idle_uniform_scale() -> float:
-    """Single scale for both axes so proportions match Figma on real panels.
-
-    ``home_layout_*`` intentionally uses different width vs height ratios when the
-    physical panel aspect ratio differs from 1024×600. On the idle float layout that
-    made boxes, glyphs, and icon squares subtly mis-sized relative to ``pos_hint``,
-    which reads as “nothing lines up” on kiosk hardware.
-    """
-    return min(home_layout_horizontal_scale(), home_layout_vertical_scale())
-
-
-def _hf(fs):
-    """Font size scaled with the same idle uniform factor as lengths."""
-    return max(6, int(round(float(fs) * _idle_uniform_scale())))
-
-
-def _idu(px):
-    """Design px → physical px using idle uniform scale (width and height agree)."""
-    return max(1, int(round(float(px) * _idle_uniform_scale())))
-
-
-def _hh(px):  # kept for readability at call sites migrating from split scales
-    return _idu(px)
-
-
-def _hv(px):
-    return _idu(px)
-
-
-def _idle_png(name: str) -> str:
-    p = _IDLE_DIR / name
-    return str(p) if p.is_file() else ""
-
-
 def _greeting(name: str | None) -> str:
     hour = display_now().hour
-    if hour < 12:
-        head = "Good morning"
-    elif hour < 17:
-        head = "Good afternoon"
-    else:
-        head = "Good evening"
+    head = (
+        "Good morning" if hour < 12
+        else "Good afternoon" if hour < 17
+        else "Good evening"
+    )
     nm = (name or "").strip()
     if nm:
-        first = nm.split()[0]
-        return f"{head}, {first}"
+        return f"{head}, {nm.split()[0]}"
     return head
 
 
-def _format_meeting_line(next_meeting: dict | None) -> tuple[str, str, int]:
-    """Return ``(time_str, title_str, more_count)`` for the Next Up block.
-
-    ``more_count`` is reserved for future use — backend ``get_home_summary``
-    only ships pending action counts today, so we surface the upcoming title
-    and time and leave "+N more" to mirror today's outstanding actions.
-    """
+def _format_meeting(next_meeting: dict | None) -> tuple[str, str, int]:
+    """Return (time_str, title, more_count) from a home-summary meeting dict."""
     if not next_meeting:
         return ("--:-- --", "No meetings today", 0)
     title = (next_meeting.get("title") or "Calendar event").strip() or "Calendar event"
@@ -133,59 +133,121 @@ def _format_meeting_line(next_meeting: dict | None) -> tuple[str, str, int]:
     return (time_str, title, 0)
 
 
+def _lbl(
+    text: str,
+    font_name: str,
+    font_size: int,
+    color: tuple,
+    *,
+    bold: bool = False,
+    halign: str = "left",
+    valign: str = "top",
+    **kwargs,
+) -> Label:
+    """Create a Label with text_size bound to its own size for proper alignment."""
+    lbl = Label(
+        text=text,
+        font_name=font_name,
+        font_size=font_size,
+        bold=bold,
+        color=color,
+        halign=halign,
+        valign=valign,
+        **kwargs,
+    )
+    lbl.bind(size=lbl.setter("text_size"))
+    return lbl
+
+
 # ---------------------------------------------------------------------------
-# Start Recording card (image-driven, tappable)
+# Start Recording card
 # ---------------------------------------------------------------------------
 
-class _StartRecordingCard(ButtonBehavior, BoxLayout):
-    """Gradient blue card with mic orb + label + subtitle.
+class _RecordingCard(ButtonBehavior, FloatLayout):
+    """Tappable card with downloaded gradient PNG background.
 
-    Uses ``BoxLayout`` (not ``FloatLayout``) so the mic + text row is laid out
-    inside the card bounds. A ``FloatLayout`` child with only ``size_hint`` can
-    end up with the wrong origin and draw over the schedule column instead.
+    Figma: Group 12 at (427, 356), 414 × 167 px — background is Rectangle 3
+    (node 395:170) with linear-gradient(#0038B6 → #002376) and r=30.
     """
 
-    def __init__(self, **kwargs):
-        kwargs.setdefault("orientation", "horizontal")
-        kwargs.setdefault("size_hint", (None, None))
-        super().__init__(**kwargs)
-        with self.canvas.before:
-            # Approximate the Figma gradient (#0038b6 → #002376) with a flat
-            # mid-blue plus a slight overlay; Kivy doesn't ship a built-in
-            # vertical gradient on RoundedRectangle, and a 2-tone mid-blue
-            # reads close enough at thumb size.
-            Color(0.000, 0.220, 0.715, 1.0)  # ~#0038b6
-            self._bg = RoundedRectangle(pos=self.pos, size=self.size, radius=[_hv(30)])
-            Color(0.000, 0.137, 0.460, 0.55)  # ~#002376 darker overlay
-            self._bg_dark = RoundedRectangle(
-                pos=(self.x, self.y),
-                size=(self.width, self.height * 0.55),
-                radius=[0, 0, _hv(30), _hv(30)],
-            )
-            # 3-px solid border #034ee2
-            Color(0.012, 0.306, 0.886, 1.0)
-            self._border = Line(
-                rounded_rectangle=(self.x, self.y, self.width, self.height, _hv(30)),
-                width=max(1.5, float(_hv(3))),
-            )
-        self.bind(pos=self._sync, size=self._sync)
+    # Figma card dimensions (used for relative child positioning)
+    _CW = 414.0
+    _CH = 167.0
 
-    def _sync(self, *_args):
-        radius = _hv(30)
-        self._bg.pos = self.pos
-        self._bg.size = self.size
-        self._bg.radius = [radius]
-        self._bg_dark.pos = (self.x, self.y)
-        self._bg_dark.size = (self.width, self.height * 0.55)
-        self._bg_dark.radius = [0, 0, radius, radius]
-        self._border.rounded_rectangle = (
-            self.x,
-            self.y,
-            self.width,
-            self.height,
-            radius,
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+        # ------------------------------------------------------------------
+        # Gradient background
+        # ------------------------------------------------------------------
+        bg_src = _idle_asset("recording_btn_bg.png")
+        if bg_src:
+            self.add_widget(
+                Image(
+                    source=bg_src,
+                    size_hint=(1, 1),
+                    pos_hint={"x": 0, "y": 0},
+                    fit_mode="fill",
+                    allow_stretch=True,
+                    keep_ratio=False,
+                )
+            )
+        else:
+            # Programmatic fallback — single mid-blue approximation
+            with self.canvas.before:
+                Color(0.0, 0.18, 0.60, 1.0)
+                self._fallback_bg = RoundedRectangle(
+                    pos=self.pos, size=self.size, radius=[_ff(30)]
+                )
+            self.bind(
+                pos=lambda *_: setattr(self._fallback_bg, "pos", self.pos),
+                size=lambda *_: setattr(self._fallback_bg, "size", self.size),
+            )
+
+        # ------------------------------------------------------------------
+        # Mic orb  — Group 16 at (27, 32) within card, 101 × 101
+        # ------------------------------------------------------------------
+        orb_src = _idle_asset("mic_orb.png")
+        if orb_src:
+            cw, ch = self._CW, self._CH
+            self.add_widget(
+                Image(
+                    source=orb_src,
+                    size_hint=(101.0 / cw, 101.0 / ch),
+                    pos_hint={"x": 27.0 / cw, "y": (ch - 32.0 - 101.0) / ch},
+                    fit_mode="contain",
+                    allow_stretch=True,
+                )
+            )
+
+        # ------------------------------------------------------------------
+        # "Start Recording" — (165, 49), 219 × 36, Bold 30px
+        # ------------------------------------------------------------------
+        cw, ch = self._CW, self._CH
+        lbl_title = _lbl(
+            "Start Recording",
+            _FONT,
+            _ff(30),
+            _WHITE,
+            bold=True,
+            valign="middle",
+            size_hint=(219.0 / cw, 36.0 / ch),
+            pos_hint={"x": 165.0 / cw, "y": (ch - 49.0 - 36.0) / ch},
         )
-        self._border.width = max(1.5, float(_hv(3)))
+        self.add_widget(lbl_title)
+
+        # ------------------------------------------------------------------
+        # Subtitle — (148, 94), 253 × 24, SemiBold 20px
+        # ------------------------------------------------------------------
+        lbl_sub = _lbl(
+            'Tap or say "start recording"',
+            _FONT_SB,
+            _ff(20),
+            _WHITE,
+            size_hint=(253.0 / cw, 24.0 / ch),
+            pos_hint={"x": 148.0 / cw, "y": (ch - 94.0 - 24.0) / ch},
+        )
+        self.add_widget(lbl_sub)
 
 
 # ---------------------------------------------------------------------------
@@ -193,7 +255,7 @@ class _StartRecordingCard(ButtonBehavior, BoxLayout):
 # ---------------------------------------------------------------------------
 
 class IdleScreen(BaseScreen):
-    """Lock-screen-style idle UI shown after inactivity (see ``main.py`` timer)."""
+    """Lock-screen-style idle UI matching Figma 338:60 pixel-for-pixel."""
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -205,19 +267,26 @@ class IdleScreen(BaseScreen):
     # ------------------------------------------------------------------
     # UI construction
     # ------------------------------------------------------------------
+
     def _build_ui(self) -> None:
         root = FloatLayout(size_hint=(1, 1))
-        # Solid #010c25 fallback in case the background image fails to load.
+
+        # ------------------------------------------------------------------
+        # 1. Solid background colour  #010C25
+        # ------------------------------------------------------------------
         with root.canvas.before:
-            Color(0.004, 0.047, 0.145, 1)
+            Color(0.004, 0.047, 0.145, 1.0)
             self._bg_rect = Rectangle(pos=root.pos, size=root.size)
         root.bind(pos=self._sync_bg, size=self._sync_bg)
 
-        bg_path = _idle_png("background_landscape.png")
-        if bg_path:
+        # ------------------------------------------------------------------
+        # 2. Background photo (full-bleed, same as Figma imageRef beb9aab8…)
+        # ------------------------------------------------------------------
+        bg_src = _idle_asset("background_landscape.png")
+        if bg_src:
             root.add_widget(
                 Image(
-                    source=bg_path,
+                    source=bg_src,
                     size_hint=(1, 1),
                     pos_hint={"x": 0, "y": 0},
                     fit_mode="cover",
@@ -226,403 +295,185 @@ class IdleScreen(BaseScreen):
                 )
             )
 
-        # Foreground: vertical flex (top row | stretch | bottom row). Schedule and card are siblings.
-        pl, pt = _idu(_IDLE_PAD_LEFT), _idu(_IDLE_PAD_TOP)
-        pr, pb = _idu(_IDLE_PAD_RIGHT), _idu(_IDLE_PAD_BOTTOM)
-
-        tl_w = _idu(_ZONE_TOP_LEFT_W)
-        gr_h = _idu(28)
-        gap_greet_clock = _idu(10)
-        clk_h = _idu(120)
-        gap_clock_date = _idu(4)
-        date_h = _idu(40)
-        tl_inner_h = (
-            gr_h + gap_greet_clock + clk_h + gap_clock_date + date_h
+        # ------------------------------------------------------------------
+        # 3. "Good morning, J.K"  — (46, 35)  171 × 24  SemiBold 20 #FFF
+        # ------------------------------------------------------------------
+        self.greeting_label = _lbl(
+            _greeting(None),
+            _FONT_SB,
+            _ff(20),
+            _WHITE,
+            size_hint=(_sw(171), _sh(24)),
+            pos_hint={"x": _x(46), "y": _y(35, 24)},
         )
+        root.add_widget(self.greeting_label)
 
-        top_left_stack = BoxLayout(
-            orientation="vertical",
-            size_hint=(None, None),
-            size=(tl_w, tl_inner_h),
-            spacing=0,
-        )
-        self.greeting_label = Label(
-            text=_greeting(getattr(self.app, "current_display_name", None)),
-            font_size=_hf(20),
+        # ------------------------------------------------------------------
+        # 4. Big clock "11:01"  — (46, 59)  237 × 119  Bold 100 #FFF
+        # ------------------------------------------------------------------
+        self.time_label = _lbl(
+            "--:--",
+            _FONT,
+            _ff(100),
+            _WHITE,
             bold=True,
-            color=COLORS["white"],
-            halign="left",
-            valign="middle",
-            size_hint=(1, None),
-            height=gr_h,
-        )
-        self.greeting_label.bind(size=self.greeting_label.setter("text_size"))
-        top_left_stack.add_widget(self.greeting_label)
-        top_left_stack.add_widget(
-            Widget(size_hint=(1, None), height=gap_greet_clock),
-        )
-
-        clock_row = BoxLayout(
-            orientation="horizontal",
-            size_hint=(1, None),
-            height=clk_h,
-            spacing=_idu(10),
-        )
-        self.time_label = Label(
-            text="--:--",
-            font_size=_hf(100),
-            bold=True,
-            color=COLORS["white"],
-            halign="left",
             valign="top",
-            size_hint=(None, None),
-            size=(_hh(290), clk_h),
+            size_hint=(_sw(237), _sh(119)),
+            pos_hint={"x": _x(46), "y": _y(59, 119)},
         )
-        self.time_label.bind(size=self.time_label.setter("text_size"))
-        clock_row.add_widget(self.time_label)
-        am_col = AnchorLayout(
-            size_hint=(None, None),
-            size=(_hh(88), clk_h),
-        )
-        self.ampm_label = Label(
-            text="",
-            font_size=_hf(35),
-            bold=True,
-            color=(0.714, 0.729, 0.949, 1),
-            halign="left",
-            valign="middle",
-            size_hint=(None, None),
-            size=(_hh(80), _hv(44)),
-        )
-        self.ampm_label.bind(size=self.ampm_label.setter("text_size"))
-        am_col.add_widget(self.ampm_label)
-        clock_row.add_widget(am_col)
-        top_left_stack.add_widget(clock_row)
-        top_left_stack.add_widget(
-            Widget(size_hint=(1, None), height=gap_clock_date),
-        )
+        root.add_widget(self.time_label)
 
-        self.date_label = Label(
-            text="",
-            font_size=_hf(30),
-            bold=True,
-            color=COLORS["white"],
-            halign="left",
+        # ------------------------------------------------------------------
+        # 5. "AM"  — (312, 121)  55 × 42  SemiBold 35  #B6BAF2
+        # ------------------------------------------------------------------
+        self.ampm_label = _lbl(
+            "",
+            _FONT_SB,
+            _ff(35),
+            _MUTED,
             valign="top",
-            size_hint=(1, None),
-            height=date_h,
+            size_hint=(_sw(55), _sh(42)),
+            pos_hint={"x": _x(312), "y": _y(121, 42)},
         )
-        self.date_label.bind(size=self.date_label.setter("text_size"))
-        top_left_stack.add_widget(self.date_label)
+        root.add_widget(self.ampm_label)
 
-        wx_w = max(_idu(200), _hh(216))
-        wx_body_h = _hv(112)
-        top_band_h = max(tl_inner_h, wx_body_h)
+        # ------------------------------------------------------------------
+        # 6. Date "Tuesday, May 21"  — (46, 178)  230 × 36  SemiBold 30 #FFF
+        # ------------------------------------------------------------------
+        self.date_label = _lbl(
+            "",
+            _FONT_SB,
+            _ff(30),
+            _WHITE,
+            valign="top",
+            size_hint=(_sw(230), _sh(36)),
+            pos_hint={"x": _x(46), "y": _y(178, 36)},
+        )
+        root.add_widget(self.date_label)
 
-        wx_col = BoxLayout(
-            orientation="vertical",
-            size_hint=(None, None),
-            size=(wx_w, wx_body_h),
-            spacing=_idu(8),
-        )
-        wt_row = BoxLayout(
-            orientation="horizontal",
-            size_hint=(1, None),
-            height=_hv(64),
-            spacing=_idu(20),
-        )
-        wx_src = _idle_png("icon_sun.png")
-        if not wx_src:
-            _alt = ASSETS_DIR / "home" / "figma" / "icon_weather.png"
-            wx_src = str(_alt) if _alt.is_file() else ""
-        self.weather_icon = Image(
-            source=wx_src,
-            size_hint=(None, None),
-            size=(_hv(64), _hv(64)),
-            fit_mode="contain",
-            allow_stretch=True,
-        )
-        wt_row.add_widget(self.weather_icon)
-
-        wt_right = AnchorLayout(
-            anchor_x="right",
-            anchor_y="center",
-            size_hint=(1, None),
-            height=_hv(64),
-        )
-        self.temp_label = Label(
-            text="--°C",
-            font_size=_hf(35),
-            bold=True,
-            color=COLORS["white"],
-            halign="right",
-            valign="middle",
-            size_hint=(None, None),
-            size=(wx_w - _hv(64) - _idu(20), _hv(48)),
-        )
-        self.temp_label.bind(size=self.temp_label.setter("text_size"))
-        wt_right.add_widget(self.temp_label)
-        wt_row.add_widget(wt_right)
-        wx_col.add_widget(wt_row)
-
-        self.condition_label = Label(
-            text="--",
-            font_size=_hf(28),
-            color=(0.714, 0.729, 0.949, 1),
-            halign="right",
-            valign="middle",
-            size_hint=(1, None),
-            height=_hv(40),
-        )
-        self.condition_label.bind(size=self.condition_label.setter("text_size"))
-        wx_col.add_widget(self.condition_label)
-
-        tl_band = AnchorLayout(
-            anchor_x="left",
-            anchor_y="top",
-            size_hint=(None, None),
-            size=(tl_w, top_band_h),
-        )
-        tl_band.add_widget(top_left_stack)
-
-        tr_band = AnchorLayout(
-            anchor_x="right",
-            anchor_y="top",
-            size_hint=(None, None),
-            size=(wx_w, top_band_h),
-        )
-        tr_band.add_widget(wx_col)
-
-        top_row = BoxLayout(
-            orientation="horizontal",
-            size_hint=(1, None),
-            spacing=0,
-            height=top_band_h,
-        )
-        top_row.add_widget(tl_band)
-        top_row.add_widget(Widget(size_hint=(1, 1)))
-        top_row.add_widget(tr_band)
-
-        sched_w = _idu(_ZONE_SCHEDULE_W)
-        row_time_h = max(_idu(38), _hv(38))
-        title_h = _idu(52)
-        sched_stack = BoxLayout(
-            orientation="vertical",
-            size_hint=(None, None),
-            spacing=_idu(12),
-        )
-
-        self.next_label = Label(
-            text="Next up",
-            font_size=_hf(28),
-            bold=True,
-            color=(0, 0.420, 0.976, 1),
-            halign="left",
-            valign="middle",
-            size_hint=(1, None),
-            height=_hv(38),
-        )
-        self.next_label.bind(size=self.next_label.setter("text_size"))
-        sched_stack.add_widget(self.next_label)
-
-        sched_time_row = BoxLayout(
-            orientation="horizontal",
-            size_hint=(1, None),
-            height=row_time_h,
-            spacing=_idu(19),
-        )
-        cal_path = _idle_png("icon_calendar.png")
-        if cal_path:
-            cal_img = Image(
-                source=cal_path,
-                size_hint=(None, None),
-                size=(_hv(34), _hv(34)),
+        # ------------------------------------------------------------------
+        # 7. Sun icon  — (677, 75)  64 × 64
+        # ------------------------------------------------------------------
+        sun_src = _idle_asset("icon_sun.png")
+        if not sun_src:
+            sun_src = _figma_asset("icon_sun.png")
+        if sun_src:
+            self.weather_icon = Image(
+                source=sun_src,
+                size_hint=(_sw(64), _sh(64)),
+                pos_hint={"x": _x(677), "y": _y(75, 64)},
                 fit_mode="contain",
                 allow_stretch=True,
             )
+            root.add_widget(self.weather_icon)
         else:
-            cal_img = Widget(size_hint=(None, None), size=(_hv(34), _hv(34)))
-        sched_time_row.add_widget(cal_img)
+            self.weather_icon = None
 
-        self.next_time_label = Label(
-            text="--:-- --",
-            font_size=_hf(28),
+        # ------------------------------------------------------------------
+        # 8. Temperature "28°C"  — (759, 86)  82 × 42  Bold 35 #FFF
+        # ------------------------------------------------------------------
+        self.temp_label = _lbl(
+            "--°C",
+            _FONT,
+            _ff(35),
+            _WHITE,
             bold=True,
-            color=(0, 0.420, 0.976, 1),
-            halign="left",
-            valign="middle",
-            size_hint=(1, None),
-            height=row_time_h,
-        )
-        self.next_time_label.bind(size=self.next_time_label.setter("text_size"))
-        sched_time_row.add_widget(self.next_time_label)
-        sched_stack.add_widget(sched_time_row)
-
-        self.next_title_label = Label(
-            text="--",
-            font_size=_hf(28),
-            bold=True,
-            color=COLORS["white"],
-            halign="left",
             valign="top",
-            size_hint=(1, None),
-            height=title_h,
-            text_size=(max(1, sched_w - 4), title_h),
-            shorten=True,
-            shorten_from="right",
-            split_str=" ",
+            size_hint=(_sw(82), _sh(42)),
+            pos_hint={"x": _x(759), "y": _y(86, 42)},
         )
-        self.next_title_label.bind(size=self.next_title_label.setter("text_size"))
-        sched_stack.add_widget(self.next_title_label)
+        root.add_widget(self.temp_label)
 
-        self.more_label = Label(
-            text="",
-            font_size=_hf(28),
-            bold=True,
-            color=(0, 0.420, 0.976, 1),
-            halign="left",
-            valign="middle",
-            size_hint=(1, None),
-            height=_hv(38),
+        # ------------------------------------------------------------------
+        # 9. Condition "Sunny"  — (759, 134)  85 × 36  Medium 30  #B6BAF2
+        # ------------------------------------------------------------------
+        self.condition_label = _lbl(
+            "--",
+            _FONT_MED,
+            _ff(30),
+            _MUTED,
+            valign="top",
+            size_hint=(_sw(85), _sh(36)),
+            pos_hint={"x": _x(759), "y": _y(134, 36)},
         )
-        self.more_label.bind(size=self.more_label.setter("text_size"))
-        sched_stack.add_widget(self.more_label)
+        root.add_widget(self.condition_label)
 
-        sh = (
-            _hv(38)
-            + _idu(12)
-            + row_time_h
-            + _idu(12)
-            + title_h
-            + _idu(12)
-            + _hv(38)
-        )
-        sched_stack.size = (sched_w, sh)
+        # ==================================================================
+        # Schedule group  (origin 46, 333 in Figma)
+        # ==================================================================
 
-        card_pl, card_pt, card_pr, card_pb = (
-            _idu(27),
-            _idu(32),
-            _idu(36),
-            _idu(32),
+        # "Next up"  — (46, 333)  100 × 33  SemiBold 28  #006BF9
+        self.next_label = _lbl(
+            "Next up",
+            _FONT_SB,
+            _ff(28),
+            _BLUE,
+            size_hint=(_sw(100), _sh(33)),
+            pos_hint={"x": _x(46), "y": _y(333, 33)},
         )
-        mic_slot_w = _hv(101)
-        spacing_h = _idu(18)
-        card_w, card_h = _hh(414), _hv(167)
-        text_w = max(
-            _hh(160),
-            card_w - card_pl - card_pr - mic_slot_w - spacing_h,
-        )
-        title_h = _hv(40)
-        sub_h = _hv(52)
-        text_stack_h = title_h + _hv(8) + sub_h
+        root.add_widget(self.next_label)
 
-        card = _StartRecordingCard(
-            orientation="horizontal",
-            size=(card_w, card_h),
-            size_hint=(None, None),
-            padding=[card_pl, card_pt, card_pr, card_pb],
-            spacing=spacing_h,
-        )
-        card.bind(on_release=self._on_start_recording)
-
-        mic_path = _idle_png("mic_orb.png")
-
-        mic_slot = AnchorLayout(
-            size_hint=(None, 1),
-            width=mic_slot_w,
-            anchor_x="center",
-            anchor_y="center",
-        )
-        if mic_path:
-            mic_slot.add_widget(
+        # Calendar icon  — group+(0, 60) = abs (46, 393)  34 × 34
+        cal_src = _idle_asset("icon_calendar.png")
+        if not cal_src:
+            cal_src = _figma_asset("icon_calendar.png")
+        if cal_src:
+            root.add_widget(
                 Image(
-                    source=mic_path,
-                    size_hint=(None, None),
-                    size=(_hv(101), _hv(101)),
+                    source=cal_src,
+                    size_hint=(_sw(34), _sh(34)),
+                    pos_hint={"x": _x(46), "y": _y(393, 34)},
                     fit_mode="contain",
                     allow_stretch=True,
-                ),
+                )
             )
-        card.add_widget(mic_slot)
 
-        text_slot = AnchorLayout(
-            size_hint=(1, 1),
-            anchor_x="left",
-            anchor_y="center",
+        # "11:00 AM"  — group+(53, 62) = abs (99, 395)  120 × 33  SemiBold 28  #006BF9
+        self.next_time_label = _lbl(
+            "--:-- --",
+            _FONT_SB,
+            _ff(28),
+            _BLUE,
+            size_hint=(_sw(120), _sh(33)),
+            pos_hint={"x": _x(99), "y": _y(395, 33)},
         )
-        text_col = BoxLayout(
-            orientation="vertical",
-            size_hint=(None, None),
-            size=(text_w, text_stack_h),
-            spacing=_hv(8),
-        )
-        cta_title = Label(
-            text="Start Recording",
-            font_size=_hf(30),
+        root.add_widget(self.next_time_label)
+
+        # "Now : Product Sync"  — group+(0, 113) = abs (46, 446)  282 × 37  Bold 31 #FFF
+        self.next_title_label = _lbl(
+            "--",
+            _FONT,
+            _ff(31),
+            _WHITE,
             bold=True,
-            color=COLORS["white"],
-            halign="left",
-            valign="bottom",
-            size_hint=(1, None),
-            height=title_h,
-            text_size=(text_w, title_h),
+            size_hint=(_sw(282), _sh(37)),
+            pos_hint={"x": _x(46), "y": _y(446, 37)},
         )
-        cta_sub = Label(
-            text='Tap or say "start recording"',
-            font_size=_hf(18),
-            color=COLORS["white"],
-            halign="left",
-            valign="top",
-            size_hint=(1, None),
-            height=sub_h,
-            text_size=(text_w, sub_h),
-        )
-        text_col.add_widget(cta_title)
-        text_col.add_widget(cta_sub)
-        text_slot.add_widget(text_col)
-        card.add_widget(text_slot)
+        root.add_widget(self.next_title_label)
 
+        # "+2 more"  — group+(0, 164) = abs (46, 497)  107 × 33  Bold 28  #006BF9
+        self.more_label = _lbl(
+            "",
+            _FONT,
+            _ff(28),
+            _BLUE,
+            bold=True,
+            size_hint=(_sw(107), _sh(33)),
+            pos_hint={"x": _x(46), "y": _y(497, 33)},
+        )
+        root.add_widget(self.more_label)
+
+        # ==================================================================
+        # Start Recording card  — (427, 356)  414 × 167
+        # ==================================================================
+        card = _RecordingCard(
+            size_hint=(_sw(414), _sh(167)),
+            pos_hint={"x": _x(427), "y": _y(356, 167)},
+        )
+        card.bind(on_release=self._on_start_recording)
         self._cta_card = card
+        root.add_widget(card)
 
-        bottom_band_h = max(sh, card_h)
-        sched_slot = AnchorLayout(
-            anchor_x="left",
-            anchor_y="bottom",
-            size_hint=(None, None),
-            size=(sched_w, bottom_band_h),
-        )
-        sched_slot.add_widget(sched_stack)
-
-        card_slot = AnchorLayout(
-            anchor_x="right",
-            anchor_y="bottom",
-            size_hint=(None, None),
-            size=(card_w, bottom_band_h),
-        )
-        card_slot.add_widget(card)
-
-        bottom_row = BoxLayout(
-            orientation="horizontal",
-            size_hint=(1, None),
-            height=bottom_band_h,
-            spacing=_idu(24),
-        )
-        bottom_row.add_widget(sched_slot)
-        bottom_row.add_widget(Widget(size_hint=(1, 1)))
-        bottom_row.add_widget(card_slot)
-
-        content = BoxLayout(
-            orientation="vertical",
-            size_hint=(1, 1),
-            pos_hint={"x": 0, "y": 0},
-            padding=[pl, pt, pr, pb],
-            spacing=0,
-        )
-        content.add_widget(top_row)
-        content.add_widget(Widget(size_hint=(1, 1)))
-        content.add_widget(bottom_row)
-
-        root.add_widget(content)
         self.add_widget(root)
 
     def _sync_bg(self, widget, *_args):
@@ -632,16 +483,17 @@ class IdleScreen(BaseScreen):
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
+
     def on_enter(self):
         self._update_clock()
         self._update_weather(self._weather.snapshot)
         self._weather.subscribe(self._update_weather)
-        # Idle screen typically lives long; refresh the home summary on enter
-        # and once a minute so "Next up" stays correct.
         self._refresh_home_summary()
         if self._clock_event:
             self._clock_event.cancel()
-        self._clock_event = Clock.schedule_interval(lambda _dt: self._update_clock(), 1.0)
+        self._clock_event = Clock.schedule_interval(
+            lambda _dt: self._update_clock(), 1.0
+        )
         if self._home_summary_event:
             self._home_summary_event.cancel()
         self._home_summary_event = Clock.schedule_interval(
@@ -658,10 +510,10 @@ class IdleScreen(BaseScreen):
         self._weather.unsubscribe(self._update_weather)
 
     # ------------------------------------------------------------------
-    # Touch anywhere → home (taps on the recording card start a meeting instead)
+    # Touch: full screen → home, card → start recording
     # ------------------------------------------------------------------
+
     def on_touch_up(self, touch):
-        # Children first (card ButtonBehavior may fire on_release).
         if super().on_touch_up(touch):
             return True
         lx, ly = self.to_widget(touch.x, touch.y)
@@ -675,16 +527,19 @@ class IdleScreen(BaseScreen):
                 return True
         try:
             self.goto("home", transition="fade")
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.debug("idle: goto(home) failed", exc_info=True)
         return True
 
     # ------------------------------------------------------------------
     # Live data
     # ------------------------------------------------------------------
+
     def _update_clock(self):
         now = display_now()
-        self.greeting_label.text = _greeting(getattr(self.app, "current_display_name", None))
+        self.greeting_label.text = _greeting(
+            getattr(self.app, "current_display_name", None)
+        )
         self.time_label.text = now.strftime("%I:%M").lstrip("0") or "12:00"
         self.ampm_label.text = now.strftime("%p")
         self.date_label.text = now.strftime("%A, %B ") + str(now.day)
@@ -692,21 +547,18 @@ class IdleScreen(BaseScreen):
     def _update_weather(self, snapshot) -> None:
         if snapshot is None:
             return
-        # snapshot is a WeatherSnapshot dataclass
         try:
-            temp = float(snapshot.temp_c)
-            self.temp_label.text = f"{temp:.0f}°C"
+            self.temp_label.text = f"{float(snapshot.temp_c):.0f}°C"
             self.condition_label.text = snapshot.label or "--"
             self._set_weather_icon(snapshot.icon)
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.debug("idle: bad weather snapshot %r", snapshot, exc_info=True)
 
     def _set_weather_icon(self, key: str) -> None:
-        # Today we only ship a sun PNG in the idle bundle. Other codes fall
-        # back to the cloud icon shipped with the home assets so we never end
-        # up with a blank tile. Adding more icons later is a drop-in.
-        cloud_path = ASSETS_DIR / "home" / "figma" / "icon_weather.png"
+        if self.weather_icon is None:
+            return
         sun_path = _IDLE_DIR / "icon_sun.png"
+        cloud_path = _FIGMA_DIR / "icon_weather.png"
         if key == "sun" and sun_path.is_file():
             self.weather_icon.source = str(sun_path)
         elif cloud_path.is_file():
@@ -718,10 +570,10 @@ class IdleScreen(BaseScreen):
         async def _fetch():
             try:
                 data = await self.backend.get_home_summary()
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 logger.debug("idle: home summary fetch failed: %s", exc)
                 return
-            time_str, title, _ = _format_meeting_line(data.get("next_meeting"))
+            time_str, title, _ = _format_meeting(data.get("next_meeting"))
             today_n = int(data.get("pending_actions_today") or 0)
 
             def _apply(_dt):
@@ -736,8 +588,9 @@ class IdleScreen(BaseScreen):
     # ------------------------------------------------------------------
     # Start Recording CTA
     # ------------------------------------------------------------------
+
     def _on_start_recording(self, _inst):
         try:
             self.app.start_recording()
-        except Exception:  # noqa: BLE001
+        except Exception:
             logger.exception("idle: start_recording failed")

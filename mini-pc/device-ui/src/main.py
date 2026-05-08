@@ -154,6 +154,55 @@ _configure_kivy_default_font()
 
 from kivy.core.window import Window  # noqa: E402 — must import after Config
 
+
+def _register_asta_fonts() -> None:
+    """Register Asta Sans (42dot Sans) TTF files with Kivy's LabelBase.
+
+    The font is open-source (OFL) and is shipped in assets/fonts/ as part of the
+    device-ui image.  We register four named families so screen code can reference
+    them by weight without synthesising faux-bold/italic:
+
+        '42dot-Sans'  – Regular (fn_regular) + Bold (fn_bold)
+        '42dot-SB'    – SemiBold (maps to fn_regular so bold=False works)
+        '42dot-Med'   – Medium
+
+    Falls back silently if the files are missing.
+    """
+    from pathlib import Path
+    from kivy.core.text import LabelBase
+    from config import ASSETS_DIR as _AD
+
+    fd = _AD / "fonts"
+    files = {
+        "regular":   fd / "AstaSans-Regular.ttf",
+        "bold":      fd / "AstaSans-Bold.ttf",
+        "semibold":  fd / "AstaSans-SemiBold.ttf",
+        "medium":    fd / "AstaSans-Medium.ttf",
+    }
+    if not all(p.is_file() for p in files.values()):
+        return
+    try:
+        LabelBase.register(
+            name="42dot-Sans",
+            fn_regular=str(files["regular"]),
+            fn_bold=str(files["bold"]),
+        )
+        LabelBase.register(
+            name="42dot-SB",
+            fn_regular=str(files["semibold"]),
+            fn_bold=str(files["bold"]),
+        )
+        LabelBase.register(
+            name="42dot-Med",
+            fn_regular=str(files["medium"]),
+            fn_bold=str(files["bold"]),
+        )
+    except Exception:
+        pass
+
+
+_register_asta_fonts()
+
 from config import (
     DISPLAY_WIDTH,
     DISPLAY_HEIGHT,
