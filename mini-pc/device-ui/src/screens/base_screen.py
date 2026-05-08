@@ -11,7 +11,7 @@ All screens inherit from this to get common functionality:
 from kivy.uix.screenmanager import Screen
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.label import Label
-from kivy.graphics import Color, Rectangle
+from kivy.graphics import Color, Ellipse, Rectangle, RoundedRectangle
 from kivy.app import App
 
 from config import (
@@ -81,14 +81,44 @@ class BaseScreen(Screen):
     # ------------------------------------------------------------------
 
     def make_dark_bg(self, widget):
-        """Attach a dark background rectangle to *widget*."""
+        """Attach the premium appliance background to *widget*.
+
+        Most screens call this helper, so this is the global visual pass: a
+        deeper navy base plus two soft blue/violet glows. It keeps the UI calm
+        and executive without requiring bitmap assets on every page.
+        """
         with widget.canvas.before:
-            Color(*COLORS['background'])
+            Color(0.035, 0.050, 0.085, 1)
             bg = Rectangle(pos=widget.pos, size=widget.size)
+            Color(0.10, 0.34, 0.70, 0.20)
+            glow_a = Ellipse(pos=(widget.x - 80, widget.y + widget.height - 220), size=(360, 360))
+            Color(0.52, 0.32, 0.92, 0.12)
+            glow_b = Ellipse(pos=(widget.x + widget.width - 260, widget.y - 140), size=(420, 420))
         widget.bind(
             pos=lambda w, v: setattr(bg, 'pos', w.pos),
             size=lambda w, v: setattr(bg, 'size', w.size),
         )
+        widget.bind(pos=lambda w, v: setattr(glow_a, 'pos', (w.x - 80, w.y + w.height - 220)))
+        widget.bind(size=lambda w, v: setattr(glow_a, 'pos', (w.x - 80, w.y + w.height - 220)))
+        widget.bind(pos=lambda w, v: setattr(glow_b, 'pos', (w.x + w.width - 260, w.y - 140)))
+        widget.bind(size=lambda w, v: setattr(glow_b, 'pos', (w.x + w.width - 260, w.y - 140)))
+        return bg
+
+    def attach_card_bg(self, widget, radius=None, color=None, border=True):
+        """Attach a reusable glass-card background to any layout/widget."""
+        r = radius if radius is not None else self.suv(24)
+        fill = color or (0.12, 0.16, 0.23, 0.82)
+        with widget.canvas.before:
+            Color(0, 0, 0, 0.18)
+            shadow = RoundedRectangle(pos=(widget.x + 1, widget.y - 3), size=widget.size, radius=[r])
+            Color(*fill)
+            bg = RoundedRectangle(pos=widget.pos, size=widget.size, radius=[r])
+        def _sync(w, *_):
+            shadow.pos = (w.x + 1, w.y - 3)
+            shadow.size = w.size
+            bg.pos = w.pos
+            bg.size = w.size
+        widget.bind(pos=_sync, size=_sync)
         return bg
 
     def build_footer(self):

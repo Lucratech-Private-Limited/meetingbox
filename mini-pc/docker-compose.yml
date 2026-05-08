@@ -82,8 +82,10 @@ services:
       - "host.docker.internal:host-gateway"
     environment:
       - PYTHONUNBUFFERED=1
-      # Local API on the mini PC: use loopback (host network). For cloud HTTPS, set BACKEND_URL in .env.
-      - BACKEND_URL=${BACKEND_URL:-http://127.0.0.1:8000}
+      # Local API on the same host: set BACKEND_URL=http://127.0.0.1:8000 in .env. For cloud,
+      # set DASHBOARD_URL and omit BACKEND_URL so the API base is derived from the dashboard URL,
+      # or set BACKEND_URL explicitly.
+      - BACKEND_URL=${BACKEND_URL:-}
       - BACKEND_WS_URL=${BACKEND_WS_URL:-}
       - DASHBOARD_URL=${DASHBOARD_URL:-}
       # Use DEVICE_UI_DISPLAY — not shell DISPLAY. SSH sets DISPLAY=localhost:10.0 which

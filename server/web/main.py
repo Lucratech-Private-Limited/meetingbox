@@ -230,9 +230,17 @@ app.state.limiter = limiter
 app.add_middleware(SlowAPIMiddleware)
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
+_cors_raw = (os.getenv("MEETINGBOX_CORS_ORIGINS", "") or "").strip()
+if _cors_raw:
+  _cors_origins = [o.strip() for o in _cors_raw.split(",") if o.strip()]
+  if not _cors_origins:
+    _cors_origins = ["*"]
+else:
+  _cors_origins = ["*"]
+
 app.add_middleware(
   CORSMiddleware,
-  allow_origins=["*"],
+  allow_origins=_cors_origins,
   allow_credentials=False,
   allow_methods=["*"],
   allow_headers=["*"],

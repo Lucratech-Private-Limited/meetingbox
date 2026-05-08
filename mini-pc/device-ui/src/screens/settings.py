@@ -21,10 +21,12 @@ from screens.base_screen import BaseScreen
 from components.status_bar import StatusBar
 from components.settings_item import SettingsItem
 from components.modal_dialog import ModalDialog
+from components.text_input_dialog import TextInputDialog
 from config import (COLORS, FONT_SIZES, SPACING, DEVICE_MODEL,
                     DASHBOARD_URL)
 from hardware import request_system_poweroff, request_system_reboot
 from network_util import linux_ethernet_ready
+from weather_client import get_weather_client
 
 logger = logging.getLogger(__name__)
 
@@ -188,13 +190,27 @@ class SettingsScreen(BaseScreen):
         )
         self.container.add_widget(self.brightness_item)
 
-        self.timeout_item = SettingsItem(
-            title='Screen Timeout',
-            subtitle='Never',
+        # Replaces the old "Screen Timeout" (display-off) entry. Opens the
+        # idle-timeout picker so users can set how long until the lock-screen
+        # idle UI takes over.
+        self.idle_timeout_item = SettingsItem(
+            title='Idle Screen',
+            subtitle='After 30 seconds',
             mode='arrow',
-            on_press=lambda _: self.goto('timeout_picker', transition='slide_left'),
+            on_press=lambda _: self.goto('idle_timeout_picker', transition='slide_left'),
         )
-        self.container.add_widget(self.timeout_item)
+        self.container.add_widget(self.idle_timeout_item)
+
+        # Weather location used by the home/idle screens. Stored locally on
+        # the device (no backend involvement) — IP-detected by default,
+        # editable here.
+        self.weather_location_item = SettingsItem(
+            title='Weather Location',
+            subtitle='Auto-detect from IP',
+            mode='arrow',
+            on_press=lambda _: self._show_weather_location_dialog(),
+        )
+        self.container.add_widget(self.weather_location_item)
 
         # ---- AUDIO ----
         self.container.add_widget(self._section_header('AUDIO'))
@@ -334,9 +350,14 @@ class SettingsScreen(BaseScreen):
                              '60': 'After 60 days', '90': 'After 90 days'}
                 br = settings.get('brightness', 'high')
                 br_labels = {'low': 'Low', 'medium': 'Medium', 'high': 'High'}
-                to = settings.get('screen_timeout', 'never')
-                to_labels = {'never': 'Never', '5': 'After 5 min',
-                             '10': 'After 10 min'}
+                idle = settings.get('idle_screen_timeout', '30')
+                idle_labels = {
+                    '30': 'After 30 seconds',
+                    '60': 'After 1 minute',
+                    '120': 'After 2 minutes',
+                    '300': 'After 5 minutes',
+                    'never': 'Never',
+                }
 
                 gmail_status = f'Configure at {DASHBOARD_URL}'
                 cal_status = f'Configure at {DASHBOARD_URL}'
@@ -368,7 +389,15 @@ class SettingsScreen(BaseScreen):
 
                     self.auto_delete_item.subtitle_label.text = ad_labels.get(ad, ad)
                     self.brightness_item.subtitle_label.text = br_labels.get(br, br)
-                    self.timeout_item.subtitle_label.text = to_labels.get(to, to)
+                    self.idle_timeout_item.subtitle_label.text = idle_labels.get(idle, f'After {idle}s')
+
+                    weather_loc = get_weather_client().location
+                    if weather_loc:
+                        self.weather_location_item.subtitle_label.text = (
+                            f"{weather_loc['city']} (auto)"
+                        )
+                    else:
+                        self.weather_location_item.subtitle_label.text = 'Auto-detect from IP'
 
                     auto_rec = settings.get('auto_record', False)
                     self.app.auto_record = auto_rec
@@ -575,3 +604,60 @@ class SettingsScreen(BaseScreen):
             except Exception:
                 pass
         run_async(_reset())
+
+    # ------------------------------------------------------------------
+    # Weather location dialog
+    # ------------------------------------------------------------------
+    def _show_weather_location_dialog(self):
+        """Modal text-input dialog to override the auto-detected city.
+
+        Empty input → keep current; non-empty input → resolve via Open-Meteo
+        geocoding (handled by ``WeatherClient.set_city``). A failure surfaces
+        a follow-up dialog so users know we couldn't find that place.
+        """
+        wc = get_weather_client()
+        cur = wc.location
+        cur_city = (cur and cur.get('city')) or ''
+
+        dialog = TextInputDialog(
+            title='Weather Location',
+            message=('Enter a city name (e.g. "Bangalore" or '
+                     '"London, UK"). Leave blank to keep auto-detect.'),
+            initial_value=cur_city,
+            placeholder='City name',
+            on_confirm=self._apply_weather_location,
+        )
+        self.add_widget(dialog)
+
+    def _apply_weather_location(self, value: str):
+        text = (value or '').strip()
+        if not text:
+            return  # treat empty as cancel — auto-detect stays in effect
+
+        wc = get_weather_client()
+
+        async def _resolve():
+            resolved = await wc.set_city(text)
+            if resolved is None:
+                Clock.schedule_once(
+                    lambda _dt: self._show_weather_resolve_failed(text), 0)
+                return
+            Clock.schedule_once(
+                lambda _dt: self._show_weather_resolved(resolved), 0)
+
+        run_async(_resolve())
+
+    def _show_weather_resolved(self, loc: dict):
+        self.weather_location_item.subtitle_label.text = (
+            f"{loc.get('city', '?')}"
+        )
+
+    def _show_weather_resolve_failed(self, text: str):
+        self.add_widget(ModalDialog(
+            title='City not found',
+            message=(f'Could not find weather data for "{text}".\n\n'
+                     'Try the city name in English, or include the country '
+                     '(e.g. "Bengaluru, IN").'),
+            confirm_text='OK',
+            cancel_text='',
+        ))

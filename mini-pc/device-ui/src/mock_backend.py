@@ -29,6 +29,7 @@ class MockBackendClient:
             'auto_delete_days': 'never',
             'brightness': 'high',
             'screen_timeout': 'never',
+            'idle_screen_timeout': '30',
             'privacy_mode': False,
             'auto_record': False,
         }

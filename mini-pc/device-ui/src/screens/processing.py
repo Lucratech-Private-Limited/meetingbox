@@ -1,23 +1,51 @@
-"""
-Processing screen aligned to Figma "Processing Complete (S-05)".
+"""Processing screen — Figma ``397:261`` (yJqcY4KovVjJ11vjysW533).
 
-Flow:
-- User presses End Meeting -> app navigates here.
-- While backend runs, stage list updates from progress/status events.
-- When summary is ready, CTA enables and user can open meeting summary.
+Shown immediately after the user taps Stop on the Recording screen. Layout
+mirrors the Figma frame (892×573 inset within the 1024×600 device baseline):
+
+- Header — back button (left), "Listening" pill (center-right), settings gear (right).
+- Title row — green check badge + ``Recording complete`` headline + meeting
+  title and duration.
+- Hero — large glowing blue orb on the left half (animated soft pulse).
+- ``Summarizing your meeting…`` headline below the orb with a one-line hint.
+- Right card — three-stage checklist (Extracting key points / Identifying
+  action items / Structuring summary) with per-row state icons.
+- Bottom pill — ``We'll notify you when your summary is ready``. Becomes a
+  tappable CTA once the transcript or summary is ready, navigating to
+  ``summary_review``.
+
+Public API preserved for ``main.py`` to call:
+
+- ``on_enter`` / ``on_leave``
+- ``on_processing_started(data)``
+- ``on_backend_progress(progress, status, eta)``
+- ``on_transcription_ready(meeting_id)``
+- ``on_summary_ready(meeting_id, summary_data)``
+- ``set_processing_status(text)``
 """
+
+from __future__ import annotations
 
 import logging
 import math
 import time
+from pathlib import Path
+from typing import Optional
 
 from kivy.clock import Clock
-from kivy.graphics import Color, Ellipse, Line, Rectangle, RoundedRectangle
-from kivy.uix.anchorlayout import AnchorLayout
+from kivy.graphics import (
+    Color,
+    Ellipse,
+    Line,
+    PopMatrix,
+    PushMatrix,
+    Rectangle,
+    RoundedRectangle,
+    Rotate,
+)
 from kivy.uix.behaviors import ButtonBehavior
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.floatlayout import FloatLayout
-from kivy.uix.button import Button
 from kivy.uix.image import Image
 from kivy.uix.label import Label
 from kivy.uix.widget import Widget
@@ -25,9 +53,6 @@ from kivy.uix.widget import Widget
 from config import (
     ASSETS_DIR,
     COLORS,
-    DISPLAY_HEIGHT,
-    DISPLAY_WIDTH,
-    FONT_SIZES,
     other_screen_horizontal_scale,
     other_screen_vertical_scale,
 )
@@ -35,1033 +60,812 @@ from screens.base_screen import BaseScreen
 
 logger = logging.getLogger(__name__)
 
-_BG = (13 / 255.0, 17 / 255.0, 23 / 255.0, 1)
-_BORDER = (30 / 255.0, 41 / 255.0, 59 / 255.0, 1)
-_MUTED = (148 / 255.0, 163 / 255.0, 184 / 255.0, 1)
-_SUCCESS = (34 / 255.0, 197 / 255.0, 94 / 255.0, 1)
-_CTA = (74 / 255.0, 143 / 255.0, 217 / 255.0, 1)
 
-# Vertical stack height in design pixels — must match the sum built in _build_ui:
-# hero_h + card_wrap + spacer(2) + cta_h + link(20) + 4*col_sp(6) (see _build_ui).
-_PROCESSING_BODY_STACK_DESIGN_PX = 552
+# ---------------------------------------------------------------------------
+# Asset locations
+# ---------------------------------------------------------------------------
+
+_FIGMA_DIR: Path = ASSETS_DIR / "processing" / "figma"
 
 
-def _compute_processing_layout_fit() -> float:
-    """Only shrink *vertical* spacing when the body column would overflow (e.g. 800px height)."""
-    v = other_screen_vertical_scale()
-    # Chrome uses the same design px as _build_ui header/footer (before fit).
-    chrome = int(round((52 + 48 + 20) * v))
-    avail = max(240, DISPLAY_HEIGHT - chrome)
-    need = _PROCESSING_BODY_STACK_DESIGN_PX * v
-    if need <= avail:
-        return 1.0
-    # Floor ~0.58: keeps touch targets readable; stack estimate is conservative.
-    return max(0.58, min(1.0, float(avail) / float(max(need, 1))))
+def _png(name: str) -> str:
+    p = _FIGMA_DIR / name
+    return str(p) if p.is_file() else ""
 
 
-_PROC_ASSETS = ASSETS_DIR / "processing"
-_REC_ASSETS = ASSETS_DIR / "recording"
-_HEADER_GEAR_PROC = _PROC_ASSETS / "header_gear.png"
-_HEADER_PROFILE_RING = _PROC_ASSETS / "header_profile_ring.png"
-_SUMMARY_CTA_IMG = _PROC_ASSETS / "view_meeting_summary.png"
+# ---------------------------------------------------------------------------
+# Color palette (sampled from Figma node 397:261)
+# ---------------------------------------------------------------------------
+
+_BG = (0x01 / 255.0, 0x08 / 255.0, 0x1A / 255.0, 1)            # #01081A
+_CARD_BG = (0x00 / 255.0, 0x0F / 255.0, 0x33 / 255.0, 1)        # #000F33
+_CARD_BG_ALT = (0x00 / 255.0, 0x0A / 255.0, 0x26 / 255.0, 1)    # #000A26
+_CARD_BORDER = (0x21 / 255.0, 0x28 / 255.0, 0x4B / 255.0, 1)    # #21284B
+_TEXT_WHITE = (1, 1, 1, 1)
+_TEXT_MUTED = (0xB6 / 255.0, 0xBA / 255.0, 0xF2 / 255.0, 1)     # #B6BAF2
+_TEXT_HINT = (0x9B / 255.0, 0xA2 / 255.0, 0xB2 / 255.0, 1)      # #9BA2B2
+_LISTENING_DOT = (0x00 / 255.0, 0x58 / 255.0, 0xF4 / 255.0, 1)  # #0058F4
+_CHECK_RING = (0x40 / 255.0, 0x98 / 255.0, 0xFC / 255.0, 1)     # #4098FC
+_DIVIDER = (0x02 / 255.0, 0x17 / 255.0, 0x4D / 255.0, 1)        # #02174D
 
 
-class _CanvasHeaderGlyph(Widget):
-    """Help (?) and user bust when ``header_help.png`` / ``header_user.png`` are missing."""
+# ---------------------------------------------------------------------------
+# Layout reference
+# ---------------------------------------------------------------------------
 
-    def __init__(self, kind: str, **kwargs):
-        kwargs.setdefault("size_hint", (None, None))
-        kwargs.setdefault("size", (22, 22))
-        super().__init__(**kwargs)
-        self._kind = kind
-        self.bind(pos=self._draw, size=self._draw)
-        Clock.schedule_once(lambda *_: self._draw(), 0)
-
-    def _draw(self, *_):
-        self.canvas.clear()
-        cx, cy = self.center_x, self.center_y
-        rr = min(self.width, self.height) * 0.48
-        if rr < 2:
-            return
-        c = (0.78, 0.82, 0.86, 1)
-        lw = max(1.8, rr * 0.12)
-        with self.canvas:
-            Color(*c)
-            if self._kind == "gear":
-                ir = rr * 0.2
-                orad = rr * 0.42
-                Line(circle=(cx, cy, ir), width=lw)
-                for i in range(6):
-                    a = (math.pi / 3.0) * i
-                    x0 = cx + math.cos(a) * ir * 0.9
-                    y0 = cy + math.sin(a) * ir * 0.9
-                    x1 = cx + math.cos(a) * orad
-                    y1 = cy + math.sin(a) * orad
-                    Line(points=[x0, y0, x1, y1], width=lw, cap="round")
-            elif self._kind == "help":
-                # Arc (partial circle) + stem + dot
-                Line(circle=(cx, cy + rr * 0.06, rr * 0.28, 70, 305), width=lw)
-                Line(points=[cx, cy + rr * 0.1, cx, cy - rr * 0.4], width=lw, cap="round")
-                Ellipse(pos=(cx - rr * 0.08, cy - rr * 0.54), size=(rr * 0.16, rr * 0.16))
-            else:
-                # Head + shoulders (U)
-                Ellipse(pos=(cx - rr * 0.32, cy - rr * 0.02), size=(rr * 0.64, rr * 0.66))
-                Line(
-                    points=[
-                        cx - rr * 0.52,
-                        cy + rr * 0.52,
-                        cx - rr * 0.32,
-                        cy - rr * 0.02,
-                        cx + rr * 0.32,
-                        cy - rr * 0.02,
-                        cx + rr * 0.52,
-                        cy + rr * 0.52,
-                    ],
-                    width=lw,
-                    cap="round",
-                    joint="round",
-                )
+# Figma frame for 397:261 — width × height in design pixels. All Figma
+# positions are mapped through ``_phint`` so the panel layout scales with
+# the device while preserving relative placement.
+_REF_W = 892
+_REF_H = 573
 
 
-class _HeroCheckCircle(Widget):
-    """Figma S-05 hero: faux-blur green glow + large light-green disc with a 4px
-    ring, and an inner solid green disc carrying the white check."""
-
-    def __init__(self, size_px: int, **kwargs):
-        kwargs.setdefault("size_hint", (None, None))
-        kwargs.setdefault("size", (size_px, size_px))
-        super().__init__(**kwargs)
-        # State controls the inner glyph (done=filled disc + check, active=spinner).
-        self._state = "done"
-        self._spin_angle = 0.0
-        self.bind(pos=self._draw, size=self._draw)
-        Clock.schedule_once(lambda *_: self._draw(), 0)
-
-    def set_state(self, state: str):
-        self._state = state if state in ("active", "done") else "done"
-        self._draw()
-
-    def set_spin_angle(self, angle: float):
-        if self._state != "active":
-            return
-        self._spin_angle = angle % 360.0
-        self._draw()
-
-    def _draw(self, *_):
-        self.canvas.clear()
-        cx, cy = self.center_x, self.center_y
-        r = min(self.width, self.height) / 2.0
-        if r < 4:
-            return
-        with self.canvas:
-            # Faux blur glow — layered fading ellipses (~50px blur in Figma).
-            for i, (factor, alpha) in enumerate(((1.55, 0.06), (1.30, 0.10), (1.10, 0.16))):
-                gr = r * factor
-                Color(34 / 255.0, 197 / 255.0, 94 / 255.0, alpha)
-                Ellipse(pos=(cx - gr, cy - gr), size=(gr * 2, gr * 2))
-
-            # Outer light-green disc (Figma: rgba(34,197,94,0.1))
-            Color(34 / 255.0, 197 / 255.0, 94 / 255.0, 0.10)
-            Ellipse(pos=(cx - r, cy - r), size=(r * 2, r * 2))
-
-            # 4px border ring (Figma: rgba(34,197,94,0.3))
-            border_w = max(2.0, r * 0.08)
-            Color(34 / 255.0, 197 / 255.0, 94 / 255.0, 0.30)
-            Line(circle=(cx, cy, r - border_w / 2.0), width=border_w)
-
-            # Inner disc (Figma inner 50px vs outer 128px → ratio ~0.39)
-            ir = r * 0.42
-            if self._state == "done":
-                Color(*_SUCCESS, 1.0)
-                Ellipse(pos=(cx - ir, cy - ir), size=(ir * 2, ir * 2))
-                # Large white check
-                Color(1, 1, 1, 1)
-                lw = max(2.5, ir * 0.22)
-                x0, y0 = cx - ir * 0.48, cy - ir * 0.04
-                x1, y1 = cx - ir * 0.10, cy - ir * 0.42
-                x2, y2 = cx + ir * 0.52, cy + ir * 0.34
-                Line(points=[x0, y0, x1, y1, x2, y2], width=lw, cap="round", joint="round")
-            else:
-                # Spinner while analysis is still running — matches the stage spinner.
-                Color(*_SUCCESS, 0.15)
-                Line(circle=(cx, cy, ir), width=max(2.0, ir * 0.14))
-                start = self._spin_angle
-                end = (self._spin_angle + 110.0) % 360.0
-                Color(*_SUCCESS, 1.0)
-                Line(
-                    circle=(cx, cy, ir, start, end),
-                    width=max(2.5, ir * 0.18),
-                    cap="round",
-                )
+def _hh(px: float) -> int:
+    return max(1, int(round(float(px) * other_screen_horizontal_scale())))
 
 
-class _StageMark(Widget):
-    """Stage icon with three clearly distinct states.
+def _hv(px: float) -> int:
+    return max(1, int(round(float(px) * other_screen_vertical_scale())))
 
-    - pending: muted hollow ring (no fill, no check)
-    - active: faint track ring + rotating green arc (animated spinner)
-    - done:   filled green disc + white check (Figma S-05)
+
+def _hf(fs: float) -> int:
+    """Font size that tracks vertical scale, matched to the recording/idle screens."""
+    return max(6, int(round(float(fs) * other_screen_vertical_scale())))
+
+
+def _phint(left_px: float, top_px: float) -> dict:
+    """Convert Figma top-left coordinates to a Kivy ``pos_hint`` dict.
+
+    Figma uses top-down coordinates inside an 892×573 reference frame; Kivy
+    uses bottom-up. Returning a dict with ``x`` and ``top`` (both fractions
+    of the parent) lets the layout scale with the panel automatically.
+    """
+    return {
+        "x": float(left_px) / _REF_W,
+        "top": float(_REF_H - top_px) / _REF_H,
+    }
+
+
+def _size_hint_from(w_px: float, h_px: float) -> tuple:
+    """Express a Figma rectangle as fractional ``size_hint`` of an 892×573 parent."""
+    return (float(w_px) / _REF_W, float(h_px) / _REF_H)
+
+
+# ---------------------------------------------------------------------------
+# Helper widgets
+# ---------------------------------------------------------------------------
+
+
+class _RoundCard(FloatLayout):
+    """A FloatLayout that paints a rounded gradient-style background.
+
+    Approximates the Figma vertical gradient #000F33 → #000A26 with a single
+    flat fill plus a 1 px stroke; the difference is barely visible at 800 px
+    height and avoids the cost of layered gradient draws on the device.
     """
 
-    def __init__(self, **kwargs):
-        kwargs.setdefault("size_hint", (None, None))
-        kwargs.setdefault("size", (22, 22))
+    def __init__(self, *, radius: float = 21, fill=_CARD_BG, border=_CARD_BORDER, **kwargs):
         super().__init__(**kwargs)
-        self._state = "pending"
-        self._spin_angle = 0.0
-        self.bind(pos=self._draw, size=self._draw)
+        self._radius_px = radius
+        with self.canvas.before:
+            self._fill_color = Color(*fill)
+            self._fill = RoundedRectangle(pos=self.pos, size=self.size, radius=[radius])
+            self._border_color = Color(*border)
+            self._border = Line(
+                rounded_rectangle=(self.x, self.y, self.width, self.height, radius),
+                width=1.2,
+            )
+        self.bind(pos=self._sync, size=self._sync)
 
-    def set_state(self, state: str):
-        if state not in ("pending", "active", "done"):
-            state = "pending"
-        self._state = state
-        self._draw()
-
-    def set_spin_angle(self, angle: float):
-        # Only redraw while actively spinning; pending/done are static.
-        if self._state != "active":
-            return
-        self._spin_angle = angle % 360.0
-        self._draw()
-
-    def is_active(self) -> bool:
-        return self._state == "active"
-
-    def _draw(self, *_):
-        self.canvas.clear()
-        cx, cy = self.center_x, self.center_y
-        r = min(self.width, self.height) * 0.46
-        if r < 2:
-            return
-        with self.canvas:
-            if self._state == "pending":
-                Color(*_MUTED, 0.55)
-                Line(circle=(cx, cy, r * 0.82), width=max(1.3, r * 0.12))
-            elif self._state == "active":
-                # Track ring (muted)
-                Color(*_MUTED, 0.30)
-                Line(circle=(cx, cy, r * 0.82), width=max(1.4, r * 0.14))
-                # Rotating green arc (~110°)
-                start = self._spin_angle
-                end = (self._spin_angle + 110.0) % 360.0
-                Color(*_SUCCESS, 0.95)
-                Line(
-                    circle=(cx, cy, r * 0.82, start, end),
-                    width=max(1.6, r * 0.18),
-                    cap="round",
-                )
-                # Small dot at arc leading tip — extra affordance of "running"
-                lead_rad = math.radians(90.0 - end)
-                dx = cx + math.cos(lead_rad) * r * 0.82
-                dy = cy + math.sin(lead_rad) * r * 0.82
-                dot_r = max(1.4, r * 0.14)
-                Color(*_SUCCESS, 1.0)
-                Ellipse(pos=(dx - dot_r, dy - dot_r), size=(dot_r * 2, dot_r * 2))
-            else:
-                # Filled green disc
-                Color(*_SUCCESS, 1.0)
-                Ellipse(pos=(cx - r, cy - r), size=(r * 2, r * 2))
-                # White check
-                Color(1, 1, 1, 1)
-                lw = max(1.8, r * 0.22)
-                x0, y0 = cx - r * 0.42, cy - r * 0.04
-                x1, y1 = cx - r * 0.10, cy - r * 0.36
-                x2, y2 = cx + r * 0.44, cy + r * 0.28
-                Line(points=[x0, y0, x1, y1, x2, y2], width=lw, cap="round", joint="round")
+    def _sync(self, *_):
+        self._fill.pos = self.pos
+        self._fill.size = self.size
+        self._fill.radius = [self._radius_px]
+        self._border.rounded_rectangle = (
+            self.x,
+            self.y,
+            self.width,
+            self.height,
+            self._radius_px,
+        )
 
 
-class _TextLink(ButtonBehavior, Label):
-    def on_press(self):
-        self.opacity = 0.60
+class _IconButton(ButtonBehavior, FloatLayout):
+    """Circular icon button matching the back/settings buttons in the Figma frame."""
 
-    def on_release(self):
-        self.opacity = 1.0
-
-
-class _SummaryImageButton(ButtonBehavior, Image):
-    """Figma-exported View Meeting Summary pill (single PNG)."""
-
-
-class _StageRow(BoxLayout):
-    """Single timeline stage row with indicator, optional connector, title, subtitle."""
-
-    def __init__(self, title: str, subtitle: str, show_connector: bool, parent_screen, **kwargs):
-        ps = parent_screen
-        row_h = ps.pv(68 if show_connector else 44)
-        kwargs.setdefault("orientation", "horizontal")
-        kwargs.setdefault("size_hint", (1, None))
-        kwargs.setdefault("height", row_h)
-        kwargs.setdefault("spacing", ps.ph(14))
+    def __init__(self, *, image_path: str, on_press_cb=None, **kwargs):
         super().__init__(**kwargs)
-        self._show_connector = show_connector
-        self._state = "pending"
-        self._screen = parent_screen
-
-        mark_sz = ps.ph(22)
-        left = BoxLayout(
-            orientation="vertical",
-            size_hint=(None, 1),
-            width=max(mark_sz, ps.ph(24)),
-            spacing=0,
-        )
-        self.mark = _StageMark(size=(mark_sz, mark_sz))
-        mark_anchor = AnchorLayout(size_hint=(1, None), height=mark_sz, anchor_x="center", anchor_y="top")
-        mark_anchor.add_widget(self.mark)
-        left.add_widget(mark_anchor)
-        if show_connector:
-            self.connector = Widget(size_hint=(1, 1))
-            with self.connector.canvas:
-                self._connector_color = Color(*_BORDER[:3], 0.45)
-                self._connector_line = Rectangle(pos=self.connector.pos, size=self.connector.size)
-            self.connector.bind(
-                pos=lambda w, *_: setattr(
-                    self._connector_line, "pos", (w.center_x - 0.5, w.y + ps.pv(2))
-                ),
-                size=lambda w, *_: setattr(
-                    self._connector_line,
-                    "size",
-                    (1, max(1, w.height - ps.pv(6))),
-                ),
-            )
-            left.add_widget(self.connector)
-        self.add_widget(left)
-
-        txt = BoxLayout(orientation="vertical", size_hint=(1, 1), spacing=ps.pv(2))
-        self.title = Label(
-            text=title,
-            font_size=ps.pf(16),
-            bold=True,
-            color=COLORS["white"],
-            halign="left",
-            valign="middle",
-            size_hint=(1, None),
-            height=ps.pv(22),
-        )
-        self.title.bind(size=self.title.setter("text_size"))
-        txt.add_widget(self.title)
-        self.subtitle = Label(
-            text=subtitle,
-            font_size=ps.pf(FONT_SIZES["small"]),
-            color=_MUTED,
-            halign="left",
-            valign="middle",
-            size_hint=(1, None),
-            height=ps.pv(20),
-        )
-        self.subtitle.bind(size=self.subtitle.setter("text_size"))
-        txt.add_widget(self.subtitle)
-        self.add_widget(txt)
-
-    def set_state(self, state: str):
-        self._state = state
-        self.mark.set_state(state)
-        if self._show_connector:
-            if state in ("done", "active"):
-                self._connector_color.rgba = (34 / 255.0, 197 / 255.0, 94 / 255.0, 0.30)
-            else:
-                self._connector_color.rgba = (*_BORDER[:3], 0.45)
-
-
-class ProcessingScreen(BaseScreen):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self._started_ts = None
-        self._meeting_id = None
-        self._summary_data = None
-        self._summary_ready = False
-        self._transcript_ready = False
-        self._pulse_event = None
-        self._pulse_alpha = 0.20
-        self._pulse_dir = 1
-        self._spin_event = None
-        self._spin_angle = 0.0
-        self._layout_fit = _compute_processing_layout_fit()
-        self._build_ui()
-
-    def pv(self, px: float) -> int:
-        v = other_screen_vertical_scale()
-        return max(1, int(round(float(px) * v * self._layout_fit)))
-
-    def ph(self, px: float) -> int:
-        # Horizontal size follows display width only — do not apply _layout_fit or the
-        # column looks like a tiny island on 1280×800 (Figma fills most of the width).
-        h = other_screen_horizontal_scale()
-        return max(1, int(round(float(px) * h)))
-
-    def pf(self, fs: float) -> int:
-        # Type size tracks vertical scale like other screens; optional slight tie to fit
-        # so fonts don't outgrow a compressed column, but stay closer to Figma on 800px.
-        v = other_screen_vertical_scale()
-        t = max(self._layout_fit, 0.82) if self._layout_fit < 1.0 else 1.0
-        return max(6, int(round(float(fs) * v * t)))
-
-    def _sync_cta_chevron(self, inst, *args):
-        ch = getattr(self, "_cta_chevron", None)
-        if ch is None or inst is None:
-            return
-        pad = self.ph(20)
-        tri_h = self.pv(10)
-        x2 = inst.right - pad
-        x0 = x2 - self.ph(12)
-        cy = inst.center_y
-        ch.points = [x0, cy - tri_h, x2, cy, x0, cy + tri_h]
-
-    def _build_ui(self):
-        root = BoxLayout(orientation="vertical")
-        with root.canvas.before:
-            Color(*_BG)
-            self._bg_rect = Rectangle(pos=root.pos, size=root.size)
-        root.bind(
-            pos=lambda w, *_: setattr(self._bg_rect, "pos", w.pos),
-            size=lambda w, *_: setattr(self._bg_rect, "size", w.size),
-        )
-
-        # Header
-        header = BoxLayout(
-            orientation="horizontal",
-            size_hint=(1, None),
-            height=self.pv(52),
-            padding=[self.ph(24), self.pv(10), self.ph(24), self.pv(10)],
-        )
-        with header.canvas.after:
-            Color(*_BORDER)
-            self._header_line = Rectangle(pos=(header.x, header.y), size=(header.width, 1))
-        header.bind(
-            pos=lambda w, *_: setattr(self._header_line, "pos", (w.x, w.y)),
-            size=lambda w, *_: setattr(self._header_line, "size", (w.width, 1)),
-        )
-        left = BoxLayout(orientation="horizontal", size_hint=(None, 1), width=self.ph(220), spacing=self.ph(10))
-        _logo_path = ASSETS_DIR / "welcome" / "LOGO.png"
-        if _logo_path.is_file():
-            logo = Image(
-                source=str(_logo_path),
-                size_hint=(None, 1),
-                width=self.ph(36),
-                fit_mode="contain",
-                allow_stretch=True,
-            )
-        else:
-            logo = Label(
-                text="MB",
-                font_size=self.pf(14),
-                bold=True,
-                color=_CTA,
-                halign="center",
-                valign="middle",
-                size_hint=(None, 1),
-                width=self.ph(36),
-            )
-            logo.bind(size=logo.setter("text_size"))
-        left.add_widget(logo)
-        brand = Label(
-            text="MeetingBox",
-            font_size=self.pf(FONT_SIZES["medium"]),
-            bold=True,
-            color=COLORS["white"],
-            halign="left",
-            valign="middle",
-            size_hint=(1, 1),
-        )
-        brand.bind(size=brand.setter("text_size"))
-        left.add_widget(brand)
-        header.add_widget(left)
-        header.add_widget(Widget())
-        right = BoxLayout(orientation="horizontal", size_hint=(None, 1), width=self.ph(146), spacing=self.ph(10))
-        try:
-            _PROC_ASSETS.mkdir(parents=True, exist_ok=True)
-        except OSError:
-            logger.debug("Could not create %s", _PROC_ASSETS)
-        _gear_src = (
-            _HEADER_GEAR_PROC
-            if _HEADER_GEAR_PROC.is_file()
-            else (_REC_ASSETS / "setteing gear icon.png")
-        )
-        _header_specs = (
-            (_gear_src, "gear"),
-            (_PROC_ASSETS / "header_help.png", "help"),
-            (_PROC_ASSETS / "header_user.png", "user"),
-        )
-        _cell_sz = (self.ph(40), self.pv(40))
-        for idx, (img_path, glyph) in enumerate(_header_specs):
-            # Third control: Figma exports ring (Button…) + user glyph (Container…) stacked.
-            if idx == 2 and _HEADER_PROFILE_RING.is_file():
-                cell = FloatLayout(size_hint=(None, None), size=_cell_sz)
-                ring = Image(
-                    source=str(_HEADER_PROFILE_RING),
-                    size_hint=(1, 1),
-                    pos_hint={"x": 0, "y": 0},
-                    allow_stretch=True,
-                    keep_ratio=True,
-                    fit_mode="contain",
-                )
-                cell.add_widget(ring)
-                user_p = _PROC_ASSETS / "header_user.png"
-                if user_p.is_file():
-                    cell.add_widget(
-                        Image(
-                            source=str(user_p),
-                            size_hint=(None, None),
-                            size=(self.ph(22), self.pv(22)),
-                            pos_hint={"center_x": 0.5, "center_y": 0.5},
-                            fit_mode="contain",
-                            allow_stretch=True,
-                        )
-                    )
-                else:
-                    cell.add_widget(
-                        _CanvasHeaderGlyph(
-                            glyph,
-                            size_hint=(None, None),
-                            size=(self.ph(22), self.pv(22)),
-                            pos_hint={"center_x": 0.5, "center_y": 0.5},
-                        )
-                    )
-                right.add_widget(cell)
-                continue
-
-            cell = AnchorLayout(
-                size_hint=(None, None),
-                size=_cell_sz,
-                anchor_x="center",
-                anchor_y="center",
-            )
-            with cell.canvas.before:
-                Color(*COLORS["surface"])
-                cell_bg = RoundedRectangle(pos=cell.pos, size=cell.size, radius=[999])
-            cell.bind(
-                pos=lambda w, _bg=cell_bg: setattr(_bg, "pos", w.pos),
-                size=lambda w, _bg=cell_bg: setattr(_bg, "size", w.size),
-            )
-            if idx == 2:
-                with cell.canvas.after:
-                    Color(74 / 255.0, 143 / 255.0, 217 / 255.0, 0.22)
-                    cell_border = Line(
-                        circle=(
-                            cell.center_x,
-                            cell.center_y,
-                            max(1, min(cell.width, cell.height) / 2 - 2),
-                        ),
-                        width=1.8,
-                    )
-                cell.bind(
-                    pos=lambda w, _bd=cell_border: setattr(
-                        _bd,
-                        "circle",
-                        (w.center_x, w.center_y, max(1, min(w.width, w.height) / 2 - 2)),
-                    ),
-                    size=lambda w, _bd=cell_border: setattr(
-                        _bd,
-                        "circle",
-                        (w.center_x, w.center_y, max(1, min(w.width, w.height) / 2 - 2)),
-                    ),
-                )
-            if img_path.is_file():
-                img = Image(
-                    source=str(img_path),
-                    size_hint=(None, None),
-                    size=(self.ph(22), self.pv(22)),
-                    fit_mode="contain",
-                    allow_stretch=True,
-                )
-                cell.add_widget(img)
-            else:
-                logger.debug(
-                    "Processing header: missing %s — vector fallback (optional: %s)",
-                    img_path.name,
-                    _PROC_ASSETS,
-                )
-                cell.add_widget(
-                    _CanvasHeaderGlyph(
-                        glyph,
-                        size=(self.ph(22), self.pv(22)),
-                    )
-                )
-            right.add_widget(cell)
-        header.add_widget(right)
-        root.add_widget(header)
-
-        body = AnchorLayout(anchor_x="center", anchor_y="center", size_hint=(1, 1))
-        side = self.ph(20)
-        col_w = max(self.ph(560), min(DISPLAY_WIDTH - 2 * side, self.ph(1024)))
-        col_sp = self.pv(6)
-        card_pad_v = self.pv(12)
-        r1, r2, r3 = self.pv(68), self.pv(68), self.pv(44)
-        card_sp = self.pv(6)
-        card_inner_h = card_pad_v * 2 + r1 + r2 + r3 + card_sp * 2
-        card_wrap_h = card_inner_h + self.pv(2)
-
-        sub_h = self.pv(50)
-        hero_h = self.pv(232)
-        cta_h = self.pv(68) if _SUMMARY_CTA_IMG.is_file() else self.pv(54)
-        link_h = self.pv(22)
-        col_h = (
-            hero_h
-            + card_wrap_h
-            + self.pv(2)
-            + cta_h
-            + link_h
-            + 4 * col_sp
-        )
-        col = BoxLayout(
-            orientation="vertical",
-            size_hint=(None, None),
-            width=col_w,
-            height=col_h,
-            spacing=col_sp,
-        )
-
-        # Hero
-        hero = AnchorLayout(size_hint=(1, None), height=hero_h, anchor_x="center", anchor_y="center")
-        with hero.canvas.before:
-            Color(34 / 255.0, 197 / 255.0, 94 / 255.0, 0.18)
-            self._hero_glow = Ellipse(
-                pos=(hero.center_x - self.ph(140), hero.center_y - self.pv(90)),
-                size=(self.ph(280), self.pv(180)),
-            )
-        hero.bind(
-            pos=lambda w, *_: setattr(
-                self._hero_glow,
-                "pos",
-                (w.center_x - self.ph(140), w.center_y - self.pv(90)),
-            ),
-            size=lambda w, *_: setattr(self._hero_glow, "size", (self.ph(280), self.pv(180))),
-        )
-        hero_col = BoxLayout(
-            orientation="vertical",
-            size_hint=(None, None),
-            width=col_w,
-            height=hero_h,
-            spacing=self.pv(4),
-        )
-
-        check_sz = self.ph(112)
-        check_wrap = AnchorLayout(size_hint=(1, None), height=self.pv(100), anchor_x="center", anchor_y="center")
-        check = _HeroCheckCircle(size_px=check_sz)
-        check_wrap.add_widget(check)
-        hero_col.add_widget(check_wrap)
-
-        self.success_badge = Label(
-            text="Success",
-            font_size=self.pf(FONT_SIZES["tiny"]),
-            color=_SUCCESS,
-            halign="center",
-            valign="middle",
-            size_hint=(None, None),
-            size=(self.ph(64), self.pv(18)),
-        )
-        self.success_badge.bind(size=self.success_badge.setter("text_size"))
-        success_badge_wrap = AnchorLayout(size_hint=(1, None), height=self.pv(20))
-        with success_badge_wrap.canvas.before:
-            Color(34 / 255.0, 197 / 255.0, 94 / 255.0, 0.10)
-            self._success_badge_bg = RoundedRectangle(
-                pos=(0, 0), size=self.success_badge.size, radius=[999]
-            )
-        # Figma: inset 1px ring of rgba(34,197,94,0.2) around the pill.
-        with success_badge_wrap.canvas.after:
-            self._success_badge_border_col = Color(
-                34 / 255.0, 197 / 255.0, 94 / 255.0, 0.28
-            )
-            self._success_badge_border = Line(
-                rounded_rectangle=(
-                    0,
-                    0,
-                    self.success_badge.width,
-                    self.success_badge.height,
-                    min(self.success_badge.width, self.success_badge.height) / 2.0,
-                ),
-                width=1.1,
-            )
-        success_badge_wrap.bind(
-            pos=lambda w, *_: setattr(
-                self._success_badge_bg,
-                "pos",
-                (
-                    w.center_x - self.success_badge.width / 2,
-                    w.center_y - self.success_badge.height / 2,
-                ),
-            ),
-            size=lambda w, *_: setattr(
-                self._success_badge_bg,
-                "size",
-                self.success_badge.size,
-            ),
-        )
-        def _sync_success_badge_border(*_a):
-            w = self.success_badge.width
-            h = self.success_badge.height
-            bx = success_badge_wrap.center_x - w / 2.0
-            by = success_badge_wrap.center_y - h / 2.0
-            self._success_badge_border.rounded_rectangle = (
-                bx,
-                by,
-                w,
-                h,
-                min(w, h) / 2.0,
-            )
-
-        self.success_badge.bind(
-            size=lambda *_: (
-                setattr(self._success_badge_bg, "size", self.success_badge.size),
-                _sync_success_badge_border(),
-            ),
-            pos=lambda *_: (
-                setattr(
-                    self._success_badge_bg,
-                    "pos",
-                    (
-                        success_badge_wrap.center_x - self.success_badge.width / 2,
-                        success_badge_wrap.center_y - self.success_badge.height / 2,
-                    ),
-                ),
-                _sync_success_badge_border(),
-            ),
-        )
-        success_badge_wrap.bind(
-            pos=lambda *_: _sync_success_badge_border(),
-            size=lambda *_: _sync_success_badge_border(),
-        )
-        success_badge_wrap.add_widget(self.success_badge)
-        hero_col.add_widget(success_badge_wrap)
-
-        self.title_label = Label(
-            text="Preparing Analysis...",
-            font_size=self.pf(42),
-            bold=True,
-            color=COLORS["white"],
-            halign="center",
-            valign="middle",
-            size_hint=(1, None),
-            height=self.pv(46),
-        )
-        self.title_label.bind(size=self.title_label.setter("text_size"))
-        hero_col.add_widget(self.title_label)
-
-        self.subtitle_label = Label(
-            text="Please wait while transcript and action items are prepared.",
-            font_size=self.pf(FONT_SIZES["body"] + 1),
-            color=_MUTED,
-            halign="center",
-            valign="middle",
-            size_hint=(1, None),
-            height=sub_h,
-        )
-        def _subtitle_text_width(*_a):
-            self.subtitle_label.text_size = (self.subtitle_label.width, None)
-
-        self.subtitle_label.bind(size=_subtitle_text_width)
-        self.subtitle_label.bind(width=_subtitle_text_width)
-        hero_col.add_widget(self.subtitle_label)
-
-        hero.add_widget(hero_col)
-        col.add_widget(hero)
-
-        # Stage card
-        card_wrap = AnchorLayout(size_hint=(1, None), height=card_wrap_h, anchor_x="center", anchor_y="center")
-        card = BoxLayout(
-            orientation="vertical",
-            size_hint=(None, None),
-            width=min(self.ph(672), col_w - self.ph(16)),
-            height=card_inner_h,
-            padding=[self.ph(18), card_pad_v, self.ph(18), card_pad_v],
-            spacing=card_sp,
-        )
-        with card.canvas.before:
-            Color(15 / 255.0, 23 / 255.0, 42 / 255.0, 0.50)
-            self._card_bg = RoundedRectangle(pos=card.pos, size=card.size, radius=[16])
-        with card.canvas.after:
-            Color(*_BORDER)
-            self._card_border = Line(
-                rounded_rectangle=(card.x, card.y, card.width, card.height, 16),
-                width=1.1,
-            )
-        card.bind(
-            pos=lambda w, *_: setattr(self._card_bg, "pos", w.pos),
-            size=lambda w, *_: setattr(self._card_bg, "size", w.size),
-        )
-        card.bind(
-            pos=lambda w, *_: setattr(self._card_border, "rounded_rectangle", (w.x, w.y, w.width, w.height, 16)),
-            size=lambda w, *_: setattr(self._card_border, "rounded_rectangle", (w.x, w.y, w.width, w.height, 16)),
-        )
-
-        self.stage_1 = _StageRow("Transcribing", "Voice data converted to text format", True, self)
-        self.stage_2 = _StageRow("Analysing", "Key insights and action items extracted", True, self)
-        self.stage_3 = _StageRow("Ready", "Summary generated and dashboard updated", False, self)
-        card.add_widget(self.stage_1)
-        card.add_widget(self.stage_2)
-        card.add_widget(self.stage_3)
-        card_wrap.add_widget(card)
-        col.add_widget(card_wrap)
-
-        col.add_widget(Widget(size_hint=(1, None), height=self.pv(2)))
-
-        # CTA — Figma bitmap when present, else drawn pill + label
-        cta_wrap = AnchorLayout(size_hint=(1, None), height=cta_h, anchor_x="center", anchor_y="center")
-        wcap = min(self.ph(448), col_w - self.ph(24))
-        if _SUMMARY_CTA_IMG.is_file():
-            self.summary_btn = _SummaryImageButton(
-                source=str(_SUMMARY_CTA_IMG),
-                size_hint=(None, None),
-                size=(wcap, self.pv(56)),
+        self._cb = on_press_cb
+        with self.canvas.before:
+            self._bg_color = Color(*_CARD_BG_ALT)
+            self._bg = Ellipse(pos=self.pos, size=self.size)
+            self._border_color = Color(*_CARD_BORDER)
+            self._border = Line(circle=(self.center_x, self.center_y, max(1, min(self.width, self.height) / 2)), width=1.0)
+        self.bind(pos=self._sync_bg, size=self._sync_bg)
+        if image_path:
+            img = Image(
+                source=image_path,
+                size_hint=(0.55, 0.55),
+                pos_hint={"center_x": 0.5, "center_y": 0.5},
                 allow_stretch=True,
                 keep_ratio=True,
                 fit_mode="contain",
-                opacity=0.60,
             )
-            # Soft drop shadow beneath the pill (Figma: 0 10 15 -3 rgba(74,143,217,0.2)).
-            with self.summary_btn.canvas.before:
-                self._cta_img_shadow_col = Color(
-                    74 / 255.0, 143 / 255.0, 217 / 255.0, 0.22 * self.summary_btn.opacity
-                )
-                self._cta_img_shadow = RoundedRectangle(
-                    pos=(self.summary_btn.x - self.ph(4), self.summary_btn.y - self.pv(8)),
-                    size=(self.summary_btn.width + self.ph(8), self.summary_btn.height),
-                    radius=[999],
-                )
+            self.add_widget(img)
+        self.bind(on_release=self._dispatch)
 
-            def _sync_cta_img_shadow(*_a):
-                self._cta_img_shadow.pos = (
-                    self.summary_btn.x - self.ph(4),
-                    self.summary_btn.y - self.pv(8),
-                )
-                self._cta_img_shadow.size = (
-                    self.summary_btn.width + self.ph(8),
-                    self.summary_btn.height,
-                )
+    def _sync_bg(self, *_):
+        self._bg.pos = self.pos
+        self._bg.size = self.size
+        r = max(1, min(self.width, self.height) / 2)
+        self._border.circle = (self.center_x, self.center_y, r)
 
-            def _sync_cta_img_shadow_opacity(*_a):
-                self._cta_img_shadow_col.rgba = (
-                    74 / 255.0,
-                    143 / 255.0,
-                    217 / 255.0,
-                    0.22 * self.summary_btn.opacity,
-                )
+    def _dispatch(self, *_):
+        if callable(self._cb):
+            self._cb()
 
-            def _fit_summary_cta_texture(*_a):
-                tw, th = self.summary_btn.texture_size
-                if not tw or not th:
-                    return
-                self.summary_btn.width = wcap
-                ar = float(th) / float(tw)
-                h = int(round(float(wcap) * ar))
-                self.summary_btn.height = min(max(self.pv(48), h), self.pv(68))
-                _sync_cta_img_shadow()
 
-            self.summary_btn.bind(texture_size=_fit_summary_cta_texture)
-            self.summary_btn.bind(pos=_sync_cta_img_shadow, size=_sync_cta_img_shadow)
-            self.summary_btn.bind(opacity=_sync_cta_img_shadow_opacity)
-            self.summary_btn.bind(on_press=self._open_summary)
-        else:
-            self.summary_btn = Button(
-                text="View Meeting Summary",
-                font_size=self.pf(FONT_SIZES["medium"] + 2),
-                bold=True,
-                color=COLORS["white"],
+class _ListeningPill(ButtonBehavior, FloatLayout):
+    """Recording-screen-style listening pill (tap to toggle voice assistant)."""
+
+    def __init__(self, *, on_press_cb=None, **kwargs):
+        super().__init__(**kwargs)
+        self._cb = on_press_cb
+        with self.canvas.before:
+            self._bg_color = Color(*_CARD_BG)
+            self._bg = RoundedRectangle(pos=self.pos, size=self.size, radius=[27])
+            self._border_color = Color(*_CARD_BORDER)
+            self._border = Line(
+                rounded_rectangle=(self.x, self.y, self.width, self.height, 27),
+                width=1.0,
+            )
+        self.bind(pos=self._sync, size=self._sync)
+
+        soundwave_p = _png("icon_soundwave.png")
+        if soundwave_p:
+            self._soundwave = Image(
+                source=soundwave_p,
                 size_hint=(None, None),
-                size=(wcap, self.pv(52)),
-                background_normal="",
-                background_down="",
-                background_color=(0, 0, 0, 0),
-                opacity=0.60,
+                size=(_hh(32), _hv(32)),
+                pos_hint={"right": 0.94, "center_y": 0.5},
+                allow_stretch=True,
+                keep_ratio=True,
+                fit_mode="contain",
             )
-            with self.summary_btn.canvas.before:
-                self._cta_color = Color(*_CTA, self.summary_btn.opacity)
-                self._cta_bg = RoundedRectangle(
-                    pos=self.summary_btn.pos,
-                    size=self.summary_btn.size,
-                    radius=[999],
-                )
-            with self.summary_btn.canvas.after:
-                self._cta_shadow_color = Color(74 / 255.0, 143 / 255.0, 217 / 255.0, 0.24)
-                self._cta_shadow = RoundedRectangle(
-                    pos=(self.summary_btn.x, self.summary_btn.y - self.pv(2)),
-                    size=self.summary_btn.size,
-                    radius=[999],
-                )
-                self._cta_chv_col = Color(1, 1, 1, self.summary_btn.opacity)
-                self._cta_chevron = Line(
-                    width=max(2.0, float(self.pv(2))),
-                    cap="round",
-                    joint="round",
-                )
-            self.summary_btn.bind(
-                pos=self._sync_cta_chevron,
-                size=self._sync_cta_chevron,
-            )
-            self.summary_btn.bind(
-                pos=lambda w, *_: setattr(self._cta_bg, "pos", w.pos),
-                size=lambda w, *_: setattr(self._cta_bg, "size", w.size),
-                opacity=lambda _, a: setattr(self._cta_color, "rgba", (*_CTA[:3], a)),
-            )
-            self.summary_btn.bind(
-                pos=lambda w, *_: setattr(self._cta_shadow, "pos", (w.x, w.y - self.pv(2))),
-                size=lambda w, *_: setattr(self._cta_shadow, "size", w.size),
-                opacity=lambda _, a: setattr(
-                    self._cta_shadow_color,
-                    "rgba",
-                    (74 / 255.0, 143 / 255.0, 217 / 255.0, 0.24 * a),
-                ),
-            )
-            self.summary_btn.bind(
-                opacity=lambda _, a: setattr(self._cta_chv_col, "rgba", (1, 1, 1, a)),
-            )
-            self.summary_btn.bind(on_press=self._open_summary)
-            Clock.schedule_once(lambda *_: self._sync_cta_chevron(self.summary_btn), 0)
-        cta_wrap.add_widget(self.summary_btn)
-        col.add_widget(cta_wrap)
+            self.add_widget(self._soundwave)
 
-        self.home_link = _TextLink(
-            text="Back to Home",
-            font_size=self.pf(FONT_SIZES["small"]),
-            color=_MUTED,
-            halign="center",
-            valign="middle",
-            size_hint=(1, None),
-            height=link_h,
-        )
-        self.home_link.bind(size=self.home_link.setter("text_size"))
-        self.home_link.bind(on_press=lambda *_: self.goto("home", transition="fade"))
-        col.add_widget(self.home_link)
-
-        body.add_widget(col)
-        root.add_widget(body)
-
-        # Footer
-        footer = BoxLayout(
-            orientation="horizontal",
-            size_hint=(1, None),
-            height=self.pv(48),
-            padding=[self.ph(20), self.pv(6), self.ph(20), self.pv(6)],
-        )
-        with footer.canvas.before:
-            Color(*_BG)
-            self._footer_bg = Rectangle(pos=footer.pos, size=footer.size)
-            Color(*_BORDER)
-            self._footer_top = Rectangle(pos=(footer.x, footer.top - 1), size=(footer.width, 1))
-        footer.bind(
-            pos=lambda w, *_: setattr(self._footer_bg, "pos", w.pos),
-            size=lambda w, *_: setattr(self._footer_bg, "size", w.size),
-        )
-        footer.bind(
-            pos=lambda w, *_: setattr(self._footer_top, "pos", (w.x, w.top - 1)),
-            size=lambda w, *_: setattr(self._footer_top, "size", (w.width, 1)),
-        )
-        left_footer = BoxLayout(
-            orientation="horizontal",
-            size_hint=(0.6, 1),
-            spacing=self.ph(8),
-        )
-        dot = Widget(size_hint=(None, None), size=(self.ph(8), self.pv(8)))
-        with dot.canvas:
-            Color(*_SUCCESS)
-            self._footer_dot = Ellipse(pos=dot.pos, size=dot.size)
-        dot.bind(
-            pos=lambda w, *_: setattr(self._footer_dot, "pos", w.pos),
-            size=lambda w, *_: setattr(self._footer_dot, "size", w.size),
-        )
-        dot_holder = AnchorLayout(size_hint=(None, 1), width=self.ph(12), anchor_x="center", anchor_y="center")
-        dot_holder.add_widget(dot)
-        left_footer.add_widget(dot_holder)
-        self.footer_left = Label(
-            text="SYSTEM ONLINE",
-            font_size=self.pf(FONT_SIZES["tiny"]),
+        self.label = Label(
+            text="Listening",
+            font_size=_hf(20),
             bold=True,
-            color=_MUTED,
+            color=_TEXT_WHITE,
             halign="left",
             valign="middle",
-            size_hint=(1, 1),
+            size_hint=(0.62, None),
+            height=_hv(24),
+            pos_hint={"x": 0.18, "center_y": 0.5},
         )
-        self.footer_left.bind(size=self.footer_left.setter("text_size"))
-        left_footer.add_widget(self.footer_left)
-        footer.add_widget(left_footer)
-        self.footer_right = Label(
-            text="Analysis in progress...",
-            font_size=self.pf(FONT_SIZES["small"]),
-            color=_MUTED,
-            halign="right",
-            valign="middle",
-            size_hint=(0.4, 1),
-        )
-        self.footer_right.bind(size=self.footer_right.setter("text_size"))
-        footer.add_widget(self.footer_right)
-        root.add_widget(footer)
+        self.label.bind(size=self.label.setter("text_size"))
+        self.add_widget(self.label)
 
-        # Keep a handle to the hero check widget so we can swap its state between
-        # "spinner while working" and "filled check when done".
-        self._hero_check = check
+        dot = Widget(
+            size_hint=(None, None),
+            size=(_hh(14), _hv(14)),
+            pos_hint={"x": 0.04, "center_y": 0.5},
+        )
+        with dot.canvas:
+            self._dot_color = Color(*_LISTENING_DOT)
+            self._dot = Ellipse(pos=dot.pos, size=dot.size)
+        dot.bind(
+            pos=lambda w, *_: setattr(self._dot, "pos", w.pos),
+            size=lambda w, *_: setattr(self._dot, "size", w.size),
+        )
+        self.add_widget(dot)
+        self.bind(on_release=self._dispatch)
+
+    def _sync(self, *_):
+        self._bg.pos = self.pos
+        self._bg.size = self.size
+        self._bg.radius = [self.height / 2]
+        self._border.rounded_rectangle = (
+            self.x,
+            self.y,
+            self.width,
+            self.height,
+            self.height / 2,
+        )
+
+    def _dispatch(self, *_):
+        if callable(self._cb):
+            self._cb()
+
+    def set_listening(self, listening: bool):
+        """Reflect the live voice-assistant state."""
+        self.label.text = "Listening" if listening else "Voice off"
+        self._dot_color.rgba = _LISTENING_DOT if listening else (0.36, 0.40, 0.55, 1)
+
+
+class _RotatingIcon(Widget):
+    """Image that rotates in place — used for the active-stage spinner.
+
+    Kivy's ``Image`` doesn't expose a built-in rotation property without
+    KV magic, so we wrap a child ``Image`` in a ``Rotate`` instruction.
+    """
+
+    def __init__(self, *, image_path: str, **kwargs):
+        super().__init__(**kwargs)
+        self._angle = 0.0
+        self._img_path = image_path
+        self._img = Image(
+            source=image_path,
+            allow_stretch=True,
+            keep_ratio=True,
+            fit_mode="contain",
+        )
+        with self.canvas.before:
+            PushMatrix()
+            self._rot = Rotate(angle=0, origin=(self.center_x, self.center_y))
+        with self.canvas.after:
+            PopMatrix()
+        self.add_widget(self._img)
+        self.bind(pos=self._sync, size=self._sync)
+
+    def _sync(self, *_):
+        self._img.pos = self.pos
+        self._img.size = self.size
+        self._rot.origin = (self.center_x, self.center_y)
+
+    def set_angle(self, angle: float):
+        self._angle = angle % 360.0
+        self._rot.angle = self._angle
+
+    def set_source(self, path: str):
+        if path and path != self._img_path:
+            self._img_path = path
+            self._img.source = path
+            self._img.reload()
+
+
+class _StepRow(FloatLayout):
+    """Single row inside the right-side checklist (icon left, text middle, status icon right)."""
+
+    STATE_PENDING = "pending"
+    STATE_ACTIVE = "active"
+    STATE_DONE = "done"
+
+    def __init__(self, *, label: str, **kwargs):
+        super().__init__(**kwargs)
+        self._state = self.STATE_PENDING
+        self._row_label_text = label
+
+        # Left mini-tile (36×36 in Figma) — purely decorative; same dark frame.
+        self._left_tile = _png("icon_step_pending.png")
+        self._left_active = _png("icon_step_active.png")
+        self._left_done = _png("icon_step_done.png")
+
+        self.left_icon = Image(
+            source=self._left_tile or "",
+            size_hint=(None, None),
+            allow_stretch=True,
+            keep_ratio=True,
+            fit_mode="contain",
+        )
+        self.add_widget(self.left_icon)
+
+        self.label = Label(
+            text=label,
+            font_size=_hf(18),
+            bold=True,
+            color=_TEXT_WHITE,
+            halign="left",
+            valign="middle",
+            size_hint=(None, None),
+        )
+        self.label.bind(size=self.label.setter("text_size"))
+        self.add_widget(self.label)
+
+        # Status (right) icon — tick-circle when done, spinner when active, blank when pending.
+        self.status_icon = _RotatingIcon(
+            image_path=_png("icon_loading.png") or "",
+            size_hint=(None, None),
+        )
+        # Default state is pending → status icon hidden until set_state flips it.
+        self.status_icon.opacity = 0.0
+        self.add_widget(self.status_icon)
+
+        self.bind(pos=self._layout_children, size=self._layout_children)
+
+    def _layout_children(self, *_):
+        h = self.height
+        if h <= 0:
+            return
+        # Left tile — 36×36 anchored to left
+        size_left = (_hh(36), _hv(36))
+        self.left_icon.size = size_left
+        self.left_icon.pos = (self.x + _hh(0), self.y + (h - size_left[1]) / 2)
+
+        # Label
+        label_w = _hh(220)
+        self.label.size = (label_w, _hv(24))
+        self.label.pos = (self.x + _hh(58), self.y + (h - _hv(24)) / 2)
+
+        # Right status icon — 36×36 right-aligned
+        size_right = (_hh(36), _hv(36))
+        self.status_icon.size = size_right
+        self.status_icon.pos = (
+            self.right - size_right[0] - _hh(0),
+            self.y + (h - size_right[1]) / 2,
+        )
+
+    def set_state(self, state: str):
+        if state not in (self.STATE_PENDING, self.STATE_ACTIVE, self.STATE_DONE):
+            return
+        if state == self._state:
+            return
+        self._state = state
+        if state == self.STATE_DONE:
+            if self._left_done:
+                self.left_icon.source = self._left_done
+            self.label.color = _TEXT_WHITE
+            self.status_icon.set_source(_png("icon_tick_circle.png") or "")
+            self.status_icon.opacity = 1.0
+            self.status_icon.set_angle(0)
+        elif state == self.STATE_ACTIVE:
+            if self._left_active:
+                self.left_icon.source = self._left_active
+            self.label.color = _TEXT_WHITE
+            self.status_icon.set_source(_png("icon_loading.png") or "")
+            self.status_icon.opacity = 1.0
+        else:  # pending
+            if self._left_tile:
+                self.left_icon.source = self._left_tile
+            self.label.color = _TEXT_MUTED
+            self.status_icon.opacity = 0.0
+        try:
+            self.left_icon.reload()
+        except Exception:
+            pass
+
+    def state(self) -> str:
+        return self._state
+
+    def is_active(self) -> bool:
+        return self._state == self.STATE_ACTIVE
+
+
+class _BottomPill(ButtonBehavior, FloatLayout):
+    """Bottom notification pill — becomes a CTA once summary/transcript ready."""
+
+    def __init__(self, *, on_press_cb=None, **kwargs):
+        super().__init__(**kwargs)
+        self._cb = on_press_cb
+        self._enabled = False
+
+        with self.canvas.before:
+            self._bg_color = Color(*_CARD_BG)
+            self._bg = RoundedRectangle(pos=self.pos, size=self.size, radius=[27])
+            self._border_color = Color(*_CARD_BORDER)
+            self._border = Line(
+                rounded_rectangle=(self.x, self.y, self.width, self.height, 27),
+                width=1.0,
+            )
+        self.bind(pos=self._sync, size=self._sync)
+
+        bell_p = _png("icon_bell.png")
+        if bell_p:
+            self._bell = Image(
+                source=bell_p,
+                size_hint=(None, None),
+                size=(_hh(36), _hv(36)),
+                pos_hint={"x": 0.04, "center_y": 0.5},
+                allow_stretch=True,
+                keep_ratio=True,
+                fit_mode="contain",
+            )
+            self.add_widget(self._bell)
+
+        self.label = Label(
+            text="We'll notify you when your summary is ready.",
+            font_size=_hf(18),
+            bold=True,
+            color=_TEXT_HINT,
+            halign="left",
+            valign="middle",
+            size_hint=(0.86, None),
+            height=_hv(24),
+            pos_hint={"x": 0.14, "center_y": 0.5},
+        )
+        self.label.bind(size=self.label.setter("text_size"))
+        self.add_widget(self.label)
+        self.bind(on_release=self._dispatch)
+
+    def _sync(self, *_):
+        self._bg.pos = self.pos
+        self._bg.size = self.size
+        self._bg.radius = [self.height / 2]
+        self._border.rounded_rectangle = (
+            self.x,
+            self.y,
+            self.width,
+            self.height,
+            self.height / 2,
+        )
+
+    def _dispatch(self, *_):
+        if self._enabled and callable(self._cb):
+            self._cb()
+
+    def set_enabled(self, enabled: bool, label_text: Optional[str] = None):
+        self._enabled = bool(enabled)
+        if label_text is not None:
+            self.label.text = label_text
+        if enabled:
+            self.label.color = _TEXT_WHITE
+            self._bg_color.rgba = _CARD_BG
+            self._border_color.rgba = (
+                _CHECK_RING[0],
+                _CHECK_RING[1],
+                _CHECK_RING[2],
+                0.55,
+            )
+        else:
+            self.label.color = _TEXT_HINT
+            self._bg_color.rgba = _CARD_BG
+            self._border_color.rgba = _CARD_BORDER
+
+
+# ---------------------------------------------------------------------------
+# Processing screen
+# ---------------------------------------------------------------------------
+
+
+class ProcessingScreen(BaseScreen):
+    """Figma 397:261 — post-meeting processing/summary state."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._meeting_id: Optional[str] = None
+        self._meeting_title: str = "Meeting"
+        self._meeting_duration_min: int = 0
+        self._summary_data: Optional[dict] = None
+        self._summary_ready: bool = False
+        self._transcript_ready: bool = False
+        self._started_ts: Optional[float] = None
+
+        # Animation state
+        self._spin_event = None
+        self._pulse_event = None
+        self._spin_angle: float = 0.0
+        self._pulse_t: float = 0.0
+        self._build_ui()
+
+    # ------------------------------------------------------------------
+    # UI construction
+    # ------------------------------------------------------------------
+
+    def _build_ui(self):
+        root = FloatLayout(size_hint=(1, 1))
+        with root.canvas.before:
+            Color(*_BG)
+            self._bg = Rectangle(pos=root.pos, size=root.size)
+        root.bind(
+            pos=lambda w, *_: setattr(self._bg, "pos", w.pos),
+            size=lambda w, *_: setattr(self._bg, "size", w.size),
+        )
+
+        # ------------------------------------------------------------------
+        # Header: back (17,15) — listening pill (570,15) — settings (821,15)
+        # ------------------------------------------------------------------
+        self.back_btn = _IconButton(
+            image_path=_png("btn_back.png"),
+            on_press_cb=self._on_back,
+            size_hint=_size_hint_from(54, 54),
+            pos_hint=_phint(17, 15 + 54),
+        )
+        root.add_widget(self.back_btn)
+
+        self.listening_pill = _ListeningPill(
+            on_press_cb=self._on_toggle_voice,
+            size_hint=_size_hint_from(214, 54),
+            pos_hint=_phint(570, 15 + 54),
+        )
+        root.add_widget(self.listening_pill)
+
+        self.settings_btn = _IconButton(
+            image_path=_png("btn_settings.png"),
+            on_press_cb=self._on_settings,
+            size_hint=_size_hint_from(54, 54),
+            pos_hint=_phint(821, 15 + 54),
+        )
+        root.add_widget(self.settings_btn)
+
+        # ------------------------------------------------------------------
+        # Title row: green check + "Recording complete" + meeting + duration
+        # Figma group: 287×57 at (71, 108)
+        # ------------------------------------------------------------------
+        title_row = FloatLayout(
+            size_hint=_size_hint_from(420, 57),
+            pos_hint=_phint(71, 108 + 57),
+        )
+
+        check_p = _png("header_check_badge.png")
+        if check_p:
+            self.title_check = Image(
+                source=check_p,
+                size_hint=(None, None),
+                size=(_hh(33), _hv(33)),
+                pos_hint={"x": 0.0, "y": 0.0},
+                allow_stretch=True,
+                keep_ratio=True,
+                fit_mode="contain",
+            )
+            title_row.add_widget(self.title_check)
+
+        self.title_label = Label(
+            text="Recording complete",
+            font_size=_hf(26),
+            bold=True,
+            color=_TEXT_WHITE,
+            halign="left",
+            valign="top",
+            size_hint=(None, None),
+            size=(_hh(280), _hv(31)),
+            pos_hint={"x": 42 / 420, "top": 1.0},
+        )
+        self.title_label.bind(size=self.title_label.setter("text_size"))
+        title_row.add_widget(self.title_label)
+
+        # Sub-row: meeting title • duration
+        meeting_strip = BoxLayout(
+            orientation="horizontal",
+            size_hint=(None, None),
+            size=(_hh(280), _hv(24)),
+            spacing=_hh(8),
+            pos_hint={"x": 42 / 420, "y": 0.0},
+        )
+        self.meeting_title_label = Label(
+            text="Meeting",
+            font_size=_hf(20),
+            bold=True,
+            color=_TEXT_MUTED,
+            halign="left",
+            valign="middle",
+            size_hint=(None, 1),
+            width=_hh(180),
+        )
+        self.meeting_title_label.bind(size=self.meeting_title_label.setter("text_size"))
+        meeting_strip.add_widget(self.meeting_title_label)
+
+        dot = Widget(size_hint=(None, 1), width=_hh(10))
+        with dot.canvas:
+            Color(*_TEXT_MUTED)
+            dot_circ = Ellipse(pos=(0, 0), size=(_hh(4), _hv(4)))
+
+        def _sync_dot(w, *_):
+            dot_circ.size = (_hh(4), _hv(4))
+            dot_circ.pos = (w.center_x - _hh(2), w.center_y - _hv(2))
+
+        dot.bind(pos=_sync_dot, size=_sync_dot)
+        meeting_strip.add_widget(dot)
+
+        self.duration_label = Label(
+            text="--",
+            font_size=_hf(20),
+            bold=True,
+            color=_TEXT_MUTED,
+            halign="left",
+            valign="middle",
+            size_hint=(None, 1),
+            width=_hh(80),
+        )
+        self.duration_label.bind(size=self.duration_label.setter("text_size"))
+        meeting_strip.add_widget(self.duration_label)
+        title_row.add_widget(meeting_strip)
+        root.add_widget(title_row)
+
+        # ------------------------------------------------------------------
+        # Glow orb hero (left center) — 286×286 at (67, 170)
+        # The exported PNG already includes the layered blur; rendering it
+        # as one image keeps the Kivy graph cheap.
+        # ------------------------------------------------------------------
+        orb_p = _png("glow_orb_outer.png")
+        if orb_p:
+            self.glow_orb = Image(
+                source=orb_p,
+                allow_stretch=True,
+                keep_ratio=True,
+                fit_mode="contain",
+                size_hint=_size_hint_from(286, 286),
+                pos_hint=_phint(67, 170 + 286),
+            )
+            root.add_widget(self.glow_orb)
+        else:
+            # Fallback: filled circle — same colour as the orb's core.
+            self.glow_orb = Widget(
+                size_hint=_size_hint_from(286, 286),
+                pos_hint=_phint(67, 170 + 286),
+            )
+            with self.glow_orb.canvas:
+                Color(0x00 / 255, 0x95 / 255, 0xFF / 255, 1)
+                self._orb_fallback = Ellipse(pos=self.glow_orb.pos, size=self.glow_orb.size)
+            self.glow_orb.bind(
+                pos=lambda w, *_: setattr(self._orb_fallback, "pos", w.pos),
+                size=lambda w, *_: setattr(self._orb_fallback, "size", w.size),
+            )
+            root.add_widget(self.glow_orb)
+
+        # ------------------------------------------------------------------
+        # Headline + sub at the bottom-left corner of the orb area
+        # Headline at (35, 460), 349×31, 26px bold
+        # Sub at (78, 501), 264×24, 20px semi-bold #B6BAF2
+        # ------------------------------------------------------------------
+        self.headline_label = Label(
+            text="Summarizing your meeting…",
+            font_size=_hf(26),
+            bold=True,
+            color=_TEXT_WHITE,
+            halign="left",
+            valign="middle",
+            size_hint=_size_hint_from(420, 36),
+            pos_hint=_phint(35, 460 + 36),
+        )
+        self.headline_label.bind(size=self.headline_label.setter("text_size"))
+        root.add_widget(self.headline_label)
+
+        self.subtitle_label = Label(
+            text="This may take a few seconds",
+            font_size=_hf(20),
+            bold=True,
+            color=_TEXT_MUTED,
+            halign="left",
+            valign="middle",
+            size_hint=_size_hint_from(420, 28),
+            pos_hint=_phint(78, 501 + 28),
+        )
+        self.subtitle_label.bind(size=self.subtitle_label.setter("text_size"))
+        root.add_widget(self.subtitle_label)
+
+        # ------------------------------------------------------------------
+        # Right card "20" — 453×178 at (409, 185), 21 radius
+        # 3 step rows at row-y 19 / 71 / 123 with two faint dividers between them.
+        # ------------------------------------------------------------------
+        step_card = _RoundCard(
+            radius=21,
+            fill=_CARD_BG,
+            border=_CARD_BORDER,
+            size_hint=_size_hint_from(453, 178),
+            pos_hint=_phint(409, 185 + 178),
+        )
+
+        # Two horizontal divider lines, semi-transparent
+        for div_y_top in (62, 114):
+            divider = Widget(
+                size_hint=(None, None),
+                size=(_hh(404), _hv(2)),
+                pos_hint={
+                    "x": 16 / 453,
+                    "top": (178 - div_y_top) / 178,
+                },
+            )
+            with divider.canvas:
+                Color(*_DIVIDER, 0.6)
+                line_rect = Rectangle(pos=divider.pos, size=divider.size)
+            divider.bind(
+                pos=lambda w, _r=line_rect: setattr(_r, "pos", w.pos),
+                size=lambda w, _r=line_rect: setattr(_r, "size", w.size),
+            )
+            step_card.add_widget(divider)
+
+        self.step_extract = _StepRow(
+            label="Extracting key points",
+            size_hint=_size_hint_from(437, 36),
+            pos_hint={"x": 16 / 453, "top": (178 - 19) / 178},
+        )
+        self.step_actions = _StepRow(
+            label="Identifying action items",
+            size_hint=_size_hint_from(437, 36),
+            pos_hint={"x": 16 / 453, "top": (178 - 71) / 178},
+        )
+        self.step_summary = _StepRow(
+            label="Structuring summary",
+            size_hint=_size_hint_from(437, 36),
+            pos_hint={"x": 16 / 453, "top": (178 - 123) / 178},
+        )
+        # Re-anchor the step rows so they fill the inner card width and live
+        # at their vertical positions; FloatLayout in FloatLayout uses
+        # fractional hints relative to the parent card.
+        for step in (self.step_extract, self.step_actions, self.step_summary):
+            step_card.add_widget(step)
+
+        root.add_widget(step_card)
+        self.step_card = step_card
+
+        # ------------------------------------------------------------------
+        # Bottom pill at (403, 384), 466×54, 34 radius
+        # Tappable once transcript or summary ready -> summary_review.
+        # ------------------------------------------------------------------
+        self.notify_pill = _BottomPill(
+            on_press_cb=self._open_summary,
+            size_hint=_size_hint_from(466, 54),
+            pos_hint=_phint(403, 384 + 54),
+        )
+        root.add_widget(self.notify_pill)
 
         self.add_widget(root)
-        self._set_stage(0, "active")
-        self._set_stage(1, "pending")
-        self._set_stage(2, "pending")
-        self._hero_check.set_state("active")
 
-    def _set_stage(self, idx: int, state: str):
-        row = (self.stage_1, self.stage_2, self.stage_3)[idx]
-        row.set_state(state)
+        # Default progress: stage 1 active, others pending.
+        self.step_extract.set_state(_StepRow.STATE_ACTIVE)
 
-    def _set_stage_progress(self, active_idx: int, ready: bool = False):
-        for i in range(3):
-            if ready:
-                self._set_stage(i, "done")
-                continue
-            if i < active_idx:
-                self._set_stage(i, "done")
-            elif i == active_idx:
-                self._set_stage(i, "active")
-            else:
-                self._set_stage(i, "pending")
-        # Hero mirrors stage state — keep the animated ring until Ready is done.
-        if hasattr(self, "_hero_check") and self._hero_check is not None:
-            self._hero_check.set_state("done" if ready else "active")
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
 
-    def _start_pulse(self):
-        self._stop_pulse()
-        self._pulse_event = Clock.schedule_interval(self._tick_pulse, 0.08)
+    def on_enter(self):
+        self._started_ts = time.monotonic()
+        self._summary_data = None
+        self._summary_ready = False
+        mid = getattr(self.app, "current_session_id", None)
+        self._meeting_id = mid
 
-    def _stop_pulse(self):
-        if self._pulse_event:
-            self._pulse_event.cancel()
-            self._pulse_event = None
+        done_for = getattr(self.app, "_transcription_done_for_session", None)
+        self._transcript_ready = bool(mid and done_for == mid)
 
-    def _start_spin(self):
-        self._stop_spin()
-        self._spin_event = Clock.schedule_interval(self._tick_spin, 1.0 / 30.0)
+        # Reset visuals to the initial Figma state.
+        self.headline_label.text = "Summarizing your meeting…"
+        self.subtitle_label.text = "This may take a few seconds"
+        self.notify_pill.set_enabled(
+            False, "We'll notify you when your summary is ready."
+        )
+        self.duration_label.text = self._format_duration(self._meeting_duration_min)
+        self.meeting_title_label.text = self._meeting_title or "Meeting"
 
-    def _stop_spin(self):
-        if self._spin_event:
-            self._spin_event.cancel()
-            self._spin_event = None
+        self.step_extract.set_state(_StepRow.STATE_ACTIVE)
+        self.step_actions.set_state(_StepRow.STATE_PENDING)
+        self.step_summary.set_state(_StepRow.STATE_PENDING)
 
-    def _tick_spin(self, dt):
-        self._spin_angle = (self._spin_angle + 360.0 * dt / 1.2) % 360.0
-        for row in (self.stage_1, self.stage_2, self.stage_3):
-            if row.mark.is_active():
-                row.mark.set_spin_angle(self._spin_angle)
-        if hasattr(self, "_hero_check") and self._hero_check is not None:
-            self._hero_check.set_spin_angle(self._spin_angle)
+        if self._transcript_ready:
+            # Came back to processing screen after transcription finished —
+            # reflect what we already know; summary may still be in flight.
+            self.step_extract.set_state(_StepRow.STATE_DONE)
+            self.step_actions.set_state(_StepRow.STATE_ACTIVE)
+            self.subtitle_label.text = "Transcription done. Building meeting report…"
+            self._enable_summary_cta()
 
-    def _tick_pulse(self, _dt):
-        if self._summary_ready:
-            self.success_badge.opacity = 1.0
-            return
-        self._pulse_alpha += 0.03 * self._pulse_dir
-        if self._pulse_alpha >= 1.0:
-            self._pulse_alpha = 1.0
-            self._pulse_dir = -1
-        elif self._pulse_alpha <= 0.35:
-            self._pulse_alpha = 0.35
-            self._pulse_dir = 1
-        self.success_badge.opacity = self._pulse_alpha
+        # Reflect live voice-assistant state on the listening pill.
+        self._sync_listening_pill()
+
+        self._start_animations()
+
+    def on_leave(self):
+        self._stop_animations()
+
+    # ------------------------------------------------------------------
+    # Public API — called from main.py WS dispatchers + summary poller
+    # ------------------------------------------------------------------
 
     def on_processing_started(self, data):
-        title = (data.get("title") or "Untitled").strip()
-        dur_min = int((data.get("duration", 0) or 0) / 60)
-        self.subtitle_label.text = (
-            f"Meeting '{title}' ({dur_min} min) is being transcribed and analysed."
-        )
+        title = (data or {}).get("title") or self._meeting_title or "Meeting"
+        title = str(title).strip() or "Meeting"
+        duration = int(((data or {}).get("duration") or 0) / 60)
+        self._meeting_title = title
+        self._meeting_duration_min = duration
+        self.meeting_title_label.text = title
+        self.duration_label.text = self._format_duration(duration)
+
+    def on_backend_progress(self, progress: int, status: str, eta: int):
+        """Drive the 3-stage checklist from a 0-100 progress value."""
+        if status:
+            self.set_processing_status(status)
+        p = max(0, min(100, int(progress or 0)))
+        if p < 34:
+            self._set_active_stage(0)
+        elif p < 67:
+            self._set_active_stage(1)
+        elif not self._summary_ready:
+            self._set_active_stage(2)
 
     def on_transcription_ready(self, meeting_id: str):
-        """Transcript is saved server-side — enable View Meeting Summary CTA."""
+        """Transcript saved server-side — summary is still being built."""
         try:
             if meeting_id:
                 self.app._transcript_cta_satisfied_meeting_id = meeting_id
@@ -1070,59 +874,71 @@ class ProcessingScreen(BaseScreen):
         if meeting_id:
             self._meeting_id = meeting_id
         self._transcript_ready = True
-        self.summary_btn.disabled = False
-        self.summary_btn.opacity = 1.0
-        self.set_processing_status("Transcription done. Building meeting report…")
-
-    def set_processing_status(self, text: str):
-        if not text:
-            return
-        low = text.lower()
-        if "transcription done" in low or "building" in low:
-            self._set_stage_progress(1)
-        elif "updating report" in low or "finishing report" in low:
-            self._set_stage_progress(1)
-        elif "transcribing" in low:
-            self._set_stage_progress(0)
-
-    def on_backend_progress(self, progress: int, status: str, eta: int):
-        if status:
-            self.set_processing_status(status)
-        eta = int(eta or 0)
-        if eta > 0:
-            if eta < 60:
-                self.footer_right.text = "Analysis took less than 1 min"
-            else:
-                self.footer_right.text = f"Analysis ETA {eta // 60} min"
-
-        p = max(0, min(100, int(progress or 0)))
-        if p < 34:
-            self._set_stage_progress(0)
-        elif p < 84:
-            self._set_stage_progress(1)
-        elif not self._summary_ready:
-            self._set_stage_progress(2)
+        # Stage 1 = done, stage 2 = active, stage 3 = pending.
+        self._set_active_stage(1)
+        self.step_extract.set_state(_StepRow.STATE_DONE)
+        self.subtitle_label.text = "Transcription done. Building meeting report…"
+        self._enable_summary_cta()
 
     def on_summary_ready(self, meeting_id: str, summary_data: dict):
         self._meeting_id = meeting_id
         self._summary_data = summary_data or {}
         self._summary_ready = True
-        self._set_stage_progress(2, ready=True)
-        self._stop_pulse()
-        self._stop_spin()
-        self.success_badge.opacity = 1.0
-        self.title_label.text = "Analysis Complete!"
-        self.subtitle_label.text = (
-            "Your meeting highlights, transcript, and AI-generated action\n"
-            "items are now ready for review."
-        )
-        elapsed = max(1, int(time.monotonic() - (self._started_ts or time.monotonic())))
-        mins, secs = divmod(elapsed, 60)
-        self.footer_right.text = f"Analysis took {mins}m {secs:02d}s"
-        self.summary_btn.disabled = False
-        self.summary_btn.opacity = 1.0
+        for step in (self.step_extract, self.step_actions, self.step_summary):
+            step.set_state(_StepRow.STATE_DONE)
 
-    def _open_summary(self, _inst):
+        self.headline_label.text = "Analysis complete!"
+        self.subtitle_label.text = (
+            "Your meeting highlights, transcript, and action items are ready."
+        )
+        self._enable_summary_cta(text="Tap to view meeting summary")
+
+    def set_processing_status(self, text: str):
+        if not text:
+            return
+        low = text.lower()
+        if "transcribing" in low:
+            self._set_active_stage(0)
+            self.subtitle_label.text = text
+        elif "transcription done" in low or "building" in low:
+            self._set_active_stage(1)
+            self.subtitle_label.text = text
+        elif "structuring" in low or "key points" in low or "action item" in low:
+            self._set_active_stage(2)
+            self.subtitle_label.text = text
+        else:
+            # Generic update — surface it as the subtitle hint.
+            self.subtitle_label.text = text
+
+    # ------------------------------------------------------------------
+    # Helpers — interaction
+    # ------------------------------------------------------------------
+
+    def _on_back(self):
+        self.goto("home", transition="fade")
+
+    def _on_settings(self):
+        self.goto("settings", transition="fade")
+
+    def _on_toggle_voice(self):
+        app = self.app
+        try:
+            new_paused = not getattr(app, "user_voice_paused", False)
+            app.user_voice_paused = new_paused
+            if hasattr(app, "_sync_voice_assistant_state"):
+                app._sync_voice_assistant_state()
+        except Exception as e:
+            logger.debug("Failed to toggle voice on processing screen: %s", e)
+        self._sync_listening_pill()
+
+    def _sync_listening_pill(self):
+        try:
+            paused = bool(getattr(self.app, "user_voice_paused", False))
+            self.listening_pill.set_listening(not paused)
+        except Exception:
+            pass
+
+    def _open_summary(self):
         if not self._meeting_id:
             logger.info("Summary CTA pressed but meeting_id is not set")
             return
@@ -1131,10 +947,6 @@ class ProcessingScreen(BaseScreen):
                 "Summary CTA pressed before transcript was ready (meeting_id=%s)",
                 self._meeting_id,
             )
-            try:
-                self.footer_right.text = "Still transcribing — please wait…"
-            except Exception:
-                pass
             return
         try:
             scr = self.app.screen_manager.get_screen("summary_review")
@@ -1149,32 +961,60 @@ class ProcessingScreen(BaseScreen):
                 logger.warning("set_meeting_data failed: %s", e)
         self.goto("summary_review", transition="fade")
 
-    def on_enter(self):
-        self._started_ts = time.monotonic()
-        self._summary_data = None
-        self._summary_ready = False
-        mid = getattr(self.app, "current_session_id", None)
-        self._meeting_id = mid
-        done_for = getattr(self.app, "_transcription_done_for_session", None)
-        self._transcript_ready = bool(mid and done_for == mid)
-        self.title_label.text = "Preparing Analysis..."
-        self.subtitle_label.text = "Please wait while transcript and action items are prepared."
-        self.footer_right.text = "Analysis in progress..."
-        # CTA appears once transcription is complete (WS or app flag).
-        if self._transcript_ready:
-            self.summary_btn.disabled = False
-            self.summary_btn.opacity = 1.0
-            self.set_processing_status("Transcription done. Building meeting report…")
-        else:
-            self.summary_btn.disabled = True
-            self.summary_btn.opacity = 0.0
-            self._set_stage_progress(0)
-        self._pulse_alpha = 0.20
-        self._pulse_dir = 1
-        self._spin_angle = 0.0
-        self._start_pulse()
-        self._start_spin()
+    def _enable_summary_cta(self, text: Optional[str] = None):
+        if text is None:
+            text = "Transcript ready — tap to view summary"
+        self.notify_pill.set_enabled(True, text)
 
-    def on_leave(self):
-        self._stop_pulse()
-        self._stop_spin()
+    def _set_active_stage(self, idx: int):
+        rows = (self.step_extract, self.step_actions, self.step_summary)
+        for i, row in enumerate(rows):
+            if self._summary_ready:
+                row.set_state(_StepRow.STATE_DONE)
+                continue
+            if i < idx:
+                row.set_state(_StepRow.STATE_DONE)
+            elif i == idx:
+                row.set_state(_StepRow.STATE_ACTIVE)
+            else:
+                row.set_state(_StepRow.STATE_PENDING)
+
+    @staticmethod
+    def _format_duration(min_value: int) -> str:
+        m = max(0, int(min_value or 0))
+        if m <= 0:
+            return "--"
+        return f"{m} min"
+
+    # ------------------------------------------------------------------
+    # Animations — orb pulse + active-stage spinner
+    # ------------------------------------------------------------------
+
+    def _start_animations(self):
+        self._stop_animations()
+        self._spin_event = Clock.schedule_interval(self._tick_spin, 1.0 / 30.0)
+        self._pulse_event = Clock.schedule_interval(self._tick_pulse, 1.0 / 20.0)
+
+    def _stop_animations(self):
+        if self._spin_event:
+            self._spin_event.cancel()
+            self._spin_event = None
+        if self._pulse_event:
+            self._pulse_event.cancel()
+            self._pulse_event = None
+
+    def _tick_spin(self, dt: float):
+        # Rotate at 360°/1.2 s — same cadence as the recording-screen waveform pulse.
+        self._spin_angle = (self._spin_angle - 360.0 * dt / 1.2) % 360.0
+        for row in (self.step_extract, self.step_actions, self.step_summary):
+            if row.is_active():
+                row.status_icon.set_angle(self._spin_angle)
+
+    def _tick_pulse(self, dt: float):
+        # Gentle scale breathing on the orb: ±2% over ~2 s.
+        if not hasattr(self, "glow_orb") or self.glow_orb is None:
+            return
+        self._pulse_t = (self._pulse_t + dt) % (2.0 * math.pi)
+        # Avoid rebuilding size_hint constantly; nudge opacity for a soft pulse.
+        amp = 0.5 + 0.5 * math.sin(self._pulse_t * math.pi)  # 0..1
+        self.glow_orb.opacity = 0.85 + 0.15 * amp

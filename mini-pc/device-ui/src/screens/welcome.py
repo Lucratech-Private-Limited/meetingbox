@@ -27,6 +27,7 @@ from kivy.graphics import Color, Rectangle
 
 from screens.base_screen import BaseScreen
 from config import COLORS, FONT_SIZES, ASSETS_DIR, DISPLAY_WIDTH
+from components.button import PrimaryButton
 
 WELCOME_DIR = ASSETS_DIR / 'welcome'
 LOGO_PATH = str(WELCOME_DIR / 'LOGO.png')
@@ -171,39 +172,49 @@ class WelcomeScreen(BaseScreen):
 
         hero.add_widget(Widget(size_hint=(1, None), height=self.suv(32)))
 
-        # CTA — design Button.png (rounded pill + baked label); size from texture aspect
+        # CTA — design Button.png (rounded pill + baked label); size from texture aspect.
+        # If exports are missing (fresh appliance clone), use the same PrimaryButton as elsewhere.
         btn_anchor = AnchorLayout(
             anchor_x='center',
             anchor_y='center',
             size_hint=(1, None),
             height=cta_h,
         )
-        cta = _ImageButton(
-            source=BUTTON_PATH,
-            size_hint=(None, None),
-            size=(self.suh(260), cta_h),
-            allow_stretch=False,
-            keep_ratio=True,
-            fit_mode='contain',
-        )
+        if Path(BUTTON_PATH).exists():
+            cta = _ImageButton(
+                source=BUTTON_PATH,
+                size_hint=(None, None),
+                size=(self.suh(260), cta_h),
+                allow_stretch=False,
+                keep_ratio=True,
+                fit_mode='contain',
+            )
 
-        def _sync_cta_size(img, *args):
-            if not img.texture or img.texture.width < 2:
-                return
-            tw, th = img.texture.size
-            nh = cta_h
-            nw = max(1, int(tw * nh / th))
-            max_w = int(DISPLAY_WIDTH * 0.90)
-            if nw > max_w:
-                nw = max_w
-                nh = max(1, int(th * nw / tw))
-            img.size = (nw, nh)
-            btn_anchor.height = max(btn_anchor.height, nh)
+            def _sync_cta_size(img, *args):
+                if not img.texture or img.texture.width < 2:
+                    return
+                tw, th = img.texture.size
+                nh = cta_h
+                nw = max(1, int(tw * nh / th))
+                max_w = int(DISPLAY_WIDTH * 0.90)
+                if nw > max_w:
+                    nw = max_w
+                    nh = max(1, int(th * nw / tw))
+                img.size = (nw, nh)
+                btn_anchor.height = max(btn_anchor.height, nh)
 
-        cta.bind(texture=_sync_cta_size)
-        cta.bind(on_press=self._on_continue)
-        btn_anchor.add_widget(cta)
-        Clock.schedule_once(lambda _dt: _sync_cta_size(cta), 0)
+            cta.bind(texture=_sync_cta_size)
+            cta.bind(on_press=self._on_continue)
+            btn_anchor.add_widget(cta)
+            Clock.schedule_once(lambda _dt: _sync_cta_size(cta), 0)
+        else:
+            cta = PrimaryButton(
+                text='Continue',
+                size_hint=(None, None),
+                size=(self.suh(260), cta_h),
+            )
+            cta.bind(on_press=self._on_continue)
+            btn_anchor.add_widget(cta)
         hero.add_widget(btn_anchor)
 
         hero.add_widget(Widget(size_hint=(1, None), height=self.suv(16)))

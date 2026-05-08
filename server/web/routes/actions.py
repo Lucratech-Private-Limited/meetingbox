@@ -37,9 +37,9 @@ def _actor_scope(actor: Optional[dict]) -> tuple[str, tuple[object, ...]]:
 
 
 def _assert_meeting_access(meeting_id: str, actor: Optional[dict]) -> None:
+    if not actor:
+        raise HTTPException(status_code=401, detail="Authentication required.")
     scope_sql, scope_params = _actor_scope(actor)
-    if not scope_sql:
-        return
     conn = get_connection()
     try:
         cur = conn.cursor()
@@ -51,9 +51,9 @@ def _assert_meeting_access(meeting_id: str, actor: Optional[dict]) -> None:
 
 
 def _assert_action_access(action_id: str, actor: Optional[dict]) -> None:
+    if not actor:
+        raise HTTPException(status_code=401, detail="Authentication required.")
     scope_sql, scope_params = _actor_scope(actor)
-    if not scope_sql:
-        return
     conn = get_connection()
     try:
         cur = conn.cursor()
@@ -144,14 +144,18 @@ class CreateManualActionBody(BaseModel):
 
 @router.get("/meetings/{meeting_id}/actions", response_model=list[ActionResponse])
 async def list_actions(meeting_id: str, current_actor: Optional[dict] = Depends(get_optional_actor)):
+    if not current_actor:
+        raise HTTPException(status_code=401, detail="Authentication required.")
     _assert_meeting_access(meeting_id, current_actor)
     return list_actions_for_meeting(meeting_id)
 
 
 @router.post("/meetings/{meeting_id}/actions/generate", response_model=list[ActionResponse])
 async def generate_actions(meeting_id: str, current_actor: Optional[dict] = Depends(get_optional_actor)):
+    if not current_actor:
+        raise HTTPException(status_code=401, detail="Authentication required.")
     _assert_meeting_access(meeting_id, current_actor)
-    user_id = current_actor["user"]["id"] if current_actor else None
+    user_id = current_actor["user"]["id"]
     return generate_actions_for_meeting(meeting_id, user_id)
 
 
@@ -186,6 +190,8 @@ async def create_manual_action(
 
 @router.patch("/actions/{action_id}", response_model=ActionResponse)
 async def update_action(action_id: str, body: ActionUpdateRequest, current_actor: Optional[dict] = Depends(get_optional_actor)):
+    if not current_actor:
+        raise HTTPException(status_code=401, detail="Authentication required.")
     _assert_action_access(action_id, current_actor)
     return update_action_record(
         action_id,
@@ -197,6 +203,8 @@ async def update_action(action_id: str, body: ActionUpdateRequest, current_actor
 
 @router.post("/actions/{action_id}/dismiss")
 async def dismiss_action(action_id: str, current_actor: Optional[dict] = Depends(get_optional_actor)):
+    if not current_actor:
+        raise HTTPException(status_code=401, detail="Authentication required.")
     _assert_action_access(action_id, current_actor)
     return dismiss_action_record(action_id)
 
@@ -204,6 +212,8 @@ async def dismiss_action(action_id: str, current_actor: Optional[dict] = Depends
 @router.post("/actions/{action_id}/ignore")
 async def ignore_action(action_id: str, current_actor: Optional[dict] = Depends(get_optional_actor)):
     """Stop showing the suggestion and exclude it from pending counts; row is kept."""
+    if not current_actor:
+        raise HTTPException(status_code=401, detail="Authentication required.")
     _assert_action_access(action_id, current_actor)
     return ignore_action_record(action_id)
 
@@ -214,8 +224,10 @@ async def execute_action(
     body: ExecuteActionRequest = Body(default_factory=ExecuteActionRequest),
     current_actor: Optional[dict] = Depends(get_optional_actor),
 ):
+    if not current_actor:
+        raise HTTPException(status_code=401, detail="Authentication required.")
     _assert_action_access(action_id, current_actor)
-    user_id = current_actor["user"]["id"] if current_actor else None
+    user_id = current_actor["user"]["id"]
     override = body.payload if body and body.payload else None
     draft = bool(body.create_draft) if body else False
     repeat = bool(getattr(body, "repeat_execution", False)) if body else False

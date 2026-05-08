@@ -58,8 +58,8 @@ class SettingsItem(ButtonBehavior, BoxLayout):
 
         kwargs.setdefault('orientation', 'horizontal')
         kwargs.setdefault('size_hint_y', None)
-        kwargs.setdefault('height', _si_suv(60))
-        kwargs.setdefault('padding', [_si_suh(16), _si_suv(8)])
+        kwargs.setdefault('height', _si_suv(68))
+        kwargs.setdefault('padding', [_si_suh(18), _si_suv(10)])
         kwargs.setdefault('spacing', _si_suh(8))
 
         super().__init__(**kwargs)
@@ -70,12 +70,14 @@ class SettingsItem(ButtonBehavior, BoxLayout):
 
         # Card background (keep Color + rect; update rgba on press — avoid clear()+rebuild)
         with self.canvas.before:
-            self._bg_color = Color(*COLORS['surface'])
+            self._shadow_color = Color(0, 0, 0, 0.14)
+            self._shadow = RoundedRectangle(pos=(self.x + 1, self.y - _si_suv(2)), size=self.size, radius=[BORDER_RADIUS])
+            self._bg_color = Color(0.12, 0.16, 0.23, 0.86)
             self._bg = RoundedRectangle(
                 pos=self.pos, size=self.size, radius=[BORDER_RADIUS])
         self.bind(
-            pos=lambda w, v: setattr(self._bg, 'pos', w.pos),
-            size=lambda w, v: setattr(self._bg, 'size', w.size),
+            pos=self._sync_bg,
+            size=self._sync_bg,
         )
 
         # Text container (left)
@@ -99,7 +101,7 @@ class SettingsItem(ButtonBehavior, BoxLayout):
         self.subtitle_label = Label(
             text=subtitle,
             font_size=_si_suf(FONT_SIZES['small']),
-            color=COLORS['gray_500'],
+            color=COLORS['gray_300'],
             halign='left',
             valign='top',
             size_hint=(1, 0.5),
@@ -125,11 +127,18 @@ class SettingsItem(ButtonBehavior, BoxLayout):
             # info – no indicator
             self.add_widget(Widget(size_hint=(0.1, 1)))
 
+
+    def _sync_bg(self, *_args):
+        self._shadow.pos = (self.x + 1, self.y - _si_suv(2))
+        self._shadow.size = self.size
+        self._bg.pos = self.pos
+        self._bg.size = self.size
+
     # Press feedback
     def on_press(self):
         if self._mode == 'arrow':
-            self._bg_color.rgba = COLORS['surface_light']
+            self._bg_color.rgba = (0.18, 0.24, 0.34, 0.96)
 
     def on_release(self):
         if self._mode == 'arrow':
-            self._bg_color.rgba = COLORS['surface']
+            self._bg_color.rgba = (0.12, 0.16, 0.23, 0.86)

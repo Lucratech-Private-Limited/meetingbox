@@ -106,6 +106,52 @@ Config.set('input', 'mouse', 'mouse,multitouch_on_demand')
 # On-screen keyboard for TextInput when no system keyboard (touch / kiosk).
 Config.set('kivy', 'keyboard_mode', 'systemanddock')
 
+
+def _configure_kivy_default_font() -> None:
+    """
+    Kivy's bundled Roboto lacks many symbols (and all emoji) used on the home screen,
+    which show as empty boxes on Linux/SDL. Prefer DejaVu Sans when installed
+    (fonts-dejavu-core in the device-ui Docker image), or MEETINGBOX_UI_FONT for one TTF.
+    """
+    from pathlib import Path
+
+    env = os.environ.get("MEETINGBOX_UI_FONT", "").strip()
+    paths: list[str] | None = None
+    if env:
+        ep = Path(env)
+        if ep.is_file():
+            p = str(ep.resolve())
+            paths = [p, p, p, p]
+    else:
+        d = Path("/usr/share/fonts/truetype/dejavu")
+        quad = (
+            d / "DejaVuSans.ttf",
+            d / "DejaVuSans-Oblique.ttf",
+            d / "DejaVuSans-Bold.ttf",
+            d / "DejaVuSans-BoldOblique.ttf",
+        )
+        if all(p.is_file() for p in quad):
+            paths = [str(p) for p in quad]
+    if not paths:
+        return
+    try:
+        Config.set(
+            "kivy",
+            "default_font",
+            [
+                "MeetingBoxSans",
+                paths[0],
+                paths[1],
+                paths[2],
+                paths[3],
+            ],
+        )
+    except Exception:
+        pass
+
+
+_configure_kivy_default_font()
+
 from kivy.core.window import Window  # noqa: E402 — must import after Config
 
 from config import (
@@ -135,12 +181,9 @@ from hardware import (
     request_system_poweroff,
     request_system_reboot,
     set_brightness,
-    screen_off,
-    screen_on,
 )
 from network_util import linux_ethernet_ready
 from profile_store import get_active_profile, clear_active_profile_selection
-from components.voice_indicator import VoiceAssistantIndicator
 from voice_assistant import VoiceAssistant, VoiceIntent
 
 # Boot-flow screens
@@ -162,12 +205,14 @@ from screens.processing import ProcessingScreen
 from screens.complete import CompleteScreen
 from screens.summary_review import SummaryReviewScreen
 from screens.error import ErrorScreen
+from screens.briefing import BriefingScreen
+from screens.idle import IdleScreen
 
 # Settings & sub-screens
 from screens.settings import SettingsScreen
 from screens.auto_delete_picker import AutoDeletePickerScreen
 from screens.brightness_picker import BrightnessPickerScreen
-from screens.timeout_picker import TimeoutPickerScreen
+from screens.idle_timeout_picker import IdleTimeoutPickerScreen
 from screens.mic_test import MicTestScreen
 from screens.update_check import UpdateCheckScreen
 from screens.update_install import UpdateInstallScreen
@@ -427,10 +472,19 @@ class MeetingBoxApp(App):
         self._local_redis_thread = None
         self._local_redis_stop = threading.Event()
 
-        # Screen timeout
-        self._screen_timeout_minutes = 0  # 0 = never
+        # Idle screen timeout (seconds; 0 = never).
+        # Replaces the older display-off timer: instead of cutting the
+        # backlight we navigate to the dedicated `idle` screen, which is
+        # itself dismissed by any touch (back to home).
+        self._idle_timeout_seconds = 30
         self._idle_event = None
-        self._screen_is_off = False
+
+        # Manual user pause for the wake-word assistant (toggled from the
+        # home Listening pill). When True, _voice_assistant_should_listen
+        # returns False even on listen-eligible screens. This is a UI knob,
+        # not a privacy setting — flipping it here doesn't touch the
+        # backend ``privacy_mode`` flag.
+        self.user_voice_paused = False
 
         # Voice UI / feedback
         self.root_layout = None
@@ -507,11 +561,13 @@ class MeetingBoxApp(App):
         self.screen_manager.add_widget(CompleteScreen(name='complete'))
         self.screen_manager.add_widget(SummaryReviewScreen(name='summary_review'))
         self.screen_manager.add_widget(ErrorScreen(name='error'))
+        self.screen_manager.add_widget(BriefingScreen(name='briefing'))
+        self.screen_manager.add_widget(IdleScreen(name='idle'))
 
         self.screen_manager.add_widget(SettingsScreen(name='settings'))
         self.screen_manager.add_widget(AutoDeletePickerScreen(name='auto_delete_picker'))
         self.screen_manager.add_widget(BrightnessPickerScreen(name='brightness_picker'))
-        self.screen_manager.add_widget(TimeoutPickerScreen(name='timeout_picker'))
+        self.screen_manager.add_widget(IdleTimeoutPickerScreen(name='idle_timeout_picker'))
         self.screen_manager.add_widget(MicTestScreen(name='mic_test'))
         self.screen_manager.add_widget(UpdateCheckScreen(name='update_check'))
         self.screen_manager.add_widget(UpdateInstallScreen(name='update_install'))
@@ -530,10 +586,10 @@ class MeetingBoxApp(App):
         # Start local Redis listener for real-time audio levels from the audio
         # container (both on the same Docker network).
         self._start_local_redis_listener()
-        self.voice_indicator = VoiceAssistantIndicator(
-            pos_hint={"right": 0.985, "y": 0.035},
-        )
-        self.root_layout.add_widget(self.voice_indicator)
+        # Voice assistant logic (wake phrase, intents) stays active; the floating
+        # "Tony" overlay is intentionally not mounted. ``self.voice_indicator``
+        # remains None (set in __init__) so existing _refresh/_set helpers no-op
+        # via their ``if not self.voice_indicator`` guards.
         self._sync_voice_assistant_state()
         self._refresh_voice_indicator()
 
@@ -664,6 +720,17 @@ class MeetingBoxApp(App):
             if tok:
                 self.backend.set_device_auth_header(tok)
         Clock.schedule_once(self._check_backend, 2.0)
+        # Idle + home both consume weather; start the singleton refresh loop
+        # once here so it's running by the time those screens are entered.
+        try:
+            from weather_client import get_weather_client
+
+            get_weather_client().start(refresh_seconds=900)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("weather client start failed: %s", e)
+        # Kick off the idle countdown immediately so a freshly-booted device
+        # that gets no touches still falls asleep into the lock screen.
+        self._reset_idle_timer()
         if self.needs_setup():
             self._setup_poll = Clock.schedule_interval(self._global_setup_check, 3.0)
         else:
@@ -738,8 +805,10 @@ class MeetingBoxApp(App):
                     logger.info("Device name loaded: %s", name)
                 brightness = settings.get('brightness', 'high')
                 set_brightness(brightness)
-                self._apply_screen_timeout(
-                    settings.get('screen_timeout', 'never'))
+                # Backend stores the value as seconds (or "never"). Default
+                # 30s matches the idle picker default.
+                self._apply_idle_timeout(
+                    settings.get('idle_screen_timeout', '30'))
                 privacy = settings.get('privacy_mode', False)
                 self.privacy_mode = privacy
                 auto_record = settings.get('auto_record', False)
@@ -1425,65 +1494,95 @@ class MeetingBoxApp(App):
         run_async(_resume())
 
     # ==================================================================
-    # SCREEN TIMEOUT
+    # IDLE SCREEN TIMEOUT
     # ==================================================================
 
-    def _apply_screen_timeout(self, value: str):
-        """Configure screen timeout from setting value ('never', '5', '10')."""
+    # Screens where the idle timer must NOT fire — recording is the obvious
+    # one (the device is actively in use), and onboarding screens have their
+    # own controlled flow that the lock screen would interrupt.
+    _IDLE_TIMER_DISABLED_SCREENS = frozenset({
+        'splash', 'welcome', 'room_name', 'network_choice',
+        'wifi_setup', 'wifi_connected', 'pair_device', 'meetingbox_ready',
+        'setup_progress', 'all_set',
+        'recording', 'processing',
+        'idle',
+    })
+
+    def _apply_idle_timeout(self, value: str):
+        """Configure idle-screen timeout.
+
+        Accepts seconds as a string (``"30"``, ``"60"``, ``"120"``, ``"300"``)
+        or ``"never"``. The legacy ``screen_timeout`` value (which was in
+        minutes — ``"5"``, ``"10"``) is interpreted as minutes for backward
+        compatibility so existing devices don't break on first read.
+        """
         if self._idle_event:
             self._idle_event.cancel()
             self._idle_event = None
 
-        if value == 'never' or not value:
-            self._screen_timeout_minutes = 0
+        v = (value or '').strip().lower()
+        if v in ('', 'never', 'off', '0'):
+            self._idle_timeout_seconds = 0
             return
 
         try:
-            self._screen_timeout_minutes = int(value)
+            n = int(v)
         except ValueError:
-            self._screen_timeout_minutes = 0
+            self._idle_timeout_seconds = 30
+            self._reset_idle_timer()
             return
-
+        # Legacy `screen_timeout` was in minutes; treat very small numbers as
+        # minutes so a stored "5" still means "5 minutes" rather than 5s.
+        if n <= 30:
+            self._idle_timeout_seconds = n
+        elif n <= 60:
+            self._idle_timeout_seconds = n  # 60s sits in the new bucket
+        else:
+            self._idle_timeout_seconds = n
         self._reset_idle_timer()
 
     def _reset_idle_timer(self, *_args):
-        """Reset the idle countdown. Called on every touch."""
-        if self._screen_is_off:
-            self._screen_is_off = False
-            brightness = 'high'
-            try:
-                async def _get_br():
-                    s = await self.backend.get_settings()
-                    return s.get('brightness', 'high')
-                import asyncio
-                loop = get_async_loop()
-                if loop and loop.is_running():
-                    asyncio.run_coroutine_threadsafe(_get_br(), loop)
-            except Exception:
-                pass
-            screen_on(brightness)
+        """Reset the idle countdown. Called on every touch.
+
+        If the user touches while the idle screen is up, immediately return
+        to home — the idle screen also handles this in its own ``on_touch_up``
+        (which fires once children pass), but doing it here as well covers
+        gestures that don't reach a screen widget (e.g. global swipes).
+        """
+        if self.screen_manager and self.screen_manager.current == 'idle':
+            self.goto_screen('home', 'fade')
 
         if self._idle_event:
             self._idle_event.cancel()
+            self._idle_event = None
 
-        if self._screen_timeout_minutes > 0:
-            secs = self._screen_timeout_minutes * 60
+        if self._idle_timeout_seconds > 0:
             self._idle_event = Clock.schedule_once(
-                self._on_idle_timeout, secs)
+                self._on_idle_timeout, self._idle_timeout_seconds)
 
     def _on_idle_timeout(self, _dt):
-        """Fires when idle timeout expires -- turn screen off."""
+        """Fires when idle timeout expires — show the dedicated idle screen."""
+        if not self.screen_manager:
+            return
+        cur = self.screen_manager.current
+        if cur in self._IDLE_TIMER_DISABLED_SCREENS:
+            # Don't interrupt onboarding / recording / processing. Restart
+            # the timer; once the user lands on a normal screen, the next
+            # touch will set the cycle going again via _reset_idle_timer.
+            self._reset_idle_timer()
+            return
         if self.recording_state.get('active'):
             self._reset_idle_timer()
             return
-        logger.info("Screen timeout — turning off display")
-        self._screen_is_off = True
-        screen_off()
+        logger.info("Idle timeout reached on screen %s — showing idle screen", cur)
+        self.goto_screen('idle', 'fade')
 
     def _voice_assistant_should_listen(self) -> bool:
         if self.screen_manager is None:
             return False
         if self._voice_start_in_flight:
+            return False
+        if self.user_voice_paused:
             return False
         blocked = {
             'splash',
@@ -2214,14 +2313,12 @@ class MeetingBoxApp(App):
             return
 
         if intent.name == "screen_off":
-            self._voice_reply("Turning screen off.", duration=2.5)
-            self._screen_is_off = True
-            Clock.schedule_once(lambda _dt: screen_off(), 0.2)
+            self._voice_reply("Showing idle screen.", duration=2.5)
+            Clock.schedule_once(lambda _dt: self.goto_screen('idle', 'fade'), 0.2)
             return
 
         if intent.name == "wake_screen":
-            self._screen_is_off = False
-            screen_on("high")
+            self.goto_screen('home', 'fade')
             self._reset_idle_timer()
             self._voice_reply("Waking the screen.", duration=2.5)
             return

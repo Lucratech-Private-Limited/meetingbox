@@ -2,7 +2,7 @@
 
 This folder contains everything that normally runs on the **meeting room device**: the **Kivy device UI** and the **audio capture** stack. The FastAPI dashboard lives in **`server/`** in the main repo (or your VPS uses a server-only clone).
 
-**Separate repository:** you can deploy from a mini-pc–only clone. Configure `BACKEND_URL`, `BACKEND_WS_URL`, `UPLOAD_AUDIO_API_URL`, and pairing tokens in `.env`; no checkout of `server/` or `frontend/` is required. For local dev, if those repos sit as siblings (e.g. `../server`), `run_device_ui.sh` and `audio/run_audio_capture.sh` optionally load a shared parent `.env`. Override that with `MEETINGBOX_MONOREPO_ROOT` when your layout differs.
+**Separate repository:** deploy from a mini-pc–only clone. Configure API URLs in `.env`; no `server/` or `frontend/` checkout is required. For local dev with sibling repos, `run_device_ui.sh` / `audio/run_audio_capture.sh` optionally load a parent `.env` when they see `../server/docker-compose.yml`, `../meetingbox-server/docker-compose.yml`, or **`MEETINGBOX_MONOREPO_ROOT`**.
 
 ## Contents
 
@@ -53,6 +53,8 @@ cp .env.example .env   # optional per-app overrides
 python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt
 ./run_device_ui.sh
 ```
+
+**UI bitmap assets:** if PNGs under `device-ui/assets/` are missing, from `device-ui/` run `python scripts/download_figma_home_assets.py` and `python scripts/download_figma_idle_recording_assets.py` (network required). Welcome-screen exports in `assets/welcome/` are optional — see `assets/welcome/README.txt`.
 
 **Mic (recommended host script):**
 
@@ -160,7 +162,7 @@ git subtree split --prefix=mini-pc -b mini-pc-release
 git push <your-appliance-remote> mini-pc-release:main
 ```
 
-On the device, clone that repo and use only this directory — no `server/` or `frontend/` checkout required. (`run_device_ui.sh` / `run_audio_capture.sh` optionally load a parent `.env` when they detect a full monorepo: sibling `server/docker-compose.yml`, sibling `meetingbox-server/docker-compose.yml`, or `MEETINGBOX_MONOREPO_ROOT`. In an appliance-only clone none of these apply and only `mini-pc/.env` is used.)
+On the device, clone that repo and use only this directory — no `server/` or `frontend/` checkout required. (`run_device_ui.sh` / `run_audio_capture.sh` optionally load a parent `.env` when they detect a full monorepo: sibling `server/docker-compose.yml`, sibling `meetingbox-server/docker-compose.yml`, or `MEETINGBOX_MONOREPO_ROOT`. In an appliance-only clone, only `mini-pc/.env` is used.)
 
 ## Monorepo usage
 
