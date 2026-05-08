@@ -25,10 +25,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 MINI_PC_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-MONOREPO_ROOT=""
-if [[ -f "$MINI_PC_ROOT/../server/docker-compose.yml" ]]; then
-  MONOREPO_ROOT="$(cd "$MINI_PC_ROOT/.." && pwd)"
-fi
+# shellcheck source=../scripts/lib_meetingbox_paths.sh
+source "$SCRIPT_DIR/../scripts/lib_meetingbox_paths.sh"
+MONOREPO_ROOT="$(meetingbox_resolve_monorepo_root "$MINI_PC_ROOT")"
 
 _load_env_file() {
   local f="$1"

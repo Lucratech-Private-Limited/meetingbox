@@ -10,7 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from pydantic import BaseModel, ConfigDict
 import redis
 import shutil
@@ -19,6 +19,7 @@ import httpx
 from auth import get_current_user, get_optional_actor
 from database import get_connection
 from meeting_agent import run_meeting_agent_pipeline
+from rate_limit import limiter
 
 logger = logging.getLogger(__name__)
 
@@ -329,12 +330,32 @@ def _load_session_owner(session_id: Optional[str]) -> tuple[Optional[str], Optio
   return user_id, device_id
 
 
+def _require_actor(current_actor: Optional[dict]) -> dict:
+  """Reject unauthenticated access to tenant-scoped meeting APIs."""
+  if not current_actor:
+    raise HTTPException(status_code=401, detail="Authentication required.")
+  return current_actor
+
+
 def _meeting_access_filter(actor: Optional[dict], alias: str = "meetings") -> tuple[str, list[object]]:
+  """
+  Scope meetings to the actor:
+  - device: rows with matching device_id
+  - user: rows owned by user_id OR created on any device paired to that user
+  """
   if not actor:
     return "", []
-  column = f"{alias}.device_id" if actor["type"] == "device" else f"{alias}.user_id"
-  value = _actor_device_id(actor) if actor["type"] == "device" else _actor_user_id(actor)
-  return f"{column} = ?", [value]
+  if actor["type"] == "device":
+    did = _actor_device_id(actor)
+    return f"{alias}.device_id = ?", [did]
+  uid = _actor_user_id(actor)
+  pred = (
+    f"({alias}.user_id = ? OR {alias}.device_id IN ("
+    " SELECT id FROM devices WHERE user_id = ? "
+    " AND (status IS NULL OR TRIM(COALESCE(status, '')) = '' OR LOWER(TRIM(status)) = 'active'))"
+    ")"
+  )
+  return pred, [uid, uid]
 
 
 # --- Start / Stop meeting (wire to Redis for audio service) ---
@@ -343,6 +364,7 @@ def _meeting_access_filter(actor: Optional[dict], alias: str = "meetings") -> tu
 @router.post("/start")
 async def start_meeting(current_actor: Optional[dict] = Depends(get_optional_actor)):
   """Start a new recording. Sends command to audio service via Redis."""
+  _require_actor(current_actor)
   session_id = _generate_session_id()
   _store_session_owner(session_id, current_actor)
   emit_audio_command(current_actor, {"action": "start_recording", "session_id": session_id})
@@ -355,6 +377,7 @@ async def start_meeting(current_actor: Optional[dict] = Depends(get_optional_act
 @router.post("/stop")
 async def stop_meeting(current_actor: Optional[dict] = Depends(get_optional_actor)):
   """Stop the current recording. Sends command to audio service via Redis."""
+  _require_actor(current_actor)
   session_id = _get_redis().get("current_meeting_id")
   emit_audio_command(
     current_actor,
@@ -370,6 +393,7 @@ async def stop_meeting(current_actor: Optional[dict] = Depends(get_optional_acto
 @router.get("/recording-status")
 async def recording_status(current_actor: Optional[dict] = Depends(get_optional_actor)):
   """Current recording state for the dashboard."""
+  _require_actor(current_actor)
   state = _get_redis().get("recording_state") or "idle"
   current_id = _get_redis().get("current_meeting_id")
   return {"state": state, "session_id": current_id}
@@ -378,6 +402,7 @@ async def recording_status(current_actor: Optional[dict] = Depends(get_optional_
 @router.post("/reset-recording-state")
 async def reset_recording_state(current_actor: Optional[dict] = Depends(get_optional_actor)):
   """Clear recording state so the dashboard shows Start/Record buttons again (e.g. if stuck on Processing)."""
+  _require_actor(current_actor)
   _get_redis().set("recording_state", "idle")
   _get_redis().delete("current_meeting_id")
   return {"status": "idle"}
@@ -386,6 +411,7 @@ async def reset_recording_state(current_actor: Optional[dict] = Depends(get_opti
 @router.post("/pause")
 async def pause_meeting(current_actor: Optional[dict] = Depends(get_optional_actor)):
   """Pause the current recording."""
+  _require_actor(current_actor)
   state = _get_redis().get("recording_state") or "idle"
   if state != "recording":
     raise HTTPException(status_code=400, detail="No active recording to pause")
@@ -402,6 +428,7 @@ async def pause_meeting(current_actor: Optional[dict] = Depends(get_optional_act
 @router.post("/resume")
 async def resume_meeting(current_actor: Optional[dict] = Depends(get_optional_actor)):
   """Resume a paused recording."""
+  _require_actor(current_actor)
   state = _get_redis().get("recording_state") or "idle"
   if state != "paused":
     raise HTTPException(status_code=400, detail="No paused recording to resume")
@@ -423,6 +450,7 @@ class MeetingUpdateRequest(BaseModel):
 @router.patch("/{meeting_id}")
 async def update_meeting(meeting_id: str, body: MeetingUpdateRequest, current_actor: Optional[dict] = Depends(get_optional_actor)):
   """Update editable fields of a meeting (title, status)."""
+  _require_actor(current_actor)
   conn = get_connection()
   conn.execute("PRAGMA foreign_keys = ON")
   conn.row_factory = lambda cursor, row: {col[0]: row[idx] for idx, col in enumerate(cursor.description)}
@@ -451,8 +479,9 @@ async def update_meeting(meeting_id: str, body: MeetingUpdateRequest, current_ac
     if not updates:
       return meeting
 
-    params.append(meeting_id)
-    cur.execute(f"UPDATE meetings SET {', '.join(updates)} WHERE id = ?", params)
+    w_sql, w_params = _meeting_access_filter(current_actor)
+    upd_sql = f"UPDATE meetings SET {', '.join(updates)} WHERE id = ? AND {w_sql}"
+    cur.execute(upd_sql, params + [meeting_id] + w_params)
     conn.commit()
 
     cur.execute(query, query_params)
@@ -464,6 +493,7 @@ async def update_meeting(meeting_id: str, body: MeetingUpdateRequest, current_ac
 @router.delete("/{meeting_id}")
 async def delete_meeting(meeting_id: str, current_actor: Optional[dict] = Depends(get_optional_actor)):
   """Delete a meeting and all its associated data."""
+  _require_actor(current_actor)
   conn = get_connection()
   conn.execute("PRAGMA foreign_keys = ON")
   try:
@@ -484,7 +514,12 @@ async def delete_meeting(meeting_id: str, current_actor: Optional[dict] = Depend
     cur.execute("DELETE FROM segments WHERE meeting_id = ?", (meeting_id,))
     cur.execute("DELETE FROM summaries WHERE meeting_id = ?", (meeting_id,))
     cur.execute("DELETE FROM local_summaries WHERE meeting_id = ?", (meeting_id,))
-    cur.execute("DELETE FROM meetings WHERE id = ?", (meeting_id,))
+    del_sql = "DELETE FROM meetings WHERE id = ?"
+    del_params: list[object] = [meeting_id]
+    if where_sql:
+      del_sql += f" AND {where_sql}"
+      del_params.extend(where_params)
+    cur.execute(del_sql, del_params)
     conn.commit()
 
     if audio_path:
@@ -504,6 +539,7 @@ async def ingest_test_wav(file: UploadFile = File(...), current_actor: dict | No
   """
   Upload a WAV file to run through the cloud-only Anthropic pipeline.
   """
+  _require_actor(current_actor)
   if not file.filename or not file.filename.lower().endswith(".wav"):
     raise HTTPException(status_code=400, detail="Upload must be a .wav file")
   return await upload_audio(file=file, session_id=_generate_session_id(), current_actor=current_actor)
@@ -554,7 +590,9 @@ def _transcribe_audio_with_openai(audio_path: Path) -> str:
 
 
 @router.post("/upload-audio")
+@limiter.limit("30/hour")
 async def upload_audio(
+  request: Request,
   file: UploadFile = File(...),
   session_id: Optional[str] = Form(default=None),
   current_actor: Optional[dict] = Depends(get_optional_actor),
@@ -564,6 +602,7 @@ async def upload_audio(
   Converts to 16kHz mono WAV, transcribes with OpenAI (Whisper), summarizes with Anthropic.
   Use this to record with your PC mic: record in the browser, then upload.
   """
+  _require_actor(current_actor)
   fn = (file.filename or "").lower()
   ext = Path(fn).suffix or ".webm"
   if ext not in UPLOAD_AUDIO_EXTENSIONS:
@@ -699,6 +738,7 @@ async def upload_audio(
 
 @router.get("/")
 async def list_meetings(limit: int = 50, offset: int = 0, status: Optional[str] = None, current_actor: Optional[dict] = Depends(get_optional_actor)):
+  _require_actor(current_actor)
   conn = get_connection()
   conn.execute("PRAGMA foreign_keys = ON")
   conn.row_factory = lambda cursor, row: {col[0]: row[idx] for idx, col in enumerate(cursor.description)}  # type: ignore
@@ -760,6 +800,7 @@ def _anthropic_message_text(resp) -> str:
 @router.post("/{meeting_id}/summarize")
 async def summarize_meeting(meeting_id: str, current_actor: Optional[dict] = Depends(get_optional_actor)):
   """Generate a detailed meeting report from the transcript using Claude (stored in summaries.summary)."""
+  _require_actor(current_actor)
   client = _get_anthropic_client()
   if not client:
     raise HTTPException(status_code=400, detail="ANTHROPIC_API_KEY is not configured on the server.")
@@ -991,6 +1032,14 @@ async def summarize_meeting(meeting_id: str, current_actor: Optional[dict] = Dep
         exc,
       )
 
+  try:
+    from services.mem0_service import maybe_ingest_meeting_summary
+
+    uid_mem = meeting.get("user_id") or _actor_user_id(current_actor)
+    maybe_ingest_meeting_summary(uid_mem, meeting_id, report_body)
+  except Exception:
+    logger.debug("mem0 ingest after summarize failed", exc_info=True)
+
   return {
     "status": "generated",
     "summary": report_body,
@@ -1025,7 +1074,9 @@ async def email_summary(meeting_id: str, body: EmailRequest, current_user: dict 
   conn.row_factory = lambda cursor, row: {col[0]: row[idx] for idx, col in enumerate(cursor.description)}
   try:
     cur = conn.cursor()
-    cur.execute("SELECT * FROM meetings WHERE id = ? AND user_id = ?", (meeting_id, user_id))
+    scope_sql, scope_params = _meeting_access_filter({"type": "user", "user": current_user})
+    mq = "SELECT * FROM meetings WHERE id = ? AND " + scope_sql
+    cur.execute(mq, [meeting_id] + scope_params)
     meeting = cur.fetchone()
     if not meeting:
       raise HTTPException(status_code=404, detail="Meeting not found")
@@ -1103,6 +1154,7 @@ async def get_meeting_audio(meeting_id: str, current_actor: Optional[dict] = Dep
   """Stream the audio recording file for a meeting."""
   from fastapi.responses import FileResponse
 
+  _require_actor(current_actor)
   conn = get_connection()
   try:
     cur = conn.cursor()
@@ -1148,6 +1200,7 @@ async def export_meeting(meeting_id: str, fmt: str, current_actor: Optional[dict
   """Export a meeting as TXT or PDF."""
   from fastapi.responses import Response
 
+  _require_actor(current_actor)
   if fmt not in ("txt", "pdf"):
     raise HTTPException(status_code=400, detail=f"Unsupported export format: {fmt}. Use 'txt' or 'pdf'.")
 
@@ -1286,6 +1339,7 @@ async def export_meeting(meeting_id: str, fmt: str, current_actor: Optional[dict
 
 @router.get("/{meeting_id}", response_model=MeetingDetail)
 async def get_meeting(meeting_id: str, current_actor: Optional[dict] = Depends(get_optional_actor)):
+  _require_actor(current_actor)
   conn = get_connection()
   conn.execute("PRAGMA foreign_keys = ON")
   conn.row_factory = lambda cursor, row: {col[0]: row[idx] for idx, col in enumerate(cursor.description)}  # type: ignore

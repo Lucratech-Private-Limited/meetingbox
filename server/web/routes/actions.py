@@ -27,7 +27,13 @@ def _actor_scope(actor: Optional[dict]) -> tuple[str, tuple[object, ...]]:
         return "", ()
     if actor["type"] == "device":
         return "m.device_id = ?", (actor["device"]["id"],)
-    return "m.user_id = ?", (actor["user"]["id"],)
+    uid = actor["user"]["id"]
+    pred = (
+        "(m.user_id = ? OR m.device_id IN ("
+        " SELECT id FROM devices WHERE user_id = ? "
+        " AND (status IS NULL OR TRIM(COALESCE(status, '')) = '' OR LOWER(TRIM(status)) = 'active')))"
+    )
+    return pred, (uid, uid)
 
 
 def _assert_meeting_access(meeting_id: str, actor: Optional[dict]) -> None:

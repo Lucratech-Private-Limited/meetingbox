@@ -301,10 +301,21 @@ def init_database() -> None:
               routed_agent_id TEXT,
               routing_method TEXT,
               response_json TEXT,
+              device_id TEXT,
+              correlation_id TEXT,
               FOREIGN KEY (user_id) REFERENCES users(id)
             )
             """
         )
+        for statement in [
+            "ALTER TABLE assistant_audits ADD COLUMN device_id TEXT",
+            "ALTER TABLE assistant_audits ADD COLUMN correlation_id TEXT",
+        ]:
+            try:
+                cursor.execute(statement)
+            except sqlite3.OperationalError:
+                pass
+
         cursor.execute(
             """
             CREATE TABLE IF NOT EXISTS pending_assistant_actions (
@@ -338,6 +349,31 @@ def init_database() -> None:
         conn.commit()
     finally:
         conn.close()
+    run_alembic_upgrade()
+
+
+def run_alembic_upgrade() -> None:
+    """Apply SQL migrations after idempotent SQLite bootstrap."""
+    try:
+        from pathlib import Path
+
+        from alembic import command
+        from alembic.config import Config
+    except ImportError:
+        return
+    ini = Path(__file__).resolve().parent / "alembic.ini"
+    if not ini.exists():
+        return
+    cfg = Config(str(ini))
+    try:
+        command.upgrade(cfg, "head")
+    except Exception:
+        import logging
+
+        logging.getLogger("meetingbox.database").warning(
+            "Alembic upgrade failed (database may still be usable via init_database DDL).",
+            exc_info=True,
+        )
 
 
 def get_connection() -> sqlite3.Connection:

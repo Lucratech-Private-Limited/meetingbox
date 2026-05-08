@@ -2,6 +2,8 @@
 
 This folder contains everything that normally runs on the **meeting room device**: the **Kivy device UI** and the **audio capture** stack. The FastAPI dashboard lives in **`server/`** in the main repo (or your VPS uses a server-only clone).
 
+**Separate repository:** you can deploy from a mini-pc–only clone. Configure `BACKEND_URL`, `BACKEND_WS_URL`, `UPLOAD_AUDIO_API_URL`, and pairing tokens in `.env`; no checkout of `server/` or `frontend/` is required. For local dev, if those repos sit as siblings (e.g. `../server`), `run_device_ui.sh` and `audio/run_audio_capture.sh` optionally load a shared parent `.env`. Override that with `MEETINGBOX_MONOREPO_ROOT` when your layout differs.
+
 ## Contents
 
 | Path | Purpose |
@@ -158,7 +160,7 @@ git subtree split --prefix=mini-pc -b mini-pc-release
 git push <your-appliance-remote> mini-pc-release:main
 ```
 
-On the device, clone that repo and use only this directory — no `server/` or `frontend/` checkout required. (`run_device_ui.sh` / `run_audio_capture.sh` look for a sibling `server/docker-compose.yml` only to detect the full monorepo and load a parent `.env`; that path is absent in an appliance-only clone and scripts still work.)
+On the device, clone that repo and use only this directory — no `server/` or `frontend/` checkout required. (`run_device_ui.sh` / `run_audio_capture.sh` optionally load a parent `.env` when they detect a full monorepo: sibling `server/docker-compose.yml`, sibling `meetingbox-server/docker-compose.yml`, or `MEETINGBOX_MONOREPO_ROOT`. In an appliance-only clone none of these apply and only `mini-pc/.env` is used.)
 
 ## Monorepo usage
 

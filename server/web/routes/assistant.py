@@ -2,7 +2,7 @@
 
 from typing import Optional
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, Field
 
 from assistant_service import (
@@ -13,6 +13,7 @@ from assistant_service import (
   update_pending_assistant_payload,
 )
 from auth import get_current_user, get_optional_user
+from rate_limit import limiter
 
 router = APIRouter()
 
@@ -27,7 +28,9 @@ class PendingPayloadUpdate(BaseModel):
 
 
 @router.post("/intent")
+@limiter.limit("60/minute")
 async def post_intent(
+  request: Request,
   body: IntentRequest,
   current_user: Optional[dict] = Depends(get_optional_user),
 ):

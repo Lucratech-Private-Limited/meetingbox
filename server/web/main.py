@@ -20,6 +20,9 @@ from fastapi import Depends, FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.routing import APIRoute
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
 from starlette.routing import Match, get_route_path
 from starlette.types import Scope
 import redis
@@ -37,10 +40,22 @@ from routes.actions import router as actions_router
 from routes.integrations import router as integrations_router
 from auth import get_optional_user
 from routes.device import SetupCompleteBody, finalize_first_boot_setup
+from rate_limit import limiter
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
 logger = logging.getLogger("meetingbox.web")
 
+
+def _startup_strict_env() -> None:
+  """Optional fail-fast when MEETINGBOX_STRICT_STARTUP=1."""
+  if os.getenv("MEETINGBOX_STRICT_STARTUP", "").strip() != "1":
+    return
+  missing = [k for k in ("JWT_SECRET_KEY",) if not (os.getenv(k) or "").strip()]
+  if missing:
+    raise RuntimeError(f"Strict startup enabled; set environment variables: {', '.join(missing)}")
+
+
+_startup_strict_env()
 init_database()
 load_agent_definitions()
 
@@ -159,6 +174,34 @@ def _auto_delete_thread() -> None:
               logger.info("Auto-delete: removed %d meetings older than %d days", len(rows), days)
           finally:
             conn.close()
+
+      audit_days = int(os.getenv("MEETINGBOX_AUDIT_RETENTION_DAYS", "0") or 0)
+      if audit_days > 0:
+        acut = (datetime.now() - timedelta(days=audit_days)).isoformat()
+        conn = get_connection()
+        try:
+          cur = conn.cursor()
+          cur.execute(
+            """
+            DELETE FROM pending_assistant_actions
+            WHERE status != 'pending' AND resolved_at IS NOT NULL AND resolved_at < ?
+            """,
+            (acut,),
+          )
+          cur.execute(
+            """
+            DELETE FROM assistant_audits
+            WHERE created_at < ?
+              AND id NOT IN (
+                SELECT audit_id FROM pending_assistant_actions
+                WHERE audit_id IS NOT NULL AND status = 'pending'
+              )
+            """,
+            (acut,),
+          )
+          conn.commit()
+        finally:
+          conn.close()
     except Exception as e:
       logger.warning("Auto-delete error: %s", e)
 
@@ -183,6 +226,9 @@ async def lifespan(app: FastAPI):  # type: ignore[override]
 
 
 app = FastAPI(title="MeetingBox API", version="1.0.0", lifespan=lifespan)
+app.state.limiter = limiter
+app.add_middleware(SlowAPIMiddleware)
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 app.add_middleware(
   CORSMiddleware,

@@ -21,6 +21,7 @@ Otherwise it is derived from the incoming request (X-Forwarded-Proto + Host), th
 import json
 import logging
 import os
+import time
 import uuid
 from datetime import datetime
 from urllib.parse import urlencode, quote_plus
@@ -226,19 +227,33 @@ def get_credentials_for_provider(user_id: str, provider: str):
 
     if creds.expired and creds.refresh_token:
         from google.auth.transport.requests import Request as GoogleRequest
-        try:
-            creds.refresh(GoogleRequest())
-            conn = get_connection()
+        last_err: Exception | None = None
+        for attempt in range(2):
             try:
-                conn.execute(
-                    "UPDATE integrations SET access_token = ?, token_expiry = ? WHERE id = ?",
-                    (creds.token, creds.expiry.isoformat() if creds.expiry else None, integration["id"]),
+                creds.refresh(GoogleRequest())
+                conn = get_connection()
+                try:
+                    conn.execute(
+                        "UPDATE integrations SET access_token = ?, token_expiry = ? WHERE id = ?",
+                        (creds.token, creds.expiry.isoformat() if creds.expiry else None, integration["id"]),
+                    )
+                    conn.commit()
+                finally:
+                    conn.close()
+                break
+            except Exception as e:
+                last_err = e
+                logger.warning(
+                    "Token refresh attempt %d failed for %s/%s: %s",
+                    attempt + 1,
+                    user_id,
+                    provider,
+                    e,
                 )
-                conn.commit()
-            finally:
-                conn.close()
-        except Exception as e:
-            logger.error("Token refresh failed for %s/%s: %s", user_id, provider, e)
+                if attempt == 0:
+                    time.sleep(0.5)
+        else:
+            logger.error("Token refresh failed for %s/%s: %s", user_id, provider, last_err)
             return None
 
     return creds

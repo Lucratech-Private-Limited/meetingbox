@@ -29,6 +29,8 @@ from database import get_connection
 
 logger = logging.getLogger(__name__)
 
+from rate_limit import limiter
+
 router = APIRouter()
 
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
@@ -226,6 +228,7 @@ async def has_users():
 
 
 @router.get("/google/auth-url")
+@limiter.limit("45/minute")
 async def google_auth_url(request: Request):
     _check_google_configured()
     frontend_base = _infer_frontend_base_url(request)
@@ -242,6 +245,7 @@ async def google_auth_url(request: Request):
 
 
 @router.get("/google/callback")
+@limiter.limit("90/minute")
 async def google_callback(
     request: Request,
     code: str = Query(default=""),

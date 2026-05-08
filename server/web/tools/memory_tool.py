@@ -22,6 +22,19 @@ def _keywords(query: str) -> list[str]:
   return [w for w in q.split() if len(w) > 1][:12]
 
 
+def _scope_clause_for_user(user_id: str | None) -> tuple[str, list[Any]]:
+  """Restrict to meetings owned by user or recorded on a device paired to that user."""
+  if not user_id or not str(user_id).strip():
+    return "1 = 0", []
+  uid = str(user_id).strip()
+  pred = (
+    "(m.user_id = ? OR m.device_id IN ("
+    " SELECT id FROM devices WHERE user_id = ? "
+    " AND (status IS NULL OR TRIM(COALESCE(status, '')) = '' OR LOWER(TRIM(status)) = 'active')))"
+  )
+  return pred, [uid, uid]
+
+
 def memory_search_meetings(
   user_id: str | None,
   query: str,
@@ -30,10 +43,10 @@ def memory_search_meetings(
   """
   Find meetings whose title, summaries, or transcript segments match the query.
   When query is empty, returns the most recent meetings (newest first).
-  user_id reserved for future per-user scoping; currently ignored.
+  Scoped to the given user_id (meetings row or paired device).
   """
-  _ = user_id
   max_results = max(1, min(int(max_results or 10), 30))
+  scope_sql, scope_params = _scope_clause_for_user(user_id)
   conn = get_connection()
   conn.row_factory = _row_factory
   try:
@@ -41,13 +54,14 @@ def memory_search_meetings(
     words = _keywords(query)
     if not words:
       cur.execute(
-        """
+        f"""
         SELECT m.id, m.title, m.start_time, m.end_time, m.created_at, m.status
         FROM meetings m
+        WHERE {scope_sql}
         ORDER BY COALESCE(m.created_at, m.start_time, '') DESC
         LIMIT ?
         """,
-        (max_results,),
+        (*scope_params, max_results),
       )
     else:
       cond_parts: list[str] = []
@@ -65,6 +79,7 @@ def memory_search_meetings(
         )
         params.extend([pat, pat, pat, pat, pat])
       where_sql = " AND ".join(cond_parts)
+      params.extend(list(scope_params))
       params.append(max_results)
       cur.execute(
         f"""
@@ -73,7 +88,7 @@ def memory_search_meetings(
         LEFT JOIN summaries s ON s.meeting_id = m.id
         LEFT JOIN local_summaries ls ON ls.meeting_id = m.id
         LEFT JOIN segments seg ON seg.meeting_id = m.id
-        WHERE {where_sql}
+        WHERE ({scope_sql}) AND ({where_sql})
         ORDER BY COALESCE(m.created_at, m.start_time, '') DESC
         LIMIT ?
         """,
@@ -107,7 +122,6 @@ def memory_fetch_meeting(
   max_total_chars: int = 20000,
 ) -> dict[str, Any]:
   """Load one meeting: metadata, best available summary, and transcript excerpt."""
-  _ = user_id
   mid = (meeting_id or "").strip()
   if not mid:
     return {"error": "meeting_id is required"}
@@ -115,11 +129,15 @@ def memory_fetch_meeting(
   max_segments = max(1, min(int(max_segments), 200))
   max_total_chars = max(500, min(int(max_total_chars), 80000))
 
+  scope_sql, scope_params = _scope_clause_for_user(user_id)
   conn = get_connection()
   conn.row_factory = _row_factory
   try:
     cur = conn.cursor()
-    cur.execute("SELECT * FROM meetings WHERE id = ?", (mid,))
+    cur.execute(
+      f"SELECT * FROM meetings m WHERE m.id = ? AND {scope_sql}",
+      (mid, *scope_params),
+    )
     meeting = cur.fetchone()
     if not meeting:
       return {"error": "Meeting not found", "meeting_id": mid}

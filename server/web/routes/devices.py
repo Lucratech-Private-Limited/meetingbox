@@ -3,7 +3,7 @@ import random
 import uuid
 from datetime import datetime, timedelta
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from auth import (
@@ -12,6 +12,7 @@ from auth import (
     hash_api_token,
 )
 from database import get_connection
+from rate_limit import limiter
 
 router = APIRouter()
 
@@ -69,7 +70,8 @@ async def list_devices(current_user: dict = Depends(get_current_user)):
 
 
 @router.post("/devices/pairing-codes", response_model=PairingCodeResponse)
-async def create_pairing_code(current_user: dict = Depends(get_current_user)):
+@limiter.limit("20/minute")
+async def create_pairing_code(request: Request, current_user: dict = Depends(get_current_user)):
     now = datetime.utcnow()
     expires_at = now + timedelta(minutes=PAIRING_TTL_MINUTES)
 
@@ -92,7 +94,8 @@ async def create_pairing_code(current_user: dict = Depends(get_current_user)):
 
 
 @router.post("/devices/claim")
-async def claim_pairing_code(body: ClaimPairingCodeRequest):
+@limiter.limit("20/minute")
+async def claim_pairing_code(request: Request, body: ClaimPairingCodeRequest):
     code = body.code.strip()
     now = datetime.utcnow().isoformat()
     device_id = str(uuid.uuid4())
