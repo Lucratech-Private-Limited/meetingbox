@@ -20,6 +20,9 @@ from fastapi import Depends, FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.routing import APIRoute
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
 from starlette.routing import Match, get_route_path
 from starlette.types import Scope
 import redis
@@ -35,12 +38,58 @@ from routes.devices import router as devices_router
 from routes.auth import router as auth_router
 from routes.actions import router as actions_router
 from routes.integrations import router as integrations_router
+<<<<<<< Updated upstream
+from routes.commitments import router as commitments_router
+from routes.briefing import router as briefing_router
+from routes.admin_memory import router as admin_memory_router
+from routes.voice import router as voice_router
+from auth import get_optional_user, resolve_actor_from_access_token
+=======
+from routes.emails import router as emails_router
 from auth import get_optional_user
+>>>>>>> Stashed changes
 from routes.device import SetupCompleteBody, finalize_first_boot_setup
+from rate_limit import limiter
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
 logger = logging.getLogger("meetingbox.web")
 
+
+def _startup_strict_env() -> None:
+  """Optional fail-fast when MEETINGBOX_STRICT_STARTUP=1 or MEETINGBOX_PRODUCTION=1."""
+  strict = os.getenv("MEETINGBOX_STRICT_STARTUP", "").strip() == "1"
+  production = os.getenv("MEETINGBOX_PRODUCTION", "").strip() == "1"
+  if strict or production:
+    missing = [k for k in ("JWT_SECRET_KEY",) if not (os.getenv(k) or "").strip()]
+    if missing:
+      raise RuntimeError(
+        f"Production/strict startup: set environment variables: {', '.join(missing)}"
+      )
+
+  if os.getenv("MEETINGBOX_REQUIRE_EXPLICIT_CORS", "").strip() == "1":
+    raw = (os.getenv("MEETINGBOX_CORS_ORIGINS", "") or "").strip()
+    parts = [o.strip() for o in raw.split(",") if o.strip()] if raw else []
+    if not parts or any(p == "*" for p in parts):
+      raise RuntimeError(
+        "MEETINGBOX_REQUIRE_EXPLICIT_CORS=1: set MEETINGBOX_CORS_ORIGINS to a comma-separated "
+        "list of real origins (no wildcard *)."
+      )
+
+  workers = (os.getenv("WEB_CONCURRENCY") or os.getenv("UVICORN_WORKERS") or "1").strip()
+  try:
+    n_workers = int(workers)
+  except ValueError:
+    n_workers = 1
+  if n_workers > 1 and os.getenv("MEETINGBOX_I_ACKNOWLEDGE_MULTI_WORKER_RECORDING", "").strip() != "1":
+    logger.warning(
+      "WEB_CONCURRENCY/UVICORN_WORKERS=%s: recording state in Redis is shared but in-memory "
+      "helpers may diverge across processes. Prefer a single worker for appliance demos or set "
+      "MEETINGBOX_I_ACKNOWLEDGE_MULTI_WORKER_RECORDING=1.",
+      workers,
+    )
+
+
+_startup_strict_env()
 init_database()
 load_agent_definitions()
 
@@ -159,6 +208,34 @@ def _auto_delete_thread() -> None:
               logger.info("Auto-delete: removed %d meetings older than %d days", len(rows), days)
           finally:
             conn.close()
+
+      audit_days = int(os.getenv("MEETINGBOX_AUDIT_RETENTION_DAYS", "0") or 0)
+      if audit_days > 0:
+        acut = (datetime.now() - timedelta(days=audit_days)).isoformat()
+        conn = get_connection()
+        try:
+          cur = conn.cursor()
+          cur.execute(
+            """
+            DELETE FROM pending_assistant_actions
+            WHERE status != 'pending' AND resolved_at IS NOT NULL AND resolved_at < ?
+            """,
+            (acut,),
+          )
+          cur.execute(
+            """
+            DELETE FROM assistant_audits
+            WHERE created_at < ?
+              AND id NOT IN (
+                SELECT audit_id FROM pending_assistant_actions
+                WHERE audit_id IS NOT NULL AND status = 'pending'
+              )
+            """,
+            (acut,),
+          )
+          conn.commit()
+        finally:
+          conn.close()
     except Exception as e:
       logger.warning("Auto-delete error: %s", e)
 
@@ -183,10 +260,21 @@ async def lifespan(app: FastAPI):  # type: ignore[override]
 
 
 app = FastAPI(title="MeetingBox API", version="1.0.0", lifespan=lifespan)
+app.state.limiter = limiter
+app.add_middleware(SlowAPIMiddleware)
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+_cors_raw = (os.getenv("MEETINGBOX_CORS_ORIGINS", "") or "").strip()
+if _cors_raw:
+  _cors_origins = [o.strip() for o in _cors_raw.split(",") if o.strip()]
+  if not _cors_origins:
+    _cors_origins = ["*"]
+else:
+  _cors_origins = ["*"]
 
 app.add_middleware(
   CORSMiddleware,
-  allow_origins=["*"],
+  allow_origins=_cors_origins,
   allow_credentials=False,
   allow_methods=["*"],
   allow_headers=["*"],
@@ -201,6 +289,14 @@ app.include_router(device_router, prefix="/api/device", tags=["device"])
 app.include_router(devices_router, prefix="/api", tags=["devices"])
 app.include_router(actions_router, prefix="/api", tags=["actions"])
 app.include_router(integrations_router, prefix="/api", tags=["integrations"])
+<<<<<<< Updated upstream
+app.include_router(commitments_router, prefix="/api", tags=["commitments"])
+app.include_router(briefing_router, prefix="/api")
+app.include_router(admin_memory_router, prefix="/api")
+app.include_router(voice_router, prefix="/api/voice")
+=======
+app.include_router(emails_router, prefix="/api", tags=["emails"])
+>>>>>>> Stashed changes
 
 
 @app.post("/api/device/setup-complete", tags=["device"])
@@ -215,8 +311,39 @@ async def post_setup_complete_root(
     return finalize_first_boot_setup(body)
 
 
+def _ws_bearer_from_request(websocket: WebSocket) -> str:
+  """Token for WS auth: query access_token, else Authorization: Bearer (non-browser clients)."""
+  q = (websocket.query_params.get("access_token") or "").strip()
+  if q:
+    return q
+  auth_hdr = (websocket.headers.get("authorization") or websocket.headers.get("Authorization") or "").strip()
+  if auth_hdr.lower().startswith("bearer "):
+    return auth_hdr[7:].strip()
+  return ""
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket) -> None:
+  secret = (os.getenv("MEETINGBOX_WS_SHARED_SECRET", "") or "").strip()
+  require_auth = os.getenv("MEETINGBOX_WS_REQUIRE_AUTH", "").strip() == "1"
+  secret_ok = bool(secret) and (websocket.query_params.get("token") or "").strip() == secret
+  actor_ok = bool(resolve_actor_from_access_token(_ws_bearer_from_request(websocket)))
+
+  if not secret and not require_auth:
+    pass  # backward compatible: open connect
+  elif not secret and require_auth:
+    if not actor_ok:
+      await websocket.close(code=1008)
+      return
+  elif secret and not require_auth:
+    if not secret_ok:
+      await websocket.close(code=1008)
+      return
+  else:
+    if not (secret_ok or actor_ok):
+      await websocket.close(code=1008)
+      return
+
   await manager.connect(websocket)
   try:
     while True:
