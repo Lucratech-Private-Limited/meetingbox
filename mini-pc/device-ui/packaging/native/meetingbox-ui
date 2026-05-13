@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Installed launcher for the native MeetingBox UI package.
+
+set -euo pipefail
+
+ENV_FILE="${MEETINGBOX_DEVICE_UI_ENV:-/etc/meetingbox/device-ui.env}"
+if [[ -f "$ENV_FILE" ]]; then
+  set -a
+  # shellcheck source=/dev/null
+  source "$ENV_FILE"
+  set +a
+fi
+
+export PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}"
+export KIVY_WINDOW="${KIVY_WINDOW:-sdl2}"
+export KIVY_NO_CONSOLELOG="${KIVY_NO_CONSOLELOG:-1}"
+export KIVY_CLIPBOARD="${KIVY_CLIPBOARD:-sdl2}"
+export SDL_VIDEODRIVER="${SDL_VIDEODRIVER:-x11}"
+export FULLSCREEN="${FULLSCREEN:-1}"
+export DISPLAY="${DEVICE_UI_DISPLAY:-${DISPLAY:-:0}}"
+export MEETINGBOX_APP_DIR="${MEETINGBOX_APP_DIR:-/usr/lib/meetingbox/device-ui}"
+export MEETINGBOX_ASSETS_DIR="${MEETINGBOX_ASSETS_DIR:-/usr/share/meetingbox/device-ui/assets}"
+
+exec /usr/lib/meetingbox/device-ui/meetingbox-ui.bin "$@"

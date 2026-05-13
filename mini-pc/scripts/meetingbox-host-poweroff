@@ -1,0 +1,23 @@
+#!/bin/sh
+# Power off the mini-PC from inside device-ui (same sudo / nsenter pattern as reboot).
+
+set -e
+SELF=/usr/local/bin/meetingbox-host-poweroff
+if [ "$(id -u)" -ne 0 ]; then
+  if ! command -v sudo >/dev/null 2>&1; then
+    echo "meetingbox-host-poweroff: need root but sudo is missing — rebuild device-ui image" >&2
+    exit 1
+  fi
+  sudo -n "$SELF" "$@" || {
+    echo "meetingbox-host-poweroff: sudo -n failed. Rebuild device-ui (sudo+sudoers)" >&2
+    exit 1
+  }
+  exit 0
+fi
+
+if ! command -v nsenter >/dev/null 2>&1; then
+  echo "meetingbox-host-poweroff: nsenter not found (install util-linux in the image)" >&2
+  exit 1
+fi
+exec nsenter -t 1 -m -u -i -n -p -- /bin/sh -c \
+  '/usr/bin/systemctl poweroff 2>/dev/null || /bin/systemctl poweroff 2>/dev/null || /sbin/poweroff -f'

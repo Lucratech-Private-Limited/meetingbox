@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# Configure Ubuntu Server to boot directly into the installed native MeetingBox UI.
+
+set -euo pipefail
+
+if [[ "${EUID:-0}" -ne 0 ]]; then
+  echo "Run as root: sudo MEETINGBOX_I_KNOW=1 meetingbox-install-native-kiosk" >&2
+  exit 1
+fi
+
+if [[ "${MEETINGBOX_I_KNOW:-}" != "1" ]]; then
+  echo "This disables the normal desktop/login flow and starts MeetingBox on tty1." >&2
+  echo "Keep SSH access available, then run:" >&2
+  echo "  MEETINGBOX_I_KNOW=1 sudo meetingbox-install-native-kiosk" >&2
+  exit 1
+fi
+
+RUN_AS_USER="${MEETINGBOX_USER:-${SUDO_USER:-meetingbox}}"
+if ! getent passwd "$RUN_AS_USER" >/dev/null 2>&1; then
+  echo "User not found: $RUN_AS_USER" >&2
+  echo "Set MEETINGBOX_USER to the kiosk user you want to auto-login." >&2
+  exit 1
+fi
+
+RUN_AS_HOME=$(getent passwd "$RUN_AS_USER" | cut -d: -f6)
+
+for group in audio video input; do
+  if getent group "$group" >/dev/null 2>&1; then
+    usermod -aG "$group" "$RUN_AS_USER"
+  fi
+done
+
+install -m 0755 /usr/share/meetingbox/device-ui/xinitrc-meetingbox-ui "$RUN_AS_HOME/.xinitrc-meetingbox-ui"
+chown "$RUN_AS_USER:$RUN_AS_USER" "$RUN_AS_HOME/.xinitrc-meetingbox-ui"
+
+GETTY_DROP=/etc/systemd/system/getty@tty1.service.d
+mkdir -p "$GETTY_DROP"
+cat >"$GETTY_DROP/meetingbox-autologin.conf" <<EOF
+[Service]
+ExecStart=
+ExecStart=-/sbin/agetty --autologin $RUN_AS_USER --noclear %I \$TERM
+EOF
+
+MARK_BEGIN="# --- MEETINGBOX_NATIVE_XINIT_BEGIN ---"
+MARK_END="# --- MEETINGBOX_NATIVE_XINIT_END ---"
+PROFILE="$RUN_AS_HOME/.profile"
+if [[ -f "$PROFILE" ]] && grep -qF "$MARK_BEGIN" "$PROFILE"; then
+  echo "Profile already contains MeetingBox native xinit block."
+else
+  cp -a "$PROFILE" "${PROFILE}.bak-meetingbox-native-$(date +%s)" 2>/dev/null || touch "$PROFILE"
+  chown "$RUN_AS_USER:$RUN_AS_USER" "$PROFILE"
+  cat >>"$PROFILE" <<EOF
+
+$MARK_BEGIN
+if [ -z "\${DISPLAY:-}" ] && [ "\$(tty 2>/dev/null)" = "/dev/tty1" ] && [ "\$(id -un)" = "$RUN_AS_USER" ]; then
+  exec startx "\$HOME/.xinitrc-meetingbox-ui" -- vt1
+fi
+$MARK_END
+EOF
+  chown "$RUN_AS_USER:$RUN_AS_USER" "$PROFILE"
+fi
+
+systemctl disable meetingbox-ui.service >/dev/null 2>&1 || true
+systemctl disable gdm3.service >/dev/null 2>&1 || true
+systemctl stop gdm3.service >/dev/null 2>&1 || true
+systemctl set-default multi-user.target
+systemctl daemon-reload
+
+echo "Native MeetingBox kiosk installed for user: $RUN_AS_USER"
+echo "Reboot with: sudo reboot"

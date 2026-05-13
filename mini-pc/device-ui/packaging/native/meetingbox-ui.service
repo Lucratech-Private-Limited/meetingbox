@@ -1,0 +1,15 @@
+[Unit]
+Description=MeetingBox native device UI
+After=graphical.target network.target
+Wants=network.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/meetingbox/device-ui.env
+Environment=DISPLAY=:0
+ExecStart=/usr/bin/meetingbox-ui
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=graphical.target

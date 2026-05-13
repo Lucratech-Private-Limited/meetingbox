@@ -1,0 +1,28 @@
+{
+  "id": "device_agent",
+  "name": "Device / recording agent",
+  "description": "Start, stop, pause, or resume recording on the paired MeetingBox mini-PC via the dashboard assistant. Commands require approval before they run.",
+  "triggers": [
+    "start recording",
+    "begin recording",
+    "record meeting",
+    "start the meeting recording",
+    "stop recording",
+    "end recording",
+    "stop the recording",
+    "pause recording",
+    "resume recording"
+  ],
+  "system_prompt": "assistant_service: queues device_start_recording etc. User must approve in pending actions.",
+  "tools": [
+    "device_start_recording",
+    "device_stop_recording",
+    "device_pause_recording",
+    "device_resume_recording"
+  ],
+  "requires_approval": true,
+  "background": false,
+  "priority": 5,
+  "memory_context": false,
+  "max_tool_calls": 4
+}
