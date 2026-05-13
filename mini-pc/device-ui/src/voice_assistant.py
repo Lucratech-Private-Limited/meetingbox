@@ -306,9 +306,13 @@ class VoiceAssistant:
         self,
         on_intent: Callable[[VoiceIntent], None],
         on_wake_phrase: Callable[[str], None] | None = None,
+        on_amplitude: Callable[[float], None] | None = None,
+        on_conversation_turn: Callable[[str], None] | None = None,
     ):
         self._on_intent = on_intent
         self._on_wake_phrase = on_wake_phrase
+        self._on_amplitude = on_amplitude
+        self._on_conversation_turn = on_conversation_turn
         self.enabled = _env_flag("VOICE_ASSISTANT_ENABLED", True)
         self.wake_phrase = (os.getenv("VOICE_ASSISTANT_WAKE_PHRASE") or "hey tony").strip() or "hey tony"
         self.start_commands = [
@@ -449,6 +453,11 @@ class VoiceAssistant:
         if not norm:
             return
         logger.debug("Voice assistant heard: %s", norm)
+        if self._on_conversation_turn is not None:
+            try:
+                self._on_conversation_turn(norm)
+            except Exception:
+                logger.exception("Voice assistant conversation_turn callback failed")
         if (
             self._on_wake_phrase is not None
             and self._interpreter.heard_wake_phrase(norm)
@@ -509,6 +518,13 @@ class VoiceAssistant:
                 logger.debug("Voice assistant sounddevice status: %s", status)
             if self._stop_event.is_set() or self._is_paused():
                 return
+            if self._on_amplitude is not None:
+                try:
+                    import numpy as _np
+                    amp = float(_np.frombuffer(indata, dtype="int16").astype("float32").std() / 32768.0)
+                    self._on_amplitude(amp)
+                except Exception:
+                    pass
             try:
                 self._audio_queue.put_nowait(bytes(indata))
             except queue.Full:
