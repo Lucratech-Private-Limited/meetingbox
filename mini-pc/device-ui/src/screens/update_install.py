@@ -41,7 +41,7 @@ class UpdateInstallScreen(BaseScreen):
         # Title
         self.title_label = Label(
             text='Installing update…',
-            font_size=FONT_SIZES['medium'],
+            font_size=self.suf(FONT_SIZES['medium']),
             color=COLORS['white'],
             halign='center',
             size_hint=(1, None), height=28,
@@ -61,7 +61,7 @@ class UpdateInstallScreen(BaseScreen):
 
         self.pct_label = Label(
             text='0%',
-            font_size=FONT_SIZES['small'],
+            font_size=self.suf(FONT_SIZES['small']),
             color=COLORS['gray_400'],
             halign='center',
             size_hint=(1, None), height=18,
@@ -71,7 +71,7 @@ class UpdateInstallScreen(BaseScreen):
         # Stage
         self.stage_label = Label(
             text='Downloading update files',
-            font_size=FONT_SIZES['small'] + 2,
+            font_size=self.suf(FONT_SIZES['small'] + 2),
             color=COLORS['gray_500'],
             halign='center',
             size_hint=(1, None), height=24,
@@ -83,7 +83,7 @@ class UpdateInstallScreen(BaseScreen):
         # Warning
         warn = Label(
             text='Do not unplug the device',
-            font_size=FONT_SIZES['small'] + 2,
+            font_size=self.suf(FONT_SIZES['small'] + 2),
             bold=True,
             color=COLORS['yellow'],
             halign='center',
@@ -94,7 +94,7 @@ class UpdateInstallScreen(BaseScreen):
         # ETA
         self.eta_label = Label(
             text='Estimated time: calculating…',
-            font_size=FONT_SIZES['small'],
+            font_size=self.suf(FONT_SIZES['small']),
             color=COLORS['gray_500'],
             halign='center',
             size_hint=(1, None), height=20,

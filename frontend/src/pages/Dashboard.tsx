@@ -148,7 +148,7 @@ export default function Dashboard() {
             <p className="text-gray-600 mt-1">{meetings.length} total meetings</p>
           </div>
 
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2" data-tutorial="tutorial-recording">
             {recordingState === 'idle' && (
               <button
                 onClick={handleStartRecording}
@@ -212,7 +212,7 @@ export default function Dashboard() {
         )}
 
         {/* Stats cards */}
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6" data-tutorial="tutorial-stats">
           <div className="bg-white rounded-lg border border-gray-200 p-4">
             <div className="flex items-center">
               <div className="flex-shrink-0">
@@ -257,7 +257,7 @@ export default function Dashboard() {
         </div>
 
         {/* Search and filter */}
-        <div className="flex flex-col sm:flex-row gap-4">
+        <div className="flex flex-col sm:flex-row gap-4" data-tutorial="tutorial-filters">
           <div className="flex-1">
             <div className="relative">
               <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">

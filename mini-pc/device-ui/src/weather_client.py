@@ -46,9 +46,8 @@ _WEATHER_FILE_NAME = "weather_location.json"
 # Anonymous IP geolocation (HTTPS, ~1k req/day per IP).
 _IPAPI_URL = "https://ipapi.co/json/"
 
-_OPEN_METEO_FORECAST    = "https://api.open-meteo.com/v1/forecast"
-_OPEN_METEO_GEOCODE     = "https://geocoding-api.open-meteo.com/v1/search"
-_OPEN_METEO_AIR_QUALITY = "https://air-quality-api.open-meteo.com/v1/air-quality"
+_OPEN_METEO_FORECAST = "https://api.open-meteo.com/v1/forecast"
+_OPEN_METEO_GEOCODE = "https://geocoding-api.open-meteo.com/v1/search"
 
 # Sensible default if every network call fails on first boot. Matches the
 # existing DISPLAY_TIMEZONE default ("Asia/Kolkata") so the experience stays
@@ -88,13 +87,8 @@ class WeatherSnapshot:
     city: str
     temp_c: float
     label: str
-    icon: str          # short key: "sun" | "cloud" | "rain" | "snow" | "thunder"
+    icon: str  # short key: "sun" | "cloud" | "rain" | "snow" | "thunder"
     fetched_at: float  # epoch seconds
-    hi_c: Optional[float] = None
-    lo_c: Optional[float] = None
-    humidity_pct: Optional[int] = None
-    wind_kmh: Optional[float] = None
-    aqi: Optional[int] = None  # US AQI index
 
     def is_stale(self, max_age_s: float = 3600.0) -> bool:
         return (time.time() - self.fetched_at) > max_age_s
@@ -240,98 +234,32 @@ class WeatherClient:
                     params={
                         "latitude": loc["latitude"],
                         "longitude": loc["longitude"],
-                        "current": (
-                            "temperature_2m,weather_code,"
-                            "relative_humidity_2m,wind_speed_10m"
-                        ),
-                        "daily": "temperature_2m_max,temperature_2m_min",
+                        "current": "temperature_2m,weather_code",
                         "temperature_unit": "celsius",
-                        "wind_speed_unit": "kmh",
                         "timezone": "auto",
-                        "forecast_days": 1,
                     },
                 )
                 resp.raise_for_status()
                 data = resp.json()
-
-                # AQI — separate endpoint; failure is non-fatal
-                aqi_val: Optional[int] = None
-                try:
-                    aqi_resp = await client.get(
-                        _OPEN_METEO_AIR_QUALITY,
-                        params={
-                            "latitude": loc["latitude"],
-                            "longitude": loc["longitude"],
-                            "current": "us_aqi",
-                        },
-                    )
-                    aqi_resp.raise_for_status()
-                    raw_aqi = (
-                        (aqi_resp.json() or {})
-                        .get("current", {})
-                        .get("us_aqi")
-                    )
-                    if raw_aqi is not None:
-                        aqi_val = int(raw_aqi)
-                except Exception:  # noqa: BLE001
-                    logger.debug("AQI fetch failed (non-fatal)", exc_info=True)
-
         except Exception as exc:  # noqa: BLE001
             logger.warning("Open-Meteo forecast failed: %s", exc)
             return
-
-        cur   = (data or {}).get("current") or {}
-        daily = (data or {}).get("daily")   or {}
-
+        cur = (data or {}).get("current") or {}
         try:
             temp_c = float(cur.get("temperature_2m"))
         except (TypeError, ValueError):
             return
-
         try:
             code = int(cur.get("weather_code") or 0)
         except (TypeError, ValueError):
             code = 0
         label, icon = _decode_weather_code(code)
-
-        hi_c = lo_c = None
-        try:
-            hi_list = daily.get("temperature_2m_max") or []
-            lo_list = daily.get("temperature_2m_min") or []
-            if hi_list:
-                hi_c = float(hi_list[0])
-            if lo_list:
-                lo_c = float(lo_list[0])
-        except (TypeError, ValueError, IndexError):
-            pass
-
-        humidity_pct: Optional[int] = None
-        try:
-            rh = cur.get("relative_humidity_2m")
-            if rh is not None:
-                humidity_pct = int(rh)
-        except (TypeError, ValueError):
-            pass
-
-        wind_kmh: Optional[float] = None
-        try:
-            ws = cur.get("wind_speed_10m")
-            if ws is not None:
-                wind_kmh = float(ws)
-        except (TypeError, ValueError):
-            pass
-
         snap = WeatherSnapshot(
             city=str(loc["city"]),
             temp_c=temp_c,
             label=label,
             icon=icon,
             fetched_at=time.time(),
-            hi_c=hi_c,
-            lo_c=lo_c,
-            humidity_pct=humidity_pct,
-            wind_kmh=wind_kmh,
-            aqi=aqi_val,
         )
         self._publish(snap)
 

@@ -87,7 +87,10 @@ export default function AssistantChat() {
   }
 
   return (
-    <div className="flex flex-col h-[calc(100vh-4rem)] max-w-4xl mx-auto px-4 py-6">
+    <div
+      className="flex flex-col h-[calc(100vh-4rem)] max-w-4xl mx-auto px-4 py-6"
+      data-tutorial="tutorial-assistant"
+    >
       <div className="mb-4 shrink-0">
         <h1 className="text-2xl font-semibold text-gray-900">Assistant</h1>
         <p className="text-sm text-gray-600 mt-1">

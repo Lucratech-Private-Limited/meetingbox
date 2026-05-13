@@ -208,16 +208,6 @@ class BriefingScreen(BaseScreen):
         )
         scroll.add_widget(self.response_label)
         card.add_widget(scroll)
-
-        self.pending_strip = BoxLayout(
-            orientation="vertical",
-            size_hint=(1, None),
-            height=0,
-            spacing=sv(6),
-            padding=[0, sv(6), 0, 0],
-        )
-        card.add_widget(self.pending_strip)
-
         root.add_widget(card)
 
         bottom = BoxLayout(orientation="horizontal", size_hint=(1, None), height=sv(56), spacing=sv(10))
@@ -233,7 +223,7 @@ class BriefingScreen(BaseScreen):
         root.add_widget(bottom)
 
         hint = Label(
-            text="Calendar and email sends can be approved here (OK) or skipped. Edits: use the web assistant queue.",
+            text="Assistant cards run real backend actions · writes still need web approval.",
             font_size=sf(FONT_SIZES["tiny"]),
             color=COLORS["gray_500"],
             halign="center",
@@ -248,115 +238,6 @@ class BriefingScreen(BaseScreen):
 
     def on_enter(self):
         self.title.text = f"Tony · {display_now().strftime('%A')}"
-
-    def _clear_pending_strip(self):
-        self.pending_strip.clear_widgets()
-        self.pending_strip.height = 0
-
-    def _populate_pending_strip(self, items):
-        self._clear_pending_strip()
-        if not items:
-            return
-        n = min(len(items), 8)
-        for it in items[:8]:
-            self._add_pending_row(it)
-        self.pending_strip.height = sv(48) * n + sv(8)
-
-    def _add_pending_row(self, item: dict):
-        pid = str(item.get("id") or "")
-        label_txt = (
-            item.get("brief_label")
-            or item.get("title")
-            or item.get("tool_name")
-            or pid[:12]
-        )
-        row = BoxLayout(
-            orientation="horizontal",
-            size_hint=(1, None),
-            height=sv(46),
-            spacing=sv(6),
-        )
-        lbl = Label(
-            text=str(label_txt)[:200],
-            font_size=sf(FONT_SIZES["small"]),
-            color=COLORS["white"],
-            halign="left",
-            valign="middle",
-            size_hint=(0.66, 1),
-        )
-        lbl.bind(size=lbl.setter("text_size"))
-        row.add_widget(lbl)
-        ok_btn = SecondaryButton(
-            text="OK",
-            size_hint=(0.17, 1),
-            font_size=sf(FONT_SIZES["tiny"]),
-        )
-        skip_btn = SecondaryButton(
-            text="Skip",
-            size_hint=(0.17, 1),
-            font_size=sf(FONT_SIZES["tiny"]),
-        )
-        ok_btn.bind(on_release=lambda *_b, p=pid: self._approve_pending(p))
-        skip_btn.bind(on_release=lambda *_b, p=pid: self._reject_pending(p))
-        row.add_widget(ok_btn)
-        row.add_widget(skip_btn)
-        self.pending_strip.add_widget(row)
-
-    def _approve_pending(self, pending_id: str):
-        if not pending_id or self._loading:
-            return
-        self._loading = True
-        self.status_label.text = "Approving…"
-
-        async def _go():
-            try:
-                await self.backend.approve_assistant_pending(pending_id)
-
-                def _ok(_dt):
-                    self.status_label.text = "Approved"
-                    self._clear_pending_strip()
-                    self._loading = False
-
-                Clock.schedule_once(_ok, 0)
-            except Exception as exc:
-                msg = str(exc).strip()[:220] or "Approve failed"
-
-                def _bad(_dt):
-                    self.status_label.text = "Approve failed"
-                    self.response_label.text = (self.response_label.text or "") + f"\n\n{msg}"
-                    self._loading = False
-
-                Clock.schedule_once(_bad, 0)
-
-        run_async(_go())
-
-    def _reject_pending(self, pending_id: str):
-        if not pending_id or self._loading:
-            return
-        self._loading = True
-        self.status_label.text = "Skipping…"
-
-        async def _go():
-            try:
-                await self.backend.reject_assistant_pending(pending_id)
-
-                def _ok(_dt):
-                    self.status_label.text = "Skipped"
-                    self._clear_pending_strip()
-                    self._loading = False
-
-                Clock.schedule_once(_ok, 0)
-            except Exception as exc:
-                msg = str(exc).strip()[:220] or "Skip failed"
-
-                def _bad(_dt):
-                    self.status_label.text = "Skip failed"
-                    self.response_label.text = (self.response_label.text or "") + f"\n\n{msg}"
-                    self._loading = False
-
-                Clock.schedule_once(_bad, 0)
-
-        run_async(_go())
 
     def run_assistant(self, prompt: str, label: str):
         if self._loading:
@@ -378,7 +259,6 @@ class BriefingScreen(BaseScreen):
                 def _apply(_dt):
                     self.status_label.text = f"Ready · {agent}{suffix}"
                     self.response_label.text = text
-                    self._populate_pending_strip(data.get("pending_actions") or [])
                     self._loading = False
                     self.refresh_btn.disabled = False
 
@@ -393,7 +273,6 @@ class BriefingScreen(BaseScreen):
                         f"Reason: {msg}\n\n"
                         "Check that the device is paired, internet is available, and backend URL is reachable."
                     )
-                    self._clear_pending_strip()
                     self._loading = False
                     self.refresh_btn.disabled = False
 

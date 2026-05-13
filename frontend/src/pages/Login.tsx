@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { useSearchParams } from 'react-router-dom'
+import { Link, useSearchParams } from 'react-router-dom'
 import { useAuthStore } from '../store/authStore'
 import toast from 'react-hot-toast'
 
@@ -48,6 +48,15 @@ export default function Login() {
           </button>
           <p className="text-center text-sm text-gray-500">
             Your Google account is only used for dashboard access. Gmail and Calendar stay optional in the Integrations tab.
+          </p>
+          <p className="text-center text-xs text-gray-600">
+            <Link to="/privacy" className="underline hover:text-gray-400">
+              Privacy Policy
+            </Link>
+            <span className="mx-2">·</span>
+            <Link to="/terms" className="underline hover:text-gray-400">
+              Terms of Service
+            </Link>
           </p>
         </div>
       </div>

@@ -25,10 +25,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 MINI_PC_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-MONOREPO_ROOT=""
-if [[ -f "$MINI_PC_ROOT/../server/docker-compose.yml" ]]; then
-  MONOREPO_ROOT="$(cd "$MINI_PC_ROOT/.." && pwd)"
-fi
+# shellcheck source=../scripts/lib_meetingbox_paths.sh
+source "$SCRIPT_DIR/../scripts/lib_meetingbox_paths.sh"
+MONOREPO_ROOT="$(meetingbox_resolve_monorepo_root "$MINI_PC_ROOT")"
 
 _load_env_file() {
   local f="$1"
@@ -88,6 +87,9 @@ fi
 export REDIS_HOST="${REDIS_HOST:-127.0.0.1}"
 export TEMP_SEGMENTS_DIR="${TEMP_SEGMENTS_DIR:-$DATA_ROOT/data/audio/temp}"
 export RECORDINGS_DIR="${RECORDINGS_DIR:-$DATA_ROOT/data/audio/recordings}"
+if [[ -z "${DEVICE_AUTH_TOKEN:-}" ]] && [[ -f "$DATA_ROOT/data/config/device_auth_token" ]]; then
+  export DEVICE_AUTH_TOKEN="$(tr -d '\r\n' < "$DATA_ROOT/data/config/device_auth_token")"
+fi
 export AUDIO_INPUT_DEVICE_INDEX="${AUDIO_INPUT_DEVICE_INDEX:-}"
 export AUDIO_INPUT_DEVICE_NAME="${AUDIO_INPUT_DEVICE_NAME:-}"
 export UPLOAD_AUDIO_ON_STOP="${UPLOAD_AUDIO_ON_STOP:-1}"

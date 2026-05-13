@@ -1,8 +1,9 @@
 """Assistant / orchestrator HTTP API (Phases 1–3)."""
 
+import os
 from typing import Optional
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from assistant_service import (
@@ -12,7 +13,10 @@ from assistant_service import (
   reject_pending_action,
   update_pending_assistant_payload,
 )
-from auth import get_current_user, get_optional_user
+from auth import get_current_user, get_optional_actor
+from rate_limit import limiter
+
+_ASSISTANT_ALLOW_ANON = os.getenv("MEETINGBOX_ASSISTANT_ALLOW_ANON", "").strip() == "1"
 
 router = APIRouter()
 
@@ -27,18 +31,25 @@ class PendingPayloadUpdate(BaseModel):
 
 
 @router.post("/intent")
+@limiter.limit("60/minute")
 async def post_intent(
+  request: Request,
   body: IntentRequest,
-  current_user: Optional[dict] = Depends(get_optional_user),
+  current_actor: Optional[dict] = Depends(get_optional_actor),
 ):
   """
   Route the user message through the orchestrator, run safe read-only tools,
   and queue calendar/email writes as pending actions until approved.
+
+  Requires a dashboard JWT or paired device token unless
+  MEETINGBOX_ASSISTANT_ALLOW_ANON=1 (not recommended for production or demos on the public internet).
   """
-  uid = current_user["id"] if current_user else None
+  if not _ASSISTANT_ALLOW_ANON and current_actor is None:
+    raise HTTPException(status_code=401, detail="Authentication required.")
+  owner_id = current_actor["user"]["id"] if current_actor else None
   return process_assistant_intent(
     message=body.message,
-    user_id=uid,
+    user_id=owner_id,
     meeting_id=body.meeting_id,
     source="api_intent",
   )

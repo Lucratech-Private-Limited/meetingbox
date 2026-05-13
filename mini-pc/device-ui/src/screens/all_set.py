@@ -42,7 +42,7 @@ class AllSetScreen(BaseScreen):
         # Green checkmark
         self.check_label = Label(
             text='\u2713',
-            font_size=48,
+            font_size=self.suf(48),
             bold=True,
             color=COLORS['green'],
             halign='center',
@@ -54,7 +54,7 @@ class AllSetScreen(BaseScreen):
         # Main message
         self.msg_label = Label(
             text="You're All Set!",
-            font_size=22,
+            font_size=self.suf(22),
             bold=True,
             color=COLORS['white'],
             halign='center',
@@ -68,7 +68,7 @@ class AllSetScreen(BaseScreen):
         # Dashboard URL prompt
         self.url_prompt = Label(
             text='Create your account at:',
-            font_size=FONT_SIZES['body'],
+            font_size=self.suf(FONT_SIZES['body']),
             color=COLORS['gray_400'],
             halign='center',
             size_hint=(1, None), height=22,
@@ -78,7 +78,7 @@ class AllSetScreen(BaseScreen):
 
         self.url_label = Label(
             text=DASHBOARD_PUBLIC_URL,
-            font_size=FONT_SIZES['medium'],
+            font_size=self.suf(FONT_SIZES['medium']),
             bold=True,
             color=COLORS['blue'],
             halign='center',
@@ -106,7 +106,7 @@ class AllSetScreen(BaseScreen):
 
         self.tap_hint = Label(
             text='Tap anywhere to continue',
-            font_size=FONT_SIZES['tiny'],
+            font_size=self.suf(FONT_SIZES['tiny']),
             color=COLORS['gray_600'],
             halign='center',
             size_hint=(1, None), height=16,
@@ -175,6 +175,6 @@ class AllSetScreen(BaseScreen):
                 pass
         return Label(
             text='[QR]',
-            font_size=FONT_SIZES['small'],
+            font_size=self.suf(FONT_SIZES['small']),
             color=COLORS['gray_500'],
         )

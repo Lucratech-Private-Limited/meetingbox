@@ -9,7 +9,31 @@ from kivy.uix.behaviors import ButtonBehavior
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.label import Label
 from kivy.graphics import Color, RoundedRectangle
-from config import COLORS, FONT_SIZES, BORDER_RADIUS, SPACING
+from config import (
+    BORDER_RADIUS,
+    COLORS,
+    FONT_SIZES,
+    SPACING,
+    display_now,
+    other_screen_horizontal_scale,
+    other_screen_vertical_scale,
+    to_display_local,
+)
+
+
+def _mc_suv(px):
+    v = other_screen_vertical_scale()
+    return max(1, int(round(float(px) * v)))
+
+
+def _mc_suh(px):
+    h = other_screen_horizontal_scale()
+    return max(1, int(round(float(px) * h)))
+
+
+def _mc_suf(fs):
+    v = other_screen_vertical_scale()
+    return max(6, int(round(float(fs) * v)))
 
 
 class MeetingCard(ButtonBehavior, BoxLayout):
@@ -24,26 +48,28 @@ class MeetingCard(ButtonBehavior, BoxLayout):
 
         kwargs.setdefault('orientation', 'vertical')
         kwargs.setdefault('size_hint_y', None)
-        kwargs.setdefault('height', 60)
-        kwargs.setdefault('padding', [SPACING['button_spacing'], 8])
-        kwargs.setdefault('spacing', 2)
+        kwargs.setdefault('height', _mc_suv(86))
+        kwargs.setdefault('padding', [_mc_suh(16), _mc_suv(12)])
+        kwargs.setdefault('spacing', _mc_suv(5))
 
         super().__init__(**kwargs)
 
-        # Background
+        # Background (avoid canvas.before.clear on press — smoother scrolling)
         with self.canvas.before:
-            Color(*COLORS['surface'])
+            self._shadow_color = Color(0, 0, 0, 0.18)
+            self._shadow = RoundedRectangle(pos=(self.x + 1, self.y - _mc_suv(3)), size=self.size, radius=[BORDER_RADIUS])
+            self._bg_color = Color(0.13, 0.17, 0.24, 0.92)
             self._bg = RoundedRectangle(
                 pos=self.pos, size=self.size, radius=[BORDER_RADIUS])
         self.bind(
-            pos=lambda w, v: setattr(self._bg, 'pos', w.pos),
-            size=lambda w, v: setattr(self._bg, 'size', w.size),
+            pos=self._sync_bg,
+            size=self._sync_bg,
         )
 
         # Title
         title = Label(
             text=meeting['title'],
-            font_size=FONT_SIZES['medium'],
+            font_size=_mc_suf(FONT_SIZES['medium'] + 1),
             color=COLORS['white'],
             bold=True,
             halign='left', valign='top',
@@ -55,8 +81,8 @@ class MeetingCard(ButtonBehavior, BoxLayout):
         # Metadata
         meta = Label(
             text=self._format_meta(),
-            font_size=FONT_SIZES['small'],
-            color=COLORS['gray_500'],
+            font_size=_mc_suf(FONT_SIZES['small']),
+            color=COLORS['gray_300'],
             halign='left', valign='top',
             size_hint=(1, 0.3),
         )
@@ -68,7 +94,7 @@ class MeetingCard(ButtonBehavior, BoxLayout):
         if pending > 0:
             pa = Label(
                 text=f"⚡ {pending} pending action{'s' if pending > 1 else ''}",
-                font_size=FONT_SIZES['small'],
+                font_size=_mc_suf(FONT_SIZES['small']),
                 color=COLORS['yellow'],
                 halign='left', valign='top',
                 size_hint=(1, 0.25),
@@ -76,10 +102,20 @@ class MeetingCard(ButtonBehavior, BoxLayout):
             pa.bind(size=pa.setter('text_size'))
             self.add_widget(pa)
 
+
+    def _sync_bg(self, *_args):
+        self._shadow.pos = (self.x + 1, self.y - _mc_suv(3))
+        self._shadow.size = self.size
+        self._bg.pos = self.pos
+        self._bg.size = self.size
+
     def _format_meta(self) -> str:
-        start = datetime.fromisoformat(
-            self.meeting['start_time'].replace('Z', '+00:00'))
-        now = datetime.now(start.tzinfo)
+        start = to_display_local(
+            datetime.fromisoformat(
+                self.meeting['start_time'].replace('Z', '+00:00')
+            )
+        )
+        now = display_now()
         delta = now - start
         if delta < timedelta(hours=1):
             ago = f"{int(delta.total_seconds() / 60)} min ago"
@@ -93,15 +129,7 @@ class MeetingCard(ButtonBehavior, BoxLayout):
         return ago
 
     def on_press(self):
-        self.canvas.before.clear()
-        with self.canvas.before:
-            Color(*COLORS['surface_light'])
-            self._bg = RoundedRectangle(
-                pos=self.pos, size=self.size, radius=[BORDER_RADIUS])
+        self._bg_color.rgba = (0.18, 0.24, 0.34, 0.98)
 
     def on_release(self):
-        self.canvas.before.clear()
-        with self.canvas.before:
-            Color(*COLORS['surface'])
-            self._bg = RoundedRectangle(
-                pos=self.pos, size=self.size, radius=[BORDER_RADIUS])
+        self._bg_color.rgba = (0.13, 0.17, 0.24, 0.92)

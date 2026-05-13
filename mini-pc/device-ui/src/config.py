@@ -16,7 +16,51 @@ logger = logging.getLogger(__name__)
 # BACKEND CONNECTION
 # ============================================================================
 
-BACKEND_URL = os.getenv('BACKEND_URL', 'http://localhost:8000')
+
+def _normalize_dashboard_config(raw: str) -> tuple[str, str]:
+    """
+    Parse DASHBOARD_URL env: accepts host:port or full URL (with optional trailing slash).
+    Returns (short_label, public_url) — public_url has no trailing slash.
+    """
+    s = (raw or "").strip().rstrip("/")
+    if not s:
+        s = "meetingbox.local"
+    low = s.lower()
+    if low.startswith("https://"):
+        rest = s[8:]
+        hostport = rest.split("/")[0]
+        if not hostport:
+            hostport = "meetingbox.local"
+        return hostport, f"https://{hostport}"
+    if low.startswith("http://"):
+        rest = s[7:]
+        hostport = rest.split("/")[0]
+        if not hostport:
+            hostport = "meetingbox.local"
+        return hostport, f"http://{hostport}"
+    hostport = s.split("/")[0]
+    return hostport, f"http://{hostport}"
+
+
+def _resolve_backend_url() -> str:
+    """
+    REST API base URL. Prefer explicit BACKEND_URL; if unset/empty and DASHBOARD_URL is set,
+    use the same scheme/host as the dashboard so pairing (claim) hits the same server that
+    issued the code (avoids claiming against localhost while the QR opened a cloud URL).
+    """
+    explicit = (os.getenv("BACKEND_URL") or "").strip().rstrip("/")
+    if explicit:
+        return explicit
+    dash_env = (os.getenv("DASHBOARD_URL") or "").strip()
+    if not dash_env:
+        return "http://localhost:8000"
+    _, pub = _normalize_dashboard_config(dash_env)
+    out = pub.strip().rstrip("/")
+    logger.info("BACKEND_URL not set; derived from DASHBOARD_URL: %s", out)
+    return out
+
+
+BACKEND_URL = _resolve_backend_url()
 
 
 def _default_ws_url(http_url: str) -> str:
@@ -44,13 +88,68 @@ WS_RECONNECT_DELAY = 3  # seconds
 WS_MAX_RECONNECT_ATTEMPTS = 10
 
 # ============================================================================
+# LOCAL REDIS (receive audio_level / mic_test_level from audio container)
+# ============================================================================
+
+LOCAL_REDIS_HOST = (os.getenv("LOCAL_REDIS_HOST", "") or "").strip() or "redis"
+LOCAL_REDIS_PORT = int(os.getenv("LOCAL_REDIS_PORT", "6379"))
+
+# ============================================================================
+# MICROPHONE (mic test + should match mini-pc/audio capture device)
+# ============================================================================
+
+AUDIO_INPUT_DEVICE_INDEX = (os.getenv("AUDIO_INPUT_DEVICE_INDEX", "") or "").strip()
+AUDIO_INPUT_DEVICE_NAME = (os.getenv("AUDIO_INPUT_DEVICE_NAME", "") or "").strip()
+
+# ============================================================================
 # DISPLAY SETTINGS
 # ============================================================================
 
+
+def _parse_display_px(name: str, default: int) -> int:
+    """Env may be unset, empty, or non-numeric (e.g. DISPLAY_WIDTH= in .env) — avoid crashing."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    s = str(raw).strip()
+    if not s:
+        logger.warning("%s is set but empty; using default %s", name, default)
+        return default
+    try:
+        v = int(s)
+    except ValueError:
+        logger.warning("%s=%r is not an integer; using default %s", name, raw, default)
+        return default
+    if v < 32 or v > 32768:
+        logger.warning("%s=%s out of range [32,32768]; using default %s", name, v, default)
+        return default
+    return v
+
+
+def _parse_unit_scale(name: str, default: float) -> float:
+    """Multiplier vs 1024×600 layout baseline (see MEETINGBOX_HOME_CONTENT_SCALE)."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    s = str(raw).strip()
+    if not s:
+        logger.warning("%s is set but empty; using default %s", name, default)
+        return default
+    try:
+        v = float(s)
+    except ValueError:
+        logger.warning("%s=%r is not a float; using default %s", name, raw, default)
+        return default
+    if v < 0.5 or v > 1.5:
+        logger.warning("%s=%s out of range [0.5,1.5]; using default %s", name, v, default)
+        return default
+    return v
+
+
 # Display resolution
 # Figma-aligned default is 1024x600; override via env vars as needed.
-DISPLAY_WIDTH = int(os.getenv('DISPLAY_WIDTH', '1024'))
-DISPLAY_HEIGHT = int(os.getenv('DISPLAY_HEIGHT', '600'))
+DISPLAY_WIDTH = _parse_display_px("DISPLAY_WIDTH", 1024)
+DISPLAY_HEIGHT = _parse_display_px("DISPLAY_HEIGHT", 600)
 
 # Display orientation
 DISPLAY_ORIENTATION = os.getenv('DISPLAY_ORIENTATION', 'landscape')
@@ -60,6 +159,48 @@ TARGET_FPS = int(os.getenv('TARGET_FPS', '30'))
 
 # Fullscreen mode (set FULLSCREEN=0 for windowed dev mode)
 FULLSCREEN = os.getenv('FULLSCREEN', '0') == '1'
+
+# ============================================================================
+# DISPLAY CLOCK (wall time in UI — default India Standard Time)
+# ============================================================================
+# Set DISPLAY_TIMEZONE to an IANA name (e.g. Europe/London) if needed.
+# If zoneinfo data is missing, falls back to fixed UTC+5:30.
+
+
+def _load_display_tzinfo():
+    from datetime import timedelta, timezone
+
+    name = (os.getenv("DISPLAY_TIMEZONE") or "Asia/Kolkata").strip() or "Asia/Kolkata"
+    try:
+        from zoneinfo import ZoneInfo
+
+        return ZoneInfo(name)
+    except Exception:
+        logger.warning(
+            "DISPLAY_TIMEZONE %r unavailable (install tzdata on this OS); using UTC+5:30",
+            name,
+        )
+        return timezone(timedelta(hours=5, minutes=30))
+
+
+DISPLAY_TZINFO = _load_display_tzinfo()
+
+
+def display_now():
+    """Current time in the configured display timezone (default IST)."""
+    from datetime import datetime
+
+    return datetime.now(DISPLAY_TZINFO)
+
+
+def to_display_local(dt):
+    """Convert an aware datetime to the display timezone; naive values treated as UTC."""
+    from datetime import datetime, timezone
+
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(DISPLAY_TZINFO)
+
 
 # ============================================================================
 # TOUCH SETTINGS
@@ -140,6 +281,54 @@ SPACING = {
     'list_item_spacing': 8,
 }
 
+
+def display_vertical_scale_raw() -> float:
+    """Height vs 600px design baseline (capped)."""
+    return min(max(DISPLAY_HEIGHT / 600.0, 0.72), 2.35)
+
+
+def display_horizontal_scale_raw() -> float:
+    """Width vs 1024px design baseline (capped)."""
+    ratio = DISPLAY_WIDTH / 1024.0
+    # Panels narrower than the 1024 design width (e.g. portrait 600×1024) must scale
+    # down; the old 0.85 floor made everything oversized horizontally.
+    if DISPLAY_WIDTH < 1024:
+        return min(max(ratio, 0.48), 3.2)
+    return min(max(ratio, 0.85), 3.2)
+
+
+# Home uses this factor on top of display scale; other screens use OTHER (20% larger than home).
+# Default 1.0 matches the Figma 1024×600 baseline; use MEETINGBOX_HOME_CONTENT_SCALE=0.75 on tight 7" panels.
+HOME_CONTENT_SCALE = _parse_unit_scale("MEETINGBOX_HOME_CONTENT_SCALE", 1.0)
+OTHER_CONTENT_SCALE = HOME_CONTENT_SCALE * 1.2
+
+
+def home_layout_vertical_scale() -> float:
+    return min(display_vertical_scale_raw(), 2.25) * HOME_CONTENT_SCALE
+
+
+def home_layout_horizontal_scale() -> float:
+    return display_horizontal_scale_raw() * HOME_CONTENT_SCALE
+
+
+def other_screen_vertical_scale() -> float:
+    return min(display_vertical_scale_raw(), 2.25) * OTHER_CONTENT_SCALE
+
+
+def other_screen_horizontal_scale() -> float:
+    return display_horizontal_scale_raw() * OTHER_CONTENT_SCALE
+
+
+def home_center_column_width() -> int:
+    """Wide panels: wide centered column; small panels: nearly full width (before HOME_CONTENT_SCALE)."""
+    side = SPACING["screen_padding"] * 4
+    usable = max(1, DISPLAY_WIDTH - side)
+    if DISPLAY_WIDTH <= 1440:
+        # Never wider than the display (old max(360, …) could exceed narrow widths).
+        return max(160, usable)
+    return min(2200, max(720, int(DISPLAY_WIDTH * 0.56)))
+
+
 # More rounded corners (Apple style)
 BORDER_RADIUS = 14
 
@@ -219,32 +408,6 @@ DEFAULT_AUTO_DELETE = 'never'       # never, 30, 60, 90
 
 DEVICE_MODEL = 'MeetingBox v1.0'
 
-
-def _normalize_dashboard_config(raw: str) -> tuple[str, str]:
-    """
-    Parse DASHBOARD_URL env: accepts host:port or full URL (with optional trailing slash).
-    Returns (short_label, public_url) — public_url has no trailing slash.
-    """
-    s = (raw or "").strip().rstrip("/")
-    if not s:
-        s = "meetingbox.local"
-    low = s.lower()
-    if low.startswith("https://"):
-        rest = s[8:]
-        hostport = rest.split("/")[0]
-        if not hostport:
-            hostport = "meetingbox.local"
-        return hostport, f"https://{hostport}"
-    if low.startswith("http://"):
-        rest = s[7:]
-        hostport = rest.split("/")[0]
-        if not hostport:
-            hostport = "meetingbox.local"
-        return hostport, f"http://{hostport}"
-    hostport = s.split("/")[0]
-    return hostport, f"http://{hostport}"
-
-
 _d_label, _d_public = _normalize_dashboard_config(os.getenv("DASHBOARD_URL", "meetingbox.local"))
 # Compact host:port for subtitles (e.g. Configure at …)
 DASHBOARD_URL = _d_label
@@ -263,8 +426,8 @@ LOG_TO_CONSOLE = os.getenv('LOG_TO_CONSOLE', '1') == '1'
 # PATHS
 # ============================================================================
 
-BASE_DIR = Path(__file__).parent.parent.resolve()
-ASSETS_DIR = BASE_DIR / 'assets'
+BASE_DIR = Path(os.getenv('MEETINGBOX_APP_DIR', Path(__file__).parent.parent)).expanduser().resolve()
+ASSETS_DIR = Path(os.getenv('MEETINGBOX_ASSETS_DIR', BASE_DIR / 'assets')).expanduser().resolve()
 FONTS_DIR = ASSETS_DIR / 'fonts'
 ICONS_DIR = ASSETS_DIR / 'icons'
 
@@ -466,6 +629,7 @@ try:
     ASSETS_DIR.mkdir(exist_ok=True)
     FONTS_DIR.mkdir(exist_ok=True)
     ICONS_DIR.mkdir(exist_ok=True)
+    (ASSETS_DIR / "welcome").mkdir(exist_ok=True)
 except OSError as e:
     logger.warning("Could not create assets/fonts/icons dirs: %s", e)
 
@@ -475,4 +639,7 @@ except OSError as e:
 
 DEV_MODE = os.getenv('DEV_MODE', '0') == '1'
 SHOW_FPS = DEV_MODE or os.getenv('SHOW_FPS', '0') == '1'
+# SDL mouse pointer in borderless fullscreen (USB mouse / trackball on a touch kiosk).
+# When False, the pointer is hidden in FULLSCREEN=1; windowed (FULLSCREEN=0) always shows it.
+SHOW_MOUSE_CURSOR = os.getenv("SHOW_MOUSE_CURSOR", "0") == "1"
 DEBUG_BORDERS = DEV_MODE and os.getenv('DEBUG_BORDERS', '0') == '1'

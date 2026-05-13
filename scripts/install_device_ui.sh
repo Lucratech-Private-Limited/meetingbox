@@ -78,7 +78,7 @@ if ! docker compose version &>/dev/null; then
 fi
 
 # Ensure user is in required groups
-usermod -aG docker,video,input,audio "$ACTUAL_USER"
+usermod -aG docker,video,input,audio,tty "$ACTUAL_USER"
 echo "   Done"
 
 # -------------------------------------------------------
@@ -102,6 +102,12 @@ rsync -a \
     "$REPO_DIR/" "$INSTALL_DIR/"
 
 chown -R "$ACTUAL_USER:$ACTUAL_USER" "$INSTALL_DIR"
+
+# Optional production overrides (touch / passthrough) — omit if file missing
+COMPOSE_FILES=(-f docker-compose.yml)
+if [ -f "$INSTALL_DIR/docker-compose.prod.yml" ]; then
+    COMPOSE_FILES+=(-f docker-compose.prod.yml)
+fi
 echo "   Done"
 
 # -------------------------------------------------------
@@ -127,15 +133,15 @@ echo "   Skipping auto-startx (dev mode — enable for production)"
 #     echo "   startx already in .bashrc, skipping"
 # fi
 
-# NOTE: .xinitrc and auto-login are disabled during development.
-# Use scripts/deploy_production.sh for kiosk-style production setup.
-echo "   Skipping .xinitrc creation (dev mode)"
+# NOTE: .xinitrc and Plymouth/silent-boot are not configured here.
+# For a full kiosk image, customize X11/autologin on the host or see DEPLOY_LINUX.md.
+echo "   Skipping .xinitrc creation (dev-oriented install)"
 
 # -------------------------------------------------------
-# 4. Auto-login on tty1 (disabled during dev)
+# 4. Auto-login on tty1 (skipped — use host display manager or manual kiosk setup)
 # -------------------------------------------------------
 echo ""
-echo "4/7  Skipping auto-login on tty1 (dev mode — use deploy_production.sh for production)"
+echo "4/7  Skipping tty1 auto-login (configure on the appliance if needed)"
 
 # -------------------------------------------------------
 # 5. Systemd service for Docker Compose
@@ -155,8 +161,8 @@ Type=oneshot
 RemainAfterExit=yes
 WorkingDirectory=$INSTALL_DIR
 ExecStartPre=/bin/bash -c 'until docker info >/dev/null 2>&1; do sleep 2; done'
-ExecStart=/usr/bin/docker compose --profile backend --profile frontend up -d
-ExecStop=/usr/bin/docker compose down
+ExecStart=/usr/bin/docker compose ${COMPOSE_FILES[*]} --profile backend --profile frontend --profile screen up -d
+ExecStop=/usr/bin/docker compose ${COMPOSE_FILES[*]} down
 TimeoutStartSec=300
 
 [Install]
@@ -180,15 +186,15 @@ echo "6/7  Building and starting Docker containers..."
 cd "$INSTALL_DIR"
 
 # Stop anything running from a previous install
-docker compose down 2>/dev/null || true
+docker compose "${COMPOSE_FILES[@]}" down 2>/dev/null || true
 
-# Build all images
+# Build all images (including device-ui)
 echo "   Building images (this may take a few minutes on first run)..."
-docker compose --profile backend --profile frontend build
+docker compose "${COMPOSE_FILES[@]}" --profile backend --profile frontend --profile screen build
 
 # Start everything
 echo "   Starting containers..."
-docker compose --profile backend --profile frontend up -d
+docker compose "${COMPOSE_FILES[@]}" --profile backend --profile frontend --profile screen up -d
 
 echo "   Waiting for services to start..."
 sleep 15

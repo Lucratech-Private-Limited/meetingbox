@@ -29,6 +29,7 @@ class MockBackendClient:
             'auto_delete_days': 'never',
             'brightness': 'high',
             'screen_timeout': 'never',
+            'idle_screen_timeout': '30',
             'privacy_mode': False,
             'auto_record': False,
         }
@@ -298,6 +299,9 @@ class MockBackendClient:
             "uptime": 172800,
             "meetings_count": len(self.meetings),
         }
+
+    async def post_appliance_system_metrics(self, metrics: Dict) -> None:
+        await asyncio.sleep(0.05)
 
     async def check_for_updates(self) -> Dict:
         await asyncio.sleep(1.5)

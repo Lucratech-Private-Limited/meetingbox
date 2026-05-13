@@ -211,18 +211,8 @@ class VoiceCommandInterpreter:
     def awaiting_confirmation(self) -> bool:
         return time.monotonic() <= self._awaiting_confirmation_until
 
-    @property
-    def awaiting_command(self) -> bool:
-        """True during the post-wake window when follow-up speech is accepted."""
-        return time.monotonic() <= self._awaiting_command_until
-
     def reset(self) -> None:
         self._awaiting_command_until = 0.0
-
-    def activate(self, now: float | None = None) -> None:
-        """Open the command-listening window as if the wake phrase was just heard."""
-        now = time.monotonic() if now is None else now
-        self._awaiting_command_until = now + self.command_timeout_seconds
 
     def begin_confirmation(self, now: float | None = None) -> None:
         now = time.monotonic() if now is None else now
@@ -239,15 +229,6 @@ class VoiceCommandInterpreter:
 
     def heard_wake_phrase(self, text: str) -> bool:
         return self._heard_wake_phrase(_normalize_text(text))
-
-    def should_trigger_wake_callback(self, norm: str) -> bool:
-        """True only for wake-only lines — not when a command is in the same utterance."""
-        if not self._heard_wake_phrase(norm):
-            return False
-        wake_wc = len(self.wake_phrase.split())
-        if len(norm.split()) <= wake_wc:
-            return True
-        return self._detect_intent(norm) is None
 
     def heard_start_command(self, text: str) -> bool:
         norm = _normalize_text(text)
@@ -325,15 +306,9 @@ class VoiceAssistant:
         self,
         on_intent: Callable[[VoiceIntent], None],
         on_wake_phrase: Callable[[str], None] | None = None,
-        on_amplitude: Callable[[float], None] | None = None,
-        on_conversation_turn: Callable[[str], None] | None = None,
     ):
         self._on_intent = on_intent
         self._on_wake_phrase = on_wake_phrase
-        self._on_amplitude = on_amplitude
-        self._on_conversation_turn = on_conversation_turn
-        self._amplitude_ema = 0.0
-        self._last_amplitude_call = 0.0
         self.enabled = _env_flag("VOICE_ASSISTANT_ENABLED", True)
         self.wake_phrase = (os.getenv("VOICE_ASSISTANT_WAKE_PHRASE") or "hey tony").strip() or "hey tony"
         self.start_commands = [
@@ -344,11 +319,7 @@ class VoiceAssistant:
             ).split(",")
             if cmd.strip()
         ]
-        # Floor keeps the post-wake speech window usable (avoid sub‑second timeouts via misconfigured env).
-        self.command_timeout_seconds = max(
-            5.0,
-            _env_float("VOICE_ASSISTANT_COMMAND_TIMEOUT", 15.0),
-        )
+        self.command_timeout_seconds = _env_float("VOICE_ASSISTANT_COMMAND_TIMEOUT", 6.0)
         self.action_cooldown_seconds = _env_float("VOICE_ASSISTANT_ACTION_COOLDOWN", 2.0)
         self.confirmation_timeout_seconds = _env_float("VOICE_ASSISTANT_CONFIRMATION_TIMEOUT", 8.0)
         self.model_name = (
@@ -424,28 +395,6 @@ class VoiceAssistant:
         else:
             logger.info("Voice assistant listening")
 
-    def simulate_wake(self) -> None:
-        """Activate command-listening mode as if the wake phrase was just heard.
-
-        Used when the user taps the mic icon to start voice interaction.
-        """
-        self._interpreter.activate()
-
-    def apply_server_settings(
-        self,
-        *,
-        wake_phrase: str | None = None,
-        enabled: bool | None = None,
-    ) -> None:
-        """Apply device settings synced from the backend (wake phrase, master enable)."""
-        if enabled is not None:
-            self.enabled = bool(enabled)
-        if wake_phrase is not None:
-            raw = (wake_phrase or "").strip()
-            if raw:
-                self.wake_phrase = raw
-                self._interpreter.wake_phrase = _normalize_text(raw)
-
     def begin_confirmation(self) -> None:
         self._interpreter.begin_confirmation()
 
@@ -502,37 +451,21 @@ class VoiceAssistant:
         logger.debug("Voice assistant heard: %s", norm)
         if (
             self._on_wake_phrase is not None
-            and self._interpreter.should_trigger_wake_callback(norm)
+            and self._interpreter.heard_wake_phrase(norm)
+            and self._interpreter.detect_intent(norm) is None
         ):
             try:
                 self._on_wake_phrase(norm)
             except Exception:
                 logger.exception("Voice assistant wake callback failed")
         intent = self._interpreter.handle_transcript(norm)
-        if intent is not None:
-            logger.info('Voice command accepted: "%s" -> %s', norm, intent.name)
-            try:
-                self._on_intent(intent)
-            except Exception:
-                logger.exception("Voice assistant callback failed")
+        if intent is None:
             return
-
-        # Natural-language assistant: anything spoken during the post-wake window
-        # that is not a rigid intent is sent to the server assistant (person-like Q&A).
-        if (
-            self._on_conversation_turn is not None
-            and self._interpreter.awaiting_command
-            and len(norm) >= 3
-        ):
-            if (
-                self._on_wake_phrase is not None
-                and self._interpreter.should_trigger_wake_callback(norm)
-            ):
-                return
-            try:
-                self._on_conversation_turn(norm)
-            except Exception:
-                logger.exception("Voice conversation turn callback failed")
+        logger.info('Voice command accepted: "%s" -> %s', norm, intent.name)
+        try:
+            self._on_intent(intent)
+        except Exception:
+            logger.exception("Voice assistant callback failed")
 
     def _resolve_input_device(self):
         idx_s = (AUDIO_INPUT_DEVICE_INDEX or "").strip()
@@ -576,32 +509,16 @@ class VoiceAssistant:
                 logger.debug("Voice assistant sounddevice status: %s", status)
             if self._stop_event.is_set() or self._is_paused():
                 return
-            raw = bytes(indata)
             try:
-                self._audio_queue.put_nowait(raw)
+                self._audio_queue.put_nowait(bytes(indata))
             except queue.Full:
                 try:
                     self._audio_queue.get_nowait()
                 except queue.Empty:
                     pass
                 try:
-                    self._audio_queue.put_nowait(raw)
+                    self._audio_queue.put_nowait(bytes(indata))
                 except queue.Full:
-                    pass
-            # Compute smoothed RMS amplitude and notify at ~30 fps
-            if self._on_amplitude is not None:
-                try:
-                    import array as _arr
-                    samples = _arr.array('h', raw)
-                    n = len(samples)
-                    if n:
-                        rms = (sum(x * x for x in samples) / n) ** 0.5 / 32768.0
-                        self._amplitude_ema = 0.3 * rms + 0.7 * self._amplitude_ema
-                        now_t = time.monotonic()
-                        if now_t - self._last_amplitude_call >= 0.033:
-                            self._last_amplitude_call = now_t
-                            self._on_amplitude(self._amplitude_ema)
-                except Exception:
                     pass
 
         last_err = None

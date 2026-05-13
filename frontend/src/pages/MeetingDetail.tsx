@@ -297,7 +297,7 @@ export default function MeetingDetailPage() {
           </div>
         </div>
 
-        <div className="flex flex-wrap items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2" data-tutorial="meeting-toolbar">
           <Link
             to={`/assistant?meeting=${encodeURIComponent(id || '')}`}
             className="px-4 py-2 text-sm font-medium text-primary-800 bg-primary-50 border border-primary-200 rounded-lg hover:bg-primary-100"
@@ -358,7 +358,7 @@ export default function MeetingDetailPage() {
       )}
 
       {/* Tabs */}
-      <div className="border-b border-gray-200 mb-6">
+      <div className="border-b border-gray-200 mb-6" data-tutorial="meeting-tabs">
         <nav className="flex space-x-8">
           {(['summary', 'transcript', 'actions', 'recording'] as const).map((tab) => (
             <button

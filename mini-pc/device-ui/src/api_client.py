@@ -355,6 +355,31 @@ class BackendClient:
             raise
 
     # ==================================================================
+    # ASSISTANT API
+    # ==================================================================
+
+    async def post_assistant_intent(
+            self,
+            message: str,
+            meeting_id: Optional[str] = None,
+    ) -> Dict:
+        """POST /api/assistant/intent — route a natural-language request."""
+        try:
+            payload: Dict = {"message": message}
+            if meeting_id:
+                payload["meeting_id"] = meeting_id
+            resp = await self.client.post(
+                f"{self.base_url}/api/assistant/intent",
+                json=payload,
+                timeout=120.0,
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.error("Assistant intent failed: %s", e)
+            raise
+
+    # ==================================================================
     # SETTINGS API (device route)
     # ==================================================================
 
@@ -507,6 +532,18 @@ class BackendClient:
                 raise
         except Exception as e:
             logger.error(f"Failed to fetch system info: {e}")
+            raise
+
+    async def post_appliance_system_metrics(self, metrics: Dict) -> None:
+        """POST /api/device/system-metrics — appliance CPU/RAM/disk for web dashboard."""
+        try:
+            resp = await self.client.post(
+                f"{self.base_url}/api/device/system-metrics",
+                json=metrics,
+            )
+            resp.raise_for_status()
+        except Exception as e:
+            logger.debug("post appliance system-metrics: %s", e)
             raise
 
     async def check_for_updates(self) -> Dict:

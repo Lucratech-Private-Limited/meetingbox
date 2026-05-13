@@ -1,14 +1,15 @@
 MeetingBox Core Software MVP
 ============================
 
-This repository can be used as a **monorepo** or split into **two packages**:
+This repository can be used as a **monorepo** or split into **three git repositories**:
 
 | Package | Folder | Role |
 |---------|--------|------|
-| **Server** | [`server/`](server/README.md) | FastAPI (`web/`), React (`frontend/` at repo root for now), nginx, Redis — deploy on a VPS |
-| **Appliance** | [`mini-pc/`](mini-pc/README.md) | Kivy UI + mic capture — runs on the meeting-room device |
+| **Server** | [`server/`](server/README.md) | FastAPI (`web/`), nginx, Redis — deploy on a VPS |
+| **Frontend** | [`frontend/`](frontend/README.md) | React (Vite) dashboard; build `dist/` and point `server` at it via `FRONTEND_DIST` |
+| **Appliance** | [`mini-pc/`](mini-pc/README.md) | Kivy UI + mic capture — meeting-room device |
 
-**Cloud deploy:** `cd server && cp .env.example .env && … && docker compose up -d --build` (see `server/README.md`).
+**Cloud deploy:** build the SPA (`frontend/README.md`), then `cd server && cp .env.example .env && … && docker compose up -d --build` (see `server/README.md`).
 
 MeetingBox captures room audio, transcribes with **OpenAI** (Whisper), summarizes with **Anthropic** Claude, and serves a React dashboard.
 
@@ -22,17 +23,29 @@ MeetingBox captures room audio, transcribes with **OpenAI** (Whisper), summarize
 - `docker-compose.yml` – **Full dev stack** (server `web` + nginx + `mini-pc` profiles)
 - `.env.example` – Root dev compose env
 
-## Splitting into two git repositories
+## Splitting into three git repositories
+
+Run from the monorepo root (replace remotes and branch names as needed):
 
 ```bash
-# Server (API + dashboard)
-git subtree split --prefix=server -b server-release
+git fetch origin
 
-# Appliance (device + mic)
+# 1) API + nginx + Redis (no React sources required on the server host if you ship dist only)
+git subtree split --prefix=server -b server-release
+git push <server-remote> server-release:main
+
+# 2) React dashboard (CI builds dist/, you sync artifacts to the host or a sibling checkout)
+git subtree split --prefix=frontend -b frontend-release
+git push <frontend-remote> frontend-release:main
+
+# 3) Device UI + audio
 git subtree split --prefix=mini-pc -b mini-pc-release
+git push <mini-pc-remote> mini-pc-release:main
 ```
 
-For a **standalone `server` repo**, move or copy `frontend/` into `server/frontend/` (or adjust `FRONTEND_DIST` / `DATA_ROOT` in `server/.env`).
+**Wiring:** In `server/.env`, set `FRONTEND_DIST` to the built SPA (for example `./frontend/dist` if you copied `frontend` under `server/`, or `../<frontend-repo-name>/dist` for sibling clones). See `server/.env.example` and `frontend/README.md`.
+
+**If `git subtree split` fails** with `Could not read <hash>` or `revision walk setup failed`, your `.git/objects` tree is damaged (common after disk/antivirus issues). Confirm with `git fsck --no-reflogs`. **Fix:** clone the repo fresh from GitHub into a new folder, or copy all files from the donor clone’s `.git/objects/pack/` into yours (same folder), then run `git fsck` again and retry the subtree command.
 
 ## Getting started (development, full stack on one machine)
 

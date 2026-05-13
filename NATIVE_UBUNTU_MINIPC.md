@@ -44,29 +44,20 @@ At boot, the mini PC should behave like an appliance:
 - Python virtualenvs: `/opt/meetingbox/.venvs`
 - Whisper.cpp runtime: `/opt/meetingbox/runtime/whisper.cpp`
 
-## Installer
+## Current appliance path (Docker)
 
-Run on the target Ubuntu mini PC:
+The native systemd services described below are **not** shipped anymore. On the mini PC use the monorepo’s Docker stack:
 
 ```bash
 cd /path/to/meetingbox
-sudo bash scripts/install_native_minipc.sh
+cp .env.example .env   # set JWT_SECRET_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY, …
+cd frontend && npm ci && npm run build && cd ..
+docker compose -f docker-compose.yml -f docker-compose.prod.yml --profile backend --profile frontend --profile screen up -d --build
 ```
 
-Then edit:
+Or: `sudo bash scripts/install_device_ui.sh` (copies to `/opt/meetingbox`, installs systemd, same compose profiles).
 
-```bash
-sudo nano /etc/meetingbox/meetingbox.env
-```
-
-Set at minimum:
-
-- `JWT_SECRET_KEY`
-- `ANTHROPIC_API_KEY` if Claude fallback is still needed
-- `GOOGLE_CLIENT_ID`
-- `GOOGLE_CLIENT_SECRET`
-- `LOCAL_LLM_MODEL` if you want a different Ollama model
-- display width and height if you want to override the attached display defaults
+**Historical:** the old installer was `scripts/install_native_minipc.sh` (removed).
 
 ## Seal it into appliance mode
 

@@ -3,7 +3,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from voice_assistant import VoiceCommandInterpreter, _normalize_text
+from voice_assistant import VoiceCommandInterpreter
 
 
 def _mk() -> VoiceCommandInterpreter:
@@ -14,18 +14,6 @@ def _mk() -> VoiceCommandInterpreter:
         action_cooldown_seconds=2.0,
         confirmation_timeout_seconds=8.0,
     )
-
-
-def test_wake_callback_suppressed_when_command_same_utterance_relaxed():
-    interpreter = _mk()
-    norm = _normalize_text("hey tony what time is it")
-    assert interpreter.should_trigger_wake_callback(norm) is False
-
-
-def test_wake_callback_allowed_for_wake_only():
-    interpreter = _mk()
-    norm = _normalize_text("hey tony")
-    assert interpreter.should_trigger_wake_callback(norm) is True
 
 
 def test_combined_wake_and_command_starts_meeting():

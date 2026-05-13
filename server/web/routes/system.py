@@ -1,4 +1,5 @@
 import logging
+import sqlite3
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -6,8 +7,9 @@ from typing import Any, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 import psutil  # type: ignore
 
-from auth import get_optional_actor
+from auth import get_current_user, get_optional_actor
 from database import get_connection
+from routes.device import fetch_appliance_metrics
 from routes.meetings import _meeting_access_filter
 
 logger = logging.getLogger(__name__)
@@ -32,6 +34,54 @@ async def system_status() -> dict:
       "disk_total_gb": disk.total / (1024**3),
     }
   }
+
+
+@router.get("/appliance-status")
+async def appliance_system_status(current_user: dict = Depends(get_current_user)) -> dict:
+  """
+  System metrics for the signed-in user's paired MeetingBox mini-PC
+  (pushed by device-ui via POST /api/device/system-metrics), not the API server.
+  """
+  conn = get_connection()
+  conn.row_factory = sqlite3.Row
+  try:
+    cur = conn.cursor()
+    cur.execute(
+      """
+      SELECT id, device_name FROM devices
+      WHERE user_id = ?
+        AND (status IS NULL OR TRIM(COALESCE(status, '')) = ''
+             OR LOWER(TRIM(status)) = 'active')
+      ORDER BY datetime(COALESCE(last_seen_at, paired_at, created_at, '1970-01-01')) DESC
+      LIMIT 1
+      """,
+      (current_user["id"],),
+    )
+    row = cur.fetchone()
+  finally:
+    conn.close()
+
+  if not row:
+    return {
+      "system": None,
+      "device": None,
+      "message": "No paired MeetingBox device. Pair an appliance to see its system status.",
+    }
+
+  device_id = row["id"]
+  device_name = (row["device_name"] or "").strip() or "MeetingBox"
+  metrics = fetch_appliance_metrics(device_id)
+  device_info = {"id": device_id, "device_name": device_name}
+  if not metrics:
+    return {
+      "system": None,
+      "device": device_info,
+      "message": (
+        "Waiting for metrics from your device. "
+        "Turn on the MeetingBox appliance — it reports about every 30 seconds when paired."
+      ),
+    }
+  return {"system": metrics, "device": device_info, "message": None}
 
 
 @router.get("/device-info")

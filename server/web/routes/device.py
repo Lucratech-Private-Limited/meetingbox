@@ -5,6 +5,7 @@ Endpoints used by the device-ui appliance interface.
 Manages: settings, WiFi, updates, system device info.
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -18,12 +19,14 @@ from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import Response
 from pydantic import BaseModel
 import psutil
 import redis
 
 from auth import get_optional_user, get_optional_actor, get_current_device_row
 from database import get_connection
+from routes.meetings import emit_audio_command
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -36,6 +39,34 @@ def _get_redis() -> redis.Redis:
     if _redis_client is None:
         _redis_client = redis.Redis(host=REDIS_HOST, port=6379, decode_responses=True)
     return _redis_client
+
+
+APPLIANCE_METRICS_REDIS_KEY = "meetingbox:appliance_metrics:{}"
+
+
+def store_appliance_metrics(device_id: str, payload: dict) -> None:
+    """Cache last CPU/RAM/disk snapshot from a paired mini-PC (short TTL)."""
+    try:
+        r = _get_redis()
+        r.setex(
+            APPLIANCE_METRICS_REDIS_KEY.format(device_id),
+            150,
+            json.dumps(payload),
+        )
+    except Exception as e:
+        logger.debug("appliance metrics redis store: %s", e)
+
+
+def fetch_appliance_metrics(device_id: str) -> Optional[dict]:
+    try:
+        r = _get_redis()
+        raw = r.get(APPLIANCE_METRICS_REDIS_KEY.format(device_id))
+        if not raw:
+            return None
+        return json.loads(raw)
+    except Exception as e:
+        logger.debug("appliance metrics redis read: %s", e)
+        return None
 
 # Persistent settings file on disk
 SETTINGS_FILE = Path(os.getenv("DEVICE_SETTINGS_PATH", "/data/config/device_settings.json"))
@@ -347,6 +378,43 @@ async def device_unpair_self(device: dict = Depends(get_current_device_row)):
     return {"status": "unpaired", "device_id": device_id}
 
 
+class ApplianceMetricsBody(BaseModel):
+    """CPU / memory / disk as reported by the on-device UI (mini-PC)."""
+
+    cpu_percent: float = 0.0
+    memory_percent: float = 0.0
+    memory_used_gb: float = 0.0
+    memory_total_gb: float = 0.0
+    disk_percent: float = 0.0
+    disk_used_gb: float = 0.0
+    disk_total_gb: float = 0.0
+
+
+@router.post("/system-metrics")
+async def post_appliance_system_metrics(
+    body: ApplianceMetricsBody,
+    device: dict = Depends(get_current_device_row),
+):
+    """
+    Mini-PC pushes resource usage so the web dashboard System page can show
+    appliance health instead of the API server host.
+    """
+    store_appliance_metrics(
+        device["id"],
+        {
+            "cpu_percent": float(body.cpu_percent),
+            "memory_percent": float(body.memory_percent),
+            "memory_used_gb": float(body.memory_used_gb),
+            "memory_total_gb": float(body.memory_total_gb),
+            "disk_percent": float(body.disk_percent),
+            "disk_used_gb": float(body.disk_used_gb),
+            "disk_total_gb": float(body.disk_total_gb),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+    return {"status": "ok"}
+
+
 def _normalize_hhmmss(time_raw: str) -> str:
     s = (time_raw or "10:00").strip()
     if s.count(":") == 2:
@@ -495,17 +563,45 @@ async def get_settings(current_user: Optional[dict] = Depends(get_optional_user)
 
 
 @router.post("/mic-test/start")
-async def start_mic_test(current_user: Optional[dict] = Depends(get_optional_user)):
+async def start_mic_test(current_actor: Optional[dict] = Depends(get_optional_actor)):
     """Start live microphone level stream for device UI test screen."""
-    _get_redis().publish("commands", json.dumps({"action": "start_mic_test"}))
+    emit_audio_command(current_actor, {"action": "start_mic_test"})
     return {"status": "mic_test_started"}
 
 
 @router.post("/mic-test/stop")
-async def stop_mic_test(current_user: Optional[dict] = Depends(get_optional_user)):
+async def stop_mic_test(current_actor: Optional[dict] = Depends(get_optional_actor)):
     """Stop live microphone level stream for device UI test screen."""
-    _get_redis().publish("commands", json.dumps({"action": "stop_mic_test"}))
+    emit_audio_command(current_actor, {"action": "stop_mic_test"})
     return {"status": "mic_test_stopped"}
+
+
+@router.get("/audio-command/wait")
+async def wait_audio_command(device: dict = Depends(get_current_device_row)):
+    """
+    Long-poll for the next audio capture command (start/stop/pause/resume/mic_test).
+
+    Appliances that cannot reach server Redis use ``AUDIO_COMMAND_SOURCE=http`` and
+    poll this endpoint with the device Bearer token. Blocks up to ~25s server-side.
+    """
+    user_id = str(device.get("owner_user_id") or "").strip()
+    if not user_id:
+        raise HTTPException(status_code=500, detail="Device has no owner_user_id")
+
+    key = f"audio:http:{user_id}"
+
+    def _blocked_pop():
+        # BLPOP: FIFO for RPUSH (oldest command first)
+        return _get_redis().blpop(key, timeout=25)
+
+    pair = await asyncio.to_thread(_blocked_pop)
+    if not pair:
+        return Response(status_code=204)
+    _, raw = pair
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=500, detail="Invalid queued command") from None
 
 
 class SettingsUpdate(BaseModel):
@@ -524,7 +620,11 @@ class SettingsUpdate(BaseModel):
 async def update_settings(body: SettingsUpdate, current_user: Optional[dict] = Depends(get_optional_user)):
     """Update one or more device settings."""
     current = _load_settings()
-    updates = body.dict(exclude_none=True)
+    updates = (
+        body.model_dump(exclude_none=True)
+        if hasattr(body, "model_dump")
+        else body.dict(exclude_none=True)
+    )
 
     # Handle special actions
     action = updates.pop("action", None)

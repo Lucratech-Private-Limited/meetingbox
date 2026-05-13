@@ -14,11 +14,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 MINI_PC_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-# Full monorepo: sibling server/docker-compose.yml
-MONOREPO_ROOT=""
-if [[ -f "$MINI_PC_ROOT/../server/docker-compose.yml" ]]; then
-  MONOREPO_ROOT="$(cd "$MINI_PC_ROOT/.." && pwd)"
-fi
+# shellcheck source=../scripts/lib_meetingbox_paths.sh
+source "$SCRIPT_DIR/../scripts/lib_meetingbox_paths.sh"
+MONOREPO_ROOT="$(meetingbox_resolve_monorepo_root "$MINI_PC_ROOT")"
 
 VENV_DIR="${VENV_DIR:-.venv}"
 ACTIVATE="$VENV_DIR/bin/activate"
@@ -87,8 +85,12 @@ if [[ "$(uname -s)" == "Linux" ]] && [[ -z "${DISPLAY:-}" ]]; then
 fi
 
 if [[ -z "${BACKEND_URL:-}" ]] && [[ "${MOCK_BACKEND:-0}" != "1" ]]; then
-  echo "[MeetingBox] BACKEND_URL is not set — the UI will use http://localhost:8000 (no server on this machine)." >&2
-  echo "[MeetingBox] Fix: set BACKEND_URL in $MINI_PC_ROOT/.env (see .env.example), monorepo .env, or $SCRIPT_DIR/.env" >&2
+  if [[ -n "${DASHBOARD_URL:-}" ]]; then
+    echo "[MeetingBox] BACKEND_URL is not set — API base will be derived from DASHBOARD_URL (see config.py)." >&2
+  else
+    echo "[MeetingBox] BACKEND_URL is not set — the UI will use http://localhost:8000." >&2
+    echo "[MeetingBox] Fix: set BACKEND_URL or DASHBOARD_URL in $MINI_PC_ROOT/.env (see .env.example), monorepo .env, or $SCRIPT_DIR/.env" >&2
+  fi
 fi
 
 exec python3 src/main.py "$@"

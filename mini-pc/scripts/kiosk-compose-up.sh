@@ -1,103 +1,112 @@
 #!/usr/bin/env bash
-# Build/start device-ui with a valid :0 Xauthority cookie bind.
+# Wait for local X11 + a usable MIT cookie, allow Docker to connect, then docker compose up -d.
+# Used by systemd meetingbox-appliance.service (do not run with sudo — the unit runs as the GUI user).
 #
-# Usage:
-#   cd mini-pc
-#   bash scripts/kiosk-compose-up.sh
-#
-# Optional env:
-#   NO_BUILD=1                      # skip --build
-#   DEVICE_UI_DISPLAY=:1            # override target display (default :0)
-#   XAUTHORITY_HOST=/path/to/file   # preferred host cookie source
+# Copies the working cookie to APPLIANCE_DIR/.meetingbox-docker.xauth and passes that path as
+# XAUTHORITY_HOST for this invocation so the device-ui bind mount matches GDM/Ubuntu 24 setups.
 
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$ROOT_DIR"
+APPLIANCE_DIR="${1:-${APPLIANCE_DIR:-$HOME/meetingbox-mini-pc-release}}"
+APPLIANCE_DIR=$(cd "$APPLIANCE_DIR" && pwd)
+COMPOSE_FILE="$APPLIANCE_DIR/docker-compose.yml"
+XAUTH_COPY="$APPLIANCE_DIR/.meetingbox-docker.xauth"
+u_id="$(id -u)"
 
-if ! command -v docker >/dev/null 2>&1; then
-  echo "[MeetingBox] ERROR: docker not found." >&2
-  exit 1
-fi
-if ! docker compose version >/dev/null 2>&1; then
-  echo "[MeetingBox] ERROR: docker compose v2 not available." >&2
-  exit 1
-fi
-if ! command -v xauth >/dev/null 2>&1; then
-  echo "[MeetingBox] ERROR: xauth not found. Install: sudo apt install xauth" >&2
+if [[ ! -f "$COMPOSE_FILE" ]]; then
+  echo "kiosk-compose-up: no docker-compose.yml in $APPLIANCE_DIR" >&2
   exit 1
 fi
 
-DISPLAY_TARGET="${DEVICE_UI_DISPLAY:-:0}"
-export DEVICE_UI_DISPLAY="$DISPLAY_TARGET"
-COOKIE_OUT="$ROOT_DIR/.meetingbox-docker.xauth"
-
-_has_display_cookie() {
-  local file="$1"
-  local display="$2"
-  [[ -f "$file" ]] || return 1
-  xauth -f "$file" list "$display" 2>/dev/null | grep -Eq 'MIT-MAGIC-COOKIE' && return 0
-  xauth -f "$file" list 2>/dev/null | grep -Eq '(^|[[:space:]])([^[:space:]]*:0([.][0-9]+)?|[^[:space:]]+/unix:0([.][0-9]+)?)([[:space:]]|$)' && return 0
+wait_for_x_socket() {
+  local max="${1:-120}"
+  local i
+  for ((i = 1; i <= max; i++)); do
+    if [[ -S /tmp/.X11-unix/X0 ]]; then
+      echo ":0"
+      return 0
+    fi
+    if [[ -S /tmp/.X11-unix/X1 ]]; then
+      echo ":1"
+      return 0
+    fi
+    sleep 1
+  done
   return 1
 }
 
-_candidate_cookie_sources() {
-  local uid
-  uid="$(id -u)"
-  printf '%s\n' \
-    "${XAUTHORITY_HOST:-}" \
-    "${MEETINGBOX_X11_COOKIE:-}" \
-    "$HOME/.meetingbox-docker.xauth" \
-    "$HOME/.Xauthority" \
-    "/run/user/$uid/gdm/Xauthority" \
-    "/run/user/1000/gdm/Xauthority"
+pick_cookie_source() {
+  local gdm="/run/user/${u_id}/gdm/Xauthority"
+  local rt="${XDG_RUNTIME_DIR:-/run/user/${u_id}}"
+  local f
+  # GDM (Xorg)
+  if [[ -f "$gdm" && -s "$gdm" ]]; then
+    echo "$gdm"
+    return 0
+  fi
+  # GNOME on Wayland: mutter leaves Xwayland cookies here
+  for f in "${rt}"/.mutter-Xwaylandauth.*; do
+    if [[ -f "$f" && -s "$f" ]]; then
+      echo "$f"
+      return 0
+    fi
+  done
+  if [[ -f "$HOME/.Xauthority" && -s "$HOME/.Xauthority" ]]; then
+    echo "$HOME/.Xauthority"
+    return 0
+  fi
+  return 1
 }
 
-SOURCE_COOKIE=""
-while IFS= read -r cand; do
-  [[ -n "$cand" ]] || continue
-  if _has_display_cookie "$cand" "$DISPLAY_TARGET"; then
-    SOURCE_COOKIE="$cand"
+echo "kiosk-compose-up: waiting for X11 socket (max ~120s)..."
+if ! disp_num=$(wait_for_x_socket 120); then
+  echo "kiosk-compose-up: timed out waiting for /tmp/.X11-unix/X0 or X1" >&2
+  exit 1
+fi
+
+echo "kiosk-compose-up: waiting for Xauthority cookie..."
+src=""
+for _try in $(seq 1 60); do
+  if src=$(pick_cookie_source); then
     break
   fi
-done < <(_candidate_cookie_sources)
-
-if [[ -z "$SOURCE_COOKIE" ]]; then
-  echo "[MeetingBox] ERROR: could not find a readable Xauthority file with cookie for $DISPLAY_TARGET." >&2
-  echo "[MeetingBox] Fix once on the built-in screen:" >&2
-  echo "  1) Log in locally as this user." >&2
-  echo "  2) Run: echo \$DISPLAY; xauth list \$DISPLAY" >&2
-  echo "  3) Re-run this script." >&2
+  sleep 2
+done
+if [[ -z "${src:-}" ]]; then
+  echo "kiosk-compose-up: no usable cookie in /run/user/${u_id}/gdm/Xauthority or ~/.Xauthority" >&2
+  echo "kiosk-compose-up: enable auto-login for this user or log in once on the built-in screen, then reboot." >&2
   exit 1
 fi
 
-rm -f "$COOKIE_OUT"
-touch "$COOKIE_OUT"
-chmod 600 "$COOKIE_OUT"
-
-# Merge only the target display cookie into a dedicated file for Docker bind.
-if ! xauth -f "$SOURCE_COOKIE" nlist "$DISPLAY_TARGET" 2>/dev/null | sed -e 's/^..../ffff/' | xauth -f "$COOKIE_OUT" nmerge - >/dev/null 2>&1; then
-  echo "[MeetingBox] ERROR: failed to extract cookie from $SOURCE_COOKIE" >&2
-  exit 1
-fi
-
-if ! _has_display_cookie "$COOKIE_OUT" "$DISPLAY_TARGET"; then
-  echo "[MeetingBox] ERROR: generated cookie file has no $DISPLAY_TARGET entry." >&2
-  exit 1
-fi
-
-chmod 644 "$COOKIE_OUT"
-export MEETINGBOX_X11_COOKIE="$COOKIE_OUT"
-
-echo "[MeetingBox] Using DISPLAY=$DISPLAY_TARGET"
-echo "[MeetingBox] Using X11 cookie: $SOURCE_COOKIE -> $COOKIE_OUT"
-
-docker compose down
-if [[ "${NO_BUILD:-0}" == "1" ]]; then
-  docker compose up -d device-ui
+export DISPLAY="$disp_num"
+export XAUTHORITY="$src"
+if /usr/bin/xhost "+local:docker" 2>/dev/null; then
+  echo "kiosk-compose-up: xhost +local:docker ok"
 else
-  docker compose up -d --build device-ui
+  echo "kiosk-compose-up: xhost failed (continuing — cookie copy may still be enough)" >&2
 fi
 
-echo "[MeetingBox] device-ui launch requested."
-echo "[MeetingBox] Logs: docker logs -f meetingbox-appliance-ui"
+if [[ -d "$XAUTH_COPY" ]]; then
+  echo "kiosk-compose-up: removing bogus directory $XAUTH_COPY (usually a bad Docker bind when the cookie file was missing)" >&2
+  rm -rf "$XAUTH_COPY"
+fi
+cp "$src" "$XAUTH_COPY"
+chmod 600 "$XAUTH_COPY"
+
+echo "kiosk-compose-up: cookie source=$src size=$(wc -c <"$XAUTH_COPY") bytes -> $XAUTH_COPY"
+if command -v xauth >/dev/null 2>&1; then
+  xauth -f "$XAUTH_COPY" list 2>/dev/null | head -5 >&2 || true
+fi
+
+cd "$APPLIANCE_DIR"
+# MEETINGBOX_X11_COOKIE is NOT in .env — Compose always uses this file for the bind mount on boot.
+export MEETINGBOX_X11_COOKIE="$XAUTH_COPY"
+export DEVICE_UI_DISPLAY="$disp_num"
+# Services are gated by Compose profiles; if .env omits COMPOSE_PROFILES, plain ``up -d``
+# starts no device-ui/redis/audio. Default only when .env does not define the variable.
+if [[ ! -f "$APPLIANCE_DIR/.env" ]] || ! grep -qE '^[[:space:]]*COMPOSE_PROFILES=' "$APPLIANCE_DIR/.env"; then
+  export COMPOSE_PROFILES="${COMPOSE_PROFILES:-mini-pc,docker-audio}"
+fi
+# One shot only — do not ``--force-recreate device-ui`` here; that stops the UI right after
+# the first start and looks like “fullscreen then closes and opens again” on the panel.
+/usr/bin/docker compose up -d

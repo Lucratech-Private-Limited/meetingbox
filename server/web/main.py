@@ -38,16 +38,11 @@ from routes.devices import router as devices_router
 from routes.auth import router as auth_router
 from routes.actions import router as actions_router
 from routes.integrations import router as integrations_router
-<<<<<<< Updated upstream
 from routes.commitments import router as commitments_router
 from routes.briefing import router as briefing_router
 from routes.admin_memory import router as admin_memory_router
 from routes.voice import router as voice_router
 from auth import get_optional_user, resolve_actor_from_access_token
-=======
-from routes.emails import router as emails_router
-from auth import get_optional_user
->>>>>>> Stashed changes
 from routes.device import SetupCompleteBody, finalize_first_boot_setup
 from rate_limit import limiter
 
@@ -289,14 +284,10 @@ app.include_router(device_router, prefix="/api/device", tags=["device"])
 app.include_router(devices_router, prefix="/api", tags=["devices"])
 app.include_router(actions_router, prefix="/api", tags=["actions"])
 app.include_router(integrations_router, prefix="/api", tags=["integrations"])
-<<<<<<< Updated upstream
 app.include_router(commitments_router, prefix="/api", tags=["commitments"])
 app.include_router(briefing_router, prefix="/api")
 app.include_router(admin_memory_router, prefix="/api")
 app.include_router(voice_router, prefix="/api/voice")
-=======
-app.include_router(emails_router, prefix="/api", tags=["emails"])
->>>>>>> Stashed changes
 
 
 @app.post("/api/device/setup-complete", tags=["device"])

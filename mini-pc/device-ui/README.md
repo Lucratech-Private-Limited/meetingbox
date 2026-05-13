@@ -18,6 +18,23 @@ Device UI for MeetingBox hardware.
 
 ## Installation
 
+### Native package for appliances
+
+For production devices, build a `.deb` on a build machine and install only that package on the Raspberry Pi / mini PC. This avoids cloning the source tree onto the device.
+
+```bash
+cd mini-pc
+VERSION=1.0.0 bash scripts/build-device-ui-deb.sh
+```
+
+Install the generated `dist/meetingbox-ui_...deb` on the device, edit `/etc/meetingbox/device-ui.env`, then run `meetingbox-ui` or configure kiosk boot with:
+
+```bash
+MEETINGBOX_I_KNOW=1 sudo meetingbox-install-native-kiosk
+```
+
+See `NATIVE_PACKAGE.md`.
+
 ### Quick Install (Automated)
 
 From the main MeetingBox repo (full checkout):
@@ -43,6 +60,41 @@ sudo apt-get install -y libsdl2-dev libsdl2-image-dev libsdl2-mixer-dev libsdl2-
 # Test run (will use mock backend)
 MOCK_BACKEND=1 python3 src/main.py
 ```
+
+### Run in venv without Docker (fast UI iteration)
+
+Docker rebuilds are slow; use a local venv and run `main.py` directly. System SDL2/Kivy packages still apply on Linux (see above); on Windows, `pip install -r requirements.txt` is usually enough for Kivy’s wheels.
+
+**Linux / mini PC (bash):**
+
+```bash
+cd mini-pc/device-ui
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+# Optional: copy mini-pc/.env.example → mini-pc/.env and edit BACKEND_URL
+./run_device_ui.sh
+# Or mock-only:
+MOCK_BACKEND=1 ./run_device_ui.sh
+```
+
+`run_device_ui.sh` loads `../.env` (mini-pc), optional monorepo `../../.env`, and `device-ui/.env`, then runs `python3 src/main.py`.
+
+**Windows (PowerShell):**
+
+```powershell
+cd mini-pc\device-ui
+py -3 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+.\run_device_ui.ps1
+# Or:
+$env:MOCK_BACKEND = "1"; .\run_device_ui.ps1
+```
+
+Use `FULLSCREEN=0` in `.env` (default for local `config.py`) for a windowed app while developing.
+
+**Bare-metal + real backend:** If Redis is not hostname `redis`, set e.g. `LOCAL_REDIS_HOST=127.0.0.1` in `.env` when you need live audio-level from a local Redis.
 
 ## Configuration
 
