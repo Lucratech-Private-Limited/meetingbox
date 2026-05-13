@@ -187,6 +187,19 @@ async def get_current_user(
     return user
 
 
+async def get_current_admin(
+    user: dict = Depends(get_current_user),
+) -> dict:
+    """Require an authenticated user with role admin (first bootstrap user or promoted)."""
+    role = (user.get("role") or "").strip().lower()
+    if role != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin access required.",
+        )
+    return user
+
+
 async def get_optional_user(
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ) -> Optional[dict]:
@@ -199,14 +212,14 @@ async def get_optional_user(
         return None
 
 
-async def get_optional_actor(
-    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
-) -> Optional[dict]:
-    """Return either {"type": "user"} or {"type": "device"} actor context."""
-    if credentials is None:
+def resolve_actor_from_access_token(token: str) -> Optional[dict]:
+    """
+    Validate a raw Bearer-equivalent string (dashboard JWT or device mbd_ token).
+    Used for WebSocket where browsers cannot set Authorization on connect.
+    """
+    if not (token or "").strip():
         return None
-
-    token = credentials.credentials
+    token = token.strip()
     user = _get_jwt_user(token)
     if user is not None:
         return {"type": "user", "user": user}
@@ -224,6 +237,15 @@ async def get_optional_actor(
             },
         }
     return None
+
+
+async def get_optional_actor(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+) -> Optional[dict]:
+    """Return either {"type": "user"} or {"type": "device"} actor context."""
+    if credentials is None:
+        return None
+    return resolve_actor_from_access_token(credentials.credentials)
 
 
 async def get_current_actor(

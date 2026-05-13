@@ -90,9 +90,23 @@ WS_MAX_RECONNECT_ATTEMPTS = 10
 # ============================================================================
 # LOCAL REDIS (receive audio_level / mic_test_level from audio container)
 # ============================================================================
+# Default host is loopback — matches docker-compose (host network: Redis on the mini-PC).
+# The old default "redis" only resolves inside a Compose bridge network and breaks native
+# ./run_device_ui.sh or any machine where Docker DNS for "redis" does not exist.
+#
+# Remote/cloud API only (no Redis on this device): set LOCAL_REDIS_ENABLED=0 to silence retries.
 
-LOCAL_REDIS_HOST = (os.getenv("LOCAL_REDIS_HOST", "") or "").strip() or "redis"
+LOCAL_REDIS_HOST = (os.getenv("LOCAL_REDIS_HOST", "") or "").strip() or "127.0.0.1"
 LOCAL_REDIS_PORT = int(os.getenv("LOCAL_REDIS_PORT", "6379"))
+_lr_en = (os.getenv("LOCAL_REDIS_ENABLED", "") or "").strip().lower()
+LOCAL_REDIS_ENABLED = _lr_en not in ("0", "false", "no", "off")
+if (os.getenv("MEETINGBOX_DISABLE_LOCAL_REDIS", "") or "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+):
+    LOCAL_REDIS_ENABLED = False
 
 # ============================================================================
 # MICROPHONE (mic test + should match mini-pc/audio capture device)
@@ -100,6 +114,14 @@ LOCAL_REDIS_PORT = int(os.getenv("LOCAL_REDIS_PORT", "6379"))
 
 AUDIO_INPUT_DEVICE_INDEX = (os.getenv("AUDIO_INPUT_DEVICE_INDEX", "") or "").strip()
 AUDIO_INPUT_DEVICE_NAME = (os.getenv("AUDIO_INPUT_DEVICE_NAME", "") or "").strip()
+
+# If true, wake word never starts OpenAI Realtime — only local Vosk + espeak (reliable on appliances).
+WAKE_LOCAL_VOICE_ONLY = str(os.getenv("MEETINGBOX_WAKE_LOCAL_VOICE_ONLY", "")).strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 
 # ============================================================================
 # DISPLAY SETTINGS
@@ -147,9 +169,9 @@ def _parse_unit_scale(name: str, default: float) -> float:
 
 
 # Display resolution
-# Figma-aligned default is 1024x600; override via env vars as needed.
-DISPLAY_WIDTH = _parse_display_px("DISPLAY_WIDTH", 1024)
-DISPLAY_HEIGHT = _parse_display_px("DISPLAY_HEIGHT", 600)
+# Figma-aligned default is 1260x800 (landscape); override via env vars as needed.
+DISPLAY_WIDTH = _parse_display_px("DISPLAY_WIDTH", 1260)
+DISPLAY_HEIGHT = _parse_display_px("DISPLAY_HEIGHT", 800)
 
 # Display orientation
 DISPLAY_ORIENTATION = os.getenv('DISPLAY_ORIENTATION', 'landscape')

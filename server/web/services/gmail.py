@@ -6,6 +6,7 @@ import base64
 import logging
 import os
 import re
+from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
@@ -358,10 +359,26 @@ def compose_list_query(user_q: str) -> str:
     return f"({q}) ({base})"
 
 
+def gmail_search_after_clause(days: int) -> str:
+    """Gmail ``q`` fragment: messages on or after this calendar day (UTC)."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=max(1, int(days)))).date()
+    return f"after:{cutoff.year}/{cutoff.month:02d}/{cutoff.day:02d}"
+
+
+def merge_days_into_gmail_query(user_q: str, days: int | None) -> str:
+    """When *days* is set, prefix the query with Gmail ``after:`` (bounded listing)."""
+    if days is None:
+        return user_q or ""
+    after_part = gmail_search_after_clause(days)
+    u = (user_q or "").strip()
+    return f"{after_part} {u}".strip() if u else after_part
+
+
 def list_recent_messages(
     credentials,
     max_results: int = 10,
     q: str = "",
+    days: int | None = None,
 ) -> list[dict]:
     """
     List recent message metadata (From, Subject, Date, snippet, threadId).
@@ -369,10 +386,14 @@ def list_recent_messages(
 
     By default applies MEETINGBOX_GMAIL_STRICT_INBOX allowlist so UIs only see
     individual + meeting/task/reminder mail. Set MEETINGBOX_GMAIL_STRICT_INBOX=0 for legacy behavior.
+
+    If *days* is set, the Gmail search is scoped with ``after:YYYY/MM/DD`` (UTC) so the API
+    returns a bounded window (e.g. dashboard inbox lists).
     """
     service = build("gmail", "v1", credentials=credentials, cache_discovery=False)
     max_results = max(1, min(int(max_results), 50))
-    q_use = compose_list_query(q)
+    q_merged = merge_days_into_gmail_query(q, days)
+    q_use = compose_list_query(q_merged)
     strict = _strict_allowlist_enabled()
 
     logger.debug(
@@ -382,7 +403,6 @@ def list_recent_messages(
     )
 
     out: list[dict] = []
-<<<<<<< Updated upstream
     seen_ids: set[str] = set()
     page_token: str | None = None
     rounds = 0
@@ -463,35 +483,12 @@ def list_recent_messages(
                 "from": frm,
                 "subject": subj,
                 "date": headers_lc.get("date", ""),
+                "is_read": "UNREAD" not in label_ids,
             })
 
         if not page_token:
             break
 
-=======
-    for ref in messages:
-        mid = ref.get("id")
-        if not mid:
-            continue
-        m = service.users().messages().get(
-            userId="me",
-            id=mid,
-            format="metadata",
-            metadataHeaders=["From", "To", "Subject", "Date"],
-        ).execute()
-        headers = {h["name"]: h["value"] for h in m.get("payload", {}).get("headers", [])}
-        label_ids = m.get("labelIds", [])
-        out.append({
-            "id": mid,
-            "threadId": m.get("threadId"),
-            "snippet": m.get("snippet", ""),
-            "from": headers.get("From", ""),
-            "to": headers.get("To", ""),
-            "subject": headers.get("Subject", ""),
-            "date": headers.get("Date", ""),
-            "is_read": "UNREAD" not in label_ids,
-        })
->>>>>>> Stashed changes
     return out
 
 
@@ -604,6 +601,7 @@ def get_message_full(credentials, message_id: str) -> dict:
         "id": m["id"],
         "threadId": m.get("threadId"),
         "from": headers.get("From", ""),
+        "to": headers.get("To", ""),
         "subject": headers.get("Subject", ""),
         "date": headers.get("Date", ""),
         "snippet": m.get("snippet", ""),

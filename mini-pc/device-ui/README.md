@@ -103,7 +103,8 @@ Use `FULLSCREEN=0` in `.env` (default for local `config.py`) for a windowed app 
 | Variable | Example | Purpose |
 |----------|---------|---------|
 | `BACKEND_URL` | `http://your-host:8000` | REST API base (no trailing slash) |
-| `BACKEND_WS_URL` | `ws://your-host:8000/ws` | Real-time captions (optional; derived from `BACKEND_URL` if unset) |
+| `BACKEND_WS_URL` | `ws://your-host:8000/ws` | Real-time captions (optional; derived from `BACKEND_URL` if unset). Connect URL adds `access_token` when paired; see below. |
+| `BACKEND_WS_SHARED_SECRET` or `MEETINGBOX_WS_SHARED_SECRET` | same as server `MEETINGBOX_WS_SHARED_SECRET` | If the API requires shared-secret WebSocket auth, set this on the device. |
 | `DASHBOARD_URL` | `http://your-host:8000` or `your-host:8000` | Dashboard link/QR; full URL or host:port (trailing `/` ok) |
 | `MOCK_BACKEND` | `1` | Local testing without a server |
 

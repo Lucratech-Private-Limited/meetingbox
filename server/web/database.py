@@ -342,6 +342,56 @@ def init_database() -> None:
         )
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_pending_assistant_audit ON pending_assistant_actions(audit_id)")
         cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS admin_memory_access_log (
+              id TEXT PRIMARY KEY,
+              created_at TEXT NOT NULL,
+              admin_user_id TEXT NOT NULL,
+              target_user_id TEXT NOT NULL,
+              action TEXT NOT NULL,
+              detail TEXT,
+              FOREIGN KEY (admin_user_id) REFERENCES users(id),
+              FOREIGN KEY (target_user_id) REFERENCES users(id)
+            )
+            """
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_admin_memory_log_created ON admin_memory_access_log(created_at)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_admin_memory_log_target ON admin_memory_access_log(target_user_id)"
+        )
+
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_commitments (
+              id TEXT PRIMARY KEY,
+              user_id TEXT NOT NULL,
+              title TEXT NOT NULL,
+              detail TEXT,
+              tags TEXT,
+              status TEXT NOT NULL DEFAULT 'active',
+              remind_at TEXT,
+              due_at TEXT,
+              source TEXT,
+              calendar_event_id TEXT,
+              audit_id TEXT,
+              meeting_id TEXT,
+              mem0_synced INTEGER NOT NULL DEFAULT 0,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+            """
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_user_commitments_user_status ON user_commitments(user_id, status)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_user_commitments_remind ON user_commitments(user_id, remind_at)"
+        )
+
+        cursor.execute(
             "INSERT OR IGNORE INTO app_settings (key, value, updated_at) VALUES (?, ?, datetime('now'))",
             ("max_meeting_upload_seconds", "10800"),
         )

@@ -1,0 +1,14 @@
+__pycache__
+*.pyc
+.git
+.gitignore
+venv/
+.venv/
+*.egg-info
+README.md
+*.md
+.idea/
+.vscode/
+.cursor/
+tests/
+*.log

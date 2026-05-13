@@ -8,7 +8,7 @@ Set environment variable: MOCK_BACKEND=1
 import asyncio
 import logging
 from typing import List, Dict, Optional, AsyncIterator
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 import random
 
 logger = logging.getLogger(__name__)
@@ -23,6 +23,7 @@ class MockBackendClient:
     def __init__(self, base_url: str = None):
         self.current_recording = None
         self.meetings = self._generate_mock_meetings()
+        self._emails = self._generate_mock_emails()
         self._settings = {
             'device_name': 'Conference Room A',
             'timezone': 'America/New_York',
@@ -32,11 +33,19 @@ class MockBackendClient:
             'idle_screen_timeout': '30',
             'privacy_mode': False,
             'auto_record': False,
+            'voice_wake_phrase': 'hey buddy',
+            'voice_assistant_enabled': True,
+            'voice_realtime_assistant': False,
+            'assistant_speech_volume': 85,
         }
         logger.info("Using MOCK backend client")
 
     async def close(self):
         pass
+
+    async def create_realtime_voice_session(self) -> Dict:
+        """No secret from mock — device UI falls back to local Vosk commands."""
+        return {"client_secret": "", "model": "", "expires_at": 0, "session": {}}
 
     # ==================================================================
     # MOCK DATA
@@ -109,6 +118,87 @@ class MockBackendClient:
                     "topics": ["Standup"],
                     "sentiment": "Brief and informative",
                 },
+            },
+        ]
+
+    # ==================================================================
+    # MOCK EMAIL DATA
+    # ==================================================================
+
+    def _generate_mock_emails(self) -> List[Dict]:
+        now = datetime.now()
+        today_str = now.strftime("%Y-%m-%d")
+        yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+        return [
+            {
+                "id": "e1",
+                "sender": "Neha Sharma",
+                "sender_email": "neha@client.com",
+                "subject": "Client follow-up from product sync",
+                "preview": "Hi Vivek, following up on our discussion...",
+                "body": (
+                    "Hi Vivek,\n\nFollowing up on our discussion in the Product Sync meeting. "
+                    "The client is aligned with the proposed solution.\n\n"
+                    "Next steps:\n"
+                    "• Share the updated timeline by EOD\n"
+                    "• Schedule a technical deep-dive with the client\n"
+                    "• Prepare the commercial proposal\n\n"
+                    "Let me know if you need anything from my side.\n\n"
+                    "Thanks,\nNeha"
+                ),
+                "to": "Vivek",
+                "time": "10:45 AM",
+                "date": today_str,
+                "is_read": False,
+                "is_today": True,
+            },
+            {
+                "id": "e2",
+                "sender": "Neha Sharma",
+                "sender_email": "neha@client.com",
+                "subject": "Re: Product Sync — action items",
+                "preview": "Just a quick note on the action items from today...",
+                "body": (
+                    "Hi Vivek,\n\nJust a quick note on the action items from today's sync. "
+                    "I've updated the project board.\n\nLet me know if anything looks off.\n\nNeha"
+                ),
+                "to": "Vivek",
+                "time": "9:30 AM",
+                "date": today_str,
+                "is_read": False,
+                "is_today": True,
+            },
+            {
+                "id": "e3",
+                "sender": "Neha Sharma",
+                "sender_email": "neha@client.com",
+                "subject": "Commercial proposal draft",
+                "preview": "Please find the draft commercial proposal attached...",
+                "body": (
+                    "Hi Vivek,\n\nPlease find the draft commercial proposal attached. "
+                    "I've kept the pricing in line with what we discussed.\n\nNeha"
+                ),
+                "to": "Vivek",
+                "time": "9:30 AM",
+                "date": yesterday,
+                "is_read": True,
+                "is_today": False,
+            },
+            {
+                "id": "e4",
+                "sender": "Neha Sharma",
+                "sender_email": "neha@client.com",
+                "subject": "Timeline update for Q3 deliverables",
+                "preview": "Following the board review, please find the updated timeline...",
+                "body": (
+                    "Hi Vivek,\n\nFollowing the board review, please find the updated timeline "
+                    "for Q3 deliverables. The dates have shifted slightly.\n\nNeha"
+                ),
+                "to": "Vivek",
+                "time": "9:30 AM",
+                "date": yesterday,
+                "is_read": True,
+                "is_today": False,
             },
         ]
 
@@ -251,6 +341,67 @@ class MockBackendClient:
         }
 
     # ==================================================================
+    # EMAILS (MOCK)
+    # ==================================================================
+
+    async def fetch_gmail_recent(
+            self,
+            *,
+            max_results: int = 40,
+            days: int = 90,
+            q: str = "",
+    ) -> Dict:
+        await asyncio.sleep(0.1)
+        msgs = []
+        for e in self._emails:
+            se = (e.get("sender_email") or "").strip()
+            sn = (e.get("sender") or "").strip()
+            if se and sn:
+                frm = f"{sn} <{se}>"
+            elif se:
+                frm = se
+            else:
+                frm = sn or "—"
+            msgs.append({
+                "id": e["id"],
+                "threadId": e.get("thread_id"),
+                "from": frm,
+                "subject": e.get("subject", ""),
+                "snippet": e.get("preview", ""),
+                "date": e.get("date", ""),
+                "is_read": bool(e.get("is_read", True)),
+            })
+        return {"connected": True, "messages": msgs[:max_results], "count": len(msgs)}
+
+    async def get_emails(self, filter: str = "all", limit: int = 50) -> List[Dict]:
+        from api_client import _GMAIL_RECENT_DAYS, _map_gmail_recent_row
+
+        data = await self.fetch_gmail_recent(max_results=limit, days=_GMAIL_RECENT_DAYS, q="")
+        rows = data.get("messages") or []
+        mapped = [
+            _map_gmail_recent_row(m)
+            for m in rows
+            if isinstance(m, dict) and m.get("id")
+        ]
+        if filter == "today":
+            mapped = [e for e in mapped if e.get("is_today")]
+        elif filter == "unread":
+            mapped = [e for e in mapped if not e.get("is_read")]
+        return mapped[:limit]
+
+    async def mark_email_unread(self, email_id: str) -> dict:
+        await asyncio.sleep(0.1)
+        for e in self._emails:
+            if e["id"] == email_id:
+                e["is_read"] = False
+        return {"status": "ok"}
+
+    async def archive_email(self, email_id: str) -> dict:
+        await asyncio.sleep(0.1)
+        self._emails = [e for e in self._emails if e["id"] != email_id]
+        return {"status": "ok"}
+
+    # ==================================================================
     # INTEGRATIONS
     # ==================================================================
 
@@ -283,6 +434,109 @@ class MockBackendClient:
             },
             "pending_actions_today": 1,
             "pending_actions_total": 2,
+        }
+
+    async def get_calendar_week(self, start_date: str, end_date: str) -> Dict:
+        """Mock weekly calendar data with realistic meeting density."""
+        await asyncio.sleep(0.15)
+        from datetime import date as _date, timedelta as _td
+
+        def _iso(d): return d.isoformat()
+
+        try:
+            ws = _date.fromisoformat(start_date)
+        except Exception:
+            return {"days": {}}
+
+        # Realistic weekly patterns: busy Mon/Wed/Thu, moderate Tue/Fri, free Sat/Sun
+        _templates = [
+            # Monday — 4 meetings (busy)
+            [
+                ("09:00", "Strategy Sync", 60),
+                ("10:30", "Engineering Standup", 30),
+                ("13:00", "Product Review", 90),
+                ("16:00", "1:1 with Manager", 60),
+            ],
+            # Tuesday — 2 meetings (moderate)
+            [
+                ("10:00", "Design Critique", 60),
+                ("15:00", "Sprint Planning", 90),
+            ],
+            # Wednesday — 3 meetings (moderate)
+            [
+                ("09:30", "All-Hands Meeting", 60),
+                ("11:00", "Client Call – Acme", 45),
+                ("14:00", "Roadmap Discussion", 60),
+            ],
+            # Thursday — 4 meetings (busy)
+            [
+                ("09:00", "Architecture Review", 90),
+                ("11:30", "QA Sync", 30),
+                ("14:00", "Stakeholder Update", 60),
+                ("16:30", "Team Retrospective", 60),
+            ],
+            # Friday — 1 meeting (light)
+            [
+                ("10:00", "Weekly Wrap-Up", 30),
+            ],
+            # Saturday — no meetings
+            [],
+            # Sunday — no meetings
+            [],
+        ]
+
+        days: dict = {}
+        for i, template in enumerate(_templates):
+            d  = ws + _td(days=i)
+            ds = _iso(d)
+            meetings = []
+            for j, (hhmm, title, dur_min) in enumerate(template):
+                h, m   = map(int, hhmm.split(":"))
+                start  = d.isoformat() + f"T{h:02d}:{m:02d}:00+05:30"
+                eh, em = divmod(h * 60 + m + dur_min, 60)
+                end    = d.isoformat() + f"T{eh:02d}:{em:02d}:00+05:30"
+                meetings.append({
+                    "id": f"mock-{ds}-{j}",
+                    "title": title,
+                    "start": start,
+                    "end":   end,
+                    "start_time": start,
+                    "duration": dur_min * 60,
+                })
+            days[ds] = {"meetings": meetings}
+
+        return {"days": days}
+
+    async def post_assistant_intent(
+        self, message: str, meeting_id: str | None = None
+    ) -> Dict:
+        await asyncio.sleep(0.2)
+        text = (message or "").strip()
+        return {
+            "audit_id": "mock-audit",
+            "assistant_message": f"Here is a quick answer about: {text[:120]}{'…' if len(text) > 120 else ''}",
+            "routed_agent_id": "mock",
+            "tool_results": [],
+        }
+
+    async def get_briefing_context(self, days_ahead: int = 1) -> Dict:
+        await asyncio.sleep(0.1)
+        today = date.today()
+        mon = today - timedelta(days=today.weekday())
+        sun = mon + timedelta(days=6)
+        week = await self.get_calendar_week(mon.isoformat(), sun.isoformat())
+        return {
+            "greeting": "Good morning",
+            "user_display_name": "Guest",
+            "today": today.isoformat(),
+            "timezone": "Asia/Kolkata",
+            "calendar_connected": True,
+            "days": week.get("days") or {},
+            "commitments": [],
+            "meetings_recent": [],
+            "mem0_snippet": None,
+            "pending_assistant": {"count_pending": 0, "count": 0, "items": []},
+            "gmail_preview": {"connected": False, "top": None},
         }
 
     async def get_system_info(self) -> Dict:

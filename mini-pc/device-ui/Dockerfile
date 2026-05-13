@@ -1,5 +1,16 @@
 FROM python:3.11-slim
 
+# --- Build time (why `docker compose ... --build` can take 10–20+ minutes) ---
+# 1) The next RUN installs a large Debian stack (SDL2+Mesa+X11 *-dev*, build-essential,
+#    network-manager for nmcli, audio tools). That step downloads hundreds of MB — mostly
+#    network + mirror speed, not Python.
+# 2) Docker caches that layer until the RUN text or FROM base changes. The floating tag
+#    `python:3.11-slim` can move to a newer Debian release on Docker Hub; when it does,
+#    this entire apt layer is rebuilt from scratch (looks like "it used to be 2 minutes").
+# 3) Avoid `docker compose build --no-cache` and avoid `--pull` unless you intend to refresh
+#    the base image. After one successful build, only changing app files usually hits cache
+#    for apt and rebuilds pip/COPY only (~minutes → ~1–3 min typical).
+
 # System dependencies for Kivy GUI on Linux (X11/SDL2 backend):
 # SDL2, OpenGL/GLES, X11 client libs, touch input, build tools,
 # PortAudio for sounddevice (mic test).
@@ -50,6 +61,7 @@ RUN set -eux; \
             util-linux \
             iproute2 \
             espeak-ng \
+            alsa-utils \
             network-manager \
             sudo \
         ; then \

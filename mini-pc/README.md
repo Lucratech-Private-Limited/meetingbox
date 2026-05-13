@@ -33,6 +33,7 @@ This folder contains everything that normally runs on the **meeting room device*
 cd mini-pc
 cp .env.example .env
 nano .env   # BACKEND_URL, BACKEND_WS_URL, UPLOAD_AUDIO_API_URL, DASHBOARD_URL
+# If the cloud API enables WebSocket auth, see BACKEND_WS_SHARED_SECRET / paired-token ?access_token= (device-ui api_client).
 mkdir -p data/audio/recordings data/audio/temp data/config
 ```
 

@@ -5,7 +5,12 @@ from __future__ import annotations
 from typing import Any
 
 from routes.integrations import get_credentials_for_provider
-from services.calendar import create_event, default_calendar_tz_name, list_upcoming_events
+from services.calendar import (
+    create_event,
+    default_calendar_tz_name,
+    list_upcoming_events,
+    suggest_free_slots,
+)
 from tools.base_tool import ToolError
 
 
@@ -50,4 +55,23 @@ def calendar_create_from_payload(user_id: str, payload: dict[str, Any]) -> dict[
     attendees=attendees,
     location=location,
     timezone=timezone,
+  )
+
+
+def calendar_suggest_free_slots(user_id: str, args: dict | None = None) -> dict[str, Any]:
+  if not user_id:
+    raise ToolError("Sign in is required to check availability.")
+  creds = get_credentials_for_provider(user_id, "calendar")
+  if not creds:
+    raise ToolError("Google Calendar is not connected. Connect it in Settings.")
+  a = args if isinstance(args, dict) else {}
+  return suggest_free_slots(
+    creds,
+    days_ahead=int(a.get("days_ahead") or 7),
+    duration_minutes=int(a.get("duration_minutes") or 30),
+    step_minutes=int(a.get("step_minutes") or 30),
+    work_start_hhmm=str(a.get("work_start_hhmm") or "09:00"),
+    work_end_hhmm=str(a.get("work_end_hhmm") or "18:00"),
+    timezone=str(a.get("timezone") or default_calendar_tz_name()),
+    max_slots=int(a.get("max_slots") or 12),
   )

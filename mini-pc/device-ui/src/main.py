@@ -218,10 +218,12 @@ from config import (
     DEFAULT_PRIVACY_MODE,
     LOCAL_REDIS_HOST,
     LOCAL_REDIS_PORT,
+    LOCAL_REDIS_ENABLED,
     display_now,
     setup_complete_marker_paths_for_read,
     get_device_auth_token,
     clear_stored_device_auth_token,
+    WAKE_LOCAL_VOICE_ONLY,
 )
 
 from api_client import BackendClient
@@ -261,6 +263,7 @@ from screens.idle import IdleScreen
 from screens.settings import SettingsScreen
 from screens.auto_delete_picker import AutoDeletePickerScreen
 from screens.brightness_picker import BrightnessPickerScreen
+from screens.speech_volume_picker import SpeechVolumePickerScreen
 from screens.idle_timeout_picker import IdleTimeoutPickerScreen
 from screens.mic_test import MicTestScreen
 from screens.update_check import UpdateCheckScreen
@@ -271,6 +274,9 @@ from screens.meetings import MeetingsScreen
 from screens.meeting_detail import MeetingDetailScreen
 from screens.wifi import WiFiScreen
 from screens.system import SystemScreen
+from screens.calendar import CalendarScreen
+from screens.morning_brief import MorningBriefScreen
+from screens.emails import EmailsScreen
 
 # ------------------------------------------------------------------
 # Logging
@@ -513,6 +519,9 @@ class MeetingBoxApp(App):
         self._transcript_cta_poll_meeting_id = None
         self._transcript_cta_satisfied_meeting_id = None
 
+        # Restore processing UI if summary/transcript-ready arrived before the processing screen.
+        self._processing_summary_cache = {}
+
         # WebSocket
         self.ws_task = None
         self._pairing_poll = None
@@ -556,8 +565,21 @@ class MeetingBoxApp(App):
         self.voice_assistant = VoiceAssistant(
             self._handle_voice_intent,
             on_wake_phrase=self._handle_voice_wake_phrase,
+            on_amplitude=self._handle_voice_amplitude,
+            on_conversation_turn=self._handle_voice_conversation_turn,
         )
         self._voice_confirmation_timeout = self.voice_assistant.confirmation_timeout_seconds
+        self._last_amplitude_sched = 0.0
+
+        # OpenAI Realtime assistant (optional; uses server /api/voice + wake phrase).
+        self._realtime_voice_session = None
+        self._realtime_session_pending = False
+        self._realtime_session_start_monotonic = None
+        self._realtime_connected_ok = False
+        self.voice_realtime_assistant = False
+        self.voice_wake_phrase_display = "Hey buddy"
+        self.voice_assistant_enabled = True
+        self.assistant_speech_volume = 85
 
     # ==================================================================
     # BUILD
@@ -616,6 +638,7 @@ class MeetingBoxApp(App):
         self.screen_manager.add_widget(SettingsScreen(name='settings'))
         self.screen_manager.add_widget(AutoDeletePickerScreen(name='auto_delete_picker'))
         self.screen_manager.add_widget(BrightnessPickerScreen(name='brightness_picker'))
+        self.screen_manager.add_widget(SpeechVolumePickerScreen(name='speech_volume_picker'))
         self.screen_manager.add_widget(IdleTimeoutPickerScreen(name='idle_timeout_picker'))
         self.screen_manager.add_widget(MicTestScreen(name='mic_test'))
         self.screen_manager.add_widget(UpdateCheckScreen(name='update_check'))
@@ -625,6 +648,9 @@ class MeetingBoxApp(App):
         self.screen_manager.add_widget(MeetingDetailScreen(name='meeting_detail'))
         self.screen_manager.add_widget(WiFiScreen(name='wifi'))
         self.screen_manager.add_widget(SystemScreen(name='system'))
+        self.screen_manager.add_widget(CalendarScreen(name='calendar'))
+        self.screen_manager.add_widget(MorningBriefScreen(name='morning_brief'))
+        self.screen_manager.add_widget(EmailsScreen(name='emails'))
 
         # BOOT: always start with splash
         self.screen_manager.current = 'splash'
@@ -632,9 +658,10 @@ class MeetingBoxApp(App):
         # Start WebSocket listener
         self.start_websocket_listener()
 
-        # Start local Redis listener for real-time audio levels from the audio
-        # container (both on the same Docker network).
-        self._start_local_redis_listener()
+        # Optional: Redis pub/sub for audio levels when appliance runs with local Redis.
+        # Disable with LOCAL_REDIS_ENABLED=0 when using a remote API only (no local Redis).
+        if LOCAL_REDIS_ENABLED:
+            self._start_local_redis_listener()
         # Voice assistant logic (wake phrase, intents) stays active; the floating
         # "Tony" overlay is intentionally not mounted. ``self.voice_indicator``
         # remains None (set in __init__) so existing _refresh/_set helpers no-op
@@ -862,6 +889,32 @@ class MeetingBoxApp(App):
                 self.privacy_mode = privacy
                 auto_record = settings.get('auto_record', False)
                 self.auto_record = auto_record
+
+                vra = settings.get("voice_realtime_assistant", False)
+                if isinstance(vra, str):
+                    vra = str(vra).strip().lower() in ("1", "true", "yes", "on")
+                self.voice_realtime_assistant = bool(vra)
+
+                vae = settings.get("voice_assistant_enabled", True)
+                if isinstance(vae, str):
+                    vae = str(vae).strip().lower() in ("1", "true", "yes", "on")
+                self.voice_assistant_enabled = bool(vae)
+
+                vwp = (settings.get("voice_wake_phrase") or "hey buddy").strip()
+                self.voice_wake_phrase_display = vwp[:1].upper() + vwp[1:] if vwp else "Hey buddy"
+                try:
+                    sv = settings.get("assistant_speech_volume", 85)
+                    if isinstance(sv, str):
+                        sv = int(float(sv.strip()))
+                    else:
+                        sv = int(sv)
+                except (TypeError, ValueError):
+                    sv = 85
+                self.assistant_speech_volume = max(0, min(100, sv))
+                self.voice_assistant.apply_server_settings(
+                    wake_phrase=vwp,
+                    enabled=self.voice_assistant_enabled,
+                )
             except Exception as e:
                 logger.warning("Could not load settings: %s", e)
             try:
@@ -1117,6 +1170,10 @@ class MeetingBoxApp(App):
 
     def on_recording_stopped(self, data):
         self.recording_state['active'] = False
+        try:
+            self._processing_summary_cache.clear()
+        except Exception:
+            pass
         sid = data.get('session_id') or self.current_session_id
         self._kick_post_stop_meeting_polls(sid)
         self._voice_start_in_flight = False
@@ -1254,15 +1311,27 @@ class MeetingBoxApp(App):
     def on_summary_complete(self, data):
         """Handle summary_complete event from AI service (if it fires separately)."""
         meeting_id = data.get('meeting_id')
-        summary = data.get('summary', {})
-        if meeting_id:
+        summary = data.get('summary') or {}
+        if not meeting_id:
+            return
+        if isinstance(summary, dict) and summary.get('status') == 'failed':
+            err = str(summary.get('error') or 'Report could not be generated.')
             Clock.schedule_once(
-                lambda _dt: self._show_processing_summary_ready(meeting_id, summary),
+                lambda _dt, mid=meeting_id, msg=err: self._show_processing_summary_failed(mid, msg),
                 0,
             )
+            return
+        Clock.schedule_once(
+            lambda _dt, mid=meeting_id, sm=summary: self._show_processing_summary_ready(mid, sm),
+            0,
+        )
 
     def _show_processing_summary_ready(self, meeting_id: str, summary: dict):
         """Keep user on processing screen and enable CTA once summary is ready."""
+        try:
+            self._processing_summary_cache[meeting_id] = {'ok': True, 'summary': summary or {}}
+        except Exception:
+            pass
         # Any path reaching here is the authoritative "summary ready" signal —
         # silence the fallback poll so we don't duplicate work.
         if self._summary_poll_meeting_id == meeting_id:
@@ -1274,6 +1343,25 @@ class MeetingBoxApp(App):
             return
         if hasattr(processing, 'on_summary_ready'):
             processing.on_summary_ready(meeting_id, summary or {})
+
+    def _show_processing_summary_failed(self, meeting_id: str, message: str):
+        """Summary/report failed — still allow transcript-only review when available."""
+        if self._summary_poll_meeting_id == meeting_id:
+            self._summary_poll_done = True
+        try:
+            self._processing_summary_cache[meeting_id] = {
+                'ok': False,
+                'error': message or 'Report unavailable.',
+            }
+        except Exception:
+            pass
+        try:
+            processing = self.screen_manager.get_screen('processing')
+        except Exception as e:
+            logger.debug('Processing screen unavailable for summary-failed update: %s', e)
+            return
+        if hasattr(processing, 'on_summary_failed'):
+            processing.on_summary_failed(meeting_id, message or 'Report unavailable.')
 
     def _start_summary_poll(self, meeting_id: str):
         """Kick off the HTTP fallback poll that watches for a saved summary.
@@ -1322,6 +1410,28 @@ class MeetingBoxApp(App):
             "Summary poll gave up for meeting %s (no summary within 5 min)",
             meeting_id,
         )
+        detail = None
+        try:
+            detail = await self.backend.get_meeting_detail(meeting_id)
+        except Exception as e:
+            logger.debug('Summary poll final detail fetch failed: %s', e)
+        segments = (detail or {}).get('segments') or []
+        if segments:
+            Clock.schedule_once(
+                lambda _dt, mid=meeting_id: self._show_processing_summary_failed(
+                    mid,
+                    'Full report is still unavailable — you can open the transcript.',
+                ),
+                0,
+            )
+        else:
+            Clock.schedule_once(
+                lambda _dt: self.show_error_screen(
+                    'Processing timeout',
+                    'No transcript or summary appeared. Check your connection and try again.',
+                ),
+                0,
+            )
 
     def _start_transcript_cta_poll(self, meeting_id: str):
         if not meeting_id:
@@ -1385,6 +1495,24 @@ class MeetingBoxApp(App):
             "Transcript CTA poll gave up for meeting %s (no segments within ~6 min)",
             meeting_id,
         )
+        detail = None
+        try:
+            detail = await self.backend.get_meeting_detail(meeting_id)
+        except Exception as e:
+            logger.debug('Transcript CTA poll final detail fetch failed: %s', e)
+        if (detail or {}).get('segments'):
+            Clock.schedule_once(
+                lambda _dt, mid=meeting_id: self._deliver_transcript_cta_from_poll(mid),
+                0,
+            )
+        else:
+            Clock.schedule_once(
+                lambda _dt: self.show_error_screen(
+                    'Processing timeout',
+                    'Transcript was not saved in time. Check your connection and try again.',
+                ),
+                0,
+            )
 
     def _auto_summarize(self, meeting_id: str):
         """After transcription completes, auto-trigger summarization then show review screen."""
@@ -1629,6 +1757,10 @@ class MeetingBoxApp(App):
     def _voice_assistant_should_listen(self) -> bool:
         if self.screen_manager is None:
             return False
+        if not getattr(self, "voice_assistant_enabled", True):
+            return False
+        if getattr(self, "_realtime_voice_session", None) is not None:
+            return False
         if self._voice_start_in_flight:
             return False
         if self.user_voice_paused:
@@ -1672,6 +1804,7 @@ class MeetingBoxApp(App):
             self._voice_indicator_reset_ev = None
         self._voice_indicator_override = None
         self._refresh_voice_indicator()
+        self._sync_voice_assistant_state()
 
     def _set_voice_indicator_override(
         self,
@@ -1690,22 +1823,322 @@ class MeetingBoxApp(App):
             )
 
     def _handle_voice_wake_phrase(self, _text: str) -> None:
-        Clock.schedule_once(
-            lambda _dt: self._set_voice_indicator_override(
+        timeout = max(2.0, self.voice_assistant.command_timeout_seconds)
+        lbl = getattr(self, "voice_wake_phrase_display", "Hey buddy") or "Hey buddy"
+
+        def _wake_ui(_dt):
+            self._set_voice_indicator_override(
                 "wake",
-                'Heard "Hey Tony"',
-                max(2.0, self.voice_assistant.command_timeout_seconds),
-            ),
+                f'Heard "{lbl}"',
+                timeout,
+            )
+            if (
+                self.screen_manager is not None
+                and self.screen_manager.current == "home"
+            ):
+                try:
+                    home = self.screen_manager.get_screen("home")
+                    home.show_listening_state()
+                    Clock.schedule_once(
+                        lambda _dt2: self._hide_home_listening_state(),
+                        timeout,
+                    )
+                except Exception:
+                    pass
+
+        Clock.schedule_once(_wake_ui, 0)
+
+        if (
+            getattr(self, "voice_realtime_assistant", False)
+            and get_device_auth_token().strip()
+            and not USE_MOCK_BACKEND
+            and not WAKE_LOCAL_VOICE_ONLY
+        ):
+            def _kick_realtime(_dt):
+                self._show_home_listening_after_wake()
+                self._start_realtime_voice_session()
+
+            Clock.schedule_once(_kick_realtime, 0)
+            return
+
+        Clock.schedule_once(
+            lambda _dt: self._begin_local_voice_command_session(),
             0,
         )
+
+    def _show_home_listening_after_wake(self) -> None:
+        """Home listening animation while OpenAI Realtime connects."""
+        timeout = max(2.0, self.voice_assistant.command_timeout_seconds)
+        if (
+            self.screen_manager is not None
+            and self.screen_manager.current == "home"
+        ):
+            try:
+                home = self.screen_manager.get_screen("home")
+                home.show_listening_state()
+                Clock.schedule_once(
+                    lambda _dt: self._hide_home_listening_state(),
+                    timeout,
+                )
+            except Exception:
+                pass
+
+    def _begin_local_voice_command_session(self) -> None:
+        """Post-wake window for local Vosk commands (no Realtime).
+
+        Refreshes the home listening animation and hide timer so Realtime failures
+        or API fallbacks do not collapse the UI after a fraction of a second.
+        """
+        try:
+            self.voice_assistant.simulate_wake()
+        except Exception:
+            logger.exception("simulate_wake after wake phrase failed")
+        timeout = max(2.0, self.voice_assistant.command_timeout_seconds)
+        if (
+            self.screen_manager is not None
+            and self.screen_manager.current == "home"
+        ):
+            try:
+                home = self.screen_manager.get_screen("home")
+                home.show_listening_state()
+                Clock.schedule_once(
+                    lambda _dt: self._hide_home_listening_state(),
+                    timeout,
+                )
+            except Exception:
+                pass
+
+    def _handle_voice_conversation_turn(self, text: str) -> None:
+        """Cloud assistant Q&A for speech that is not a rigid local intent (person-like dialogue)."""
+        if not getattr(self, "voice_assistant_enabled", True):
+            return
+        if self._voice_pending_confirmation:
+            return
+        phrase = (text or "").strip()
+        if len(phrase) < 3:
+            return
+
+        async def _go():
+            self._set_voice_indicator_override("wake", "Thinking…", duration=None)
+            try:
+                if not USE_MOCK_BACKEND and not get_device_auth_token().strip():
+                    Clock.schedule_once(
+                        lambda _dt: self._voice_reply_and_extend_listening(
+                            "Pair this device with your account so I can answer questions.",
+                            error=True,
+                        ),
+                        0,
+                    )
+                    return
+                res = await self.backend.post_assistant_intent(phrase)
+                raw = (res.get("assistant_message") or "").strip() or "Okay."
+                Clock.schedule_once(lambda _dt, m=raw: self._voice_reply_and_extend_listening(m), 0)
+            except Exception as e:
+                logger.warning("Assistant conversation failed: %s", e)
+                Clock.schedule_once(
+                    lambda _dt: self._voice_reply_and_extend_listening(
+                        "I could not reach the assistant. Check BACKEND_URL and your network.",
+                        error=True,
+                    ),
+                    0,
+                )
+            finally:
+                Clock.schedule_once(lambda _dt: self._clear_voice_indicator_override(), 0)
+
+        run_async(_go())
+
+    def _hide_home_listening_state(self, *_args) -> None:
+        """Called after wake-word timeout to restore the home screen to idle."""
+        if (self.screen_manager is not None
+                and self.screen_manager.current == 'home'):
+            try:
+                home = self.screen_manager.get_screen('home')
+                home.hide_listening_state()
+            except Exception:
+                pass
+
+    def _handle_voice_amplitude(self, amplitude: float) -> None:
+        """Received from the audio thread — forward to home screen at ~30 fps."""
+        import time as _time
+        now = _time.monotonic()
+        if now - self._last_amplitude_sched < 0.033:
+            return
+        self._last_amplitude_sched = now
+        Clock.schedule_once(
+            lambda _dt, a=amplitude: self._apply_amplitude_to_home(a), 0
+        )
+
+    def _apply_amplitude_to_home(self, amplitude: float) -> None:
+        if (self.screen_manager is not None
+                and self.screen_manager.current == 'home'):
+            try:
+                home = self.screen_manager.get_screen('home')
+                home.update_amplitude(amplitude)
+            except Exception:
+                pass
+
+    def _end_realtime_voice_session(self) -> None:
+        sess = self._realtime_voice_session
+        started = getattr(self, "_realtime_session_start_monotonic", None)
+        connected = getattr(self, "_realtime_connected_ok", False)
+        if sess is not None:
+            try:
+                sess.stop()
+            except Exception:
+                logger.debug("Realtime session stop", exc_info=True)
+        short_failed = (
+            started is not None
+            and not connected
+            and (time.monotonic() - float(started)) < 30.0
+        )
+        self._realtime_session_start_monotonic = None
+        self._realtime_connected_ok = False
+        self._realtime_voice_session = None
+        self._realtime_session_pending = False
+        self._sync_voice_assistant_state()
+        if short_failed:
+            # Do not hide listening here — local fallback re-shows it for the full timeout.
+            Clock.schedule_once(
+                lambda _dt: self._begin_local_voice_command_session(), 0
+            )
+            return
+        self._clear_voice_indicator_override()
+        self._hide_home_listening_state()
+        self._refresh_voice_indicator()
+
+    def _start_realtime_voice_session(self) -> None:
+        if self._realtime_voice_session is not None:
+            logger.info(
+                "Ending prior Realtime voice session before starting a new one"
+            )
+            self._end_realtime_voice_session()
+
+        if self._realtime_session_pending:
+            logger.debug(
+                "Realtime voice session request already in flight; skipping duplicate"
+            )
+            return
+
+        if not get_device_auth_token().strip():
+            Clock.schedule_once(
+                lambda _dt: self._begin_local_voice_command_session(), 0
+            )
+            return
+
+        self._realtime_session_pending = True
+
+        self._set_voice_indicator_override(
+            "wake",
+            "Connecting to assistant…",
+            duration=None,
+        )
+
+        async def _go():
+            try:
+                data = await self.backend.create_realtime_voice_session()
+            except Exception as e:
+                logger.warning("Realtime voice session request failed: %s", e)
+                self._realtime_session_pending = False
+                Clock.schedule_once(lambda _dt: self._clear_voice_indicator_override(), 0)
+                Clock.schedule_once(
+                    lambda _dt: self._begin_local_voice_command_session(), 0
+                )
+                return
+            Clock.schedule_once(lambda _dt, d=data: self._run_realtime_voice_session(d), 0)
+
+        run_async(_go())
+
+    def _run_realtime_voice_session(self, data: dict) -> None:
+        self._realtime_session_pending = False
+        try:
+            from realtime_voice_session import RealtimeVoiceSession
+        except ImportError:
+            logger.exception("realtime_voice_session module missing")
+            self._clear_voice_indicator_override()
+            self._sync_voice_assistant_state()
+            Clock.schedule_once(lambda _dt: self._begin_local_voice_command_session(), 0)
+            return
+
+        from config import BACKEND_URL
+
+        secret = (data.get("client_secret") or "").strip()
+        model = (data.get("model") or "").strip()
+        if not secret or not model:
+            self._clear_voice_indicator_override()
+            self._sync_voice_assistant_state()
+            Clock.schedule_once(lambda _dt: self._begin_local_voice_command_session(), 0)
+            return
+        tok = get_device_auth_token().strip()
+
+        def _end() -> None:
+            Clock.schedule_once(lambda _dt: self._end_realtime_voice_session(), 0)
+
+        def _err(msg: str) -> None:
+            logger.error("Realtime voice error: %s", msg)
+            # Do not hide home listening here — session end + local fallback restore the UI.
+            Clock.schedule_once(lambda _dt: self._end_realtime_voice_session(), 0)
+
+        def _on_rt_connected() -> None:
+            # Run on Realtime worker thread — release Vosk mic before opening Realtime input.
+            try:
+                self.voice_assistant.set_paused(True)
+            except Exception:
+                logger.exception("pause local voice for Realtime failed")
+
+            def _ui(_dt):
+                self._realtime_connected_ok = True
+                self._clear_voice_indicator_override()
+                self._set_voice_indicator_override(
+                    "assistant_live",
+                    "Speak now — assistant is listening",
+                    duration=None,
+                )
+                self._sync_voice_assistant_state()
+
+            Clock.schedule_once(_ui, 0)
+
+        try:
+            self._realtime_connected_ok = False
+            self._realtime_session_start_monotonic = time.monotonic()
+            self._realtime_voice_session = RealtimeVoiceSession(
+                client_secret=secret,
+                model=model,
+                backend_base_url=BACKEND_URL,
+                device_token=tok,
+                on_session_end=_end,
+                on_error=_err,
+                on_connected=_on_rt_connected,
+            )
+            self._sync_voice_assistant_state()
+            self._realtime_voice_session.start()
+        except Exception:
+            logger.exception("Realtime voice session failed to start")
+            self._realtime_voice_session = None
+            self._realtime_session_pending = False
+            self._clear_voice_indicator_override()
+            self._sync_voice_assistant_state()
+            Clock.schedule_once(lambda _dt: self._begin_local_voice_command_session(), 0)
+
+    def _espeak_amplitude(self) -> int:
+        """Map stored volume 0–100 to espeak-ng -a (0–200)."""
+        try:
+            v = int(getattr(self, "assistant_speech_volume", 85) or 85)
+        except (TypeError, ValueError):
+            v = 85
+        v = max(0, min(100, v))
+        return max(0, min(200, int(round(v * 2))))
 
     def _speak_text_blocking(self, text: str) -> bool:
         phrase = (text or "").strip()
         if not phrase:
             return False
+        amp_n = self._espeak_amplitude()
+        if amp_n <= 0:
+            return True
+        amp = str(amp_n)
         for cmd in (
-            ["espeak-ng", "-s", "165", "-a", "180", phrase],
-            ["espeak", "-s", "165", "-a", "180", phrase],
+            ["espeak-ng", "-s", "165", "-a", amp, phrase],
+            ["espeak", "-s", "165", "-a", amp, phrase],
         ):
             exe = shutil.which(cmd[0])
             if not exe:
@@ -1721,6 +2154,31 @@ class MeetingBoxApp(App):
                 return True
             except Exception as e:
                 logger.warning("Voice feedback via %s failed: %s", exe, e)
+        esng = shutil.which("espeak-ng")
+        aplay = shutil.which("aplay")
+        if esng and aplay:
+            try:
+                proc = subprocess.Popen(
+                    [esng, "-s", "165", "-a", amp, phrase, "--stdout"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                )
+                try:
+                    subprocess.run(
+                        [aplay, "-q"],
+                        stdin=proc.stdout,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        check=False,
+                        timeout=30,
+                    )
+                finally:
+                    if proc.stdout:
+                        proc.stdout.close()
+                    proc.wait(timeout=30)
+                return True
+            except Exception as e:
+                logger.warning("Voice feedback via espeak-ng stdout | aplay failed: %s", e)
         logger.warning("Voice feedback unavailable: no espeak command found")
         return False
 
@@ -1746,6 +2204,22 @@ class MeetingBoxApp(App):
             duration if duration is not None else self._voice_duration_seconds(text),
         )
         self._speak_text_async(text)
+
+    def _voice_reply_and_extend_listening(self, message: str, *, error: bool = False) -> None:
+        """Speak assistant text and reopen the post-wake command window for multi-turn chat."""
+        msg = self._trim_voice_text(message, 450)
+        words = max(1, len(msg.split()))
+        dur = min(45.0, max(2.5, words * 0.42))
+        st = "error" if error else "speaking"
+        self._voice_reply(msg, state=st, duration=dur)
+
+        def _extend(_dt):
+            try:
+                self.voice_assistant.simulate_wake()
+            except Exception:
+                logger.debug("simulate_wake after assistant reply failed", exc_info=True)
+
+        Clock.schedule_once(_extend, dur + 0.35)
 
     @staticmethod
     def _format_voice_duration(seconds: int) -> str:

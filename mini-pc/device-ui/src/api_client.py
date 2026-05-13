@@ -8,8 +8,12 @@ Aligned with the actual backend routes in server/web/.
 import asyncio
 import json
 import logging
-from typing import List, Dict, Optional, AsyncIterator
-from datetime import datetime
+import os
+import re
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from typing import AsyncIterator, Dict, List, Optional
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import httpx
 import websockets
@@ -26,6 +30,114 @@ from config import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Match dashboard Emails tab (`frontend/src/pages/Emails.tsx`).
+_GMAIL_RECENT_DAYS = 90
+
+
+def _parse_sender_display(raw: str) -> str:
+    """Parse 'Display Name <addr@host>' into a short display name (same idea as server emails route)."""
+    m = re.match(r"^(.*?)\s*<([^>]+)>", (raw or "").strip())
+    if m:
+        name = m.group(1).strip().strip('"')
+        addr = m.group(2).strip()
+        return name or addr
+    s = (raw or "").strip()
+    return s or "—"
+
+
+def _parse_message_date(raw_date: str) -> Optional[datetime]:
+    s = (raw_date or "").strip()
+    if not s:
+        return None
+    try:
+        return parsedate_to_datetime(s)
+    except Exception:
+        pass
+    try:
+        if len(s) >= 10 and s[4] == "-" and s[7] == "-":
+            return datetime.fromisoformat(s[:10]).replace(tzinfo=timezone.utc)
+    except Exception:
+        pass
+    return None
+
+
+def _is_today_rfc(raw_date: str) -> bool:
+    dt = _parse_message_date(raw_date)
+    if dt is None:
+        return False
+    try:
+        now = datetime.now(tz=timezone.utc)
+        return (now - dt).days == 0
+    except Exception:
+        return False
+
+
+def _friendly_time_rfc(raw_date: str) -> str:
+    """Portable version of server emails `_friendly_time` (no platform-specific strftime)."""
+    dt = _parse_message_date(raw_date)
+    if dt is None:
+        return (raw_date or "")[:10] if raw_date else "—"
+    try:
+        now = datetime.now(tz=timezone.utc)
+        local_dt = dt.astimezone()
+        delta_days = (now - dt).days
+        if delta_days == 0:
+            h24 = local_dt.hour
+            h12 = h24 % 12 or 12
+            ampm = "AM" if h24 < 12 else "PM"
+            return f"{h12}:{local_dt.minute:02d} {ampm}"
+        if delta_days < 7:
+            return local_dt.strftime("%a %d")
+        return local_dt.strftime("%b %d")
+    except Exception:
+        return raw_date[:10] if raw_date else "—"
+
+
+def _map_gmail_recent_row(msg: Dict) -> Dict:
+    """Shape from `GET /api/integrations/gmail/recent` `messages[]` → device EmailsScreen row."""
+    raw_from = msg.get("from") or ""
+    raw_date = msg.get("date") or ""
+    snippet = msg.get("snippet") or ""
+    return {
+        "id": msg["id"],
+        "thread_id": msg.get("threadId"),
+        "sender": _parse_sender_display(raw_from),
+        "sender_email": raw_from,
+        "subject": (msg.get("subject") or "(no subject)").strip() or "(no subject)",
+        "preview": snippet,
+        "body": snippet,
+        "time": _friendly_time_rfc(raw_date),
+        "date": raw_date,
+        "is_today": _is_today_rfc(raw_date),
+        "is_read": bool(msg.get("is_read", True)),
+        "to": "",
+    }
+
+
+def build_websocket_url(base_ws_url: str) -> str:
+    """
+    Match server/web WebSocket auth: optional MEETINGBOX_WS_REQUIRE_AUTH (access_token query)
+    and/or MEETINGBOX_WS_SHARED_SECRET (token query). Harmless extras when server auth is off.
+    """
+    base = (base_ws_url or "").strip()
+    if not base:
+        return base
+    parts = urlparse(base)
+    q = dict(parse_qsl(parts.query, keep_blank_values=False))
+    tok = (get_device_auth_token() or "").strip()
+    if tok:
+        q["access_token"] = tok
+    secret = (
+        (os.getenv("BACKEND_WS_SHARED_SECRET") or os.getenv("MEETINGBOX_WS_SHARED_SECRET") or "")
+        .strip()
+    )
+    if secret:
+        q["token"] = secret
+    new_query = urlencode(q) if q else ""
+    return urlunparse(
+        (parts.scheme, parts.netloc, parts.path, parts.params, new_query, parts.fragment)
+    )
 
 
 class BackendClient:
@@ -50,7 +162,7 @@ class BackendClient:
       WiFi connect:    POST /api/device/wifi/connect       (device route)
       Check updates:   GET  /api/device/check-updates      (device route)
       Install update:  POST /api/device/install-update     (device route)
-      WebSocket:       ws://host:port/ws
+      WebSocket:       ws://host:port/ws (?access_token= / ?token= when server requires it)
       Claim pairing:   POST /api/devices/claim              (no auth)
     """
 
@@ -379,6 +491,47 @@ class BackendClient:
             logger.error("Assistant intent failed: %s", e)
             raise
 
+    async def approve_assistant_pending(self, pending_id: str) -> Dict:
+        """POST /api/assistant/pending-actions/{id}/approve"""
+        try:
+            resp = await self.client.post(
+                f"{self.base_url}/api/assistant/pending-actions/{pending_id}/approve",
+                timeout=120.0,
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.error("approve_assistant_pending failed: %s", e)
+            raise
+
+    async def reject_assistant_pending(self, pending_id: str) -> Dict:
+        """POST /api/assistant/pending-actions/{id}/reject"""
+        try:
+            resp = await self.client.post(
+                f"{self.base_url}/api/assistant/pending-actions/{pending_id}/reject",
+                timeout=60.0,
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.error("reject_assistant_pending failed: %s", e)
+            raise
+
+    async def patch_assistant_pending_payload(
+            self, pending_id: str, payload: Dict) -> Dict:
+        """PATCH /api/assistant/pending-actions/{id} (email or calendar draft)."""
+        try:
+            resp = await self.client.patch(
+                f"{self.base_url}/api/assistant/pending-actions/{pending_id}",
+                json={"payload": payload},
+                timeout=60.0,
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.error("patch_assistant_pending_payload failed: %s", e)
+            raise
+
     # ==================================================================
     # SETTINGS API (device route)
     # ==================================================================
@@ -480,6 +633,161 @@ class BackendClient:
         except Exception as e:
             logger.error(f"Failed to disconnect {integration_id}: {e}")
             raise
+
+    # ==================================================================
+    # CALENDAR API
+    # ==================================================================
+
+    async def get_calendar_week(self, start_date: str, end_date: str) -> Dict:
+        """GET /api/calendar/week?start=YYYY-MM-DD&end=YYYY-MM-DD
+
+        Returns meetings grouped by date:
+        {
+          "days": {
+            "2026-05-04": {"meetings": [{id, title, start, end, ...}]},
+            ...
+          }
+        }
+        """
+        try:
+            resp = await self.client.get(
+                f"{self.base_url}/api/calendar/week",
+                params={"start": start_date, "end": end_date},
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.debug("get_calendar_week failed: %s", e)
+            return {"days": {}}
+
+    async def get_briefing_context(self, days_ahead: int = 1) -> Dict:
+        """GET /api/briefing/context — calendar slice, tasks, mem0, Gmail preview."""
+        try:
+            resp = await self.client.get(
+                f"{self.base_url}/api/briefing/context",
+                params={"days_ahead": int(days_ahead)},
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.debug("get_briefing_context failed: %s", e)
+            return {}
+
+    async def get_commitments(self, status: str = "", limit: int = 40) -> Dict:
+        """GET /api/commitments"""
+        try:
+            params: Dict = {"limit": int(limit)}
+            if (status or "").strip():
+                params["status"] = status.strip()
+            resp = await self.client.get(
+                f"{self.base_url}/api/commitments",
+                params=params,
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.debug("get_commitments failed: %s", e)
+            return {"commitments": [], "count": 0}
+
+    async def create_realtime_voice_session(self) -> Dict:
+        """POST /api/voice/realtime/session — OpenAI Realtime client secret (Bearer token)."""
+        resp = await self.client.post(f"{self.base_url}/api/voice/realtime/session")
+        resp.raise_for_status()
+        return resp.json()
+
+    # ==================================================================
+    # GMAIL (same feed as dashboard: GET /api/integrations/gmail/recent)
+    # ==================================================================
+
+    async def fetch_gmail_recent(
+            self,
+            *,
+            max_results: int = 40,
+            days: int = _GMAIL_RECENT_DAYS,
+            q: str = "",
+    ) -> Dict:
+        """
+        GET /api/integrations/gmail/recent — same feed as dashboard Emails tab; works with device Bearer token.
+        """
+        try:
+            resp = await self.client.get(
+                f"{self.base_url}/api/integrations/gmail/recent",
+                params={
+                    "max_results": int(max_results),
+                    "days": int(days),
+                    "q": (q or "").strip(),
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            if not isinstance(data, dict):
+                return {"connected": False, "messages": [], "error": "Invalid response"}
+            return data
+        except httpx.HTTPStatusError as e:
+            logger.warning(
+                "fetch_gmail_recent HTTP %s: %s",
+                e.response.status_code,
+                (e.response.text or "")[:300],
+            )
+            return {
+                "connected": False,
+                "messages": [],
+                "error": f"HTTP {e.response.status_code}",
+            }
+        except Exception as e:
+            logger.warning("fetch_gmail_recent failed: %s", e)
+            return {"connected": False, "messages": [], "error": str(e)}
+
+    async def get_emails(self, filter: str = "all", limit: int = 50) -> List[Dict]:
+        """Load Gmail rows using the same API as the web dashboard (filter applied locally by EmailsScreen)."""
+        data = await self.fetch_gmail_recent(max_results=limit, days=_GMAIL_RECENT_DAYS, q="")
+        if not data.get("connected"):
+            err = (data.get("error") or "").strip()
+            if err:
+                logger.warning("get_emails: Gmail not connected: %s", err[:300])
+            else:
+                logger.warning("get_emails: connected=false (connect Gmail from dashboard Settings)")
+            return []
+        rows = data.get("messages") or []
+        if not isinstance(rows, list):
+            return []
+        return [_map_gmail_recent_row(m) for m in rows if isinstance(m, dict) and m.get("id")]
+
+    async def get_email_detail(self, email_id: str) -> Dict:
+        """GET /api/integrations/gmail/messages/{id} — full body."""
+        try:
+            resp = await self.client.get(
+                f"{self.base_url}/api/integrations/gmail/messages/{email_id}"
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.debug("get_email_detail failed: %s", e)
+            return {}
+
+    async def mark_email_unread(self, email_id: str) -> Dict:
+        """POST /api/integrations/gmail/messages/{id}/mark-unread"""
+        try:
+            resp = await self.client.post(
+                f"{self.base_url}/api/integrations/gmail/messages/{email_id}/mark-unread"
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.debug("mark_email_unread failed: %s", e)
+            return {}
+
+    async def archive_email(self, email_id: str) -> Dict:
+        """POST /api/integrations/gmail/messages/{id}/archive"""
+        try:
+            resp = await self.client.post(
+                f"{self.base_url}/api/integrations/gmail/messages/{email_id}/archive"
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.debug("archive_email failed: %s", e)
+            return {}
 
     # ==================================================================
     # SYSTEM API
@@ -637,7 +945,8 @@ class BackendClient:
         """
         while True:
             try:
-                async with websockets.connect(self.ws_url) as ws:
+                ws_connect_url = build_websocket_url(self.ws_url)
+                async with websockets.connect(ws_connect_url) as ws:
                     logger.info("WebSocket connected")
                     self._ws_reconnect_attempts = 0
                     self.ws_connection = ws

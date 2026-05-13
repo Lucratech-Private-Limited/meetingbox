@@ -21,16 +21,19 @@ Otherwise it is derived from the incoming request (X-Forwarded-Proto + Host), th
 import json
 import logging
 import os
+import re
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from typing import Optional
 from urllib.parse import urlencode, quote_plus
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import RedirectResponse
 
-from auth import get_current_user, SECRET_KEY
+from auth import get_current_actor, get_current_user, get_optional_actor, SECRET_KEY
 from database import get_connection
 
 logger = logging.getLogger(__name__)
@@ -56,6 +59,7 @@ SCOPES_BY_PROVIDER = {
     ]),
     "calendar": " ".join([
         "https://www.googleapis.com/auth/calendar.events",
+        "https://www.googleapis.com/auth/calendar.readonly",
         "https://www.googleapis.com/auth/userinfo.email",
     ]),
 }
@@ -335,6 +339,301 @@ async def list_integrations(current_user: dict = Depends(get_current_user)):
         })
 
     return results
+
+
+# ======================================================================
+# READ-ONLY CALENDAR / GMAIL FEEDS FOR DASHBOARD (must be declared before `/{provider}/auth-url`)
+# ======================================================================
+
+def _calendar_feed_error_payload(http_status: int, message: str) -> dict:
+    """Structured JSON when Calendar API fails after OAuth row exists."""
+    if http_status in (401,):
+        return {
+            "connected": False,
+            "events": [],
+            "count": 0,
+            "error": message or "Reconnect Google Calendar in Settings.",
+            "google_status": http_status,
+        }
+    if http_status == 429:
+        return {
+            "connected": True,
+            "events": [],
+            "count": 0,
+            "error": "Google Calendar rate limited. Try again shortly.",
+            "google_status": http_status,
+        }
+    return {
+        "connected": True,
+        "events": [],
+        "count": 0,
+        "error": message or "Could not load Google Calendar.",
+        "google_status": http_status,
+    }
+
+
+def _gmail_feed_error_payload(http_status: int, message: str) -> dict:
+    if http_status in (401,):
+        return {
+            "connected": False,
+            "messages": [],
+            "count": 0,
+            "error": message or "Reconnect Gmail in Settings.",
+            "google_status": http_status,
+        }
+    if http_status == 429:
+        return {
+            "connected": True,
+            "messages": [],
+            "count": 0,
+            "error": "Gmail rate limited. Try again shortly.",
+            "google_status": http_status,
+        }
+    return {
+        "connected": True,
+        "messages": [],
+        "count": 0,
+        "error": message or "Could not load Gmail.",
+        "google_status": http_status,
+    }
+
+
+def _parse_gmail_sender(raw: str) -> tuple[str, str]:
+    m = re.match(r"^(.*?)\s*<([^>]+)>", (raw or "").strip())
+    if m:
+        name = m.group(1).strip().strip('"')
+        addr = m.group(2).strip()
+        return name or addr, addr
+    s = (raw or "").strip()
+    return s, s
+
+
+def _gmail_friendly_time(raw_date: str) -> str:
+    try:
+        dt = parsedate_to_datetime(raw_date)
+        now = datetime.now(tz=timezone.utc)
+        local_dt = dt.astimezone()
+        if (now - dt).days == 0:
+            return local_dt.strftime("%-I:%M %p")
+        if (now - dt).days < 7:
+            return local_dt.strftime("%a %d")
+        return local_dt.strftime("%b %d")
+    except Exception:
+        return raw_date[:10] if raw_date else "—"
+
+
+def _gmail_is_today(raw_date: str) -> bool:
+    try:
+        dt = parsedate_to_datetime(raw_date)
+        now = datetime.now(tz=timezone.utc)
+        return (now - dt).days == 0
+    except Exception:
+        return False
+
+
+def _gmail_message_to_device_row(msg: dict) -> dict:
+    """Shape one Gmail metadata row for device-ui / SPA inbox lists."""
+    sender_name, sender_addr = _parse_gmail_sender(msg.get("from", ""))
+    raw_date = msg.get("date", "")
+    return {
+        "id": msg["id"],
+        "thread_id": msg.get("threadId"),
+        "sender": sender_name,
+        "sender_email": sender_addr,
+        "subject": msg.get("subject") or "(no subject)",
+        "preview": msg.get("snippet", ""),
+        "body": msg.get("snippet", ""),
+        "time": _gmail_friendly_time(raw_date),
+        "date": raw_date,
+        "is_today": _gmail_is_today(raw_date),
+        "is_read": msg.get("is_read", True),
+        "to": "",
+    }
+
+
+@router.get("/integrations/calendar/events")
+async def integrations_calendar_events(
+    current_user: dict = Depends(get_current_user),
+    days_past: int = Query(14, ge=0, le=90),
+    days_future: int = Query(365, ge=1, le=547),
+    max_results: int = Query(250, ge=1, le=500),
+):
+    """Upcoming/recent primary-calendar events using stored OAuth (read-only)."""
+    from googleapiclient.errors import HttpError
+
+    from services.calendar import list_events_time_range
+
+    user_id = current_user["id"]
+    creds = get_credentials_for_provider(user_id, "calendar")
+    if not creds:
+        return {"connected": False, "events": [], "count": 0}
+
+    try:
+        raw = list_events_time_range(
+            creds,
+            days_past=days_past,
+            days_future=days_future,
+            max_results=max_results,
+        )
+    except HttpError as e:
+        status = int(e.resp.status) if e.resp else 500
+        reason = getattr(e, "reason", "") or ""
+        msg = reason.strip() or "Google Calendar request failed."
+        logger.warning("Calendar feed HttpError status=%s: %s", status, msg)
+        return _calendar_feed_error_payload(status, msg)
+    except Exception:
+        logger.exception("Calendar feed unexpected error")
+        return {
+            "connected": True,
+            "events": [],
+            "count": 0,
+            "error": "Could not load Google Calendar.",
+            "google_status": None,
+        }
+
+    slim = []
+    for ev in raw:
+        slim.append({
+            "id": ev.get("id"),
+            "summary": ev.get("summary") or "(No title)",
+            "start": ev.get("start") or {},
+            "end": ev.get("end") or {},
+            "htmlLink": ev.get("htmlLink"),
+            "location": ev.get("location") or "",
+            "reminders": ev.get("reminders"),
+            "eventType": ev.get("eventType"),
+            "status": ev.get("status"),
+        })
+
+    return {"connected": True, "events": slim, "count": len(slim)}
+
+
+@router.get("/integrations/gmail/recent")
+async def integrations_gmail_recent(
+    current_actor: Optional[dict] = Depends(get_optional_actor),
+    max_results: int = Query(25, ge=1, le=50),
+    days: int = Query(
+        90,
+        ge=1,
+        le=730,
+        description="Only mail from the last N days; forwarded to services.gmail.list_recent_messages.",
+    ),
+    q: str = Query("", max_length=500),
+):
+    """Recent Gmail message metadata via stored OAuth (read-only).
+
+    Accepts JWT (dashboard) or paired-device token (device-ui); uses owner user_id.
+    """
+    from googleapiclient.errors import HttpError
+
+    from services.gmail import list_recent_messages
+
+    if not current_actor:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    user_id = current_actor["user"]["id"]
+    creds = get_credentials_for_provider(user_id, "gmail")
+    if not creds:
+        return {"connected": False, "messages": [], "count": 0}
+
+    try:
+        messages = list_recent_messages(
+            creds,
+            max_results=max_results,
+            q=q or "",
+            days=days,
+        )
+    except HttpError as e:
+        status = int(e.resp.status) if e.resp else 500
+        reason = getattr(e, "reason", "") or ""
+        msg = reason.strip() or "Gmail request failed."
+        logger.warning("Gmail feed HttpError status=%s: %s", status, msg)
+        return _gmail_feed_error_payload(status, msg)
+    except Exception:
+        logger.exception("Gmail feed unexpected error")
+        return {
+            "connected": True,
+            "messages": [],
+            "count": 0,
+            "error": "Could not load Gmail.",
+            "google_status": None,
+        }
+
+    return {"connected": True, "messages": messages, "count": len(messages)}
+
+
+@router.get("/integrations/gmail/messages/{message_id}")
+async def integrations_gmail_message_detail(
+    message_id: str,
+    actor: dict = Depends(get_current_actor),
+):
+    """Full single-message fetch for device inbox detail (same Gmail OAuth as dashboard)."""
+    from services.gmail import get_message_full
+
+    user_id = actor["user"]["id"]
+    creds = get_credentials_for_provider(user_id, "gmail")
+    if not creds:
+        raise HTTPException(status_code=403, detail="Gmail not connected.")
+
+    try:
+        msg = get_message_full(creds, message_id)
+    except Exception as exc:
+        logger.error("get_message_full %s failed: %s", message_id, exc)
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    sender_name, sender_addr = _parse_gmail_sender(msg.get("from", ""))
+    raw_date = msg.get("date", "")
+    return {
+        "id": msg["id"],
+        "thread_id": msg.get("threadId"),
+        "sender": sender_name,
+        "sender_email": sender_addr,
+        "subject": msg.get("subject", "(no subject)"),
+        "preview": msg.get("snippet", ""),
+        "body": msg.get("body", msg.get("snippet", "")),
+        "time": _gmail_friendly_time(raw_date),
+        "date": raw_date,
+        "is_today": _gmail_is_today(raw_date),
+        "is_read": msg.get("is_read", True),
+        "to": (msg.get("to") or "").strip() or "—",
+    }
+
+
+@router.post("/integrations/gmail/messages/{message_id}/mark-unread")
+async def integrations_gmail_message_mark_unread(
+    message_id: str,
+    actor: dict = Depends(get_current_actor),
+):
+    from services.gmail import mark_message_unread
+
+    user_id = actor["user"]["id"]
+    creds = get_credentials_for_provider(user_id, "gmail")
+    if not creds:
+        raise HTTPException(status_code=403, detail="Gmail not connected.")
+    try:
+        mark_message_unread(creds, message_id)
+    except Exception as exc:
+        logger.error("mark_message_unread %s failed: %s", message_id, exc)
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return {"status": "ok", "id": message_id}
+
+
+@router.post("/integrations/gmail/messages/{message_id}/archive")
+async def integrations_gmail_message_archive(
+    message_id: str,
+    actor: dict = Depends(get_current_actor),
+):
+    from services.gmail import archive_message
+
+    user_id = actor["user"]["id"]
+    creds = get_credentials_for_provider(user_id, "gmail")
+    if not creds:
+        raise HTTPException(status_code=403, detail="Gmail not connected.")
+    try:
+        archive_message(creds, message_id)
+    except Exception as exc:
+        logger.error("archive_message %s failed: %s", message_id, exc)
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return {"status": "ok", "id": message_id}
 
 
 # ======================================================================

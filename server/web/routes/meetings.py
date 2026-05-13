@@ -62,6 +62,22 @@ def _get_redis() -> redis.Redis:
     _redis_client = redis.Redis(host=REDIS_HOST, port=6379, decode_responses=True)
   return _redis_client
 
+
+def _recording_redis(callable_fn):
+  """
+  Run callable_fn(redis_client). Maps Redis outages to HTTP 503 so clients
+  see a clear message instead of a generic 500 (common when Redis is down).
+  """
+  try:
+    return callable_fn(_get_redis())
+  except redis.RedisError as exc:
+    logger.exception("Recording Redis operation failed")
+    raise HTTPException(
+      status_code=503,
+      detail="Recording service is unavailable (cannot reach Redis). Ensure the Redis service is running and REDIS_HOST is correct.",
+    ) from exc
+
+
 # Must match audio capture + MEETINGBOX_ROOT layout (native installs use e.g. /opt/meetingbox/data/...).
 RECORDINGS_DIR = Path(os.getenv("RECORDINGS_DIR", "/data/audio/recordings"))
 RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
@@ -261,44 +277,6 @@ def _actor_device_id(actor: Optional[dict]) -> Optional[str]:
   return actor["device"]["id"]
 
 
-def emit_audio_command(actor: Optional[dict], payload: dict) -> None:
-  """
-  Tell audio capture to run an action.
-
-  - Publishes to Redis channel ``commands`` (same-host / SSH-tunnel subscribers).
-  - Also pushes to per-user list ``audio:http:{user_id}`` for HTTP long-poll on
-    appliances that cannot reach server Redis (cloud API + mini PC).
-  """
-  payload.setdefault("ts", datetime.now().timestamp())
-  body = json.dumps(payload)
-  r = _get_redis()
-  r.publish("commands", body)
-  uid = _actor_user_id(actor)
-  if uid:
-    uid_key = str(uid).strip()
-    if uid_key:
-      r.rpush(f"audio:http:{uid_key}", body)
-
-
-def _publish_recording_ws_event(event_type: str, session_id: Optional[str] = None) -> None:
-  """
-  Mirror audio_capture lifecycle publishes on the API host Redis ``events`` channel.
-
-  WebSocket clients (dashboard + device-ui) subscribe via server Redis. The appliance
-  audio service only publishes to its *local* Redis, so dashboard-initiated
-  start/stop never reached the device UI until this relay existed.
-  """
-  payload: dict = {
-    "type": event_type,
-    "timestamp": datetime.now().isoformat(),
-  }
-  if session_id:
-    payload["session_id"] = session_id
-  if event_type == "recording_stopped":
-    payload["path"] = None
-  _get_redis().publish("events", json.dumps(payload))
-
-
 def _session_owner_key(session_id: str) -> str:
   return f"meeting_session_owner:{session_id}"
 
@@ -366,11 +344,14 @@ async def start_meeting(current_actor: Optional[dict] = Depends(get_optional_act
   """Start a new recording. Sends command to audio service via Redis."""
   _require_actor(current_actor)
   session_id = _generate_session_id()
-  _store_session_owner(session_id, current_actor)
-  emit_audio_command(current_actor, {"action": "start_recording", "session_id": session_id})
-  _get_redis().set("current_meeting_id", session_id)
-  _get_redis().set("recording_state", "recording")
-  _publish_recording_ws_event("recording_started", session_id)
+
+  def _work(r):
+    _store_session_owner(session_id, current_actor)
+    r.publish("commands", json.dumps({"action": "start_recording", "session_id": session_id}))
+    r.set("current_meeting_id", session_id)
+    r.set("recording_state", "recording")
+
+  _recording_redis(_work)
   return {"session_id": session_id, "status": "recording_started"}
 
 
@@ -378,15 +359,19 @@ async def start_meeting(current_actor: Optional[dict] = Depends(get_optional_act
 async def stop_meeting(current_actor: Optional[dict] = Depends(get_optional_actor)):
   """Stop the current recording. Sends command to audio service via Redis."""
   _require_actor(current_actor)
-  session_id = _get_redis().get("current_meeting_id")
-  emit_audio_command(
-    current_actor,
-    {"action": "stop_recording", "session_id": session_id},
-  )
-  _get_redis().set("recording_state", "processing")
-  _publish_recording_ws_event("recording_stopped", session_id)
-  if session_id:
-    _get_redis().delete("current_meeting_id")
+
+  def _work(r):
+    session_id = r.get("current_meeting_id")
+    r.publish(
+      "commands",
+      json.dumps({"action": "stop_recording", "session_id": session_id}),
+    )
+    r.set("recording_state", "processing")
+    if session_id:
+      r.delete("current_meeting_id")
+    return session_id
+
+  session_id = _recording_redis(_work)
   return {"session_id": session_id, "status": "recording_stopped"}
 
 
@@ -394,17 +379,25 @@ async def stop_meeting(current_actor: Optional[dict] = Depends(get_optional_acto
 async def recording_status(current_actor: Optional[dict] = Depends(get_optional_actor)):
   """Current recording state for the dashboard."""
   _require_actor(current_actor)
-  state = _get_redis().get("recording_state") or "idle"
-  current_id = _get_redis().get("current_meeting_id")
-  return {"state": state, "session_id": current_id}
+
+  def _read(r):
+    state = r.get("recording_state") or "idle"
+    current_id = r.get("current_meeting_id")
+    return {"state": state, "session_id": current_id}
+
+  return _recording_redis(_read)
 
 
 @router.post("/reset-recording-state")
 async def reset_recording_state(current_actor: Optional[dict] = Depends(get_optional_actor)):
   """Clear recording state so the dashboard shows Start/Record buttons again (e.g. if stuck on Processing)."""
   _require_actor(current_actor)
-  _get_redis().set("recording_state", "idle")
-  _get_redis().delete("current_meeting_id")
+
+  def _reset(r):
+    r.set("recording_state", "idle")
+    r.delete("current_meeting_id")
+
+  _recording_redis(_reset)
   return {"status": "idle"}
 
 
@@ -412,16 +405,20 @@ async def reset_recording_state(current_actor: Optional[dict] = Depends(get_opti
 async def pause_meeting(current_actor: Optional[dict] = Depends(get_optional_actor)):
   """Pause the current recording."""
   _require_actor(current_actor)
-  state = _get_redis().get("recording_state") or "idle"
-  if state != "recording":
-    raise HTTPException(status_code=400, detail="No active recording to pause")
-  session_id = _get_redis().get("current_meeting_id")
-  emit_audio_command(
-    current_actor,
-    {"action": "pause_recording", "session_id": session_id},
-  )
-  _get_redis().set("recording_state", "paused")
-  _publish_recording_ws_event("recording_paused", session_id)
+
+  def _work(r):
+    state = r.get("recording_state") or "idle"
+    if state != "recording":
+      raise HTTPException(status_code=400, detail="No active recording to pause")
+    session_id = r.get("current_meeting_id")
+    r.publish(
+      "commands",
+      json.dumps({"action": "pause_recording", "session_id": session_id}),
+    )
+    r.set("recording_state", "paused")
+    return session_id
+
+  session_id = _recording_redis(_work)
   return {"status": "paused", "session_id": session_id}
 
 
@@ -429,16 +426,20 @@ async def pause_meeting(current_actor: Optional[dict] = Depends(get_optional_act
 async def resume_meeting(current_actor: Optional[dict] = Depends(get_optional_actor)):
   """Resume a paused recording."""
   _require_actor(current_actor)
-  state = _get_redis().get("recording_state") or "idle"
-  if state != "paused":
-    raise HTTPException(status_code=400, detail="No paused recording to resume")
-  session_id = _get_redis().get("current_meeting_id")
-  emit_audio_command(
-    current_actor,
-    {"action": "resume_recording", "session_id": session_id},
-  )
-  _get_redis().set("recording_state", "recording")
-  _publish_recording_ws_event("recording_resumed", session_id)
+
+  def _work(r):
+    state = r.get("recording_state") or "idle"
+    if state != "paused":
+      raise HTTPException(status_code=400, detail="No paused recording to resume")
+    session_id = r.get("current_meeting_id")
+    r.publish(
+      "commands",
+      json.dumps({"action": "resume_recording", "session_id": session_id}),
+    )
+    r.set("recording_state", "recording")
+    return session_id
+
+  session_id = _recording_redis(_work)
   return {"status": "recording", "session_id": session_id}
 
 
@@ -734,6 +735,23 @@ async def upload_audio(
       }),
     )
     raise
+  except Exception as exc:
+    logger.exception("upload_audio pipeline failed meeting_id=%s", session_id)
+    _get_redis().set("recording_state", "idle")
+    _get_redis().delete("current_meeting_id")
+    _get_redis().delete(_session_owner_key(session_id))
+    err_msg = str(exc).strip() or "Unexpected processing error"
+    _get_redis().publish(
+      "events",
+      json.dumps({
+        "type": "error",
+        "error_type": "Processing Failed",
+        "message": err_msg,
+        "meeting_id": session_id,
+        "timestamp": datetime.now().isoformat(),
+      }),
+    )
+    raise HTTPException(status_code=500, detail=err_msg) from exc
 
 
 @router.get("/")

@@ -530,6 +530,7 @@ class ProcessingScreen(BaseScreen):
         self._summary_data: Optional[dict] = None
         self._summary_ready: bool = False
         self._transcript_ready: bool = False
+        self._failed_summary_message: str = ""
         self._started_ts: Optional[float] = None
 
         # Animation state
@@ -807,6 +808,21 @@ class ProcessingScreen(BaseScreen):
         mid = getattr(self.app, "current_session_id", None)
         self._meeting_id = mid
 
+        cache = {}
+        try:
+            cache = getattr(self.app, "_processing_summary_cache", {}) or {}
+        except Exception:
+            cache = {}
+        cached = cache.get(mid) if mid else None
+        if isinstance(cached, dict) and cached.get("ok") is True and mid:
+            self._summary_data = cached.get("summary") or {}
+            self._summary_ready = True
+        elif isinstance(cached, dict) and cached.get("ok") is False and mid:
+            # Failed path handled after transcript flags below
+            self._failed_summary_message = str(cached.get("error") or "")
+        else:
+            self._failed_summary_message = ""
+
         done_for = getattr(self.app, "_transcription_done_for_session", None)
         self._transcript_ready = bool(mid and done_for == mid)
 
@@ -823,7 +839,18 @@ class ProcessingScreen(BaseScreen):
         self.step_actions.set_state(_StepRow.STATE_PENDING)
         self.step_summary.set_state(_StepRow.STATE_PENDING)
 
-        if self._transcript_ready:
+        if self._summary_ready:
+            self.step_extract.set_state(_StepRow.STATE_DONE)
+            self.step_actions.set_state(_StepRow.STATE_DONE)
+            self.step_summary.set_state(_StepRow.STATE_DONE)
+            self.headline_label.text = "Analysis complete!"
+            self.subtitle_label.text = (
+                "Your meeting highlights, transcript, and action items are ready."
+            )
+            self._enable_summary_cta(text="Tap to view meeting summary")
+        elif self._failed_summary_message and self._transcript_ready:
+            self.on_summary_failed(mid, self._failed_summary_message)
+        elif self._transcript_ready:
             # Came back to processing screen after transcription finished —
             # reflect what we already know; summary may still be in flight.
             self.step_extract.set_state(_StepRow.STATE_DONE)
@@ -879,6 +906,13 @@ class ProcessingScreen(BaseScreen):
         self.step_extract.set_state(_StepRow.STATE_DONE)
         self.subtitle_label.text = "Transcription done. Building meeting report…"
         self._enable_summary_cta()
+        try:
+            cache = getattr(self.app, "_processing_summary_cache", {}) or {}
+            ent = cache.get(meeting_id)
+            if isinstance(ent, dict) and ent.get("ok") is False:
+                self.on_summary_failed(meeting_id, str(ent.get("error") or ""))
+        except Exception:
+            pass
 
     def on_summary_ready(self, meeting_id: str, summary_data: dict):
         self._meeting_id = meeting_id
@@ -893,7 +927,25 @@ class ProcessingScreen(BaseScreen):
         )
         self._enable_summary_cta(text="Tap to view meeting summary")
 
-    def set_processing_status(self, text: str):
+    def on_summary_failed(self, meeting_id: str, detail: str):
+        """Full report failed — keep transcript path usable."""
+        if meeting_id:
+            self._meeting_id = meeting_id
+        self._summary_ready = False
+        self._summary_data = {}
+        # Progress: transcription done; report step skipped or failed.
+        self.step_extract.set_state(_StepRow.STATE_DONE)
+        self.step_actions.set_state(_StepRow.STATE_DONE)
+        self.step_summary.set_state(_StepRow.STATE_DONE)
+        self.headline_label.text = "Transcript ready"
+        self.subtitle_label.text = (detail or "Full report could not be generated.")[:240]
+        if self._transcript_ready:
+            self._enable_summary_cta(text="Tap to view transcript & actions")
+        else:
+            self.notify_pill.set_enabled(
+                False,
+                "Waiting for transcript — you can retry from Meetings if this takes too long.",
+            )
         if not text:
             return
         low = text.lower()

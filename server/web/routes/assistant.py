@@ -13,7 +13,7 @@ from assistant_service import (
   reject_pending_action,
   update_pending_assistant_payload,
 )
-from auth import get_current_user, get_optional_actor
+from auth import get_current_actor, get_optional_actor
 from rate_limit import limiter
 
 _ASSISTANT_ALLOW_ANON = os.getenv("MEETINGBOX_ASSISTANT_ALLOW_ANON", "").strip() == "1"
@@ -56,30 +56,30 @@ async def post_intent(
 
 
 @router.get("/pending-actions")
-async def get_pending_actions(current_user: dict = Depends(get_current_user)):
-  return {"pending": list_pending_actions_for_user(current_user["id"])}
+async def get_pending_actions(actor: dict = Depends(get_current_actor)):
+  return {"pending": list_pending_actions_for_user(actor["user"]["id"])}
 
 
 @router.patch("/pending-actions/{pending_id}")
 async def patch_pending_payload(
   pending_id: str,
   body: PendingPayloadUpdate,
-  current_user: dict = Depends(get_current_user),
+  actor: dict = Depends(get_current_actor),
 ):
-  return update_pending_assistant_payload(pending_id, current_user["id"], body.payload)
+  return update_pending_assistant_payload(pending_id, actor["user"]["id"], body.payload)
 
 
 @router.post("/pending-actions/{pending_id}/approve")
 async def post_approve_pending(
   pending_id: str,
-  current_user: dict = Depends(get_current_user),
+  actor: dict = Depends(get_current_actor),
 ):
-  return approve_pending_action(pending_id, current_user["id"])
+  return approve_pending_action(pending_id, actor["user"]["id"])
 
 
 @router.post("/pending-actions/{pending_id}/reject")
 async def post_reject_pending(
   pending_id: str,
-  current_user: dict = Depends(get_current_user),
+  actor: dict = Depends(get_current_actor),
 ):
-  return reject_pending_action(pending_id, current_user["id"])
+  return reject_pending_action(pending_id, actor["user"]["id"])

@@ -1,7 +1,7 @@
 {
   "id": "calendar_agent",
   "name": "Calendar Agent",
-  "description": "Lists upcoming Google Calendar events (read) and queues new events for approval before creation (write). Requires Calendar OAuth in Settings.",
+  "description": "Calendar (Google), free-time suggestions, and local commitments/reminders (SQLite + Mem0). Requires Calendar OAuth for Google reads/writes.",
   "triggers": [
     "calendar",
     "schedule",
@@ -13,13 +13,31 @@
     "next meeting",
     "book a",
     "create event",
-    "add to calendar"
+    "add to calendar",
+    "free time",
+    "availability",
+    "open slot",
+    "when am i free",
+    "remind me",
+    "reminder",
+    "follow up",
+    "follow-up",
+    "commitment",
+    "todo",
+    "to-do",
+    "next friday"
   ],
-  "system_prompt": "Used by assistant_service with calendar_list_upcoming and calendar_create_event tools.",
-  "tools": ["calendar_list_upcoming", "calendar_create_event"],
+  "system_prompt": "Used by assistant_service with calendar and commitment tools.",
+  "tools": [
+    "calendar_list_upcoming",
+    "calendar_create_event",
+    "calendar_suggest_free_slots",
+    "commitment_list",
+    "commitment_upsert"
+  ],
   "requires_approval": true,
   "background": false,
   "priority": 5,
-  "memory_context": false,
+  "memory_context": true,
   "max_tool_calls": 8
 }

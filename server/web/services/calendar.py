@@ -4,7 +4,7 @@ Google Calendar Service -- create events using stored OAuth2 tokens.
 
 import logging
 import os
-from datetime import datetime, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from googleapiclient.discovery import build
@@ -168,3 +168,263 @@ def list_upcoming_events(credentials, max_results: int = 10) -> list[dict]:
         .execute()
     )
     return result.get("items", [])
+
+
+def list_events_time_range(
+    credentials,
+    *,
+    days_past: int = 7,
+    days_future: int = 90,
+    max_results: int = 250,
+) -> list[dict]:
+    """
+    List Google Calendar events (single instances) in a UTC window.
+    Includes past items for the given days_past (e.g. completed meetings) and future items.
+    """
+    service = build("calendar", "v3", credentials=credentials, cache_discovery=False)
+    now = datetime.now(timezone.utc)
+    time_min = (now - timedelta(days=max(0, int(days_past)))).isoformat().replace("+00:00", "Z")
+    time_max = (now + timedelta(days=max(1, int(days_future)))).isoformat().replace("+00:00", "Z")
+    mr = max(1, min(int(max_results), 500))
+    result = (
+        service.events()
+        .list(
+            calendarId="primary",
+            timeMin=time_min,
+            timeMax=time_max,
+            maxResults=mr,
+            singleEvents=True,
+            orderBy="startTime",
+        )
+        .execute()
+    )
+    return result.get("items", [])
+
+
+def query_freebusy_blocks(
+    credentials,
+    time_min_utc: datetime,
+    time_max_utc: datetime,
+) -> list[tuple[datetime, datetime]]:
+    """Return busy intervals as UTC-aware datetimes from Google Calendar freeBusy."""
+    utc = ZoneInfo("UTC")
+    a = time_min_utc.astimezone(utc)
+    b = time_max_utc.astimezone(utc)
+    service = build("calendar", "v3", credentials=credentials, cache_discovery=False)
+    body = {
+        "timeMin": a.isoformat().replace("+00:00", "Z"),
+        "timeMax": b.isoformat().replace("+00:00", "Z"),
+        "items": [{"id": "primary"}],
+    }
+    fb = service.freebusy().query(body=body).execute()
+    busy = fb.get("calendars", {}).get("primary", {}).get("busy") or []
+    out: list[tuple[datetime, datetime]] = []
+    for block in busy:
+        try:
+            s_raw = str(block.get("start", "")).replace("Z", "+00:00")
+            e_raw = str(block.get("end", "")).replace("Z", "+00:00")
+            s_dt = datetime.fromisoformat(s_raw)
+            e_dt = datetime.fromisoformat(e_raw)
+            out.append((s_dt, e_dt))
+        except (ValueError, TypeError):
+            continue
+    out.sort(key=lambda t: t[0])
+    return out
+
+
+def _parse_hhmm_pair(hhmm: str, default_h: int, default_m: int) -> tuple[int, int]:
+    s = (hhmm or "").strip()
+    if len(s) >= 4 and ":" in s:
+        a, b = s.split(":", 1)
+        try:
+            return int(a), int(b[:2])
+        except ValueError:
+            return default_h, default_m
+    return default_h, default_m
+
+
+def suggest_free_slots(
+    credentials,
+    *,
+    days_ahead: int = 7,
+    duration_minutes: int = 30,
+    step_minutes: int = 30,
+    work_start_hhmm: str = "09:00",
+    work_end_hhmm: str = "18:00",
+    timezone: str | None = None,
+    max_slots: int = 12,
+) -> dict:
+    """
+    Heuristic free blocks using Calendar freeBusy + simple working-hours scan.
+    Does not model all-day events perfectly; good enough for assistant slot suggestions.
+    """
+    tz_name = (timezone or _default_tz_name()).strip() or _default_tz_name()
+    zone = _safe_zone(tz_name)
+    now = datetime.now(zone)
+    days = max(1, min(int(days_ahead), 21))
+    end_horizon = now + timedelta(days=days)
+
+    busy = query_freebusy_blocks(
+        credentials,
+        now.astimezone(ZoneInfo("UTC")),
+        end_horizon.astimezone(ZoneInfo("UTC")),
+    )
+
+    ws_h, ws_m = _parse_hhmm_pair(work_start_hhmm, 9, 0)
+    we_h, we_m = _parse_hhmm_pair(work_end_hhmm, 18, 0)
+    step = timedelta(minutes=max(15, min(int(step_minutes), 120)))
+    dur = timedelta(minutes=max(15, min(int(duration_minutes), 480)))
+
+    def overlaps(a0: datetime, a1: datetime, b0: datetime, b1: datetime) -> bool:
+        return a0 < b1 and a1 > b0
+
+    slots: list[dict] = []
+    day = now.date()
+    end_day = end_horizon.date()
+
+    while day <= end_day and len(slots) < max(1, min(int(max_slots), 24)):
+        day_start = datetime.combine(day, time(ws_h, ws_m, tzinfo=zone))
+        day_end = datetime.combine(day, time(we_h, we_m, tzinfo=zone))
+        if day_end <= day_start:
+            day = day + timedelta(days=1)
+            continue
+        scan_start = max(day_start, now) if day == now.date() else day_start
+        t = scan_start
+        while t + dur <= day_end and len(slots) < max(1, min(int(max_slots), 24)):
+            t_end = t + dur
+            conflict = False
+            for b0, b1 in busy:
+                b0l = b0.astimezone(zone)
+                b1l = b1.astimezone(zone)
+                if overlaps(t, t_end, b0l, b1l):
+                    conflict = True
+                    break
+            if not conflict:
+                slots.append({
+                    "start_local": t.isoformat(),
+                    "end_local": t_end.isoformat(),
+                    "timezone": tz_name,
+                    "duration_minutes": int(duration_minutes),
+                })
+            t += step
+        day += timedelta(days=1)
+
+    return {
+        "slots": slots,
+        "count": len(slots),
+        "timezone": tz_name,
+        "days_searched": days,
+        "busy_block_count": len(busy),
+    }
+
+
+def list_events_in_range(
+    credentials,
+    time_min_rfc3339: str,
+    time_max_rfc3339: str,
+    max_results: int = 250,
+) -> list[dict]:
+    """
+    List primary-calendar events whose start time falls in [timeMin, timeMax],
+    as RFC3339 timestamps (with zone offset or Z).
+    """
+    service = build("calendar", "v3", credentials=credentials, cache_discovery=False)
+    mr = max(1, min(int(max_results), 500))
+    result = (
+        service.events()
+        .list(
+            calendarId="primary",
+            timeMin=time_min_rfc3339,
+            timeMax=time_max_rfc3339,
+            maxResults=mr,
+            singleEvents=True,
+            orderBy="startTime",
+        )
+        .execute()
+    )
+    return result.get("items", [])
+
+
+def calendar_event_to_device_meeting(ev: dict, tz_name: str) -> dict:
+    """Normalize a Google Calendar API event to the mini-pc `meetings[]` row shape."""
+    zone = _safe_zone(tz_name)
+    start = ev.get("start") or {}
+    end = ev.get("end") or {}
+    start_dt: datetime | None = None
+    end_dt: datetime | None = None
+
+    if start.get("dateTime"):
+        s = str(start["dateTime"]).replace("Z", "+00:00")
+        start_dt = datetime.fromisoformat(s)
+    elif start.get("date"):
+        d0 = datetime.fromisoformat(str(start["date"])).date()
+        start_dt = datetime.combine(d0, time.min, tzinfo=zone)
+
+    if end.get("dateTime"):
+        e = str(end["dateTime"]).replace("Z", "+00:00")
+        end_dt = datetime.fromisoformat(e)
+    elif end.get("date"):
+        # All-day end date is exclusive in Google Calendar.
+        e0 = datetime.fromisoformat(str(end["date"])).date()
+        end_exclusive = datetime.combine(e0, time.min, tzinfo=zone)
+        end_dt = end_exclusive - timedelta(seconds=1)
+
+    if start_dt is not None and end_dt is None:
+        end_dt = start_dt + timedelta(hours=1)
+    if start_dt is not None and end_dt is not None and end_dt <= start_dt:
+        end_dt = start_dt + timedelta(minutes=30)
+
+    duration_sec = 0
+    if start_dt is not None and end_dt is not None:
+        duration_sec = max(0, int((end_dt - start_dt).total_seconds()))
+
+    return {
+        "id": ev.get("id"),
+        "title": ev.get("summary") or "(No title)",
+        "start": start_dt.isoformat() if start_dt else "",
+        "end": end_dt.isoformat() if end_dt else "",
+        "start_time": start_dt.isoformat() if start_dt else "",
+        "duration": duration_sec,
+        "htmlLink": ev.get("htmlLink") or "",
+    }
+
+
+def local_date_key_for_meeting_start(start_iso: str, tz_name: str) -> str | None:
+    """Return YYYY-MM-DD in tz_name for an ISO start timestamp, if parseable."""
+    if not (start_iso or "").strip():
+        return None
+    zone = _safe_zone(tz_name)
+    try:
+        dt = datetime.fromisoformat(start_iso.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return dt.astimezone(zone).date().isoformat()
+
+
+def build_days_map_for_range(
+    d0: date,
+    d1: date,
+    raw_events: list[dict],
+    tz_name: str,
+) -> dict[str, dict]:
+    """
+    Initialize every date in [d0, d1] with {\"meetings\": []}, attach events by local day.
+    """
+    if d1 < d0:
+        d0, d1 = d1, d0
+    days: dict[str, dict] = {}
+    cur = d0
+    while cur <= d1:
+        days[cur.isoformat()] = {"meetings": []}
+        cur += timedelta(days=1)
+
+    for ev in raw_events:
+        m = calendar_event_to_device_meeting(ev, tz_name)
+        key = local_date_key_for_meeting_start(m.get("start") or "", tz_name)
+        if key and key in days:
+            days[key]["meetings"].append(m)
+
+    for ds in days:
+        days[ds]["meetings"].sort(key=lambda x: x.get("start") or "")
+
+    return days

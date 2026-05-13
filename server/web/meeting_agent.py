@@ -14,6 +14,8 @@ from typing import Any, Optional
 
 import redis
 
+from fastapi import HTTPException
+
 from database import get_connection
 
 logger = logging.getLogger("meetingbox.meeting_agent")
@@ -101,7 +103,46 @@ async def run_meeting_agent_pipeline(
   )
 
   _emit_stage(redis_client, session_id, "reporting", "Building meeting report…")
-  summary_result = await meetings_routes.summarize_meeting(session_id, current_actor)
+  summary_result: dict[str, Any] = {}
+  try:
+    summary_result = await meetings_routes.summarize_meeting(session_id, current_actor)
+  except HTTPException as exc:
+    logger.warning(
+      "summarize_meeting HTTP error meeting_id=%s: %s",
+      session_id,
+      getattr(exc, "detail", exc),
+    )
+    d = exc.detail
+    if isinstance(d, str):
+      detail = d
+    elif isinstance(d, list):
+      detail = "; ".join(str(x) for x in d)
+    else:
+      detail = str(d)
+    summary_result = {
+      "status": "failed",
+      "error": detail,
+      "meeting_id": session_id,
+    }
+  except Exception as exc:
+    logger.exception("summarize_meeting failed meeting_id=%s", session_id)
+    summary_result = {
+      "status": "failed",
+      "error": str(exc).strip() or "Summary generation failed",
+      "meeting_id": session_id,
+    }
+
+  if summary_result.get("status") == "failed":
+    conn = get_connection()
+    conn.execute("PRAGMA foreign_keys = ON")
+    try:
+      conn.execute(
+        "UPDATE meetings SET status = ?, end_time = ? WHERE id = ?",
+        ("completed", datetime.now().isoformat(), session_id),
+      )
+      conn.commit()
+    finally:
+      conn.close()
 
   _emit(
     redis_client,
@@ -120,7 +161,7 @@ async def run_meeting_agent_pipeline(
     log_pipeline_completion_audit(
       redis_client,
       session_id,
-      current_actor["user"]["id"] if current_actor else None,
+      (current_actor.get("user") or {}).get("id") if current_actor else None,
       summary_result,
     )
   except Exception:

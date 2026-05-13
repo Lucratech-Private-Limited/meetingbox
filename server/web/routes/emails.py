@@ -27,6 +27,9 @@ from services.gmail import (
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
+# Match dashboard Emails tab (frontend) and /api/integrations/gmail/recent default.
+_GMAIL_DEVICE_LIST_DAYS = 90
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -96,15 +99,20 @@ async def list_emails(
             detail="Gmail not connected. Connect Gmail from the Settings page.",
         )
 
-    # Build Gmail query based on filter
-    q = "in:inbox"
+    # Same bounded window and q fragments as dashboard `listGmailRecent` (not raw `in:inbox` only).
+    q_fragment = ""
     if filter == "unread":
-        q = "in:inbox is:unread"
+        q_fragment = "is:unread"
     elif filter == "today":
-        q = "in:inbox newer_than:1d"
+        q_fragment = "newer_than:1d"
 
     try:
-        raw_messages = list_recent_messages(creds, max_results=limit, q=q)
+        raw_messages = list_recent_messages(
+            creds,
+            max_results=limit,
+            q=q_fragment,
+            days=_GMAIL_DEVICE_LIST_DAYS,
+        )
     except Exception as exc:
         logger.error("Gmail list_recent_messages failed: %s", exc)
         raise HTTPException(status_code=502, detail=f"Gmail API error: {exc}")

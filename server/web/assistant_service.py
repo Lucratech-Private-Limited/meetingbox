@@ -11,6 +11,7 @@ import uuid
 from datetime import datetime
 from typing import Any, Optional
 
+import redis
 from fastapi import HTTPException
 
 from agent_registry import get_agent
@@ -18,7 +19,12 @@ from database import get_connection
 from orchestrator import RouteResult, route_intent
 from tools.base_tool import ToolError
 from services.calendar import default_calendar_tz_name
-from tools.calendar_tool import calendar_create_from_payload, calendar_list_upcoming
+from tools.calendar_tool import (
+  calendar_create_from_payload,
+  calendar_list_upcoming,
+  calendar_suggest_free_slots,
+)
+from tools.commitments_tool import commitment_list_for_user, commitment_upsert_for_user
 from tools.gmail_tool import gmail_list_recent, gmail_send_from_payload
 from tools.memory_tool import memory_fetch_meeting, memory_search_meetings
 
@@ -29,12 +35,21 @@ from services.device_assistant import (
   plan_device_steps,
   resolve_primary_device_id,
 )
-from services.mem0_service import search_context_for_prompt
+from services.mem0_service import (
+  maybe_ingest_assistant_turn,
+  maybe_ingest_calendar_snapshot,
+  maybe_ingest_commitment_row,
+  maybe_ingest_gmail_snapshot,
+  search_context_for_prompt,
+)
 
 logger = logging.getLogger("meetingbox.assistant")
 
 TOOL_CAL_LIST = "calendar_list_upcoming"
 TOOL_CAL_CREATE = "calendar_create_event"
+TOOL_CAL_SLOTS = "calendar_suggest_free_slots"
+TOOL_COMMITMENT_LIST = "commitment_list"
+TOOL_COMMITMENT_UPSERT = "commitment_upsert"
 TOOL_GMAIL_LIST = "gmail_list_recent"
 TOOL_GMAIL_SEND = "gmail_send_email"
 TOOL_MEMORY_SEARCH = "memory_search_meetings"
@@ -42,7 +57,13 @@ TOOL_MEMORY_FETCH = "memory_fetch_meeting"
 WRITE_TOOLS = frozenset({TOOL_CAL_CREATE, TOOL_GMAIL_SEND})
 
 AGENT_ALLOWED_TOOLS: dict[str, frozenset[str]] = {
-  "calendar_agent": frozenset({TOOL_CAL_LIST, TOOL_CAL_CREATE}),
+  "calendar_agent": frozenset({
+    TOOL_CAL_LIST,
+    TOOL_CAL_CREATE,
+    TOOL_CAL_SLOTS,
+    TOOL_COMMITMENT_LIST,
+    TOOL_COMMITMENT_UPSERT,
+  }),
   "gmail_agent": frozenset({TOOL_GMAIL_LIST, TOOL_GMAIL_SEND}),
   "communication_agent": frozenset({TOOL_GMAIL_LIST, TOOL_GMAIL_SEND}),
   "memory_agent": frozenset({TOOL_MEMORY_SEARCH, TOOL_MEMORY_FETCH}),
@@ -87,11 +108,19 @@ def _llm_calendar_plan(message: str) -> list[dict[str, Any]] | None:
 
   prompt = (
     "Plan calendar tool steps for the user message. Return **only** valid JSON: "
-    "a single object {\"steps\": [ {\"tool\": \"calendar_list_upcoming\"|\"calendar_create_event\", "
+    "a single object {\"steps\": [ {\"tool\": \"calendar_list_upcoming\"|\"calendar_create_event\"|"
+    "\"calendar_suggest_free_slots\"|\"commitment_list\"|\"commitment_upsert\", "
     "\"args\": object, \"is_write\": boolean } ] }.\n"
     "Rules:\n"
     "- Use calendar_list_upcoming for viewing schedule, what's on, upcoming events.\n"
-    "- Use calendar_create_event for scheduling, booking, creating events. Args may include "
+    "- Use calendar_suggest_free_slots for free time, availability, open slots this week. "
+    "Args: days_ahead (1–21), duration_minutes, work_start_hhmm, work_end_hhmm, timezone (IANA).\n"
+    "- Use commitment_list to show reminders/tasks/follow-ups. Args: max_results, status (optional; "
+    "active|completed|snoozed|cancelled|all).\n"
+    "- Use commitment_upsert to save or update a reminder/task/commitment (voice or chat). "
+    "Args: id or commitment_id (update), title, detail, tags (array), status, remind_at, due_at (ISO strings if known), "
+    "source (chat|meeting|voice), calendar_event_id.\n"
+    "- Use calendar_create_event for scheduling on Google Calendar. Args may include "
     "title, description, start_time (ISO or null for default), duration_minutes, attendees (emails), timezone "
     f'(IANA; default "{default_calendar_tz_name()}").\n'
     "- At most one create per message unless user clearly asks for multiple.\n"
@@ -121,11 +150,20 @@ def _llm_calendar_plan(message: str) -> list[dict[str, Any]] | None:
     if not isinstance(step, dict):
       continue
     tool = str(step.get("tool") or "").strip()
-    if tool not in (TOOL_CAL_LIST, TOOL_CAL_CREATE):
+    allowed = frozenset({
+      TOOL_CAL_LIST,
+      TOOL_CAL_CREATE,
+      TOOL_CAL_SLOTS,
+      TOOL_COMMITMENT_LIST,
+      TOOL_COMMITMENT_UPSERT,
+    })
+    if tool not in allowed:
       continue
     args = step.get("args") if isinstance(step.get("args"), dict) else {}
     is_write = bool(step.get("is_write"))
     if tool == TOOL_CAL_CREATE:
+      is_write = True
+    if tool == TOOL_COMMITMENT_UPSERT:
       is_write = True
     normalized.append({"tool": tool, "args": args, "is_write": is_write})
   return normalized or None
@@ -133,6 +171,47 @@ def _llm_calendar_plan(message: str) -> list[dict[str, Any]] | None:
 
 def _heuristic_calendar_plan(message: str) -> list[dict[str, Any]]:
   m = message.lower()
+  free_markers = (
+    "free time",
+    "am i free",
+    "when am i free",
+    "availability",
+    "open slot",
+    "spare time",
+    "empty calendar",
+  )
+  if any(x in m for x in free_markers):
+    return [{
+      "tool": TOOL_CAL_SLOTS,
+      "args": {"days_ahead": 7, "duration_minutes": 30, "max_slots": 12},
+      "is_write": False,
+    }]
+  remind_markers = (
+    "remind me",
+    "don't forget",
+    "dont forget",
+    "follow up",
+    "follow-up",
+    "todo:",
+    "to-do",
+    "commitment",
+    "next friday",
+    "next week i",
+  )
+  if any(x in m for x in remind_markers):
+    tags = ["from_chat"]
+    if "voice" in m:
+      tags.append("voice")
+    return [{
+      "tool": TOOL_COMMITMENT_UPSERT,
+      "args": {
+        "title": message.strip()[:400] or "Reminder",
+        "detail": message.strip()[:4000],
+        "tags": tags,
+        "source": "voice" if "voice" in m else "chat",
+      },
+      "is_write": True,
+    }]
   create_markers = (
     "schedule ",
     "book ",
@@ -179,8 +258,9 @@ def _llm_communication_plan(message: str) -> list[dict[str, Any]] | None:
     "\"args\": object, \"is_write\": boolean } ] }.\n"
     "Rules:\n"
     "- Use gmail_list_recent for inbox, unread, recent mail, checking email, what arrived.\n"
-    "  Args: max_results (int 1–30, default 15), q (optional Gmail search query e.g. "
-    "is:unread or from:x).\n"
+    "  Args: max_results (int 1–30, default 15), q (optional Gmail search).\n"
+    "  For general inbox / briefing scans omit q or use \"\" — the server applies a Primary + meeting-invite filter.\n"
+    "  Only set q for targeted search (from:, subject:, in:sent, in:spam, after:, newer_than:, etc.).\n"
     "- Use gmail_send_email for sending mail. Args: to, subject, body, cc (array), "
     "bcc (optional array), html_body (optional), thread_id (optional, for replies).\n"
     "- gmail_send_email must have is_write true.\n"
@@ -442,6 +522,92 @@ def _row_factory(cursor, row):
   return {col[0]: row[idx] for idx, col in enumerate(cursor.description)}
 
 
+def assistant_action_brief_label(tool_name: str, payload: Any) -> str:
+  """One-line description for UI / Morning Brief (no full summaries)."""
+  if not isinstance(payload, dict):
+    try:
+      payload = json.loads(payload or "{}")
+    except Exception:
+      payload = {}
+  if tool_name == TOOL_CAL_CREATE:
+    t = (payload.get("title") or payload.get("summary") or "Calendar event").strip()
+    st = (
+      payload.get("start_datetime")
+      or payload.get("start_time")
+      or payload.get("start")
+      or ""
+    )
+    st = str(st).strip()
+    return f"{t} · {st}" if st else t
+  if tool_name == TOOL_GMAIL_SEND:
+    subj = str(payload.get("subject") or "Draft email").strip()[:72]
+    to_addr = str(payload.get("to") or "").strip()[:48]
+    return f"Email to {to_addr}: {subj}" if to_addr else subj
+  if tool_name in DEVICE_TOOLS:
+    return f"Device: {tool_name}"
+  return str(tool_name or "assistant action")
+
+
+def list_assistant_queue_for_briefing(user_id: str, limit: int = 24) -> dict[str, Any]:
+  """
+  Pending + recently resolved assistant actions for Morning Brief / device home.
+  All rows are already in SQLite (`pending_assistant_actions`); this shapes them for APIs.
+  """
+  uid = (user_id or "").strip()
+  if not uid:
+    return {"count_pending": 0, "items": []}
+  lim = max(1, min(int(limit), 50))
+  conn = get_connection()
+  conn.row_factory = _row_factory
+  try:
+    cur = conn.cursor()
+    cur.execute(
+      "SELECT COUNT(*) AS c FROM pending_assistant_actions WHERE user_id = ? AND status = 'pending'",
+      (uid,),
+    )
+    pending_row = cur.fetchone() or {"c": 0}
+    pending_n = int(pending_row.get("c") or 0)
+    cur.execute(
+      """
+      SELECT id, created_at, audit_id, agent_id, tool_name, payload, status, error, resolved_at, result_json
+      FROM pending_assistant_actions
+      WHERE user_id = ?
+        AND (
+          status = 'pending'
+          OR datetime(COALESCE(resolved_at, created_at)) >= datetime('now', '-2 days')
+        )
+      ORDER BY
+        CASE WHEN status = 'pending' THEN 0 ELSE 1 END,
+        datetime(COALESCE(resolved_at, created_at)) DESC
+      LIMIT ?
+      """,
+      (uid, lim),
+    )
+    rows = cur.fetchall()
+  finally:
+    conn.close()
+
+  items: list[dict[str, Any]] = []
+  for row in rows:
+    payload = json.loads(row.get("payload") or "{}")
+    tool = row.get("tool_name") or ""
+    st = row.get("status") or ""
+    items.append({
+      "id": row["id"],
+      "created_at": row.get("created_at"),
+      "audit_id": row.get("audit_id"),
+      "agent_id": row.get("agent_id"),
+      "tool_name": tool,
+      "payload": payload,
+      "status": st,
+      "error": row.get("error"),
+      "resolved_at": row.get("resolved_at"),
+      "brief_label": assistant_action_brief_label(tool, payload),
+      "needs_approval": st == "pending",
+    })
+  return {"count_pending": pending_n, "items": items}
+
+
 def _filter_steps_for_agent(agent_id: str, steps: list[dict[str, Any]]) -> list[dict[str, Any]]:
   allowed = AGENT_ALLOWED_TOOLS.get(agent_id)
   if not allowed:
@@ -455,7 +621,7 @@ def _filter_steps_for_agent(agent_id: str, steps: list[dict[str, Any]]) -> list[
 
 
 def _augment_user_text_for_agent(agent_doc: dict[str, Any], user_id: str | None, text: str) -> str:
-  """Inject SQLite recent-meeting list (if memory_context) and Mem0 recall as untrusted data."""
+  """Inject SQLite recent-meeting list (if memory_context), Mem0 recall, and commitments (always)."""
   msg = text
   if user_id and agent_doc.get("memory_context"):
     try:
@@ -475,6 +641,18 @@ def _augment_user_text_for_agent(agent_doc: dict[str, Any], user_id: str | None,
         f"{mem0_blob[:8000]}\nMEM0>>>\n\n"
         f"{msg}"
       )
+  if user_id:
+    try:
+      from services.commitments_service import commitments_context_for_prompt
+
+      cblock = commitments_context_for_prompt(user_id)
+      if cblock:
+        msg = (
+          "User commitments / tasks (SQLite; authoritative for tags, status, remind/due dates):\n"
+          f"<<<COMMITMENTS_DB\n{cblock}\nCOMMITMENTS_DB>>>\n\n{msg}"
+        )
+    except Exception:
+      logger.exception("commitments_context augment failed")
   return msg
 
 
@@ -659,27 +837,94 @@ def process_assistant_intent(
           continue
         pid = str(uuid.uuid4())
         pending_rows.append((pid, agent_id, tool, args))
-        pending_meta.append({"id": pid, "tool_name": tool, "status": "pending"})
+        pending_meta.append({
+          "id": pid,
+          "tool_name": tool,
+          "status": "pending",
+          "brief_label": assistant_action_brief_label(tool, args),
+        })
         tool_results.append({
           "tool": tool,
           "queued": True,
           "pending_id": pid,
           "note": "Awaiting approval before creating the event.",
         })
+      elif tool == TOOL_CAL_SLOTS:
+        if not user_id:
+          tool_results.append({"tool": tool, "error": "Sign in is required to check availability."})
+          continue
+        try:
+          res = calendar_suggest_free_slots(user_id, args)
+          tool_results.append({"tool": tool, "result": res})
+        except ToolError as e:
+          tool_results.append({"tool": tool, "error": str(e)})
+      elif tool == TOOL_COMMITMENT_LIST:
+        if not user_id:
+          tool_results.append({"tool": tool, "error": "Sign in is required to list commitments."})
+          continue
+        try:
+          res = commitment_list_for_user(
+            user_id,
+            max_results=int(args.get("max_results") or 30),
+            status=str(args.get("status") or ""),
+          )
+          tool_results.append({"tool": tool, "result": res})
+        except ToolError as e:
+          tool_results.append({"tool": tool, "error": str(e)})
+      elif tool == TOOL_COMMITMENT_UPSERT:
+        if not user_id:
+          tool_results.append({"tool": tool, "error": "Sign in is required to save commitments."})
+          continue
+        try:
+          res = commitment_upsert_for_user(user_id, args)
+          tool_results.append({"tool": tool, "result": res})
+          crow = (res.get("commitment") or {}) if isinstance(res, dict) else {}
+          if crow.get("id"):
+            maybe_ingest_commitment_row(user_id, crow)
+        except ToolError as e:
+          tool_results.append({"tool": tool, "error": str(e)})
       else:
         tool_results.append({"tool": tool, "error": "Unknown calendar tool"})
 
     # assistant summary text
     if pending_meta:
-      assistant_lines.append(
-        "I queued a calendar change for your approval. Open pending actions to confirm."
-      )
+      if len(pending_meta) == 1:
+        assistant_lines.append(
+          f"I queued one calendar update for approval: {pending_meta[0].get('brief_label', 'event')}."
+        )
+      else:
+        bits = [m.get("brief_label", "event") for m in pending_meta[:12]]
+        assistant_lines.append(
+          f"I queued {len(pending_meta)} calendar updates for approval: "
+          + "; ".join(bits)
+          + (". Say OK or approve to create them, or ask to edit or cancel one." if bits else "."),
+        )
     listed = next((t for t in tool_results if t.get("tool") == TOOL_CAL_LIST and "result" in t), None)
     if listed and "result" in listed:
       n = listed["result"].get("count", 0)
       assistant_lines.append(f"Here are upcoming events ({n} shown). See tool_results for details.")
+    slotted = next((t for t in tool_results if t.get("tool") == TOOL_CAL_SLOTS and "result" in t), None)
+    if slotted and isinstance(slotted.get("result"), dict):
+      sc = int(slotted["result"].get("count") or 0)
+      assistant_lines.append(
+        f"Suggested {sc} possible free slot(s) from your calendar (see tool_results for times)."
+      )
+    com_up = next((t for t in tool_results if t.get("tool") == TOOL_COMMITMENT_UPSERT and "result" in t), None)
+    if com_up and isinstance(com_up.get("result"), dict) and com_up["result"].get("saved"):
+      assistant_lines.append("Saved your commitment/reminder to your account (also synced to memory when enabled).")
+    com_li = next((t for t in tool_results if t.get("tool") == TOOL_COMMITMENT_LIST and "result" in t), None)
+    if com_li and isinstance(com_li.get("result"), dict):
+      nc = int(com_li["result"].get("count") or 0)
+      assistant_lines.append(f"Listed {nc} commitment(s). See tool_results for details.")
     if not assistant_lines:
       assistant_lines.append("Calendar request processed. See tool_results for details.")
+    for tr in tool_results:
+      if (
+        tr.get("tool") == TOOL_CAL_LIST
+        and isinstance(tr.get("result"), dict)
+        and not tr.get("error")
+      ):
+        maybe_ingest_calendar_snapshot(user_id, tr["result"])
 
   elif agent_id in ("gmail_agent", "communication_agent"):
     ctx = _augment_user_text_for_agent(agent_doc, user_id, text)
@@ -713,7 +958,12 @@ def process_assistant_intent(
           continue
         pid = str(uuid.uuid4())
         pending_rows.append((pid, agent_id, tool, args))
-        pending_meta.append({"id": pid, "tool_name": tool, "status": "pending"})
+        pending_meta.append({
+          "id": pid,
+          "tool_name": tool,
+          "status": "pending",
+          "brief_label": assistant_action_brief_label(tool, args),
+        })
         tool_results.append({
           "tool": tool,
           "queued": True,
@@ -733,6 +983,13 @@ def process_assistant_intent(
       assistant_lines.append(f"Here are recent messages ({n} shown). See tool_results for details.")
     if not assistant_lines:
       assistant_lines.append("Communication request processed. See tool_results for details.")
+    for tr in tool_results:
+      if (
+        tr.get("tool") == TOOL_GMAIL_LIST
+        and isinstance(tr.get("result"), dict)
+        and not tr.get("error")
+      ):
+        maybe_ingest_gmail_snapshot(user_id, tr["result"])
 
   elif agent_id == "memory_agent":
     ctx = _augment_user_text_for_agent(agent_doc, user_id, text)
@@ -828,7 +1085,12 @@ def process_assistant_intent(
           tool = str(st.get("tool") or "")
           pid = str(uuid.uuid4())
           pending_rows.append((pid, agent_id, tool, {"device_id": dev}))
-          pending_meta.append({"id": pid, "tool_name": tool, "status": "pending"})
+          pending_meta.append({
+            "id": pid,
+            "tool_name": tool,
+            "status": "pending",
+            "brief_label": assistant_action_brief_label(tool, {"device_id": dev}),
+          })
           tool_results.append({
             "tool": tool,
             "queued": True,
@@ -846,6 +1108,15 @@ def process_assistant_intent(
     )
 
   assistant_message = " ".join(assistant_lines) if assistant_lines else "Done."
+
+  if user_id and agent_id:
+    maybe_ingest_assistant_turn(
+      user_id,
+      user_message=text,
+      assistant_reply=assistant_message,
+      routed_agent_id=agent_id,
+      meeting_id=meeting_id,
+    )
 
   response_payload = {
     "assistant_message": assistant_message,
@@ -877,7 +1148,7 @@ def update_pending_assistant_payload(
   user_id: str,
   payload: dict[str, Any],
 ) -> dict[str, Any]:
-  """Replace stored JSON payload for a pending email draft (pre-approve edit)."""
+  """Replace stored JSON payload for a pending email draft or calendar event (pre-approve edit)."""
   conn = get_connection()
   conn.row_factory = _row_factory
   try:
@@ -891,8 +1162,8 @@ def update_pending_assistant_payload(
       raise HTTPException(status_code=404, detail="Pending action not found")
     if row["status"] != "pending":
       raise HTTPException(status_code=400, detail=f"Action is not pending (status={row['status']})")
-    if row["tool_name"] != TOOL_GMAIL_SEND:
-      raise HTTPException(status_code=400, detail="Only email drafts can be edited here")
+    if row["tool_name"] not in (TOOL_GMAIL_SEND, TOOL_CAL_CREATE):
+      raise HTTPException(status_code=400, detail="Only email drafts or calendar events can be edited here")
     cur.execute(
       "UPDATE pending_assistant_actions SET payload = ? WHERE id = ?",
       (json.dumps(payload), pending_id),
@@ -930,14 +1201,18 @@ def list_pending_actions_for_user(user_id: str) -> list[dict[str, Any]]:
 
   out = []
   for row in rows:
+    payload = json.loads(row["payload"] or "{}")
+    tool = row["tool_name"]
     out.append({
       "id": row["id"],
       "created_at": row["created_at"],
       "audit_id": row["audit_id"],
       "agent_id": row["agent_id"],
-      "tool_name": row["tool_name"],
-      "payload": json.loads(row["payload"] or "{}"),
+      "tool_name": tool,
+      "payload": payload,
       "status": row["status"],
+      "brief_label": assistant_action_brief_label(tool, payload),
+      "needs_approval": True,
     })
   return out
 
@@ -1006,6 +1281,24 @@ def approve_pending_action(pending_id: str, user_id: str) -> dict[str, Any]:
     finally:
       conn.close()
     raise
+  except Exception as e:
+    logger.exception("approve_pending_action failed pending_id=%s", pending_id)
+    now = datetime.utcnow().isoformat()
+    msg = str(e).strip() or "Execution failed"
+    conn = get_connection()
+    try:
+      conn.execute(
+        """
+        UPDATE pending_assistant_actions
+        SET status = 'failed', error = ?, resolved_at = ?
+        WHERE id = ?
+        """,
+        (msg[:4000], now, pending_id),
+      )
+      conn.commit()
+    finally:
+      conn.close()
+    raise HTTPException(status_code=500, detail=msg) from e
 
   now = datetime.utcnow().isoformat()
   conn = get_connection()

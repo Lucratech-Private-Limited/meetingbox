@@ -11,6 +11,7 @@ All screens inherit from this to get common functionality:
 from kivy.uix.screenmanager import Screen
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.label import Label
+from kivy.uix.widget import Widget
 from kivy.graphics import Color, Ellipse, Rectangle, RoundedRectangle
 from kivy.app import App
 
@@ -122,58 +123,9 @@ class BaseScreen(Screen):
         return bg
 
     def build_footer(self):
-        """
-        Create the persistent footer bar (20 px).
-
-        Returns a BoxLayout with WiFi / Storage / Dashboard labels
-        that can be appended to the bottom of any screen layout.
-        """
-        footer = BoxLayout(
-            orientation='horizontal',
-            size_hint=(1, None),
-            height=self.suv(FOOTER_HEIGHT),
-            padding=[self.suh(SPACING['screen_padding']), 0],
-        )
-        with footer.canvas.before:
-            Color(*COLORS['background'])
-            _fb = Rectangle(pos=footer.pos, size=footer.size)
-        footer.bind(
-            pos=lambda w, v: setattr(_fb, 'pos', w.pos),
-            size=lambda w, v: setattr(_fb, 'size', w.size),
-        )
-
-        self._footer_left = Label(
-            text='WiFi: ✓   Storage: …GB free',
-            font_size=self.suf(FONT_SIZES['tiny']),
-            color=COLORS['gray_500'],
-            halign='left',
-            valign='middle',
-            size_hint=(0.5, 1),
-        )
-        self._footer_left.bind(size=self._footer_left.setter('text_size'))
-        footer.add_widget(self._footer_left)
-
-        sep = Label(
-            text='|',
-            font_size=self.suf(FONT_SIZES['tiny']),
-            color=COLORS['gray_700'],
-            size_hint=(None, 1),
-            width=self.suh(16),
-        )
-        footer.add_widget(sep)
-
-        self._footer_right = Label(
-            text='Dashboard: meetingbox.local',
-            font_size=self.suf(FONT_SIZES['tiny']),
-            color=COLORS['gray_500'],
-            halign='right',
-            valign='middle',
-            size_hint=(0.5, 1),
-        )
-        self._footer_right.bind(size=self._footer_right.setter('text_size'))
-        footer.add_widget(self._footer_right)
-
-        return footer
+        """Footer bar removed. Returns a zero-height placeholder so existing
+        callers that do ``layout.add_widget(self.build_footer())`` are safe."""
+        return Widget(size_hint=(1, None), height=0)
 
     def update_footer(
         self,
