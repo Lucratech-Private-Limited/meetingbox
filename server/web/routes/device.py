@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 import psutil
 import redis
@@ -863,31 +863,20 @@ async def list_integrations(current_actor: dict | None = Depends(get_optional_ac
 
 
 @router.get("/integrations/{integration_id}/auth-url")
-async def get_integration_auth_url(
-    integration_id: str,
-    request: Request,
-    current_actor: Optional[dict] = Depends(get_optional_actor),
-):
-    """Proxy to integrations auth-url — supports dashboard JWT or paired device (owner)."""
-    if not current_actor:
+async def get_integration_auth_url(integration_id: str, current_user: Optional[dict] = Depends(get_optional_user)):
+    """Proxy to the auth-url endpoint in the integrations router."""
+    if not current_user:
         raise HTTPException(status_code=401, detail="Authentication required to connect integrations")
     from routes.integrations import get_auth_url
-
-    owner_user = current_actor["user"]
-    return await get_auth_url(integration_id, request, owner_user)
+    return await get_auth_url(integration_id, current_user)
 
 
 @router.post("/integrations/{integration_id}/disconnect")
-async def disconnect_integration(
-    integration_id: str,
-    current_actor: Optional[dict] = Depends(get_optional_actor),
-):
-    """Proxy to integrations disconnect — supports dashboard JWT or paired device (owner)."""
-    if not current_actor:
+async def disconnect_integration(integration_id: str, current_user: Optional[dict] = Depends(get_optional_user)):
+    """Proxy to the real disconnect in the integrations router."""
+    if not current_user:
         raise HTTPException(status_code=401, detail="Authentication required to disconnect integrations")
     from routes.integrations import disconnect_integration as real_disconnect
-
-    owner_user = current_actor["user"]
-    return await real_disconnect(integration_id, owner_user)
+    return await real_disconnect(integration_id, current_user)
 
 

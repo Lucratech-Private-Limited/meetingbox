@@ -26,14 +26,13 @@ import time
 import uuid
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-from typing import Optional
 from urllib.parse import urlencode, quote_plus
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import RedirectResponse
 
-from auth import get_current_actor, get_current_user, get_optional_actor, SECRET_KEY
+from auth import get_current_actor, get_current_user, SECRET_KEY
 from database import get_connection
 
 logger = logging.getLogger(__name__)
@@ -510,7 +509,7 @@ async def integrations_calendar_events(
 
 @router.get("/integrations/gmail/recent")
 async def integrations_gmail_recent(
-    current_actor: Optional[dict] = Depends(get_optional_actor),
+    actor: dict = Depends(get_current_actor),
     max_results: int = Query(25, ge=1, le=50),
     days: int = Query(
         90,
@@ -528,9 +527,7 @@ async def integrations_gmail_recent(
 
     from services.gmail import list_recent_messages
 
-    if not current_actor:
-        raise HTTPException(status_code=401, detail="Not authenticated")
-    user_id = current_actor["user"]["id"]
+    user_id = actor["user"]["id"]
     creds = get_credentials_for_provider(user_id, "gmail")
     if not creds:
         return {"connected": False, "messages": [], "count": 0}

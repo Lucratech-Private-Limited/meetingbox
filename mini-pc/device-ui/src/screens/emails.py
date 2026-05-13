@@ -28,6 +28,7 @@ from kivy.uix.scrollview import ScrollView
 from kivy.uix.widget import Widget
 
 from async_helper import run_async
+from api_client import _GMAIL_RECENT_DAYS
 from config import ASSETS_DIR, COLORS, DISPLAY_HEIGHT, DISPLAY_WIDTH
 from screens.base_screen import BaseScreen
 
@@ -380,39 +381,73 @@ class EmailsScreen(BaseScreen):
         self.add_widget(root)
 
     def _build_header_bar(self, root: FloatLayout) -> None:
-        """Tab bar  (23, 104)  1214 × 101  — Emails title + Today/All/Unread tabs."""
+        """Header bar  (23, 104)  1214 × 101  — Emails title + Today/All/Unread tabs + search."""
         BX, BY, BW, BH = 23, 104, 1214, 101
 
         bar = FloatLayout(
             size_hint=(_sw(BW), _sh(BH)),
             pos_hint={"x": _x(BX), "y": _y(BY, BH)},
         )
-        with bar.canvas.before:
-            Color(1, 1, 1, 1)
-            self._hdr_bg = RoundedRectangle(
-                pos=bar.pos, size=bar.size,
-                radius=[_ff(22.6)],
-                texture=_grad(_HDR_TOP, _HDR_BOT),
-            )
-            Color(*_BDR_HDR)
-            self._hdr_ln = Line(
-                rounded_rectangle=(bar.x, bar.y, bar.width, bar.height, _ff(22.6)),
-                width=1.0,
-            )
-        bar.bind(pos=self._sync_hdr, size=self._sync_hdr)
 
-        # "Emails" title  (37, 21)  SemiBold 30px white
+        # Figma asset background — falls back to drawn gradient
+        hdr_bg_src = _fp("email_header_bar.png")
+        if hdr_bg_src:
+            bar.add_widget(Image(
+                source=hdr_bg_src,
+                size_hint=(1, 1),
+                pos_hint={"x": 0, "y": 0},
+                fit_mode="fill",
+                allow_stretch=True,
+                keep_ratio=False,
+            ))
+        else:
+            with bar.canvas.before:
+                Color(1, 1, 1, 1)
+                self._hdr_bg = RoundedRectangle(
+                    pos=bar.pos, size=bar.size,
+                    radius=[_ff(22.6)],
+                    texture=_grad(_HDR_TOP, _HDR_BOT),
+                )
+                Color(*_BDR_HDR)
+                self._hdr_ln = Line(
+                    rounded_rectangle=(bar.x, bar.y, bar.width, bar.height, _ff(22.6)),
+                    width=1.0,
+                )
+
+        # "Emails" title  (37, 21)  row 1 left — SemiBold 30px white
         bar.add_widget(_lbl(
             "Emails", _FONT_SB, _ff(30), _WHITE,
-            size_hint=(90 / BW, 36 / BH),
+            size_hint=(120 / BW, 36 / BH),
             pos_hint={"x": 37 / BW, "y": (BH - 21 - 36) / BH},
         ))
 
-        # Tabs: Today | All | Unread
+        # Search bar placeholder  (right side of row 1)  ~680px from left, width ~480
+        sb = FloatLayout(
+            size_hint=(480 / BW, 34 / BH),
+            pos_hint={"x": 690 / BW, "y": (BH - 18 - 34) / BH},
+        )
+        with sb.canvas.before:
+            Color(0.012, 0.063, 0.208, 1.0)
+            self._sb_bg = RoundedRectangle(pos=sb.pos, size=sb.size, radius=[_ff(17)])
+            Color(*_BDR_PANEL)
+            self._sb_ln = Line(
+                rounded_rectangle=(sb.x, sb.y, sb.width, sb.height, _ff(17)),
+                width=1.0,
+            )
+        sb.bind(pos=self._sync_sb, size=self._sync_sb)
+        sb.add_widget(_lbl(
+            "Search", _FONT_MD, _ff(18), _MUTED,
+            halign="left", valign="middle",
+            size_hint=(0.85, 1),
+            pos_hint={"x": 0.08, "y": 0},
+        ))
+        bar.add_widget(sb)
+
+        # Tabs: Today | All | Unread  (row 2)
         tabs = [
-            ("today", "Today",  37,  68),
-            ("all",   "All",   212,  68),
-            ("unread","Unread", 365,  68),
+            ("today",  "Today",   37, 68),
+            ("all",    "All",    212, 68),
+            ("unread", "Unread", 365, 68),
         ]
         count_x = {"today": 122, "all": 276, "unread": 463}
 
@@ -427,19 +462,17 @@ class EmailsScreen(BaseScreen):
             self._tab_labels[tab_id] = lbl
             bar.add_widget(lbl)
 
-            # Count label next to tab name
             cnt_lbl = _lbl(
                 "0", _FONT_SB, _ff(24), _BLUE if is_active else _WHITE,
-                size_hint=(20 / BW, 29 / BH),
+                size_hint=(25 / BW, 29 / BH),
                 pos_hint={"x": count_x[tab_id] / BW, "y": (BH - ty - 29) / BH},
             )
             self._count_labels[tab_id] = cnt_lbl
             bar.add_widget(cnt_lbl)
 
-            # Transparent tap target for each tab
             tap = _Tap(
                 draw_bg=False,
-                size_hint=(120 / BW, 35 / BH),
+                size_hint=(130 / BW, 35 / BH),
                 pos_hint={"x": (tx - 5) / BW, "y": (BH - ty - 33) / BH},
             )
             tap.bind(on_release=lambda _, t=tab_id: self._on_tab(t))
@@ -447,9 +480,12 @@ class EmailsScreen(BaseScreen):
 
         root.add_widget(bar)
 
+    def _sync_sb(self, w, *_):
+        self._sb_bg.pos = w.pos
+        self._sb_bg.size = w.size
+        self._sb_ln.rounded_rectangle = (w.x, w.y, w.width, w.height, _ff(17))
+
     def _sync_hdr(self, *_):
-        bar = self._hdr_bg.parent if hasattr(self._hdr_bg, "parent") else None
-        # Handled via bind below
         pass
 
     def _build_list_panel(self, root: FloatLayout) -> None:
@@ -460,32 +496,40 @@ class EmailsScreen(BaseScreen):
             size_hint=(_sw(PW), _sh(PH)),
             pos_hint={"x": _x(PX), "y": _y(PY, PH)},
         )
-        with panel_outer.canvas.before:
-            Color(1, 1, 1, 1)
-            self._list_bg = RoundedRectangle(
-                pos=panel_outer.pos, size=panel_outer.size,
-                radius=[_ff(29.7)],
-                texture=_grad(_PANEL_TOP, _PANEL_BOT),
-            )
-            Color(*_BDR_PANEL)
-            self._list_ln = Line(
-                rounded_rectangle=(
-                    panel_outer.x, panel_outer.y,
-                    panel_outer.width, panel_outer.height, _ff(29.7)
-                ),
-                width=1.0,
-            )
-        panel_outer.bind(pos=self._sync_list_bg, size=self._sync_list_bg)
 
-        # Scrollable content
+        list_bg_src = _fp("email_list_panel.png")
+        if list_bg_src:
+            panel_outer.add_widget(Image(
+                source=list_bg_src,
+                size_hint=(1, 1),
+                pos_hint={"x": 0, "y": 0},
+                fit_mode="fill",
+                allow_stretch=True,
+                keep_ratio=False,
+            ))
+        else:
+            with panel_outer.canvas.before:
+                Color(1, 1, 1, 1)
+                self._list_bg = RoundedRectangle(
+                    pos=panel_outer.pos, size=panel_outer.size,
+                    radius=[_ff(29.7)],
+                    texture=_grad(_PANEL_TOP, _PANEL_BOT),
+                )
+                Color(*_BDR_PANEL)
+                self._list_ln = Line(
+                    rounded_rectangle=(
+                        panel_outer.x, panel_outer.y,
+                        panel_outer.width, panel_outer.height, _ff(29.7)
+                    ),
+                    width=1.0,
+                )
+
         sv = ScrollView(
             size_hint=(1, 1),
             pos_hint={"x": 0, "y": 0},
             do_scroll_x=False,
             bar_width=_ff(9),
         )
-
-        # Inner container — height set dynamically when emails load
         self._list_container = FloatLayout(
             size_hint=(1, None),
             height=_ff(PH),
@@ -494,12 +538,8 @@ class EmailsScreen(BaseScreen):
         panel_outer.add_widget(sv)
         root.add_widget(panel_outer)
 
-    def _sync_list_bg(self, w, *_):
-        self._list_bg.pos = w.pos
-        self._list_bg.size = w.size
-        self._list_ln.rounded_rectangle = (
-            w.x, w.y, w.width, w.height, _ff(29.7)
-        )
+    def _sync_list_bg(self, *_):
+        pass
 
     def _build_detail_panel(self, root: FloatLayout) -> None:
         """Right panel  (570, 212)  667 × 567 — email detail view."""
@@ -509,160 +549,155 @@ class EmailsScreen(BaseScreen):
             size_hint=(_sw(PW), _sh(PH)),
             pos_hint={"x": _x(PX), "y": _y(PY, PH)},
         )
-        with panel.canvas.before:
-            Color(1, 1, 1, 1)
-            self._det_bg = RoundedRectangle(
-                pos=panel.pos, size=panel.size,
-                radius=[_ff(29.7)],
-                texture=_grad(_PANEL_TOP, _PANEL_BOT),
-            )
-            Color(*_BDR_PANEL)
-            self._det_ln = Line(
-                rounded_rectangle=(
-                    panel.x, panel.y, panel.width, panel.height, _ff(29.7)
-                ),
-                width=1.0,
-            )
-        panel.bind(pos=self._sync_det_bg, size=self._sync_det_bg)
 
-        self._detail_panel = panel
-
-        # ── Action buttons row (y=17 in panel) ───────────────────────────
-        # Back action  (39, 17)  72 × 24
-        back_act_src = _fp("email_action_back.png")
-        if back_act_src:
-            back_act = _Tap(
-                draw_bg=False,
-                size_hint=(72 / PW, 24 / PH),
-                pos_hint={"x": 39 / PW, "y": (PH - 17 - 24) / PH},
-            )
-            back_act.add_widget(Image(
-                source=back_act_src,
-                size_hint=(1, 1),
-                pos_hint={"x": 0, "y": 0},
-                fit_mode="contain",
-            ))
-            back_act.bind(on_release=lambda *_: self._on_detail_back())
-            panel.add_widget(back_act)
-
-        # Mark unread  (133, 17)  134 × 24
-        unread_act_src = _fp("email_action_mark_unread.png")
-        if unread_act_src:
-            unread_act = _Tap(
-                draw_bg=False,
-                size_hint=(134 / PW, 24 / PH),
-                pos_hint={"x": 133 / PW, "y": (PH - 17 - 24) / PH},
-            )
-            unread_act.add_widget(Image(
-                source=unread_act_src,
-                size_hint=(1, 1),
-                pos_hint={"x": 0, "y": 0},
-                fit_mode="contain",
-            ))
-            unread_act.bind(on_release=lambda *_: self._on_mark_unread())
-            panel.add_widget(unread_act)
-
-        # Archive  (298, 17)  92 × 24
-        archive_act_src = _fp("email_action_archive.png")
-        if archive_act_src:
-            archive_act = _Tap(
-                draw_bg=False,
-                size_hint=(92 / PW, 24 / PH),
-                pos_hint={"x": 298 / PW, "y": (PH - 17 - 24) / PH},
-            )
-            archive_act.add_widget(Image(
-                source=archive_act_src,
-                size_hint=(1, 1),
-                pos_hint={"x": 0, "y": 0},
-                fit_mode="contain",
-            ))
-            archive_act.bind(on_release=lambda *_: self._on_archive())
-            panel.add_widget(archive_act)
-
-        # More button  (528, 8)  101 × 42
-        more_src = _fp("email_btn_more.png")
-        if more_src:
-            more_btn = _Tap(
-                draw_bg=False,
-                size_hint=(101 / PW, 42 / PH),
-                pos_hint={"x": 528 / PW, "y": (PH - 8 - 42) / PH},
-            )
-            more_btn.add_widget(Image(
-                source=more_src,
+        det_bg_src = _fp("email_detail_panel.png")
+        if det_bg_src:
+            panel.add_widget(Image(
+                source=det_bg_src,
                 size_hint=(1, 1),
                 pos_hint={"x": 0, "y": 0},
                 fit_mode="fill",
                 allow_stretch=True,
                 keep_ratio=False,
             ))
+        else:
+            with panel.canvas.before:
+                Color(1, 1, 1, 1)
+                self._det_bg = RoundedRectangle(
+                    pos=panel.pos, size=panel.size,
+                    radius=[_ff(29.7)],
+                    texture=_grad(_PANEL_TOP, _PANEL_BOT),
+                )
+                Color(*_BDR_PANEL)
+                self._det_ln = Line(
+                    rounded_rectangle=(
+                        panel.x, panel.y, panel.width, panel.height, _ff(29.7)
+                    ),
+                    width=1.0,
+                )
+
+        self._detail_panel = panel
+
+        # All widgets below are hidden until an email is tapped.
+        # They are stored in self._detail_content_widgets and toggled via opacity.
+        self._detail_content_widgets: list = []
+
+        def _tracked(w):
+            w.opacity = 0
+            self._detail_content_widgets.append(w)
+            return w
+
+        # ── Action buttons row (y=17 in panel) ─────────────────────────────
+        back_act_src = _fp("email_action_back.png")
+        if back_act_src:
+            back_act = _tracked(_Tap(
+                draw_bg=False,
+                size_hint=(72 / PW, 24 / PH),
+                pos_hint={"x": 39 / PW, "y": (PH - 17 - 24) / PH},
+            ))
+            back_act.add_widget(Image(
+                source=back_act_src, size_hint=(1, 1),
+                pos_hint={"x": 0, "y": 0}, fit_mode="contain",
+            ))
+            back_act.bind(on_release=lambda *_: self._on_detail_back())
+            panel.add_widget(back_act)
+
+        unread_act_src = _fp("email_action_mark_unread.png")
+        if unread_act_src:
+            unread_act = _tracked(_Tap(
+                draw_bg=False,
+                size_hint=(134 / PW, 24 / PH),
+                pos_hint={"x": 133 / PW, "y": (PH - 17 - 24) / PH},
+            ))
+            unread_act.add_widget(Image(
+                source=unread_act_src, size_hint=(1, 1),
+                pos_hint={"x": 0, "y": 0}, fit_mode="contain",
+            ))
+            unread_act.bind(on_release=lambda *_: self._on_mark_unread())
+            panel.add_widget(unread_act)
+
+        archive_act_src = _fp("email_action_archive.png")
+        if archive_act_src:
+            archive_act = _tracked(_Tap(
+                draw_bg=False,
+                size_hint=(92 / PW, 24 / PH),
+                pos_hint={"x": 298 / PW, "y": (PH - 17 - 24) / PH},
+            ))
+            archive_act.add_widget(Image(
+                source=archive_act_src, size_hint=(1, 1),
+                pos_hint={"x": 0, "y": 0}, fit_mode="contain",
+            ))
+            archive_act.bind(on_release=lambda *_: self._on_archive())
+            panel.add_widget(archive_act)
+
+        more_src = _fp("email_btn_more.png")
+        if more_src:
+            more_btn = _tracked(_Tap(
+                draw_bg=False,
+                size_hint=(101 / PW, 42 / PH),
+                pos_hint={"x": 528 / PW, "y": (PH - 8 - 42) / PH},
+            ))
+            more_btn.add_widget(Image(
+                source=more_src, size_hint=(1, 1),
+                pos_hint={"x": 0, "y": 0},
+                fit_mode="fill", allow_stretch=True, keep_ratio=False,
+            ))
             panel.add_widget(more_btn)
 
-        # ── Horizontal divider  (28, 57)  611 × 3 ────────────────────────
-        with panel.canvas:
-            Color(0.008, 0.090, 0.302, 1.0)  # #02173C approx divider mid
-            self._det_div = Rectangle(pos=(0, 0), size=(1, 1))
-        panel.bind(
-            pos=lambda w, _: self._sync_det_div(w),
-            size=lambda w, _: self._sync_det_div(w),
-        )
-
-        # ── Avatar circle  (50, 79)  48 × 48 ─────────────────────────────
+        # ── Avatar + dot + sender + To row ─────────────────────────────────
         av_src = _fp("email_avatar.png")
-        self._avatar = _AvatarCircle(
+        self._avatar = _tracked(_AvatarCircle(
             source=av_src,
             size_hint=(48 / PW, 48 / PH),
             pos_hint={"x": 50 / PW, "y": (PH - 79 - 48) / PH},
-        )
+        ))
         panel.add_widget(self._avatar)
 
-        # Detail dot  (28, 99)  12 × 12
         det_dot_src = _fp("email_dot_detail.png") or _fp("email_dot_unread.png")
         if det_dot_src:
-            panel.add_widget(Image(
+            panel.add_widget(_tracked(Image(
                 source=det_dot_src,
                 size_hint=(12 / PW, 12 / PH),
                 pos_hint={"x": 28 / PW, "y": (PH - 99 - 12) / PH},
                 fit_mode="contain",
-            ))
+            )))
 
-        # Sender name  (107, 74)  142 × 27  SemiBold 23px white
-        self._detail_sender_lbl = _lbl(
-            "—", _FONT_SB, _ff(23), _WHITE,
+        self._detail_sender_lbl = _tracked(_lbl(
+            "", _FONT_SB, _ff(23), _WHITE,
             size_hint=(220 / PW, 27 / PH),
             pos_hint={"x": 107 / PW, "y": (PH - 74 - 27) / PH},
-        )
+        ))
         panel.add_widget(self._detail_sender_lbl)
 
-        # "To:" label  (107, 108)  28 × 24  SemiBold 20px muted
-        panel.add_widget(_lbl(
+        to_key = _tracked(_lbl(
             "To:", _FONT_SB, _ff(20), _MUTED,
             size_hint=(28 / PW, 24 / PH),
             pos_hint={"x": 107 / PW, "y": (PH - 108 - 24) / PH},
         ))
+        panel.add_widget(to_key)
 
-        # "To" value  (144, 108)  51 × 24  SemiBold 20px blue
-        self._detail_to_val = _lbl(
-            "—", _FONT_SB, _ff(20), _BLUE,
+        self._detail_to_val = _tracked(_lbl(
+            "", _FONT_SB, _ff(20), _BLUE,
             size_hint=(200 / PW, 24 / PH),
             pos_hint={"x": 144 / PW, "y": (PH - 108 - 24) / PH},
-        )
+        ))
         panel.add_widget(self._detail_to_val)
 
-        # Subject  (32, 146)  402 × 30  SemiBold 25px white
-        self._detail_subject_lbl = _lbl(
-            "—", _FONT_SB, _ff(25), _WHITE,
+        # ── Subject ──────────────────────────────────────────────────────────
+        self._detail_subject_lbl = _tracked(_lbl(
+            "", _FONT_SB, _ff(25), _WHITE,
             size_hint=(500 / PW, 30 / PH),
             pos_hint={"x": 32 / PW, "y": (PH - 146 - 30) / PH},
-        )
+        ))
         panel.add_widget(self._detail_subject_lbl)
 
-        # Body scroll area — scrollable below subject
-        body_sv = ScrollView(
+        # ── Body scroll ──────────────────────────────────────────────────────
+        body_sv = _tracked(ScrollView(
             size_hint=(590 / PW, 340 / PH),
             pos_hint={"x": 32 / PW, "y": (PH - 189 - 340) / PH},
             do_scroll_x=False,
             bar_width=0,
-        )
+        ))
         self._detail_body_lbl = Label(
             text="",
             font_name=_FONT_MD,
@@ -680,9 +715,9 @@ class EmailsScreen(BaseScreen):
         body_sv.add_widget(self._detail_body_lbl)
         panel.add_widget(body_sv)
 
-        # Empty state label (shown when no email selected)
+        # ── Empty-state prompt (visible until first tap) ─────────────────────
         self._empty_lbl = _lbl(
-            "Select an email to read",
+            "Tap an email to read",
             _FONT_MD, _ff(20), _MUTED,
             halign="center", valign="middle",
             size_hint=(1, 1),
@@ -692,17 +727,11 @@ class EmailsScreen(BaseScreen):
 
         root.add_widget(panel)
 
-    def _sync_det_bg(self, w, *_):
-        self._det_bg.pos = w.pos
-        self._det_bg.size = w.size
-        self._det_ln.rounded_rectangle = (
-            w.x, w.y, w.width, w.height, _ff(29.7)
-        )
+    def _sync_det_bg(self, *_):
+        pass
 
-    def _sync_det_div(self, w):
-        pw, ph = w.width, w.height
-        self._det_div.pos = (w.x + 28 / 667 * pw, w.y + (1 - 60 / 567) * ph)
-        self._det_div.size = (611 / 667 * pw, max(1, _ff(3)))
+    def _sync_det_div(self, *_):
+        pass
 
     # -----------------------------------------------------------------------
     # Lifecycle
@@ -710,6 +739,16 @@ class EmailsScreen(BaseScreen):
 
     def on_enter(self):
         self._load_emails()
+        if not hasattr(self, "_refresh_event") or self._refresh_event is None:
+            from kivy.clock import Clock
+            self._refresh_event = Clock.schedule_interval(
+                lambda _dt: self._load_emails(), 30.0
+            )
+
+    def on_leave(self):
+        if hasattr(self, "_refresh_event") and self._refresh_event is not None:
+            self._refresh_event.cancel()
+            self._refresh_event = None
 
     # -----------------------------------------------------------------------
     # Data loading
@@ -723,7 +762,7 @@ class EmailsScreen(BaseScreen):
             try:
                 fetch = getattr(self.backend, "fetch_gmail_recent", None)
                 if fetch is not None:
-                    data = await fetch(max_results=40, days=90, q="")
+                    data = await fetch(max_results=40, days=_GMAIL_RECENT_DAYS, q="")
                     connected = bool(data.get("connected"))
                     err_msg = (data.get("error") or "").strip() or None
                     rows = data.get("messages") or []
@@ -752,7 +791,9 @@ class EmailsScreen(BaseScreen):
                 if self._active_tab == "today" and not any(e.get("is_today") for e in emails):
                     self._active_tab = "all"
                     for tid, lbl in self._tab_labels.items():
-                        lbl.bold = (tid == "all")
+                        lbl.color = _BLUE if tid == "all" else _MUTED
+                    for tid, lbl in self._count_labels.items():
+                        lbl.color = _BLUE if tid == "all" else _WHITE
                 self._apply_filter()
                 if emails and self._selected_email is None:
                     self._select_email(emails[0])
@@ -787,17 +828,19 @@ class EmailsScreen(BaseScreen):
 
         emails = self._filtered_emails
         if not self._gmail_connected:
+            err_detail = f"\n({self._gmail_error})" if self._gmail_error else ""
             self._list_container.add_widget(_lbl(
                 (
                     "Connect Gmail in the web dashboard:\n"
                     "Settings → Integrations → Gmail.\n"
                     "Then reopen Emails here."
+                    + err_detail
                 ),
                 _FONT_MD, _ff(18), _MUTED,
                 halign="center", valign="middle",
                 size_hint=(0.92, None),
-                height=_ff(120),
-                pos_hint={"x": 0.04, "y": 0.38},
+                height=_ff(140),
+                pos_hint={"x": 0.04, "y": 0.35},
             ))
             self._list_container.height = _ff(567)
             return
@@ -927,8 +970,7 @@ class EmailsScreen(BaseScreen):
         self._rebuild_list()          # refresh row highlight
 
     def _update_detail(self, email: dict):
-        if self._empty_lbl:
-            self._empty_lbl.opacity = 0.0
+        # Populate fields
         if self._detail_sender_lbl:
             self._detail_sender_lbl.text = email.get("sender", "")
         if self._detail_to_val:
@@ -936,20 +978,27 @@ class EmailsScreen(BaseScreen):
         if self._detail_subject_lbl:
             self._detail_subject_lbl.text = email.get("subject", "")
         if self._detail_body_lbl:
-            body = email.get("body", email.get("preview", ""))
-            self._detail_body_lbl.text = body
+            self._detail_body_lbl.text = email.get("body", email.get("preview", ""))
+        # Show all content, hide empty state
+        for w in getattr(self, "_detail_content_widgets", []):
+            w.opacity = 1.0
+        if self._empty_lbl:
+            self._empty_lbl.opacity = 0.0
 
     def _on_detail_back(self):
         """Back action in detail panel — deselect email."""
         self._selected_email = None
-        if self._empty_lbl:
-            self._empty_lbl.opacity = 1.0
         if self._detail_sender_lbl:
-            self._detail_sender_lbl.text = "—"
+            self._detail_sender_lbl.text = ""
         if self._detail_subject_lbl:
-            self._detail_subject_lbl.text = "—"
+            self._detail_subject_lbl.text = ""
         if self._detail_body_lbl:
             self._detail_body_lbl.text = ""
+        # Hide all content, show empty state
+        for w in getattr(self, "_detail_content_widgets", []):
+            w.opacity = 0.0
+        if self._empty_lbl:
+            self._empty_lbl.opacity = 1.0
         self._rebuild_list()
 
     def _on_mark_unread(self):

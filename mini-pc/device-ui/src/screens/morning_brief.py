@@ -12,6 +12,7 @@ All coordinates are Figma absolute px, converted with _ph() to Kivy fractions.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import date, datetime
 
@@ -24,6 +25,11 @@ from kivy.uix.label import Label
 from kivy.uix.widget import Widget
 
 from async_helper import run_async
+from api_client import (
+    _GMAIL_RECENT_DAYS,
+    _map_gmail_recent_row,
+    summarize_gmail_feed_for_home,
+)
 from config import ASSETS_DIR, DISPLAY_HEIGHT, DISPLAY_WIDTH, display_now
 from screens.base_screen import BaseScreen
 from weather_client import WeatherSnapshot, get_weather_client
@@ -703,15 +709,25 @@ class MorningBriefScreen(BaseScreen):
 
     def _load_briefing_backend(self) -> None:
         async def _go():
-            try:
-                data = await self.backend.get_briefing_context(days_ahead=1)
-            except Exception as exc:
-                logger.debug("get_briefing_context failed: %s", exc)
-                data = {}
-            Clock.schedule_once(lambda dt: self._apply_briefing_data(data or {}), 0)
+            async def _briefing():
+                return await self.backend.get_briefing_context(days_ahead=1)
+
+            async def _gmail():
+                gf = getattr(self.backend, "fetch_gmail_recent", None)
+                if gf is None:
+                    return {}
+                return await gf(max_results=40, days=_GMAIL_RECENT_DAYS, q="")
+
+            results = await asyncio.gather(_briefing(), _gmail(), return_exceptions=True)
+            data  = results[0] if not isinstance(results[0], BaseException) else {}
+            gfeed = results[1] if not isinstance(results[1], BaseException) else {}
+            Clock.schedule_once(
+                lambda dt: self._apply_briefing_data(data or {}, gfeed),
+                0,
+            )
         run_async(_go())
 
-    def _apply_briefing_data(self, data: dict) -> None:
+    def _apply_briefing_data(self, data: dict, gfeed: dict | None = None) -> None:
         try:
             dn = data.get("user_display_name")
             greet = (data.get("greeting") or "Hello").strip()
@@ -812,7 +828,16 @@ class MorningBriefScreen(BaseScreen):
 
             gprev = data.get("gmail_preview") or {}
             top = gprev.get("top") if isinstance(gprev, dict) else None
-            if top and self._em_sender and self._em_subject:
+            gsum = summarize_gmail_feed_for_home(gfeed or {})
+            top_raw = gsum.get("top_raw")
+            if isinstance(top_raw, dict) and self._em_sender and self._em_subject:
+                row = _map_gmail_recent_row(top_raw)
+                self._em_sender.text = (row.get("sender") or "—")[:42]
+                self._em_subject.text = (
+                    (row.get("subject") or row.get("preview") or "—")[:64]
+                )
+                self._em_time.text = (row.get("time") or "—")[:12]
+            elif top and self._em_sender and self._em_subject:
                 self._em_sender.text = (top.get("from") or "—")[:42]
                 self._em_subject.text = (top.get("subject") or top.get("snippet") or "—")[:64]
                 self._em_time.text = (top.get("date") or "")[-12:] or "—"
@@ -820,7 +845,9 @@ class MorningBriefScreen(BaseScreen):
                 self._em_sender.text = "No recent mail"
                 if self._em_subject:
                     self._em_subject.text = (
-                        "Connect Gmail in settings" if not gprev.get("connected") else "—"
+                        "Connect Gmail in settings"
+                        if not (gsum.get("connected") or gprev.get("connected"))
+                        else "—"
                     )
                 if self._em_time:
                     self._em_time.text = ""

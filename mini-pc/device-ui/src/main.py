@@ -237,6 +237,11 @@ from network_util import linux_ethernet_ready
 from profile_store import get_active_profile, clear_active_profile_selection
 from voice_assistant import VoiceAssistant, VoiceIntent
 
+try:
+    from realtime_voice_session import REALTIME_VOICE_IMPLEMENTED
+except ImportError:
+    REALTIME_VOICE_IMPLEMENTED = False
+
 # Boot-flow screens
 from screens.splash import SplashScreen
 from screens.welcome import WelcomeScreen
@@ -577,9 +582,16 @@ class MeetingBoxApp(App):
         self._realtime_session_start_monotonic = None
         self._realtime_connected_ok = False
         self.voice_realtime_assistant = False
+        # Sync interpreter to the UI default immediately so wake works before
+        # async device-settings load (VoiceAssistant env-var default is "hey tony").
         self.voice_wake_phrase_display = "Hey buddy"
+        self.voice_assistant.apply_server_settings(wake_phrase="hey buddy")
         self.voice_assistant_enabled = True
         self.assistant_speech_volume = 85
+        # Realtime may only start when _handle_voice_wake_phrase sets this True (one-shot).
+        self._realtime_launch_permitted = False
+        # Limits cloud NL replies per wake/mic activation (local wake listening unaffected).
+        self._voice_cloud_qa_budget = 0
 
     # ==================================================================
     # BUILD
@@ -1040,7 +1052,7 @@ class MeetingBoxApp(App):
             logger.info("WebSocket listener cancelled")
         except Exception as e:
             logger.error(f"WebSocket error: {e}")
-            await asyncio.sleep(5)
+            await asyncio.sleep(2)
             Clock.schedule_once(lambda _: self.start_websocket_listener(), 0)
 
     # ==================================================================
@@ -1823,6 +1835,17 @@ class MeetingBoxApp(App):
             )
 
     def _handle_voice_wake_phrase(self, _text: str) -> None:
+        """Run after local wake detection or mic orb (same flow).
+
+        Arms at most one cloud Q&A reply for this wake. OpenAI Realtime may only start
+        when voice_realtime_assistant is on and `_realtime_launch_permitted` is set here.
+        """
+        if getattr(self, "voice_assistant_enabled", True):
+            self._voice_cloud_qa_budget = 1
+        else:
+            self._voice_cloud_qa_budget = 0
+        self._realtime_launch_permitted = False
+
         timeout = max(2.0, self.voice_assistant.command_timeout_seconds)
         lbl = getattr(self, "voice_wake_phrase_display", "Hey buddy") or "Hey buddy"
 
@@ -1850,10 +1873,13 @@ class MeetingBoxApp(App):
 
         if (
             getattr(self, "voice_realtime_assistant", False)
+            and REALTIME_VOICE_IMPLEMENTED
             and get_device_auth_token().strip()
             and not USE_MOCK_BACKEND
             and not WAKE_LOCAL_VOICE_ONLY
         ):
+            self._realtime_launch_permitted = True
+
             def _kick_realtime(_dt):
                 self._show_home_listening_after_wake()
                 self._start_realtime_voice_session()
@@ -1914,34 +1940,44 @@ class MeetingBoxApp(App):
             return
         if self._voice_pending_confirmation:
             return
-        phrase = (text or "").strip()
-        if len(phrase) < 3:
+        if getattr(self, "_voice_cloud_qa_budget", 0) <= 0:
+            logger.debug("Cloud assistant Q&A skipped (no budget for this wake cycle)")
             return
+        phrase = (text or "").strip()
+        if len(phrase) < 6:
+            return
+
+        self._voice_cloud_qa_budget -= 1
 
         async def _go():
             self._set_voice_indicator_override("wake", "Thinking…", duration=None)
             try:
                 if not USE_MOCK_BACKEND and not get_device_auth_token().strip():
+                    if getattr(self, "voice_assistant_enabled", True):
+                        Clock.schedule_once(
+                            lambda _dt: self._voice_reply_and_extend_listening(
+                                "Pair this device with your account so I can answer questions.",
+                                error=True,
+                            ),
+                            0,
+                        )
+                    return
+                res = await self.backend.post_assistant_intent(phrase)
+                raw = (res.get("assistant_message") or "").strip() or "Okay."
+                if getattr(self, "voice_assistant_enabled", True):
+                    Clock.schedule_once(
+                        lambda _dt, m=raw: self._voice_reply_and_extend_listening(m), 0
+                    )
+            except Exception as e:
+                logger.warning("Assistant conversation failed: %s", e)
+                if getattr(self, "voice_assistant_enabled", True):
                     Clock.schedule_once(
                         lambda _dt: self._voice_reply_and_extend_listening(
-                            "Pair this device with your account so I can answer questions.",
+                            "Cannot reach the server. Check your network or ask an admin to restart the server.",
                             error=True,
                         ),
                         0,
                     )
-                    return
-                res = await self.backend.post_assistant_intent(phrase)
-                raw = (res.get("assistant_message") or "").strip() or "Okay."
-                Clock.schedule_once(lambda _dt, m=raw: self._voice_reply_and_extend_listening(m), 0)
-            except Exception as e:
-                logger.warning("Assistant conversation failed: %s", e)
-                Clock.schedule_once(
-                    lambda _dt: self._voice_reply_and_extend_listening(
-                        "I could not reach the assistant. Check BACKEND_URL and your network.",
-                        error=True,
-                    ),
-                    0,
-                )
             finally:
                 Clock.schedule_once(lambda _dt: self._clear_voice_indicator_override(), 0)
 
@@ -2017,7 +2053,18 @@ class MeetingBoxApp(App):
             logger.debug(
                 "Realtime voice session request already in flight; skipping duplicate"
             )
+            self._realtime_launch_permitted = False
             return
+
+        if not getattr(self, "_realtime_launch_permitted", False):
+            logger.warning(
+                "Realtime voice session rejected (not armed by wake phrase); using local assistant"
+            )
+            Clock.schedule_once(
+                lambda _dt: self._begin_local_voice_command_session(), 0
+            )
+            return
+        self._realtime_launch_permitted = False
 
         if not get_device_auth_token().strip():
             Clock.schedule_once(
@@ -2136,16 +2183,82 @@ class MeetingBoxApp(App):
         if amp_n <= 0:
             return True
         amp = str(amp_n)
-        for cmd in (
-            ["espeak-ng", "-s", "165", "-a", amp, phrase],
-            ["espeak", "-s", "165", "-a", amp, phrase],
-        ):
-            exe = shutil.which(cmd[0])
+
+        # --- 1. piper (neural TTS — best quality, fully offline) ---
+        # Usage: echo "text" | piper --model MODEL --output_file /tmp/piper_out.wav && aplay /tmp/piper_out.wav
+        piper = shutil.which("piper")
+        aplay = shutil.which("aplay")
+        if piper and aplay:
+            import glob as _glob
+            model_candidates = [
+                "/usr/share/piper/voices/en_US-amy-medium.onnx",
+                "/usr/share/piper/voices/en_US-lessac-medium.onnx",
+                "/usr/share/piper/voices/en_US-ryan-medium.onnx",
+                "/usr/local/share/piper/en_US-amy-medium.onnx",
+            ]
+            # Also search dynamically
+            model_candidates += _glob.glob("/usr/share/piper/voices/en_US-*.onnx")
+            model_candidates += _glob.glob("/usr/local/share/piper/**/*.onnx", recursive=True)
+            piper_model = next((m for m in model_candidates if os.path.isfile(m)), None)
+            if piper_model:
+                try:
+                    import tempfile
+                    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                        tmp_path = tmp.name
+                    proc = subprocess.run(
+                        [piper, "--model", piper_model, "--output_file", tmp_path],
+                        input=phrase.encode(),
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=15,
+                        check=False,
+                    )
+                    if proc.returncode == 0 and os.path.getsize(tmp_path) > 0:
+                        subprocess.run(
+                            [aplay, "-q", tmp_path],
+                            check=False,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            timeout=30,
+                        )
+                        try:
+                            os.unlink(tmp_path)
+                        except OSError:
+                            pass
+                        return True
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
+                except Exception as e:
+                    logger.debug("piper TTS failed: %s", e)
+
+        # --- 2. mimic3 (Mycroft neural TTS — good quality) ---
+        mimic3 = shutil.which("mimic3")
+        if mimic3:
+            try:
+                result = subprocess.run(
+                    [mimic3, "--voice", "en_US/vctk_low#p236", phrase],
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=20,
+                )
+                if result.returncode == 0:
+                    return True
+            except Exception as e:
+                logger.debug("mimic3 TTS failed: %s", e)
+
+        # --- 3. espeak-ng / espeak with natural voice settings ---
+        # Use en-us+f3 (natural American English female, variant 3)
+        # -p 46 = moderate pitch, -s 125 = comfortable speed, -g 3 = small word gap
+        for exe_name, voice in (("espeak-ng", "en-us+f3"), ("espeak", "en")):
+            exe = shutil.which(exe_name)
             if not exe:
                 continue
             try:
                 subprocess.run(
-                    [exe, *cmd[1:]],
+                    [exe, "-v", voice, "-s", "125", "-p", "46", "-g", "3", "-a", amp, phrase],
                     check=False,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
@@ -2154,12 +2267,13 @@ class MeetingBoxApp(App):
                 return True
             except Exception as e:
                 logger.warning("Voice feedback via %s failed: %s", exe, e)
+
+        # --- 4. espeak-ng --stdout | aplay (last resort) ---
         esng = shutil.which("espeak-ng")
-        aplay = shutil.which("aplay")
         if esng and aplay:
             try:
                 proc = subprocess.Popen(
-                    [esng, "-s", "165", "-a", amp, phrase, "--stdout"],
+                    [esng, "-v", "en-us+f3", "-s", "125", "-p", "46", "-g", "3", "-a", amp, phrase, "--stdout"],
                     stdout=subprocess.PIPE,
                     stderr=subprocess.DEVNULL,
                 )
@@ -2179,7 +2293,7 @@ class MeetingBoxApp(App):
                 return True
             except Exception as e:
                 logger.warning("Voice feedback via espeak-ng stdout | aplay failed: %s", e)
-        logger.warning("Voice feedback unavailable: no espeak command found")
+        logger.warning("Voice feedback unavailable: no TTS engine found")
         return False
 
     def _speak_text_async(self, text: str) -> None:
@@ -2206,20 +2320,12 @@ class MeetingBoxApp(App):
         self._speak_text_async(text)
 
     def _voice_reply_and_extend_listening(self, message: str, *, error: bool = False) -> None:
-        """Speak assistant text and reopen the post-wake command window for multi-turn chat."""
+        """Speak assistant text; next question requires another wake phrase or mic tap."""
         msg = self._trim_voice_text(message, 450)
         words = max(1, len(msg.split()))
         dur = min(45.0, max(2.5, words * 0.42))
         st = "error" if error else "speaking"
         self._voice_reply(msg, state=st, duration=dur)
-
-        def _extend(_dt):
-            try:
-                self.voice_assistant.simulate_wake()
-            except Exception:
-                logger.debug("simulate_wake after assistant reply failed", exc_info=True)
-
-        Clock.schedule_once(_extend, dur + 0.35)
 
     @staticmethod
     def _format_voice_duration(seconds: int) -> str:
@@ -2704,7 +2810,7 @@ class MeetingBoxApp(App):
             if self.recording_state.get("active"):
                 self._voice_reply("A meeting is already recording.", duration=3.0)
                 return
-            logger.info('Voice trigger accepted ("hey tony" -> "start meeting")')
+            logger.info('Voice trigger accepted ("hey buddy" -> "start meeting")')
             self._voice_start_in_flight = True
             self._voice_start_confirmation_pending = True
             self._reset_idle_timer()

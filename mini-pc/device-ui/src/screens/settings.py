@@ -232,8 +232,8 @@ class SettingsScreen(BaseScreen):
         self.container.add_widget(self.mic_test_item)
 
         self.voice_assistant_enabled_item = SettingsItem(
-            title='Wake word listening',
-            subtitle='Keep mic on for your wake phrase',
+            title='Voice assistant',
+            subtitle='Wake word + cloud Q&A (main toggle)',
             mode='toggle',
             active=True,
             on_toggle=self._on_voice_assistant_enabled_toggled,
@@ -241,8 +241,8 @@ class SettingsScreen(BaseScreen):
         self.container.add_widget(self.voice_assistant_enabled_item)
 
         self.voice_realtime_item = SettingsItem(
-            title='AI voice assistant',
-            subtitle='OpenAI Realtime after wake word',
+            title='Realtime voice mode',
+            subtitle='OpenAI Realtime — coming soon',
             mode='toggle',
             active=False,
             on_toggle=self._on_voice_realtime_toggled,
@@ -542,8 +542,13 @@ class SettingsScreen(BaseScreen):
 
     def _on_voice_assistant_enabled_toggled(self, active):
         self.app.voice_assistant_enabled = bool(active)
+        if not active:
+            self.app._voice_cloud_qa_budget = 0
+            self.app._realtime_launch_permitted = False
         if hasattr(self.app, "voice_assistant") and self.app.voice_assistant:
             self.app.voice_assistant.apply_server_settings(enabled=bool(active))
+            if active:
+                self.app.voice_assistant.start()
         if hasattr(self.app, "_sync_voice_assistant_state"):
             self.app._sync_voice_assistant_state()
 
@@ -557,6 +562,8 @@ class SettingsScreen(BaseScreen):
 
     def _on_voice_realtime_toggled(self, active):
         self.app.voice_realtime_assistant = bool(active)
+        if not active and hasattr(self.app, "_realtime_launch_permitted"):
+            self.app._realtime_launch_permitted = False
 
         async def _save():
             try:

@@ -3,6 +3,9 @@ OpenAI Realtime voice bridge for the device UI.
 
 Full duplex audio + WebSocket session can be expanded here. When Realtime is not
 deployed, ``start()`` fails fast so the app can fall back to local Vosk commands.
+
+The device app only invokes this after the local wake flow arms
+``MeetingBoxApp._realtime_launch_permitted`` — do not start sessions from arbitrary UI.
 """
 
 from __future__ import annotations
@@ -13,6 +16,9 @@ import threading
 from kivy.clock import Clock
 
 logger = logging.getLogger(__name__)
+
+# Flip to True when OpenAI Realtime WebSocket/session is wired up end-to-end.
+REALTIME_VOICE_IMPLEMENTED = False
 
 
 class RealtimeVoiceSession:

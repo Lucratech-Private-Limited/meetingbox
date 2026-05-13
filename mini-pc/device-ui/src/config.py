@@ -16,6 +16,9 @@ logger = logging.getLogger(__name__)
 # BACKEND CONNECTION
 # ============================================================================
 
+_CLOUD_BACKEND_URL = "https://meetingboxai.lucratechsol.com"
+_LOCAL_BACKEND_DEFAULTS = {"http://127.0.0.1:8000", "http://localhost:8000"}
+
 
 def _normalize_dashboard_config(raw: str) -> tuple[str, str]:
     """
@@ -42,6 +45,11 @@ def _normalize_dashboard_config(raw: str) -> tuple[str, str]:
     return hostport, f"http://{hostport}"
 
 
+def _native_runtime_uses_packaged_defaults() -> bool:
+    app_dir = (os.getenv("MEETINGBOX_APP_DIR") or "").strip()
+    return app_dir == "/usr/lib/meetingbox/device-ui"
+
+
 def _resolve_backend_url() -> str:
     """
     REST API base URL. Prefer explicit BACKEND_URL; if unset/empty and DASHBOARD_URL is set,
@@ -49,9 +57,23 @@ def _resolve_backend_url() -> str:
     issued the code (avoids claiming against localhost while the QR opened a cloud URL).
     """
     explicit = (os.getenv("BACKEND_URL") or "").strip().rstrip("/")
-    if explicit:
-        return explicit
     dash_env = (os.getenv("DASHBOARD_URL") or "").strip()
+    if explicit:
+        if explicit in _LOCAL_BACKEND_DEFAULTS:
+            if dash_env:
+                _, pub = _normalize_dashboard_config(dash_env)
+                out = pub.strip().rstrip("/")
+                if out not in _LOCAL_BACKEND_DEFAULTS:
+                    logger.warning("Ignoring localhost BACKEND_URL; derived backend from DASHBOARD_URL: %s", out)
+                    return out
+            if (os.getenv("MEETINGBOX_ALLOW_LOCAL_BACKEND") or "").strip() != "1":
+                logger.warning(
+                    "BACKEND_URL is localhost — overriding with cloud backend: %s "
+                    "(set MEETINGBOX_ALLOW_LOCAL_BACKEND=1 to keep localhost)",
+                    _CLOUD_BACKEND_URL,
+                )
+                return _CLOUD_BACKEND_URL
+        return explicit
     if not dash_env:
         return "http://localhost:8000"
     _, pub = _normalize_dashboard_config(dash_env)
@@ -80,11 +102,11 @@ DEVICE_AUTH_TOKEN_FILE_NAME = 'device_auth_token'
 # Use mock backend for testing (set MOCK_BACKEND=1)
 USE_MOCK_BACKEND = os.getenv('MOCK_BACKEND', '0') == '1'
 
-# API timeout in seconds
-API_TIMEOUT = 30
+# API timeout in seconds (keep snappy; long uploads have their own timeout)
+API_TIMEOUT = 15
 
 # WebSocket reconnect settings
-WS_RECONNECT_DELAY = 3  # seconds
+WS_RECONNECT_DELAY = 1  # seconds (exponential backoff: 1 → 2 → 4 → … capped at 30)
 WS_MAX_RECONNECT_ATTEMPTS = 10
 
 # ============================================================================

@@ -111,6 +111,19 @@ set -e
 systemctl daemon-reload >/dev/null 2>&1 || true
 mkdir -p /opt/meetingbox/data/config
 chmod 0755 /opt/meetingbox /opt/meetingbox/data /opt/meetingbox/data/config 2>/dev/null || true
+
+ENV_FILE=/etc/meetingbox/device-ui.env
+if [[ -f "$ENV_FILE" ]]; then
+  backend="$(sed -n 's/^BACKEND_URL=//p' "$ENV_FILE" | tail -n 1)"
+  dashboard="$(sed -n 's/^DASHBOARD_URL=//p' "$ENV_FILE" | tail -n 1)"
+  if [[ -z "$dashboard" && ( "$backend" == "http://127.0.0.1:8000" || "$backend" == "http://localhost:8000" ) ]]; then
+    sed -i \
+      -e 's#^BACKEND_URL=.*#BACKEND_URL=https://meetingboxai.lucratechsol.com#' \
+      -e 's#^BACKEND_WS_URL=.*#BACKEND_WS_URL=wss://meetingboxai.lucratechsol.com/ws#' \
+      -e 's#^DASHBOARD_URL=.*#DASHBOARD_URL=https://meetingboxai.lucratechsol.com/#' \
+      "$ENV_FILE"
+  fi
+fi
 exit 0
 EOF
 chmod 0755 "$PKG_ROOT/DEBIAN/postinst"

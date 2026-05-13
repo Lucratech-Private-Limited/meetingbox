@@ -101,3 +101,20 @@ def test_help_command_is_supported():
     intent = interpreter.handle_transcript("hey tony what can you do", now=10.0)
     assert intent is not None
     assert intent.name == "help"
+
+
+def test_wake_only_utterance_detected():
+    interpreter = _mk()
+    assert interpreter.is_wake_only_utterance("hey tony") is True
+    assert interpreter.is_wake_only_utterance("please hey tony uh") is True
+
+
+def test_non_wake_only_with_extra_words():
+    interpreter = _mk()
+    assert interpreter.is_wake_only_utterance("hey tony what time is it") is False
+
+
+def test_is_awaiting_command_after_wake():
+    interpreter = _mk()
+    interpreter.handle_transcript("hey tony", now=10.0)
+    assert interpreter.is_awaiting_command(now=10.5) is True

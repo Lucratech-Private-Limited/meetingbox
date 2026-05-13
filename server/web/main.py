@@ -38,10 +38,12 @@ from routes.devices import router as devices_router
 from routes.auth import router as auth_router
 from routes.actions import router as actions_router
 from routes.integrations import router as integrations_router
+from routes.emails import router as emails_router
 from routes.commitments import router as commitments_router
 from routes.briefing import router as briefing_router
 from routes.admin_memory import router as admin_memory_router
 from routes.voice import router as voice_router
+from routes.weather import router as weather_router
 from auth import get_optional_user, resolve_actor_from_access_token
 from routes.device import SetupCompleteBody, finalize_first_boot_setup
 from rate_limit import limiter
@@ -272,7 +274,8 @@ app.add_middleware(
   allow_origins=_cors_origins,
   allow_credentials=False,
   allow_methods=["*"],
-  allow_headers=["*"],
+  allow_headers=["*", "Authorization", "Content-Type", "X-Requested-With"],
+  expose_headers=["Content-Length", "X-Request-Id"],
 )
 
 app.include_router(auth_router, prefix="/api/auth", tags=["auth"])
@@ -284,10 +287,12 @@ app.include_router(device_router, prefix="/api/device", tags=["device"])
 app.include_router(devices_router, prefix="/api", tags=["devices"])
 app.include_router(actions_router, prefix="/api", tags=["actions"])
 app.include_router(integrations_router, prefix="/api", tags=["integrations"])
+app.include_router(emails_router, prefix="/api", tags=["emails"])
 app.include_router(commitments_router, prefix="/api", tags=["commitments"])
 app.include_router(briefing_router, prefix="/api")
 app.include_router(admin_memory_router, prefix="/api")
 app.include_router(voice_router, prefix="/api/voice")
+app.include_router(weather_router, prefix="/api", tags=["weather"])
 
 
 @app.post("/api/device/setup-complete", tags=["device"])

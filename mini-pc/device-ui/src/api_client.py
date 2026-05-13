@@ -115,6 +115,60 @@ def _map_gmail_recent_row(msg: Dict) -> Dict:
     }
 
 
+def summarize_gmail_feed_for_home(feed: Optional[Dict]) -> Dict[str, object]:
+    """
+    Normalize `GET /api/integrations/gmail/recent` (same as frontend `Emails.tsx`)
+    for home / morning-brief widgets: unread count + one-line preview.
+    """
+    out: Dict[str, object] = {
+        "connected": False,
+        "unread_count": 0,
+        "message_count": 0,
+        "brief_subtitle": "Connect Gmail for updates",
+        "top_raw": None,
+    }
+    if not isinstance(feed, dict):
+        return out
+    out["connected"] = bool(feed.get("connected"))
+    raw_msgs = feed.get("messages")
+    if not isinstance(raw_msgs, list):
+        raw_msgs = []
+    normalized: List[Dict] = []
+    unread = 0
+    for m in raw_msgs:
+        if not isinstance(m, dict) or not m.get("id"):
+            continue
+        normalized.append(m)
+        if not m.get("is_read", True):
+            unread += 1
+    out["message_count"] = len(normalized)
+    out["unread_count"] = unread
+    err = (feed.get("error") or "").strip()
+    if not out["connected"]:
+        out["brief_subtitle"] = "Connect Gmail for updates"
+        return out
+    if not normalized:
+        out["brief_subtitle"] = err or "No recent messages"
+        return out
+    out["top_raw"] = normalized[0]
+
+    def _name(mi: Dict) -> str:
+        return _parse_sender_display(mi.get("from") or "")
+
+    first = _name(normalized[0])
+    if len(normalized) == 1:
+        subj = (normalized[0].get("subject") or normalized[0].get("snippet") or "").strip()
+        out["brief_subtitle"] = f"{first}: {subj[:40]}" if subj else first
+        return out
+    second = _name(normalized[1])
+    rest = len(normalized) - 2
+    if rest > 0:
+        out["brief_subtitle"] = f"{first}, {second} +{rest}"
+    else:
+        out["brief_subtitle"] = f"{first}, {second}"
+    return out
+
+
 def build_websocket_url(base_ws_url: str) -> str:
     """
     Match server/web WebSocket auth: optional MEETINGBOX_WS_REQUIRE_AUTH (access_token query)
@@ -707,8 +761,27 @@ class BackendClient:
             q: str = "",
     ) -> Dict:
         """
-        GET /api/integrations/gmail/recent — same feed as dashboard Emails tab; works with device Bearer token.
+        Fetch Gmail inbox. Tries the dedicated /api/emails endpoint first (purpose-built
+        for device + user Bearer), then falls back to /api/integrations/gmail/recent.
         """
+        # --- Primary: /api/emails (returns list directly) ---
+        try:
+            resp = await self.client.get(
+                f"{self.base_url}/api/emails",
+                params={"filter": "all", "limit": int(max_results)},
+            )
+            resp.raise_for_status()
+            rows = resp.json()
+            if isinstance(rows, list):
+                return {"connected": True, "messages": rows, "count": len(rows)}
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code not in (401, 403):
+                logger.debug("fetch_gmail_recent /api/emails HTTP %s", e.response.status_code)
+            # Fall through to legacy endpoint on auth errors too (device may not be paired yet)
+        except Exception as e:
+            logger.debug("fetch_gmail_recent /api/emails failed: %s", e)
+
+        # --- Fallback: /api/integrations/gmail/recent ---
         try:
             resp = await self.client.get(
                 f"{self.base_url}/api/integrations/gmail/recent",
@@ -754,40 +827,46 @@ class BackendClient:
         return [_map_gmail_recent_row(m) for m in rows if isinstance(m, dict) and m.get("id")]
 
     async def get_email_detail(self, email_id: str) -> Dict:
-        """GET /api/integrations/gmail/messages/{id} — full body."""
-        try:
-            resp = await self.client.get(
-                f"{self.base_url}/api/integrations/gmail/messages/{email_id}"
-            )
-            resp.raise_for_status()
-            return resp.json()
-        except Exception as e:
-            logger.debug("get_email_detail failed: %s", e)
-            return {}
+        """GET /api/emails/{id} — full body (falls back to integrations route)."""
+        for url in (
+            f"{self.base_url}/api/emails/{email_id}",
+            f"{self.base_url}/api/integrations/gmail/messages/{email_id}",
+        ):
+            try:
+                resp = await self.client.get(url)
+                resp.raise_for_status()
+                return resp.json()
+            except Exception as e:
+                logger.debug("get_email_detail %s failed: %s", url, e)
+        return {}
 
     async def mark_email_unread(self, email_id: str) -> Dict:
-        """POST /api/integrations/gmail/messages/{id}/mark-unread"""
-        try:
-            resp = await self.client.post(
-                f"{self.base_url}/api/integrations/gmail/messages/{email_id}/mark-unread"
-            )
-            resp.raise_for_status()
-            return resp.json()
-        except Exception as e:
-            logger.debug("mark_email_unread failed: %s", e)
-            return {}
+        """POST /api/emails/{id}/mark-unread (falls back to integrations route)."""
+        for url in (
+            f"{self.base_url}/api/emails/{email_id}/mark-unread",
+            f"{self.base_url}/api/integrations/gmail/messages/{email_id}/mark-unread",
+        ):
+            try:
+                resp = await self.client.post(url)
+                resp.raise_for_status()
+                return resp.json()
+            except Exception as e:
+                logger.debug("mark_email_unread %s failed: %s", url, e)
+        return {}
 
     async def archive_email(self, email_id: str) -> Dict:
-        """POST /api/integrations/gmail/messages/{id}/archive"""
-        try:
-            resp = await self.client.post(
-                f"{self.base_url}/api/integrations/gmail/messages/{email_id}/archive"
-            )
-            resp.raise_for_status()
-            return resp.json()
-        except Exception as e:
-            logger.debug("archive_email failed: %s", e)
-            return {}
+        """POST /api/emails/{id}/archive (falls back to integrations route)."""
+        for url in (
+            f"{self.base_url}/api/emails/{email_id}/archive",
+            f"{self.base_url}/api/integrations/gmail/messages/{email_id}/archive",
+        ):
+            try:
+                resp = await self.client.post(url)
+                resp.raise_for_status()
+                return resp.json()
+            except Exception as e:
+                logger.debug("archive_email %s failed: %s", url, e)
+        return {}
 
     # ==================================================================
     # SYSTEM API
@@ -977,7 +1056,7 @@ class BackendClient:
         if self._ws_reconnect_attempts > WS_MAX_RECONNECT_ATTEMPTS:
             logger.error("Max WS reconnect attempts reached")
             raise ConnectionError("Failed to reconnect to backend WebSocket")
-        delay = min(WS_RECONNECT_DELAY * (2 ** self._ws_reconnect_attempts), 60)
+        delay = min(WS_RECONNECT_DELAY * (2 ** self._ws_reconnect_attempts), 30)
         logger.info(f"Reconnecting WS in {delay}s (attempt {self._ws_reconnect_attempts})")
         await asyncio.sleep(delay)
 
