@@ -189,18 +189,28 @@ def find_and_delete_event(
     if not title_hint:
         raise ValueError("event_id or title_hint is required to delete an event")
 
-    # Build search window: default ±7 days from date_hint or now
-    if date_hint:
-        try:
-            base = datetime.fromisoformat(date_hint.split("T")[0])
-            base = base.replace(tzinfo=zone)
-        except ValueError:
-            base = datetime.now(zone)
-    else:
-        base = datetime.now(zone)
+    # Build search window centred on the date hint
+    now_local = datetime.now(zone)
+    base = now_local  # default: today
 
+    if date_hint:
+        dh = date_hint.strip().lower()
+        if dh in ("today",):
+            base = now_local
+        elif dh in ("tomorrow",):
+            base = now_local + timedelta(days=1)
+        elif dh in ("yesterday",):
+            base = now_local - timedelta(days=1)
+        else:
+            try:
+                parsed = datetime.fromisoformat(date_hint.split("T")[0])
+                base = parsed.replace(tzinfo=zone)
+            except ValueError:
+                base = now_local  # fallback
+
+    # Wide window: -1 day to +21 days so we catch events near the hint
     time_min = (base - timedelta(days=1)).isoformat()
-    time_max = (base + timedelta(days=14)).isoformat()
+    time_max = (base + timedelta(days=21)).isoformat()
 
     result = (
         service.events()

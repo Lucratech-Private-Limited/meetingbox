@@ -61,6 +61,36 @@ def calendar_create_from_payload(user_id: str, payload: dict[str, Any]) -> dict[
   )
 
 
+def _extract_event_title(raw: str) -> str:
+  """
+  Defensively extract just the event name from a potentially full sentence.
+  The LLM planner sometimes puts the full request sentence as the 'title' arg.
+  """
+  import re
+  raw = raw.strip()
+  # If short enough, use as-is
+  if len(raw) <= 60 and not any(w in raw.lower() for w in ("delete ", "remove ", "cancel ", "the calendar", "scheduled")):
+    return raw
+  # Try quoted string first: "Focus Time" or 'Focus Time'
+  quoted = re.search(r'"([^"]{2,60})"', raw) or re.search(r"'([^']{2,60})'", raw)
+  if quoted:
+    return quoted.group(1).strip()
+  # Try "titled X", "named X", "called X" patterns
+  named = re.search(
+    r'(?:titled|named|called)\s+"?\'?([A-Za-z0-9 _\-]{2,60}?)\'?"?\s+(?:scheduled|on|at|for|from|tomorrow|today|in\b)',
+    raw, re.I,
+  )
+  if named:
+    return named.group(1).strip()
+  # Fall back to the first few words (likely the event name before qualifying text)
+  words = raw.split()
+  for i, w in enumerate(words):
+    if w.lower() in ("scheduled", "on", "at", "from", "in", "tomorrow", "today", "the", "delete", "remove", "cancel"):
+      if i > 0:
+        return " ".join(words[:i]).strip()
+  return raw[:60].strip()
+
+
 def calendar_delete_from_payload(user_id: str, payload: dict[str, Any]) -> dict[str, Any]:
   if not user_id:
     raise ToolError("Sign in is required to delete calendar events.")
@@ -68,7 +98,8 @@ def calendar_delete_from_payload(user_id: str, payload: dict[str, Any]) -> dict[
   if not creds:
     raise ToolError("Google Calendar is not connected. Connect it in Settings.")
   event_id = str(payload.get("event_id") or "").strip() or None
-  title_hint = str(payload.get("title") or payload.get("title_hint") or "").strip() or None
+  raw_title = str(payload.get("title") or payload.get("title_hint") or "").strip()
+  title_hint = _extract_event_title(raw_title) if raw_title else None
   date_hint = str(payload.get("date") or payload.get("date_hint") or payload.get("start_time") or "").strip() or None
   timezone = str(payload.get("timezone") or default_calendar_tz_name())
   return find_and_delete_event(
