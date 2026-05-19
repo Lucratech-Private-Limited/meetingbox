@@ -858,7 +858,8 @@ def process_assistant_intent(
 
   if agent_id == "calendar_agent":
     ctx = _augment_user_text_for_agent(agent_doc, user_id, text)
-    steps = _filter_steps_for_agent(agent_id, plan_calendar_steps(ctx))
+    # Use raw text for planning — augmented ctx contains memory/commitment blocks that confuse the LLM planner
+    steps = _filter_steps_for_agent(agent_id, plan_calendar_steps(text))
     for step in steps:
       tool = step["tool"]
       args = dict(step.get("args") or {})
