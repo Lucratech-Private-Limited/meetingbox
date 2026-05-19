@@ -46,6 +46,7 @@ def calendar_create_from_payload(user_id: str, payload: dict[str, Any]) -> dict[
   attendees = payload.get("attendees") if isinstance(payload.get("attendees"), list) else []
   location = str(payload.get("location") or "")
   timezone = str(payload.get("timezone") or default_calendar_tz_name())
+  recurrence = payload.get("recurrence") or None
   return create_event(
     credentials=creds,
     title=title,
@@ -55,6 +56,7 @@ def calendar_create_from_payload(user_id: str, payload: dict[str, Any]) -> dict[
     attendees=attendees,
     location=location,
     timezone=timezone,
+    recurrence=recurrence,
   )
 
 

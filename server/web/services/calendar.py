@@ -68,6 +68,7 @@ def create_event(
     attendees: list[str] | None = None,
     location: str = "",
     timezone: str | None = None,
+    recurrence: list[str] | str | None = None,
     *,
     start_date: str | None = None,
     start_time_hhmm: str | None = None,
@@ -135,6 +136,11 @@ def create_event(
 
     if attendees:
         event_body["attendees"] = [{"email": e.strip()} for e in attendees if e and str(e).strip()]
+
+    if recurrence:
+        if isinstance(recurrence, str):
+            recurrence = [recurrence]
+        event_body["recurrence"] = [r if r.upper().startswith("RRULE:") else f"RRULE:{r}" for r in recurrence]
 
     result = (
         service.events()
