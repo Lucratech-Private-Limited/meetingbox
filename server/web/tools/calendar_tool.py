@@ -8,6 +8,7 @@ from routes.integrations import get_credentials_for_provider
 from services.calendar import (
     create_event,
     default_calendar_tz_name,
+    find_and_delete_event,
     list_upcoming_events,
     suggest_free_slots,
 )
@@ -57,6 +58,25 @@ def calendar_create_from_payload(user_id: str, payload: dict[str, Any]) -> dict[
     location=location,
     timezone=timezone,
     recurrence=recurrence,
+  )
+
+
+def calendar_delete_from_payload(user_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+  if not user_id:
+    raise ToolError("Sign in is required to delete calendar events.")
+  creds = get_credentials_for_provider(user_id, "calendar")
+  if not creds:
+    raise ToolError("Google Calendar is not connected. Connect it in Settings.")
+  event_id = str(payload.get("event_id") or "").strip() or None
+  title_hint = str(payload.get("title") or payload.get("title_hint") or "").strip() or None
+  date_hint = str(payload.get("date") or payload.get("date_hint") or payload.get("start_time") or "").strip() or None
+  timezone = str(payload.get("timezone") or default_calendar_tz_name())
+  return find_and_delete_event(
+    creds,
+    event_id=event_id,
+    title_hint=title_hint,
+    date_hint=date_hint,
+    timezone=timezone,
   )
 
 

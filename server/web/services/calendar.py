@@ -157,6 +157,98 @@ def create_event(
     return result
 
 
+def find_and_delete_event(
+    credentials,
+    *,
+    event_id: str | None = None,
+    title_hint: str | None = None,
+    date_hint: str | None = None,
+    timezone: str | None = None,
+) -> dict:
+    """
+    Find a calendar event and delete it.
+
+    Priority: event_id (direct) > title_hint + date_hint (search).
+    Returns: {"deleted": True, "event_id": ..., "summary": ..., "start": ...}
+    Raises: ValueError if no match found or multiple matches are ambiguous.
+    """
+    service = build("calendar", "v3", credentials=credentials, cache_discovery=False)
+    tz_name = (timezone or _default_tz_name()).strip() or _default_tz_name()
+    zone = _safe_zone(tz_name)
+
+    if event_id:
+        try:
+            ev = service.events().get(calendarId="primary", eventId=event_id).execute()
+            service.events().delete(calendarId="primary", eventId=event_id).execute()
+            logger.info("Calendar event deleted by id: %s", event_id)
+            return {"deleted": True, "event_id": event_id, "summary": ev.get("summary", ""), "start": ev.get("start", {})}
+        except Exception as exc:
+            raise ValueError(f"Could not delete event {event_id}: {exc}") from exc
+
+    # Search by title + date
+    if not title_hint:
+        raise ValueError("event_id or title_hint is required to delete an event")
+
+    # Build search window: default ±7 days from date_hint or now
+    if date_hint:
+        try:
+            base = datetime.fromisoformat(date_hint.split("T")[0])
+            base = base.replace(tzinfo=zone)
+        except ValueError:
+            base = datetime.now(zone)
+    else:
+        base = datetime.now(zone)
+
+    time_min = (base - timedelta(days=1)).isoformat()
+    time_max = (base + timedelta(days=14)).isoformat()
+
+    result = (
+        service.events()
+        .list(
+            calendarId="primary",
+            timeMin=time_min,
+            timeMax=time_max,
+            singleEvents=True,
+            orderBy="startTime",
+            maxResults=50,
+        )
+        .execute()
+    )
+    events = result.get("items", [])
+
+    # Fuzzy match by title
+    title_lower = title_hint.strip().lower()
+    matches = [e for e in events if title_lower in (e.get("summary") or "").lower()]
+
+    if not matches:
+        raise ValueError(f"No event matching '{title_hint}' found near {date_hint or 'today'}.")
+    if len(matches) > 1 and date_hint:
+        # Narrow by date
+        date_str = date_hint.split("T")[0]
+        narrowed = [
+            e for e in matches
+            if (e.get("start") or {}).get("dateTime", (e.get("start") or {}).get("date", "")).startswith(date_str)
+        ]
+        if narrowed:
+            matches = narrowed
+
+    if len(matches) > 1:
+        summaries = ", ".join(
+            f"'{e.get('summary')}' on {(e.get('start') or {}).get('dateTime', (e.get('start') or {}).get('date', '?'))[:10]}"
+            for e in matches[:4]
+        )
+        raise ValueError(f"Multiple matching events found: {summaries}. Please be more specific.")
+
+    ev = matches[0]
+    ev_id = ev["id"]
+    summary = ev.get("summary", "")
+    start = ev.get("start", {})
+
+    service.events().delete(calendarId="primary", eventId=ev_id).execute()
+    logger.info("Calendar event deleted by search: id=%s title=%s", ev_id, summary)
+    return {"deleted": True, "event_id": ev_id, "summary": summary, "start": start}
+
+
 def list_upcoming_events(credentials, max_results: int = 10) -> list[dict]:
     """Return upcoming calendar events (for context in action execution)."""
     service = build("calendar", "v3", credentials=credentials, cache_discovery=False)

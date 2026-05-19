@@ -21,6 +21,7 @@ from tools.base_tool import ToolError
 from services.calendar import default_calendar_tz_name
 from tools.calendar_tool import (
   calendar_create_from_payload,
+  calendar_delete_from_payload,
   calendar_list_upcoming,
   calendar_suggest_free_slots,
 )
@@ -47,6 +48,7 @@ logger = logging.getLogger("meetingbox.assistant")
 
 TOOL_CAL_LIST = "calendar_list_upcoming"
 TOOL_CAL_CREATE = "calendar_create_event"
+TOOL_CAL_DELETE = "calendar_delete_event"
 TOOL_CAL_SLOTS = "calendar_suggest_free_slots"
 TOOL_COMMITMENT_LIST = "commitment_list"
 TOOL_COMMITMENT_UPSERT = "commitment_upsert"
@@ -55,12 +57,13 @@ TOOL_GMAIL_SEND = "gmail_send_email"
 TOOL_GMAIL_DRAFT = "gmail_create_draft"
 TOOL_MEMORY_SEARCH = "memory_search_meetings"
 TOOL_MEMORY_FETCH = "memory_fetch_meeting"
-WRITE_TOOLS = frozenset({TOOL_CAL_CREATE, TOOL_GMAIL_SEND, TOOL_GMAIL_DRAFT})
+WRITE_TOOLS = frozenset({TOOL_CAL_CREATE, TOOL_CAL_DELETE, TOOL_GMAIL_SEND, TOOL_GMAIL_DRAFT})
 
 AGENT_ALLOWED_TOOLS: dict[str, frozenset[str]] = {
   "calendar_agent": frozenset({
     TOOL_CAL_LIST,
     TOOL_CAL_CREATE,
+    TOOL_CAL_DELETE,
     TOOL_CAL_SLOTS,
     TOOL_COMMITMENT_LIST,
     TOOL_COMMITMENT_UPSERT,
@@ -124,17 +127,21 @@ def _llm_calendar_plan(message: str) -> list[dict[str, Any]] | None:
     "   'Mondays for 4 weeks'): use ONE step with a recurrence RRULE. "
     "   'All weekdays for two weeks' = RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;COUNT=10. "
     "   'Every day for 2 weeks' = RRULE:FREQ=DAILY;COUNT=14.\n\n"
-    "2. calendar_list_upcoming — use ONLY when user wants to VIEW/SEE/CHECK what's on their calendar "
+    "2. calendar_delete_event — use when the user wants to DELETE, REMOVE, CANCEL, or CLEAR an existing "
+    "calendar event (e.g. 'delete focus time tomorrow', 'cancel my 3pm', 'remove the standup on Friday').\n"
+    "   Args: title (str — the event name to search for), date (ISO date or datetime hint, e.g. '2026-05-20'), "
+    "   event_id (str — only if known). is_write: true.\n\n"
+    "3. calendar_list_upcoming — use ONLY when user wants to VIEW/SEE/CHECK what's on their calendar "
     "(e.g. 'what do I have today', 'show my schedule', 'any meetings tomorrow').\n"
     "   Args: max_results (int, default 10). is_write: false.\n\n"
-    "3. calendar_suggest_free_slots — use ONLY when user asks about FREE TIME, AVAILABILITY, "
+    "4. calendar_suggest_free_slots — use ONLY when user asks about FREE TIME, AVAILABILITY, "
     "open slots (e.g. 'when am I free', 'find time for a meeting').\n"
     "   Args: days_ahead (1–21), duration_minutes, work_start_hhmm, work_end_hhmm, timezone. is_write: false.\n\n"
-    "4. commitment_upsert — use ONLY for vague REMINDERS or TASKS that are NOT calendar events "
+    "5. commitment_upsert — use ONLY for vague REMINDERS or TASKS that are NOT calendar events "
     "(e.g. 'remind me to call John', 'note to self: buy milk', 'follow up with Sarah next week').\n"
     "   Args: title, detail, tags (array), source (voice|chat), remind_at, due_at. is_write: true.\n\n"
-    "5. commitment_list — use ONLY when user wants to SEE their existing reminders/todos/tasks "
-    "(e.g. 'what are my reminders', 'show my todos'). NEVER use this for CREATE requests. is_write: false.\n\n"
+    "6. commitment_list — use ONLY when user wants to SEE their existing reminders/todos/tasks "
+    "(e.g. 'what are my reminders', 'show my todos'). NEVER use this for CREATE or DELETE requests. is_write: false.\n\n"
     f"Today is {today_str}.\n"
     f"User message:\n{message.strip()[:4000]}\n"
   )
@@ -224,6 +231,27 @@ def _heuristic_calendar_plan(message: str) -> list[dict[str, Any]]:
       },
       "is_write": True,
     }]
+  delete_markers = (
+    "delete ",
+    "remove ",
+    "cancel the",
+    "cancel my",
+    "remove the",
+    "remove my",
+    "delete the",
+    "delete my",
+    "clear the event",
+    "clear my event",
+    "get rid of",
+    "drop the event",
+  )
+  if any(x in m for x in delete_markers) and any(w in m for w in ("event", "meeting", "invite", "calendar", "block", "focus", "standup", "reminder", "slot")):
+    return [{
+      "tool": TOOL_CAL_DELETE,
+      "args": {"title": message.strip()[:300]},
+      "is_write": True,
+    }]
+
   create_markers = (
     "schedule ",
     "book ",
@@ -562,6 +590,10 @@ def assistant_action_brief_label(tool_name: str, payload: Any) -> str:
     )
     st = str(st).strip()
     return f"{t} · {st}" if st else t
+  if tool_name == TOOL_CAL_DELETE:
+    t = (payload.get("title") or payload.get("title_hint") or "Calendar event").strip()
+    d = str(payload.get("date") or payload.get("date_hint") or "").strip()
+    return f"Delete '{t}'" + (f" on {d[:10]}" if d else "")
   if tool_name == TOOL_GMAIL_SEND:
     subj = str(payload.get("subject") or "Draft email").strip()[:72]
     to_addr = str(payload.get("to") or "").strip()[:48]
@@ -894,6 +926,24 @@ def process_assistant_intent(
           "queued": True,
           "pending_id": pid,
           "note": "Awaiting approval before creating the event.",
+        })
+      elif tool == TOOL_CAL_DELETE:
+        if not user_id:
+          tool_results.append({"tool": tool, "error": "Sign in is required to delete calendar events."})
+          continue
+        pid = str(uuid.uuid4())
+        pending_rows.append((pid, agent_id, tool, args))
+        pending_meta.append({
+          "id": pid,
+          "tool_name": tool,
+          "status": "pending",
+          "brief_label": assistant_action_brief_label(tool, args),
+        })
+        tool_results.append({
+          "tool": tool,
+          "queued": True,
+          "pending_id": pid,
+          "note": "Awaiting approval before deleting the event.",
         })
       elif tool == TOOL_CAL_SLOTS:
         if not user_id:
@@ -1323,6 +1373,9 @@ def approve_pending_action(pending_id: str, user_id: str) -> dict[str, Any]:
     if tool == TOOL_CAL_CREATE:
       result = calendar_create_from_payload(user_id, payload)
       result_blob = {"calendar": result}
+    elif tool == TOOL_CAL_DELETE:
+      result = calendar_delete_from_payload(user_id, payload)
+      result_blob = {"calendar_delete": result}
     elif tool == TOOL_GMAIL_SEND:
       result = gmail_send_from_payload(user_id, payload)
       result_blob = {"gmail": result}
