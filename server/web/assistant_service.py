@@ -332,14 +332,6 @@ def _heuristic_communication_plan(message: str) -> list[dict[str, Any]]:
 
   emails = _extract_emails_from_text(message)
   first_to = emails[0] if emails else ""
-  tone = "professional"
-  m = message.lower()
-  if any(k in m for k in ("friendly", "warm", "casual")):
-    tone = "friendly"
-  elif any(k in m for k in ("formal", "executive", "strictly professional")):
-    tone = "formal"
-  elif any(k in m for k in ("urgent", "asap", "immediately")):
-    tone = "urgent"
   return [{
     "tool": TOOL_GMAIL_SEND,
     "args": {
@@ -350,7 +342,6 @@ def _heuristic_communication_plan(message: str) -> list[dict[str, Any]]:
       "bcc": [],
       "html_body": "",
       "thread_id": "",
-      "tone": tone,
     },
     "is_write": True,
   }]
@@ -848,12 +839,10 @@ def process_assistant_intent(
   agent_id = route.agent_id
 
   if agent_id == "calendar_agent":
-    # Planner must see ONLY the raw user request; injecting MEM0/COMMITMENTS_DB
-    # context biases the LLM toward read-only tools (commitment_list / calendar_list_upcoming)
-    # instead of calendar_create_event for explicit create requests.
+    ctx = _augment_user_text_for_agent(agent_doc, user_id, text)
     steps = _filter_steps_for_agent(
       agent_id,
-      plan_calendar_steps(text, agent_doc.get("system_prompt") or None),
+      plan_calendar_steps(ctx, agent_doc.get("system_prompt") or None),
     )
     for step in steps:
       tool = step["tool"]
@@ -931,14 +920,14 @@ def process_assistant_intent(
     if pending_meta:
       if len(pending_meta) == 1:
         assistant_lines.append(
-          f"I drafted one calendar action: {pending_meta[0].get('brief_label', 'event')}. Please confirm before I execute it."
+          f"I queued a calendar change for you to okay first: {pending_meta[0].get('brief_label', 'event')}."
         )
       else:
         bits = [m.get("brief_label", "event") for m in pending_meta[:12]]
         assistant_lines.append(
-          f"I drafted {len(pending_meta)} calendar actions pending your confirmation: "
+          f"I've got {len(pending_meta)} calendar items waiting on your thumbs-up: "
           + "; ".join(bits)
-          + ". Tell me what to adjust, or confirm to proceed."
+          + ". Say yes when you're good with them, or tell me to tweak or drop one."
         )
     listed = next((t for t in tool_results if t.get("tool") == TOOL_CAL_LIST and "result" in t), None)
     if listed and "result" in listed:
@@ -958,7 +947,7 @@ def process_assistant_intent(
       nc = int(com_li["result"].get("count") or 0)
       assistant_lines.append(f"{nc} reminders or tasks matched what you asked; details are attached.")
     if not assistant_lines:
-      assistant_lines.append("Calendar request is prepared.")
+      assistant_lines.append("Calendar side looks handled—anything else on your mind?")
     for tr in tool_results:
       if (
         tr.get("tool") == TOOL_CAL_LIST
@@ -968,9 +957,8 @@ def process_assistant_intent(
         maybe_ingest_calendar_snapshot(user_id, tr["result"])
 
   elif agent_id in ("gmail_agent", "communication_agent"):
-    # Same reasoning as calendar_agent: pass raw user request so the planner picks
-    # gmail_send_email vs gmail_list_recent based on user intent, not recalled context.
-    steps = _filter_steps_for_agent(agent_id, plan_communication_steps(text))
+    ctx = _augment_user_text_for_agent(agent_doc, user_id, text)
+    steps = _filter_steps_for_agent(agent_id, plan_communication_steps(ctx))
     for step in steps:
       tool = step["tool"]
       args = dict(step.get("args") or {})
@@ -999,10 +987,6 @@ def process_assistant_intent(
           })
           continue
         pid = str(uuid.uuid4())
-        # Preserve explicit tone/style request for downstream draft rendering.
-        tone = str(args.get("tone") or "").strip()
-        if tone:
-          args["tone"] = tone
         pending_rows.append((pid, agent_id, tool, args))
         pending_meta.append({
           "id": pid,
@@ -1042,14 +1026,14 @@ def process_assistant_intent(
 
     if pending_meta:
       assistant_lines.append(
-        "I drafted the email and queued it for your confirmation before sending."
+        "There's a draft email queued—give it a look and approve it when it feels right."
       )
     listed = next((t for t in tool_results if t.get("tool") == TOOL_GMAIL_LIST and "result" in t), None)
     if listed and "result" in listed:
       n = listed["result"].get("count", 0)
-      assistant_lines.append(f"I pulled {n} recent emails and summarized the inbox context.")
+      assistant_lines.append(f"Pulled {n} recent messages; the thread list is in results.")
     if not assistant_lines:
-      assistant_lines.append("Email request is ready.")
+      assistant_lines.append("Inbox run's done—I bundled what I found below.")
     for tr in tool_results:
       if (
         tr.get("tool") == TOOL_GMAIL_LIST
