@@ -9,7 +9,7 @@ data (clock, weather, next meeting) is still refreshed at runtime.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from kivy.clock import Clock
 from kivy.graphics import Color, Rectangle, RoundedRectangle
@@ -116,62 +116,21 @@ def _greeting(name: str | None) -> str:
 def _format_meeting(next_meeting: dict | None) -> tuple[str, str, int]:
     """Return (time_str, title, more_count) from a home-summary meeting dict."""
     if not next_meeting:
-        return ("Free today", "", 0)
+        return ("--:-- --", "No meetings today", 0)
     title = (next_meeting.get("title") or "Calendar event").strip() or "Calendar event"
-    tnorm = title.lower().replace("_", " ").strip()
-    if tnorm in ("schedule request", "schedule requested"):
-        return ("Free today", "", 0)
     start = (next_meeting.get("start") or "").strip()
     if not start:
-        return ("Free today", "", 0)
+        return ("Time not set", title, 0)
     try:
         if "T" in start:
             dt = datetime.fromisoformat(start.replace("Z", "+00:00"))
-            local_dt = to_display_local(dt)
-            if local_dt.date() != display_now().date():
-                return ("Free today", "", 0)
-            time_str = local_dt.strftime("%I:%M %p").lstrip("0")
+            time_str = to_display_local(dt).strftime("%I:%M %p").lstrip("0")
         else:
             d = datetime.strptime(start[:10], "%Y-%m-%d")
-            if d.date() != display_now().date():
-                return ("Free today", "", 0)
             time_str = d.strftime("%b %d · all day")
     except (TypeError, ValueError):
-        return ("Free today", "", 0)
+        time_str = start
     return (time_str, title, 0)
-
-
-def _pick_next_today_meeting_from_week(week_payload: dict | None) -> dict | None:
-    if not isinstance(week_payload, dict):
-        return None
-    days = week_payload.get("days")
-    if not isinstance(days, dict):
-        return None
-    today_key = display_now().date().isoformat()
-    rows = (days.get(today_key) or {}).get("meetings") or []
-    if not isinstance(rows, list) or not rows:
-        return None
-    now_local = display_now()
-    parsed: list[tuple[datetime, dict]] = []
-    for m in rows:
-        if not isinstance(m, dict):
-            continue
-        raw = (m.get("start") or m.get("start_time") or "").strip()
-        if not raw:
-            continue
-        try:
-            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-            loc = to_display_local(dt)
-            parsed.append((loc, m))
-        except Exception:
-            continue
-    if not parsed:
-        return None
-    parsed.sort(key=lambda x: x[0])
-    for dt, row in parsed:
-        if dt >= now_local:
-            return row
-    return parsed[-1][1]
 
 
 def _lbl(
@@ -538,7 +497,7 @@ class IdleScreen(BaseScreen):
         if self._home_summary_event:
             self._home_summary_event.cancel()
         self._home_summary_event = Clock.schedule_interval(
-            lambda _dt: self._refresh_home_summary(), 30.0
+            lambda _dt: self._refresh_home_summary(), 60.0
         )
 
     def on_leave(self):
@@ -615,29 +574,11 @@ class IdleScreen(BaseScreen):
                 logger.debug("idle: home summary fetch failed: %s", exc)
                 return
             time_str, title, _ = _format_meeting(data.get("next_meeting"))
-            if not title:
-                try:
-                    today = display_now().date()
-                    monday = today - timedelta(days=today.weekday())
-                    week = await self.backend.get_calendar_week(
-                        monday.isoformat(),
-                        (monday + timedelta(days=6)).isoformat(),
-                    )
-                    picked = _pick_next_today_meeting_from_week(week if isinstance(week, dict) else {})
-                    if isinstance(picked, dict):
-                        time_str, title, _ = _format_meeting(
-                            {
-                                "title": picked.get("title"),
-                                "start": picked.get("start") or picked.get("start_time"),
-                            }
-                        )
-                except Exception:
-                    logger.debug("idle: calendar-week fallback failed", exc_info=True)
             today_n = int(data.get("pending_actions_today") or 0)
 
             def _apply(_dt):
                 self.next_time_label.text = time_str
-                self.next_title_label.text = f"Now: {title}" if title else ""
+                self.next_title_label.text = title or "--"
                 self.more_label.text = f"+{max(0, today_n)} more" if today_n else ""
 
             Clock.schedule_once(_apply, 0)

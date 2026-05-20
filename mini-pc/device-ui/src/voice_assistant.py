@@ -24,11 +24,7 @@ from tempfile import TemporaryDirectory
 from typing import Callable
 from urllib.request import Request, urlopen
 
-from config import resolve_device_config_dir
-from mic_input_resolve import (
-    capture_device_fallback_candidates,
-    resolve_sounddevice_capture_device_index,
-)
+from config import AUDIO_INPUT_DEVICE_INDEX, AUDIO_INPUT_DEVICE_NAME, resolve_device_config_dir
 
 logger = logging.getLogger(__name__)
 
@@ -88,67 +84,6 @@ def _env_float(name: str, default: float) -> float:
 
 def _normalize_text(text: str) -> str:
     return " ".join(_NON_ALNUM_RE.sub(" ", (text or "").lower()).split())
-
-
-_VOICE_TRIGGER_SKIP = frozenset({"hey", "hi", "hello", "ok", "okay", "please", "yo"})
-_FAREWELL_SUBPHRASES = (
-    "good bye",
-    "goodbye",
-    "bye bye",
-    "see you later",
-    "see you soon",
-    "talk to you later",
-    "catch you later",
-    "thanks bye",
-    "thank you bye",
-    "ok bye",
-    "okay bye",
-)
-# Dropped loose substrings (were false positives in normal questions): "have a good day",
-# "see ya", "later alligator", etc.
-
-
-def _farewell_fragment_word_bounded(u: str, frag: str) -> bool:
-    if frag not in u:
-        return False
-    return re.search(r"(^| )" + re.escape(frag) + r"( |$)", u) is not None
-
-
-def utterance_is_voice_farewell(wake_phrase: str, utterance: str) -> bool:
-    """
-    True when the user is clearly ending conversation (bye / goodbye aligned with wake name).
-
-    Used to leave post-wake follow-up listening without invoking cloud Q&A again.
-    """
-    wake = _normalize_text(wake_phrase)
-    u = _normalize_text(utterance)
-    if len(u) < 2:
-        return False
-    words = u.split()
-    for frag in _FAREWELL_SUBPHRASES:
-        if not _farewell_fragment_word_bounded(u, frag):
-            continue
-        frag_w = frag.split()
-        # Tight slack for long stock phrases — avoids "see you later at five" style matches.
-        slack = 1 if len(frag_w) >= 3 else 2
-        if len(words) <= len(frag_w) + slack:
-            return True
-    vocab = frozenset(t for t in wake.split() if t and t not in _VOICE_TRIGGER_SKIP)
-    bye_word = frozenset({"bye", "goodbye", "farewell"})
-    nickname = vocab.union({"buddy", "tony", "pal", "mate", "there", "sir", "maam"})
-
-    toks = u.split()
-    if len(toks) == 1 and toks[0] in bye_word:
-        return True
-    if len(toks) == 2 and toks[0] in bye_word:
-        # "bye buddy" while wake ends with buddy, etc.
-        if toks[1] in vocab or toks[1] in nickname:
-            return True
-    if len(toks) >= 2 and toks[0] in bye_word and toks[1] in vocab:
-        return True
-    if len(toks) >= 2 and tuple(toks[:2]) == ("bye", "bye"):
-        return True
-    return False
 
 
 def _phrase_windows(text: str, target: str) -> list[str]:
@@ -215,33 +150,10 @@ def _build_intent_specs(start_commands: list[str]) -> tuple[_IntentSpec, ...]:
         _IntentSpec("recording_elapsed", ("how long have we been recording", "recording duration", "meeting duration", "how long is the meeting")),
         _IntentSpec("go_home", ("go home", "open home", "show home screen", "take me home", "home screen")),
         _IntentSpec("open_settings", ("open settings", "show settings", "go to settings")),
-        _IntentSpec("show_emails", (
-            "show emails", "open emails", "show inbox", "open inbox", "my inbox",
-            "check emails", "read emails", "view emails", "check inbox",
-            "show my inbox", "open my inbox", "check my emails",
-            "any new emails", "new emails", "any emails", "new mail",
-        )),
-        _IntentSpec("show_calendar", (
-            "show calendar", "open calendar", "my calendar", "check calendar",
-            "view calendar", "show schedule", "open schedule",
-            "what's on my calendar", "whats on today", "my schedule",
-            "when am i free", "am i free", "show my schedule",
-        )),
-        _IntentSpec("morning_brief", (
-            "morning brief", "morning briefing", "daily brief", "daily briefing",
-            "give me a briefing", "what's my briefing", "today's briefing",
-            "show briefing", "open briefing", "my brief", "give me brief",
-            "start of day", "morning update", "daily update",
-        )),
-        _IntentSpec("show_tasks", (
-            "show tasks", "my tasks", "open tasks", "any tasks", "new tasks",
-            "what are my tasks", "task list", "to do list", "my to dos",
-            "any new tasks", "pending tasks", "check tasks",
-        )),
         _IntentSpec("show_meetings", ("show meetings", "open meetings", "show recent meetings", "my meetings")),
         _IntentSpec("show_last_meeting", ("show last meeting", "open last meeting", "last meeting")),
         _IntentSpec("summarize_last_meeting", ("summarize last meeting", "read last meeting summary", "what was the last meeting about", "summarize my last meeting")),
-        _IntentSpec("read_action_items", ("read action items", "read my action items", "what are my action items", "show action items", "action items")),
+        _IntentSpec("read_action_items", ("read action items", "read my action items", "what are my action items", "show action items", "my tasks")),
         _IntentSpec("test_microphone", ("test microphone", "test mic", "microphone test", "check microphone", "is the mic working")),
         _IntentSpec("what_time", (
             "what time is it", "tell me the time", "current time", "what time",
@@ -332,8 +244,7 @@ class VoiceCommandInterpreter:
         self._awaiting_confirmation_until = 0.0
 
     def _heard_wake_phrase(self, text: str) -> bool:
-        # Slightly looser fuzzy match so noisy rooms / small-model errors still wake reliably.
-        return _best_phrase_similarity(text, self.wake_phrase) >= 0.77
+        return _best_phrase_similarity(text, self.wake_phrase) >= 0.80
 
     def _matches_any(self, text: str, phrases: tuple[str, ...], threshold: float = 0.76) -> bool:
         return any(_best_phrase_similarity(text, phrase) >= threshold for phrase in phrases)
@@ -358,9 +269,9 @@ class VoiceCommandInterpreter:
         residual = [w for w in words if w not in wake_set and w not in fillers]
         if not residual:
             return True
-        # Wake phrase with transcript typos (e.g. "hey toni") — at most one extra word and very close.
+        # Wake phrase with transcript typos (e.g. "hey toni") — extras are small and very close.
         wake_wc = len(self.wake_phrase.split())
-        if len(words) <= wake_wc + 1 and _best_phrase_similarity(norm, self.wake_phrase) >= 0.88:
+        if len(words) <= wake_wc + 2 and _best_phrase_similarity(norm, self.wake_phrase) >= 0.88:
             return True
         return False
 
@@ -414,10 +325,7 @@ class VoiceCommandInterpreter:
         intent = self._detect_intent(norm)
         heard_wake = self._heard_wake_phrase(norm)
 
-        # If the transcript is essentially just the wake phrase (plus uh/please),
-        # do NOT treat a spurious fuzzy intent hit as “wake + command” — otherwise
-        # the wake UI never runs and the user thinks wake is broken.
-        if heard_wake and intent is not None and not self.is_wake_only_utterance(norm):
+        if heard_wake and intent is not None:
             self.reset()
             self._last_action_at = now
             return intent
@@ -487,8 +395,6 @@ class VoiceAssistant:
         self._stop_event = threading.Event()
         self._pause_lock = threading.Lock()
         self._paused = True
-        self._tts_lock = threading.Lock()
-        self._tts_active = False   # True while speaker is playing — drops mic input
         self._thread: threading.Thread | None = None
         self._stream = None
         self._stream_samplerate = 0
@@ -524,35 +430,6 @@ class VoiceAssistant:
             self._thread.join(timeout=2.0)
         self._thread = None
 
-    def set_tts_active(self, active: bool) -> None:
-        """Suppress mic input while TTS speaker output is playing (prevents feedback loop).
-
-        Also closes the sounddevice input stream while TTS is playing so the
-        ALSA audio device is fully released before espeak-ng/aplay open the
-        output side. The _run loop re-opens the stream automatically once
-        _tts_active clears and the stream is None.
-        """
-        with self._tts_lock:
-            self._tts_active = active
-        if active:
-            # Close the mic stream so ALSA is not held while the speaker plays.
-            # This avoids hard-to-catch audio-subsystem crashes on single-device
-            # USB dongles and on some ALSA configurations.
-            try:
-                self._close_stream()
-            except Exception:
-                logger.debug("Voice: _close_stream during TTS failed (ignored)", exc_info=True)
-            # Flush any queued audio so leftover snippets don't trigger a command
-            self._clear_audio_queue()
-            logger.debug("Voice: mic stream closed (TTS playing)")
-        else:
-            # Stream will be re-opened by _run loop on the next iteration.
-            logger.debug("Voice: mic will resume (TTS done)")
-
-    def _is_tts_active(self) -> bool:
-        with self._tts_lock:
-            return self._tts_active
-
     def set_paused(self, paused: bool) -> None:
         with self._pause_lock:
             changed = self._paused != paused
@@ -578,11 +455,6 @@ class VoiceAssistant:
         now = time.monotonic()
         self._interpreter._awaiting_command_until = now + self.command_timeout_seconds
 
-    def exit_command_window(self) -> None:
-        """End post-wake follow-up mode; back to passive wake-word listening only."""
-        self._interpreter.reset()
-        self._clear_audio_queue()
-
     def in_command_window(self) -> bool:
         return self._interpreter.is_awaiting_command()
 
@@ -597,7 +469,7 @@ class VoiceAssistant:
         if enabled is not None:
             self.enabled = bool(enabled)
         if wake_phrase is not None:
-            wp = _normalize_text(str(wake_phrase).strip())
+            wp = str(wake_phrase).strip()
             if wp:
                 self.wake_phrase = wp
         self._interpreter = VoiceCommandInterpreter(
@@ -622,7 +494,7 @@ class VoiceAssistant:
 
     def _run(self) -> None:
         while not self._stop_event.is_set():
-            if self._is_paused() or self._is_tts_active():
+            if self._is_paused():
                 self._stop_event.wait(0.25)
                 continue
             if not self._ensure_model_ready():
@@ -656,11 +528,10 @@ class VoiceAssistant:
         if not norm:
             return
         logger.debug("Voice assistant heard: %s", norm)
-        preempt = self._interpreter.detect_intent(norm)
         if (
             self._on_wake_phrase is not None
             and self._interpreter.heard_wake_phrase(norm)
-            and (preempt is None or self._interpreter.is_wake_only_utterance(norm))
+            and self._interpreter.detect_intent(norm) is None
         ):
             try:
                 self._on_wake_phrase(norm)
@@ -687,49 +558,46 @@ class VoiceAssistant:
             logger.exception("Voice assistant callback failed")
 
     def _resolve_input_device(self):
-        preferred = resolve_sounddevice_capture_device_index(sd)
-        return preferred, capture_device_fallback_candidates(sd, preferred)
+        idx_s = (AUDIO_INPUT_DEVICE_INDEX or "").strip()
+        if idx_s.isdigit():
+            return int(idx_s)
+        name_sub = (AUDIO_INPUT_DEVICE_NAME or "").strip().lower()
+        if not name_sub or sd is None:
+            return None
+        try:
+            for idx, dev in enumerate(sd.query_devices()):
+                if int(dev.get("max_input_channels") or 0) > 0 and name_sub in (
+                    dev.get("name") or ""
+                ).lower():
+                    return idx
+        except Exception:
+            logger.exception("Voice assistant could not enumerate audio devices")
+        return None
 
     def _samplerates_to_try(self, device_id) -> list[int]:
-        # Prefer the device's default sample rate first — ALSA/USB often returns paInvalidSampleRate for everything else.
-        fallback = [16000, 22050, 32000, 44100, 48000]
-        ordered: list[int] = []
-
-        resolved_id = device_id
-        if sd is not None:
-            try:
-                if resolved_id is None:
-                    inp_idx = sd.default.device[0]
-                    if isinstance(inp_idx, int) and inp_idx >= 0:
-                        resolved_id = inp_idx
-            except Exception:
-                pass
-
-            try:
-                if resolved_id is not None:
-                    info = sd.query_devices(resolved_id)
-                    dr = int(float(info.get("default_samplerate") or 0))
-                    if dr > 0:
-                        ordered.append(dr)
-            except Exception:
-                pass
-
-        for r in fallback:
-            if r not in ordered:
-                ordered.append(r)
-        return ordered
+        out = [16000, 22050, 32000, 44100, 48000]
+        if sd is None or device_id is None:
+            return out
+        try:
+            info = sd.query_devices(device_id)
+            default_rate = int(float(info.get("default_samplerate") or 0))
+            if default_rate > 0 and default_rate not in out:
+                out.insert(0, default_rate)
+        except Exception:
+            pass
+        return out
 
     def _open_stream(self) -> bool:
         if sd is None or self._model is None:
             return False
 
-        preferred_device_id, candidate_device_ids = self._resolve_input_device()
+        device_id = self._resolve_input_device()
 
         def callback(indata, frames, time_info, status):
             del frames, time_info
             if status and str(status):
                 logger.debug("Voice assistant sounddevice status: %s", status)
-            if self._stop_event.is_set() or self._is_paused() or self._is_tts_active():
+            if self._stop_event.is_set() or self._is_paused():
                 return
             if self._on_amplitude is not None:
                 try:
@@ -751,31 +619,30 @@ class VoiceAssistant:
                     pass
 
         last_err = None
-        for device_id in candidate_device_ids:
-            for samplerate in self._samplerates_to_try(device_id):
-                try:
-                    kwargs = {
-                        "channels": 1,
-                        "samplerate": samplerate,
-                        "blocksize": 4000,
-                        "dtype": "int16",
-                        "callback": callback,
-                    }
-                    if device_id is not None:
-                        kwargs["device"] = device_id
-                    self._stream = sd.RawInputStream(**kwargs)
-                    self._stream.start()
-                    self._stream_samplerate = samplerate
-                    self._recognizer = KaldiRecognizer(self._model, samplerate)
-                    logger.info(
-                        "Voice assistant input stream started (device=%s samplerate=%s)",
-                        device_id,
-                        samplerate,
-                    )
-                    return True
-                except Exception as exc:
-                    last_err = exc
-                    self._close_stream()
+        for samplerate in self._samplerates_to_try(device_id):
+            try:
+                kwargs = {
+                    "channels": 1,
+                    "samplerate": samplerate,
+                    "blocksize": 4000,
+                    "dtype": "int16",
+                    "callback": callback,
+                }
+                if device_id is not None:
+                    kwargs["device"] = device_id
+                self._stream = sd.RawInputStream(**kwargs)
+                self._stream.start()
+                self._stream_samplerate = samplerate
+                self._recognizer = KaldiRecognizer(self._model, samplerate)
+                logger.info(
+                    "Voice assistant input stream started (device=%s samplerate=%s)",
+                    device_id,
+                    samplerate,
+                )
+                return True
+            except Exception as exc:
+                last_err = exc
+                self._close_stream()
 
         logger.warning("Voice assistant could not open microphone: %s", last_err)
         return False

@@ -31,26 +31,6 @@ from weather_client import get_weather_client
 logger = logging.getLogger(__name__)
 
 
-def voice_realtime_settings_subtitle() -> str:
-    """Explains why cloud Realtime may or may not run (not a 'coming soon' placeholder)."""
-    try:
-        from realtime_voice_session import REALTIME_VOICE_IMPLEMENTED
-    except ImportError:
-        REALTIME_VOICE_IMPLEMENTED = False
-
-    from config import USE_MOCK_BACKEND, get_device_auth_token, WAKE_LOCAL_VOICE_ONLY
-
-    if not REALTIME_VOICE_IMPLEMENTED:
-        return "Not available in this firmware build"
-    if USE_MOCK_BACKEND:
-        return "MOCK_BACKEND is on — use a real backend to enable"
-    if WAKE_LOCAL_VOICE_ONLY:
-        return "MEETINGBOX_WAKE_LOCAL_VOICE_ONLY is on — disables cloud Realtime"
-    if not get_device_auth_token().strip():
-        return "Pair device (link account) — DEVICE_AUTH_TOKEN needed"
-    return "On: speech-to-speech after wake · VPS needs Realtime + OpenAI key"
-
-
 class SettingsScreen(BaseScreen):
     """Scrollable settings screen – PRD §5.11."""
 
@@ -262,7 +242,7 @@ class SettingsScreen(BaseScreen):
 
         self.voice_realtime_item = SettingsItem(
             title='Realtime voice mode',
-            subtitle=voice_realtime_settings_subtitle(),
+            subtitle='OpenAI Realtime — coming soon',
             mode='toggle',
             active=False,
             on_toggle=self._on_voice_realtime_toggled,
@@ -365,7 +345,6 @@ class SettingsScreen(BaseScreen):
         self.voice_assistant_enabled_item.toggle.active = bool(vae)
         vra = getattr(self.app, "voice_realtime_assistant", False)
         self.voice_realtime_item.toggle.active = bool(vra)
-        self._refresh_voice_realtime_subtitle()
         wk = getattr(self.app, "voice_wake_phrase_display", "hey buddy")
         self.wake_phrase_item.subtitle_label.text = (wk or "hey buddy").lower()
         try:
@@ -373,11 +352,6 @@ class SettingsScreen(BaseScreen):
         except (TypeError, ValueError):
             sv = 85
         self.speech_volume_item.subtitle_label.text = f'{max(0, min(100, sv))}%'
-
-    def _refresh_voice_realtime_subtitle(self):
-        if not hasattr(self, "voice_realtime_item") or not self.voice_realtime_item:
-            return
-        self.voice_realtime_item.subtitle_label.text = voice_realtime_settings_subtitle()
 
     # ------------------------------------------------------------------
     # Data
@@ -427,8 +401,6 @@ class SettingsScreen(BaseScreen):
                     '60': 'After 1 minute',
                     '120': 'After 2 minutes',
                     '300': 'After 5 minutes',
-                    '600': 'After 10 minutes',
-                    '1800': 'After 30 minutes',
                     'never': 'Never',
                 }
 
@@ -503,7 +475,6 @@ class SettingsScreen(BaseScreen):
                             )
                         if hasattr(self.app, "_sync_voice_assistant_state"):
                             Clock.schedule_once(lambda _dt: self.app._sync_voice_assistant_state(), 0)
-                        self._refresh_voice_realtime_subtitle()
                     except Exception:
                         pass
 
@@ -601,7 +572,6 @@ class SettingsScreen(BaseScreen):
                 pass
 
         run_async(_save())
-        self._refresh_voice_realtime_subtitle()
 
     def _show_wake_phrase_dialog(self):
         dialog = TextInputDialog(

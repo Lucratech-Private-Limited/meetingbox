@@ -13,10 +13,11 @@ from kivy.clock import Clock
 from async_helper import run_async
 from screens.base_screen import BaseScreen
 from components.status_bar import StatusBar
-from config import COLORS, FONT_SIZES
-from mic_input_resolve import (
-    capture_device_fallback_candidates,
-    resolve_sounddevice_capture_device_index,
+from config import (
+    AUDIO_INPUT_DEVICE_INDEX,
+    AUDIO_INPUT_DEVICE_NAME,
+    COLORS,
+    FONT_SIZES,
 )
 
 logger = logging.getLogger(__name__)
@@ -132,25 +133,30 @@ class MicTestScreen(BaseScreen):
     def _resolve_sounddevice_input_device(self):
         """PortAudio device index, or None for host default."""
         if sd is None:
-            return None, [None]
-        preferred = resolve_sounddevice_capture_device_index(sd)
-        return preferred, capture_device_fallback_candidates(sd, preferred)
+            return None
+        idx_s = (AUDIO_INPUT_DEVICE_INDEX or "").strip()
+        if idx_s.isdigit():
+            return int(idx_s)
+        name_sub = (AUDIO_INPUT_DEVICE_NAME or "").strip()
+        if name_sub:
+            low = name_sub.lower()
+            for i, dev in enumerate(sd.query_devices()):
+                if int(dev.get("max_input_channels") or 0) > 0 and low in (
+                    dev.get("name") or ""
+                ).lower():
+                    return i
+        return None
 
     def _samplerates_to_try(self, device_id):
-        out: list[int] = []
-        idx = device_id
-        try:
-            if idx is None:
-                inp_def = sd.default.device[0]
-                if isinstance(inp_def, int) and inp_def >= 0:
-                    idx = inp_def
-            if idx is not None:
-                info = sd.query_devices(idx)
+        out = []
+        if device_id is not None:
+            try:
+                info = sd.query_devices(device_id)
                 dflt = int(float(info.get("default_samplerate") or 0))
                 if dflt > 0:
                     out.append(dflt)
-        except Exception:
-            pass
+            except Exception:
+                pass
         for sr in (48000, 44100, 32000, 22050, 16000, 8000):
             if sr not in out:
                 out.append(sr)
@@ -190,7 +196,7 @@ class MicTestScreen(BaseScreen):
         if sd is None or np is None:
             return
         self._close_local_stream()
-        _preferred_device_id, candidate_device_ids = self._resolve_sounddevice_input_device()
+        device_id = self._resolve_sounddevice_input_device()
 
         def callback(indata, frames, t_info, status):
             if status and str(status):
@@ -207,30 +213,29 @@ class MicTestScreen(BaseScreen):
                 logger.exception("Mic test: callback error")
 
         last_err = None
-        for device_id in candidate_device_ids:
-            for sr in self._samplerates_to_try(device_id):
-                try:
-                    kwargs = dict(
-                        channels=1,
-                        samplerate=sr,
-                        blocksize=1024,
-                        dtype="float32",
-                        callback=callback,
-                    )
-                    if device_id is not None:
-                        kwargs["device"] = device_id
-                    self._local_stream = sd.InputStream(**kwargs)
-                    self._local_stream.start()
-                    logger.info(
-                        "Mic test: local stream started (device=%s samplerate=%s)",
-                        device_id,
-                        sr,
-                    )
-                    return
-                except Exception as e:
-                    last_err = e
-                    self._close_local_stream()
-                    continue
+        for sr in self._samplerates_to_try(device_id):
+            try:
+                kwargs = dict(
+                    channels=1,
+                    samplerate=sr,
+                    blocksize=1024,
+                    dtype="float32",
+                    callback=callback,
+                )
+                if device_id is not None:
+                    kwargs["device"] = device_id
+                self._local_stream = sd.InputStream(**kwargs)
+                self._local_stream.start()
+                logger.info(
+                    "Mic test: local stream started (device=%s samplerate=%s)",
+                    device_id,
+                    sr,
+                )
+                return
+            except Exception as e:
+                last_err = e
+                self._close_local_stream()
+                continue
 
         logger.warning(
             "Mic test: local capture failed (%s) — check /dev/snd, audio group, AUDIO_INPUT_DEVICE_*",

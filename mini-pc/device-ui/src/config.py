@@ -9,7 +9,6 @@ import functools
 import logging
 import os
 from pathlib import Path
-from urllib.parse import urlparse, urlunparse
 
 logger = logging.getLogger(__name__)
 
@@ -17,41 +16,8 @@ logger = logging.getLogger(__name__)
 # BACKEND CONNECTION
 # ============================================================================
 
-def _strip_trailing_rest_api_path(url: str) -> str:
-    """
-    Client always calls ``{BASE}/api/...``. If BASE wrongly ends with ``/api``,
-    requests become ``.../api/api/...`` (404). Wrong WS derivation: ``wss://host/api/ws``.
-    """
-    u = (url or "").strip().rstrip("/")
-    if len(u) > 8 and u.lower().endswith("/api"):
-        out = u[:-4].rstrip("/")
-        logger.warning(
-            "BACKEND_URL had a trailing /api — removed it (%s → %s). "
-            "Use scheme + host only; paths already include /api/....",
-            u,
-            out,
-        )
-        return out or u
-    return u
-
-
-def _fix_ws_wrong_under_api(ws_url: str) -> str:
-    """API WebSocket route is ``/ws`` on the FastAPI root, never ``/api/ws``."""
-    w = (ws_url or "").strip()
-    if not w:
-        return w
-    try:
-        pu = urlparse(w)
-    except ValueError:
-        return w
-    path = (pu.path or "").rstrip("/")
-    if path == "/api/ws":
-        logger.warning(
-            "BACKEND_WS_URL used path /api/ws — correcting to /ws (%s)",
-            w,
-        )
-        return urlunparse((pu.scheme, pu.netloc, "/ws", pu.params, pu.query, pu.fragment))
-    return w
+_CLOUD_BACKEND_URL = "https://meetingboxai.lucratechsol.com"
+_LOCAL_BACKEND_DEFAULTS = {"http://127.0.0.1:8000", "http://localhost:8000"}
 
 
 def _normalize_dashboard_config(raw: str) -> tuple[str, str]:
@@ -91,9 +57,23 @@ def _resolve_backend_url() -> str:
     issued the code (avoids claiming against localhost while the QR opened a cloud URL).
     """
     explicit = (os.getenv("BACKEND_URL") or "").strip().rstrip("/")
-    if explicit:
-        return explicit
     dash_env = (os.getenv("DASHBOARD_URL") or "").strip()
+    if explicit:
+        if explicit in _LOCAL_BACKEND_DEFAULTS:
+            if dash_env:
+                _, pub = _normalize_dashboard_config(dash_env)
+                out = pub.strip().rstrip("/")
+                if out not in _LOCAL_BACKEND_DEFAULTS:
+                    logger.warning("Ignoring localhost BACKEND_URL; derived backend from DASHBOARD_URL: %s", out)
+                    return out
+            if (os.getenv("MEETINGBOX_ALLOW_LOCAL_BACKEND") or "").strip() != "1":
+                logger.warning(
+                    "BACKEND_URL is localhost — overriding with cloud backend: %s "
+                    "(set MEETINGBOX_ALLOW_LOCAL_BACKEND=1 to keep localhost)",
+                    _CLOUD_BACKEND_URL,
+                )
+                return _CLOUD_BACKEND_URL
+        return explicit
     if not dash_env:
         return "http://localhost:8000"
     _, pub = _normalize_dashboard_config(dash_env)
@@ -102,7 +82,7 @@ def _resolve_backend_url() -> str:
     return out
 
 
-BACKEND_URL = _strip_trailing_rest_api_path(_resolve_backend_url())
+BACKEND_URL = _resolve_backend_url()
 
 
 def _default_ws_url(http_url: str) -> str:
@@ -115,19 +95,18 @@ def _default_ws_url(http_url: str) -> str:
     return "ws://localhost:8000/ws"
 
 
-_WS_ENV = (os.getenv("BACKEND_WS_URL", "") or "").strip()
-BACKEND_WS_URL = _fix_ws_wrong_under_api(_WS_ENV) if _WS_ENV else _default_ws_url(BACKEND_URL)
+BACKEND_WS_URL = (os.getenv("BACKEND_WS_URL", "") or "").strip() or _default_ws_url(BACKEND_URL)
 DEVICE_AUTH_TOKEN = os.getenv('DEVICE_AUTH_TOKEN', '')
 DEVICE_AUTH_TOKEN_FILE_NAME = 'device_auth_token'
 
 # Use mock backend for testing (set MOCK_BACKEND=1)
 USE_MOCK_BACKEND = os.getenv('MOCK_BACKEND', '0') == '1'
 
-# API timeout in seconds (most requests; assistant intent uses its own 120s timeout).
-API_TIMEOUT = 30
+# API timeout in seconds (keep snappy; long uploads have their own timeout)
+API_TIMEOUT = 15
 
-# WebSocket reconnect settings (first wait ≈ WS_RECONNECT_DELAY × 2^0; see api_client backoff)
-WS_RECONNECT_DELAY = 0.5  # seconds; exponential: ~0.5 → 1 → 2 → … capped at 30
+# WebSocket reconnect settings
+WS_RECONNECT_DELAY = 1  # seconds (exponential backoff: 1 → 2 → 4 → … capped at 30)
 WS_MAX_RECONNECT_ATTEMPTS = 10
 
 # ============================================================================
@@ -155,8 +134,6 @@ if (os.getenv("MEETINGBOX_DISABLE_LOCAL_REDIS", "") or "").strip().lower() in (
 # MICROPHONE (mic test + should match mini-pc/audio capture device)
 # ============================================================================
 
-# Audio capture (device UI: wake word, mic test, realtime). If unset, USB-like
-# devices are preferred — see mic_input_resolve.resolve_sounddevice_capture_device_index.
 AUDIO_INPUT_DEVICE_INDEX = (os.getenv("AUDIO_INPUT_DEVICE_INDEX", "") or "").strip()
 AUDIO_INPUT_DEVICE_NAME = (os.getenv("AUDIO_INPUT_DEVICE_NAME", "") or "").strip()
 

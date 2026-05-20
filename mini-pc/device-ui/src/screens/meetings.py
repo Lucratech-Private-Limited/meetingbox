@@ -92,34 +92,18 @@ class MeetingsScreen(BaseScreen):
         self.add_widget(root)
 
     def on_enter(self):
-        # If meetings are already cached, refresh silently in the background so
-        # the existing list stays visible while new data is fetched.  Only show
-        # the "Loading meetings…" spinner when there is nothing to display yet.
-        self._load_meetings(silent=bool(self.meetings))
-        if getattr(self, "_poll_event", None):
-            self._poll_event.cancel()
-        self._poll_event = Clock.schedule_interval(
-            lambda _dt: self._load_meetings(silent=True), 30.0
-        )
+        self._load_meetings()
 
-    def on_leave(self):
-        if getattr(self, "_poll_event", None):
-            self._poll_event.cancel()
-            self._poll_event = None
-
-    def _load_meetings(self, silent: bool = False):
-        if not silent:
-            self._show_loading()
+    def _load_meetings(self):
+        self._show_loading()
 
         async def _load():
-            meetings = await self.backend.get_meetings(limit=MEETINGS_LIST_LIMIT)
-            def _apply(_dt):
-                if meetings:
-                    self.meetings = meetings
-                    self._populate()
-                elif not silent:
-                    self._show_empty('No meetings yet. Start a recording to create one.')
-            Clock.schedule_once(_apply, 0)
+            try:
+                meetings = await self.backend.get_meetings(limit=MEETINGS_LIST_LIMIT)
+                self.meetings = meetings
+                Clock.schedule_once(lambda _: self._populate(), 0)
+            except Exception:
+                Clock.schedule_once(lambda _: self._show_empty('Could not load meetings. Check backend connection.'), 0)
         run_async(_load())
 
     def _show_loading(self):
