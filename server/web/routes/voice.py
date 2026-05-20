@@ -68,7 +68,7 @@ LANGUAGE: English unless they explicitly ask for another. Keep proper nouns as-i
 WHAT YOU KNOW (answer directly, no tools needed)
 ═══════════════════════════════════════
 You have vast training knowledge — use it confidently and directly for:
-- Current date and time (your session context includes this — state it immediately)
+- Current date and time (you know this — answer directly if asked, do NOT announce it unprompted)
 - Science, mathematics, physics, chemistry, biology, medicine basics
 - History, geography, politics, economics, law fundamentals
 - Technology, software, coding, engineering
@@ -347,12 +347,24 @@ class ToolInvokeResponse(BaseModel):
     output: str
 
 
-async def _execute_tool(body: ToolInvokeBody, actor: dict, tag: str) -> ToolInvokeResponse:
-    """Shared handler for Realtime and Pipecat tool invocation."""
+@router.post("/realtime/tools/invoke", response_model=ToolInvokeResponse)
+async def invoke_realtime_tool(body: ToolInvokeBody, actor: dict = Depends(get_current_actor)):
+    """
+    Execute a server-side Realtime tool (Mem0 search or briefing bundle). Called by the device
+    after `response.function_call_arguments.done` over the Realtime WebSocket.
+    """
+    if not _realtime_enabled():
+        raise HTTPException(status_code=503, detail="Realtime voice is disabled on this server.")
+
     user_id = actor["user"]["id"]
     tool_name = body.name.strip()
     args_preview = (body.arguments or "{}")[:240]
-    print(f"VOICE_TOOL_CALL[{tag}] user={user_id} name={tool_name} args={args_preview}", file=sys.stderr, flush=True)
+    # uvicorn root config silences non-uvicorn loggers; use stderr+flush so this lands in `docker logs`.
+    print(f"VOICE_TOOL_CALL user={user_id} name={tool_name} args={args_preview}", file=sys.stderr, flush=True)
+    # execute_realtime_voice_tool is synchronous and may call blocking I/O (mem0 HTTP, Google
+    # Calendar API, SQLite). Running it directly in the async handler freezes the uvicorn event
+    # loop for the duration of the call — with a single-worker server this starves every other
+    # request, which is the recurring "Backend offline / all routes time out" deadlock.
     loop = asyncio.get_running_loop()
     out = await loop.run_in_executor(
         None,
@@ -365,27 +377,5 @@ async def _execute_tool(body: ToolInvokeBody, actor: dict, tag: str) -> ToolInvo
         ),
     )
     out_preview = (out or "")[:240]
-    print(f"VOICE_TOOL_RESULT[{tag}] user={user_id} name={tool_name} out={out_preview}", file=sys.stderr, flush=True)
+    print(f"VOICE_TOOL_RESULT user={user_id} name={tool_name} out={out_preview}", file=sys.stderr, flush=True)
     return ToolInvokeResponse(output=out)
-
-
-@router.post("/realtime/tools/invoke", response_model=ToolInvokeResponse)
-async def invoke_realtime_tool(body: ToolInvokeBody, actor: dict = Depends(get_current_actor)):
-    """
-    Execute a server-side Realtime tool. Called by the device after
-    response.function_call_arguments.done over the Realtime WebSocket.
-    """
-    if not _realtime_enabled():
-        raise HTTPException(status_code=503, detail="Realtime voice is disabled on this server.")
-    return await _execute_tool(body, actor, "realtime")
-
-
-@router.post("/pipecat/tools/invoke", response_model=ToolInvokeResponse)
-async def invoke_pipecat_tool(body: ToolInvokeBody, actor: dict = Depends(get_current_actor)):
-    """
-    Execute a server-side voice tool for the Pipecat pipeline.
-    Does not require MEETINGBOX_REALTIME_VOICE_ENABLED — only OPENAI_API_KEY.
-    """
-    if not _openai_api_key():
-        raise HTTPException(status_code=503, detail="OPENAI_API_KEY not configured on server.")
-    return await _execute_tool(body, actor, "pipecat")

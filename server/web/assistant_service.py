@@ -128,14 +128,14 @@ def _llm_calendar_plan(message: str, agent_system_prompt: str | None = None) -> 
     f"User message:\n{message.strip()[:4000]}\n"
   )
   model = os.getenv("AI_MODEL", "claude-sonnet-4-20250514")
-  create_kwargs: dict[str, Any] = {
-    "model": model,
-    "max_tokens": 800,
-    "messages": [{"role": "user", "content": prompt}],
-  }
-  if agent_system_prompt:
-    create_kwargs["system"] = agent_system_prompt
   try:
+    create_kwargs: dict[str, Any] = {
+      "model": model,
+      "max_tokens": 800,
+      "messages": [{"role": "user", "content": prompt}],
+    }
+    if agent_system_prompt:
+      create_kwargs["system"] = agent_system_prompt
     resp = client.messages.create(**create_kwargs)
   except Exception:
     logger.exception("calendar plan LLM failed")
@@ -840,10 +840,7 @@ def process_assistant_intent(
 
   if agent_id == "calendar_agent":
     ctx = _augment_user_text_for_agent(agent_doc, user_id, text)
-    steps = _filter_steps_for_agent(
-      agent_id,
-      plan_calendar_steps(ctx, agent_doc.get("system_prompt") or None),
-    )
+    steps = _filter_steps_for_agent(agent_id, plan_calendar_steps(ctx, agent_doc.get("system_prompt") or None))
     for step in steps:
       tool = step["tool"]
       args = dict(step.get("args") or {})

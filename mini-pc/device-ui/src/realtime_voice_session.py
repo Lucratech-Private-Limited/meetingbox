@@ -11,7 +11,7 @@ Design:
   and barge-in are handled at the source instead of being gated on a
   second model hop (transcription + manual response.create on the
   client). This removes ~0.5–1.5 s of dead air per turn.
-- Send ONE small session.update: nudge eagerness to "high" and enable
+- Send ONE small session.update: set eagerness to "low" and enable
   user-audio transcription (used only for farewell detection). The
   server's full instructions, tools, voice, and audio format are left
   exactly as configured.
@@ -978,9 +978,9 @@ class RealtimeVoiceSession:
         session.created) with the client-only end_session tool.
 
         We override:
-          - input.turn_detection.eagerness = "high" (server default is
-            "low" for legacy hardware with no echo cancellation; with
-            external mic + AEC we want snappy end-of-turn detection).
+          - input.turn_detection.eagerness = "low" (no hardware AEC on
+            this device; high eagerness causes speaker echo to be picked
+            up as new user speech, creating an infinite interruption loop).
           - input.transcription.model — enables a transcript stream of
             user speech (also used as a fallback farewell heuristic).
           - tools — server tools + end_session.
@@ -1000,7 +1000,7 @@ class RealtimeVoiceSession:
                             },
                             "turn_detection": {
                                 "type": "semantic_vad",
-                                "eagerness": "high",
+                                "eagerness": "low",
                                 "create_response": True,
                                 "interrupt_response": True,
                             },
