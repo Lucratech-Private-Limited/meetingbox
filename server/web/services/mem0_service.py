@@ -31,8 +31,32 @@ def mem0_writes_disabled() -> bool:
     return os.getenv("MEETINGBOX_MEM0_WRITES_DISABLE", "").strip().lower() in ("1", "true", "yes", "on")
 
 
+def mem0_runtime_ready() -> bool:
+    """True only when Mem0 is BOTH not-disabled AND actually initialized.
+
+    Distinct from `mem0_disabled_globally()`: that one only inspects the
+    explicit disable env var. This helper also catches the silent
+    "MEM0_API_KEY missing" / "Memory() init failed" cases. The voice
+    `memory_search` tool MUST use this so it never tells the model
+    "mem0_enabled=true" when the underlying client is actually unusable
+    — the model would then truthfully report "I have nothing saved"
+    when in fact memory is offline entirely.
+    """
+    if mem0_disabled_globally():
+        return False
+    return _memory() is not None
+
+
 def _env_ingest_enabled(name: str) -> bool:
-    return (os.getenv(name, "") or "").strip().lower() in ("1", "true", "yes", "on")
+    raw = (os.getenv(name, "") or "").strip().lower()
+    if raw in ("0", "false", "no", "off"):
+        return False
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    # Backward-compatible default: when unset, keep chat-turn ingest ON.
+    if name == "MEETINGBOX_MEM0_INGEST_CHAT":
+        return True
+    return False
 
 
 def _memory():
@@ -54,11 +78,19 @@ def _memory():
         _init_failed = True
         return None
     try:
-        from mem0 import Memory
+        # `Memory` is the SELF-HOSTED class (takes a config dict and runs
+        # against a local vector store). `MemoryClient` is the CLOUD client
+        # — what our `m0-...` API keys target. mem0ai 2.x removed the
+        # `api_key` kwarg from `Memory()`; passing it raises:
+        #   TypeError: Memory.__init__() got an unexpected keyword argument 'api_key'
+        # which previously caused silent init failure, leaving the voice
+        # assistant truthfully but misleadingly saying "I have nothing
+        # saved" for every memory_search call.
+        from mem0 import MemoryClient
 
-        _memory_singleton = Memory(api_key=api_key)
+        _memory_singleton = MemoryClient(api_key=api_key)
     except Exception:
-        logger.exception("Mem0 Memory() initialization failed")
+        logger.exception("Mem0 MemoryClient() initialization failed")
         _init_failed = True
         return None
     return _memory_singleton

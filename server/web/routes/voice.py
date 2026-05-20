@@ -8,15 +8,12 @@ import json
 import logging
 import os
 import sys
-from datetime import datetime
-from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException
 from openai import OpenAI
 from pydantic import BaseModel, Field
 
 from auth import get_current_actor
-from services.calendar import default_calendar_tz_name
 from services.realtime_voice_tools import (
     REALTIME_VOICE_TOOL_DEFINITIONS,
     execute_realtime_voice_tool,
@@ -51,33 +48,7 @@ _REALTIME_VOICE_ALLOWED = frozenset(
 )
 _REALTIME_VOICE_ALIASES = {"nova": "shimmer", "fable": "sage"}
 
-def _build_realtime_instructions() -> str:
-    """Generate the session system prompt with live date/time/timezone injected."""
-    tz_name = default_calendar_tz_name()
-    try:
-        zone = ZoneInfo(tz_name)
-        now = datetime.now(zone)
-        day_name = now.strftime("%A")
-        date_str = now.strftime("%-d %B %Y") if sys.platform != "win32" else now.strftime("%#d %B %Y")
-        time_str = now.strftime("%I:%M %p").lstrip("0")
-        offset_hours = int(now.utcoffset().total_seconds() // 3600)
-        offset_mins = int(abs(now.utcoffset().total_seconds()) % 3600 // 60)
-        offset_str = f"UTC{offset_hours:+d}" if offset_mins == 0 else f"UTC{offset_hours:+d}:{offset_mins:02d}"
-        datetime_block = (
-            f"CONTEXT FACTS (silent — use only when relevant, do NOT announce at session start):\n"
-            f"  today = {day_name}, {date_str}\n"
-            f"  local_time_at_session_start = {time_str}\n"
-            f"  user_timezone = {tz_name} ({offset_str})\n"
-            f"Use these to answer date/time/timezone questions when asked, and to resolve "
-            f'relative dates like "tomorrow" or "next Monday". NEVER ask the user for their '
-            f"timezone or today's date. NEVER recite this block unprompted."
-        )
-    except Exception:
-        datetime_block = "CONTEXT FACTS: (date/time unavailable; call get_briefing_context to get timezone and today's date when needed)"
-
-    return f"""You are MeetingBox — a fast, natural, always-on voice assistant powered by GPT-5. You are a full general-purpose AI with deep knowledge across every domain, plus live tools for the user's personal data and real-time information.
-
-{datetime_block}
+_REALTIME_INSTRUCTIONS = """You are MeetingBox — a fast, natural, always-on voice assistant powered by GPT-5. You are a full general-purpose AI with deep knowledge across every domain, plus live tools for the user's personal data and real-time information.
 
 ═══════════════════════════════════════
 CORE VOICE BEHAVIOUR
@@ -89,7 +60,7 @@ RESPOND IMMEDIATELY — never stay silent after the user speaks:
 - No markdown or bullet lists in spoken replies — flowing sentences only.
 - Vary rhythm. Never stack closers ("take care / let me know / anything else").
 - If interrupted: stop immediately and attend to the new utterance.
-- end_session: ONLY call this when the user EXPLICITLY says goodbye/bye/good night/done/see you/that's all/I'm done/signing off. NEVER call it on short unclear fragments ("Are you?", "Ok", "Yeah"), garbled audio, or mid-task. If in doubt, stay in the session.
+- If the user says bye / done / thanks that's all: one short line, then stop.
 
 LANGUAGE: English unless they explicitly ask for another. Keep proper nouns as-is.
 
@@ -97,7 +68,7 @@ LANGUAGE: English unless they explicitly ask for another. Keep proper nouns as-i
 WHAT YOU KNOW (answer directly, no tools needed)
 ═══════════════════════════════════════
 You have vast training knowledge — use it confidently and directly for:
-- Current date and time (provided in CONTEXT FACTS above — answer when asked, never ask the user; do NOT announce unprompted)
+- Current date and time (your session context includes this — state it immediately)
 - Science, mathematics, physics, chemistry, biology, medicine basics
 - History, geography, politics, economics, law fundamentals
 - Technology, software, coding, engineering
@@ -172,22 +143,17 @@ Step 1 — Gather (if not already given):
   "What's the message about?" (if no content)
   User may say "take down the context first, I'll give you the address later" — that's fine. Collect what's offered, ask for the rest after.
 
-Step 2 — Tone:
-  If the user explicitly states a tone ("polite", "firm", "friendly", "formal", "casual", "requesting"), USE IT EXACTLY — do not override or blend with your own judgement.
-  If no tone is given, infer from context:
+Step 2 — Infer tone from context and user emotion if not specified:
   - User sounds rushed or frustrated → concise and direct
   - User is excited → warm and enthusiastic
   - Topic is a complaint or escalation → formal, measured
   - Topic is casual follow-up → friendly and brief
   Say the tone you chose only if it's non-obvious: "I'll keep it professional since it's a vendor follow-up."
 
-Step 3 — Read the draft aloud before saving/sending:
-  Read the full email body aloud (or a faithful 2–3 sentence summary for long emails) and ask:
-  "Here's the draft: [read body]. Does that sound right, or shall I adjust anything?"
-  Wait for the user's approval of the CONTENT before proceeding.
-  Only after content is approved: "Want me to send it now or save it as a draft for later?"
+Step 3 — Announce the draft:
+  Say: "Alright, I've drafted the email — [1-sentence summary of recipient + subject]. Want me to send it now or save it as a draft for later?"
   — "Send now" → call assistant_intent with the send request, then ask for approval
-  — "Draft for later" / "Save it" / "I'll send it myself" / recipient not yet known → call assistant_intent with a *save as Gmail draft* request (recipient may be empty). Then call memory_remember: "Drafted email about [subject] — saved to Gmail Drafts."
+  — "Draft for later" / "Save it" / "I'll send it myself" → call assistant_intent with a *save as Gmail draft* request. Then call memory_remember with the key facts: "Drafted email to [name/address] about [subject] — saved to Gmail Drafts. User may want to send this later." so you can find and send it in a future session.
 
 Step 4 — Confirmation:
   For send: state recipient + subject, ask "Good to go?" Wait for verbal yes before approve_pending_action.
@@ -195,46 +161,20 @@ Step 4 — Confirmation:
 
 Email address rules — voice is lossy:
   - NEVER invent or guess an email address. If you didn't clearly hear the full address, ask for it.
-  - Spell back what you heard letter-by-letter before acting: "Got it — that's v-i-v-e-k at gmail dot com, right?"
-  - If the user says "I'll give you the address later", draft the email content first WITHOUT a recipient, save it as a Gmail draft, then ask for the address only when they're ready to send.
-  - Do NOT refuse to save a draft just because you don't have the recipient yet.
-  - When proposing to send, always read the recipient address aloud so they can catch errors.
+  - Spell back what you heard letter-by-letter before acting: "Got it — that's j-o-h-n at acme dot com, right?"
+  - If the user says "I'll give you the address later", draft the email content first (save to drafts with a placeholder or hold in conversation), then ask for the address when they're ready.
+  - When proposing the email, always read the recipient address aloud so they can catch errors.
 
 ── CALENDAR EVENT ─────────────────────
-Required: title, date/time (or relative like "tomorrow", "next Monday"), duration or end time.
-Optional: attendees (with email), location, agenda/description, recurrence.
+Required: title, date/time, duration or end time.
+Optional: attendees (with email), location, agenda/description.
 
-TIMEZONE — you already know it. The user's timezone is in get_briefing_context (e.g. "Asia/Kolkata").
-  NEVER ask the user for their timezone. Use it automatically.
-  Only ask if the user explicitly says "in a different timezone" or mentions a city outside their home.
+Step 1 — Gather if missing (one question at a time):
+  "What's the meeting for?" → "When, and how long?" → "Anyone to invite?"
 
-DATE INFERENCE — resolve relative dates yourself using today's date from get_briefing_context:
-  "tomorrow" → today + 1 day (you know today's date, compute it)
-  "next Monday" → compute the date of the upcoming Monday
-  "for two weeks starting next week" → compute the Monday of next week
-  "for the next two weeks" / "for two weeks" with no start given → START TOMORROW, do not ask
-  "this week" → starts today or tomorrow if today is late
-  NEVER ask "which date should I start?" for these — infer it and proceed.
-  Only ask for a date if the user says something genuinely ambiguous like "sometime in June".
-
-Step 1 — Gather only what's truly missing (ask one thing at a time):
-  Title → time (if no time given) → duration (if no end given)
-  If the user gives all three upfront, skip straight to Step 2.
-
-Step 2 — Announce and confirm:
-  For single event: "Got it — '[title]' on [day] at [time] for [duration]. Want me to add it?"
-  For recurring: "Got it — '[title]' every weekday, [time]–[end time], starting [date] for two weeks (10 events). Shall I go ahead?"
+Step 2 — Announce:
+  "All set — I've got a [duration] meeting called '[title]' on [day] at [time][, with [attendees]]. Want me to add it to the calendar?"
   Wait for yes before approve_pending_action.
-
-── DELETE / CANCEL EVENT ─────────────
-Use this when the user says: "delete", "remove", "cancel", "clear" a calendar event.
-
-Step 1 — Confirm what you're deleting:
-  "Just to confirm — you want me to delete '[title]' on [date]?"
-  Wait for yes before approve_pending_action.
-
-Step 2 — After approve_pending_action succeeds: "Done — '[title]' has been removed from your calendar."
-  If not found: tell the user the event wasn't found and ask them to clarify the name or date.
 
 Step 3 — Email notification (if attendees present):
   After confirming the calendar invite: "Should I also send them an email letting them know?"
@@ -366,7 +306,7 @@ async def create_realtime_voice_session(actor: dict = Depends(get_current_actor)
             session={
                 "type": "realtime",
                 "model": model,
-                "instructions": _build_realtime_instructions(),
+                "instructions": _REALTIME_INSTRUCTIONS,
                 "tools": REALTIME_VOICE_TOOL_DEFINITIONS,
                 "tool_choice": "auto",
                 "output_modalities": ["audio"],
@@ -407,24 +347,12 @@ class ToolInvokeResponse(BaseModel):
     output: str
 
 
-@router.post("/realtime/tools/invoke", response_model=ToolInvokeResponse)
-async def invoke_realtime_tool(body: ToolInvokeBody, actor: dict = Depends(get_current_actor)):
-    """
-    Execute a server-side Realtime tool (Mem0 search or briefing bundle). Called by the device
-    after `response.function_call_arguments.done` over the Realtime WebSocket.
-    """
-    if not _realtime_enabled():
-        raise HTTPException(status_code=503, detail="Realtime voice is disabled on this server.")
-
+async def _execute_tool(body: ToolInvokeBody, actor: dict, tag: str) -> ToolInvokeResponse:
+    """Shared handler for Realtime and Pipecat tool invocation."""
     user_id = actor["user"]["id"]
     tool_name = body.name.strip()
     args_preview = (body.arguments or "{}")[:240]
-    # uvicorn root config silences non-uvicorn loggers; use stderr+flush so this lands in `docker logs`.
-    print(f"VOICE_TOOL_CALL user={user_id} name={tool_name} args={args_preview}", file=sys.stderr, flush=True)
-    # execute_realtime_voice_tool is synchronous and may call blocking I/O (mem0 HTTP, Google
-    # Calendar API, SQLite). Running it directly in the async handler freezes the uvicorn event
-    # loop for the duration of the call — with a single-worker server this starves every other
-    # request, which is the recurring "Backend offline / all routes time out" deadlock.
+    print(f"VOICE_TOOL_CALL[{tag}] user={user_id} name={tool_name} args={args_preview}", file=sys.stderr, flush=True)
     loop = asyncio.get_running_loop()
     out = await loop.run_in_executor(
         None,
@@ -437,5 +365,27 @@ async def invoke_realtime_tool(body: ToolInvokeBody, actor: dict = Depends(get_c
         ),
     )
     out_preview = (out or "")[:240]
-    print(f"VOICE_TOOL_RESULT user={user_id} name={tool_name} out={out_preview}", file=sys.stderr, flush=True)
+    print(f"VOICE_TOOL_RESULT[{tag}] user={user_id} name={tool_name} out={out_preview}", file=sys.stderr, flush=True)
     return ToolInvokeResponse(output=out)
+
+
+@router.post("/realtime/tools/invoke", response_model=ToolInvokeResponse)
+async def invoke_realtime_tool(body: ToolInvokeBody, actor: dict = Depends(get_current_actor)):
+    """
+    Execute a server-side Realtime tool. Called by the device after
+    response.function_call_arguments.done over the Realtime WebSocket.
+    """
+    if not _realtime_enabled():
+        raise HTTPException(status_code=503, detail="Realtime voice is disabled on this server.")
+    return await _execute_tool(body, actor, "realtime")
+
+
+@router.post("/pipecat/tools/invoke", response_model=ToolInvokeResponse)
+async def invoke_pipecat_tool(body: ToolInvokeBody, actor: dict = Depends(get_current_actor)):
+    """
+    Execute a server-side voice tool for the Pipecat pipeline.
+    Does not require MEETINGBOX_REALTIME_VOICE_ENABLED — only OPENAI_API_KEY.
+    """
+    if not _openai_api_key():
+        raise HTTPException(status_code=503, detail="OPENAI_API_KEY not configured on server.")
+    return await _execute_tool(body, actor, "pipecat")

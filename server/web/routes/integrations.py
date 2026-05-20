@@ -512,7 +512,7 @@ async def integrations_calendar_events(
 
 
 @router.get("/integrations/gmail/recent")
-async def integrations_gmail_recent(
+def integrations_gmail_recent(
     actor: dict = Depends(get_current_actor),
     max_results: int = Query(25, ge=1, le=50),
     days: int = Query(
@@ -563,7 +563,7 @@ async def integrations_gmail_recent(
 
 
 @router.get("/integrations/gmail/messages/{message_id}")
-async def integrations_gmail_message_detail(
+def integrations_gmail_message_detail(
     message_id: str,
     actor: dict = Depends(get_current_actor),
 ):
@@ -600,7 +600,7 @@ async def integrations_gmail_message_detail(
 
 
 @router.post("/integrations/gmail/messages/{message_id}/mark-unread")
-async def integrations_gmail_message_mark_unread(
+def integrations_gmail_message_mark_unread(
     message_id: str,
     actor: dict = Depends(get_current_actor),
 ):
@@ -618,8 +618,27 @@ async def integrations_gmail_message_mark_unread(
     return {"status": "ok", "id": message_id}
 
 
+@router.post("/integrations/gmail/messages/{message_id}/mark-read")
+def integrations_gmail_message_mark_read(
+    message_id: str,
+    actor: dict = Depends(get_current_actor),
+):
+    from services.gmail import mark_message_read
+
+    user_id = actor["user"]["id"]
+    creds = get_credentials_for_provider(user_id, "gmail")
+    if not creds:
+        raise HTTPException(status_code=403, detail="Gmail not connected.")
+    try:
+        mark_message_read(creds, message_id)
+    except Exception as exc:
+        logger.error("mark_message_read %s failed: %s", message_id, exc)
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return {"status": "ok", "id": message_id}
+
+
 @router.post("/integrations/gmail/messages/{message_id}/archive")
-async def integrations_gmail_message_archive(
+def integrations_gmail_message_archive(
     message_id: str,
     actor: dict = Depends(get_current_actor),
 ):

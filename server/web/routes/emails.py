@@ -20,6 +20,7 @@ from routes.integrations import get_credentials_for_provider
 from services.gmail import (
     list_recent_messages,
     get_message_full,
+    mark_message_read,
     mark_message_unread,
     archive_message,
 )
@@ -82,7 +83,7 @@ def _get_user_id(actor: dict) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 @router.get("/emails")
-async def list_emails(
+def list_emails(
     filter: str = Query(default="all", description="all | today | unread | sent | drafts"),
     limit: int = Query(default=20, ge=1, le=50),
     current_actor: Optional[dict] = Depends(get_optional_actor),
@@ -145,7 +146,7 @@ async def list_emails(
 
 
 @router.get("/emails/{email_id}")
-async def get_email(
+def get_email(
     email_id: str,
     current_actor: Optional[dict] = Depends(get_optional_actor),
 ):
@@ -182,7 +183,7 @@ async def get_email(
 
 
 @router.post("/emails/{email_id}/mark-unread")
-async def mark_unread(
+def mark_unread(
     email_id: str,
     current_actor: Optional[dict] = Depends(get_optional_actor),
 ):
@@ -204,8 +205,31 @@ async def mark_unread(
     return {"status": "ok", "id": email_id}
 
 
+@router.post("/emails/{email_id}/mark-read")
+def mark_read(
+    email_id: str,
+    current_actor: Optional[dict] = Depends(get_optional_actor),
+):
+    """Mark a Gmail message as read (removes UNREAD label)."""
+    user_id = _get_user_id(current_actor)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    creds = get_credentials_for_provider(user_id, "gmail")
+    if not creds:
+        raise HTTPException(status_code=403, detail="Gmail not connected")
+
+    try:
+        mark_message_read(creds, email_id)
+    except Exception as exc:
+        logger.error("mark_message_read %s failed: %s", email_id, exc)
+        raise HTTPException(status_code=502, detail=f"Gmail API error: {exc}")
+
+    return {"status": "ok", "id": email_id}
+
+
 @router.post("/emails/{email_id}/archive")
-async def archive_email(
+def archive_email(
     email_id: str,
     current_actor: Optional[dict] = Depends(get_optional_actor),
 ):

@@ -21,7 +21,6 @@ from tools.base_tool import ToolError
 from services.calendar import default_calendar_tz_name
 from tools.calendar_tool import (
   calendar_create_from_payload,
-  calendar_delete_from_payload,
   calendar_list_upcoming,
   calendar_suggest_free_slots,
 )
@@ -48,7 +47,6 @@ logger = logging.getLogger("meetingbox.assistant")
 
 TOOL_CAL_LIST = "calendar_list_upcoming"
 TOOL_CAL_CREATE = "calendar_create_event"
-TOOL_CAL_DELETE = "calendar_delete_event"
 TOOL_CAL_SLOTS = "calendar_suggest_free_slots"
 TOOL_COMMITMENT_LIST = "commitment_list"
 TOOL_COMMITMENT_UPSERT = "commitment_upsert"
@@ -57,13 +55,12 @@ TOOL_GMAIL_SEND = "gmail_send_email"
 TOOL_GMAIL_DRAFT = "gmail_create_draft"
 TOOL_MEMORY_SEARCH = "memory_search_meetings"
 TOOL_MEMORY_FETCH = "memory_fetch_meeting"
-WRITE_TOOLS = frozenset({TOOL_CAL_CREATE, TOOL_CAL_DELETE, TOOL_GMAIL_SEND, TOOL_GMAIL_DRAFT})
+WRITE_TOOLS = frozenset({TOOL_CAL_CREATE, TOOL_GMAIL_SEND, TOOL_GMAIL_DRAFT})
 
 AGENT_ALLOWED_TOOLS: dict[str, frozenset[str]] = {
   "calendar_agent": frozenset({
     TOOL_CAL_LIST,
     TOOL_CAL_CREATE,
-    TOOL_CAL_DELETE,
     TOOL_CAL_SLOTS,
     TOOL_COMMITMENT_LIST,
     TOOL_COMMITMENT_UPSERT,
@@ -104,58 +101,42 @@ def _parse_json_loose(text: str) -> Any:
   return json.loads(text)
 
 
-def _llm_calendar_plan(message: str) -> list[dict[str, Any]] | None:
+def _llm_calendar_plan(message: str, agent_system_prompt: str | None = None) -> list[dict[str, Any]] | None:
   client = _get_anthropic()
   if not client:
     return None
   import os
 
-  today_str = __import__("datetime").date.today().isoformat()
   prompt = (
-    "You are a calendar planning assistant. Given a user message, return ONLY valid JSON:\n"
-    "{\"steps\": [ {\"tool\": \"<tool_name>\", \"args\": {}, \"is_write\": true|false} ]}\n\n"
-    "TOOL SELECTION RULES (apply in order):\n\n"
-    "1. calendar_create_event — use when the user wants to CREATE, ADD, SCHEDULE, BOOK, SET UP, or BLOCK "
-    "a named event/slot on their calendar. This includes focus blocks, standups, meetings, time blocks, "
-    "work sessions, recurring slots, etc. ANY intent to put something NEW on the calendar → this tool.\n"
-    "   Args: title (str), start_time (ISO datetime, e.g. '2026-05-19T15:00:00'), duration_minutes (int), "
-    "   attendees (list of emails, empty [] if none), timezone (IANA, default "
-    f'"{default_calendar_tz_name()}"), description (str, optional),\n'
-    "   recurrence (str RRULE rule for recurring events, e.g. 'RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;COUNT=10').\n"
-    "   is_write: true.\n"
-    "   For RECURRING requests (e.g. 'every weekday for two weeks', 'daily for next month', "
-    "   'Mondays for 4 weeks'): use ONE step with a recurrence RRULE. "
-    "   'All weekdays for two weeks' = RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;COUNT=10. "
-    "   'Every day for 2 weeks' = RRULE:FREQ=DAILY;COUNT=14.\n\n"
-    "2. calendar_delete_event — use when the user wants to DELETE, REMOVE, CANCEL, or CLEAR an existing "
-    "calendar event (e.g. 'delete focus time tomorrow', 'cancel my 3pm', 'remove the standup on Friday').\n"
-    "   Args:\n"
-    "     title (str) — ONLY the event name/title, nothing else. Extract JUST the name. "
-    "     Examples: 'Focus Time', 'Standup', 'Team meeting'. NEVER put a full sentence here.\n"
-    "     date (str) — ISO date hint, e.g. '2026-05-20'. Resolve 'tomorrow'/'today' to an actual date.\n"
-    "     event_id (str) — only if you have the exact Google Calendar event ID.\n"
-    "   is_write: true.\n\n"
-    "3. calendar_list_upcoming — use ONLY when user wants to VIEW/SEE/CHECK what's on their calendar "
-    "(e.g. 'what do I have today', 'show my schedule', 'any meetings tomorrow').\n"
-    "   Args: max_results (int, default 10). is_write: false.\n\n"
-    "4. calendar_suggest_free_slots — use ONLY when user asks about FREE TIME, AVAILABILITY, "
-    "open slots (e.g. 'when am I free', 'find time for a meeting').\n"
-    "   Args: days_ahead (1–21), duration_minutes, work_start_hhmm, work_end_hhmm, timezone. is_write: false.\n\n"
-    "5. commitment_upsert — use ONLY for vague REMINDERS or TASKS that are NOT calendar events "
-    "(e.g. 'remind me to call John', 'note to self: buy milk', 'follow up with Sarah next week').\n"
-    "   Args: title, detail, tags (array), source (voice|chat), remind_at, due_at. is_write: true.\n\n"
-    "6. commitment_list — use ONLY when user wants to SEE their existing reminders/todos/tasks "
-    "(e.g. 'what are my reminders', 'show my todos'). NEVER use this for CREATE or DELETE requests. is_write: false.\n\n"
-    f"Today is {today_str}.\n"
+    "Plan calendar tool steps for the user message. Return **only** valid JSON: "
+    "a single object {\"steps\": [ {\"tool\": \"calendar_list_upcoming\"|\"calendar_create_event\"|"
+    "\"calendar_suggest_free_slots\"|\"commitment_list\"|\"commitment_upsert\", "
+    "\"args\": object, \"is_write\": boolean } ] }.\n"
+    "Rules:\n"
+    "- Use calendar_list_upcoming for viewing schedule, what's on, upcoming events.\n"
+    "- Use calendar_suggest_free_slots for free time, availability, open slots this week. "
+    "Args: days_ahead (1–21), duration_minutes, work_start_hhmm, work_end_hhmm, timezone (IANA).\n"
+    "- Use commitment_list to show reminders/tasks/follow-ups. Args: max_results, status (optional; "
+    "active|completed|snoozed|cancelled|all).\n"
+    "- Use commitment_upsert to save or update a reminder/task/commitment (voice or chat). "
+    "Args: id or commitment_id (update), title, detail, tags (array), status, remind_at, due_at (ISO strings if known), "
+    "source (chat|meeting|voice), calendar_event_id.\n"
+    "- Use calendar_create_event for scheduling on Google Calendar. Args may include "
+    "title, description, start_time (ISO or null for default), duration_minutes, attendees (emails), timezone "
+    f'(IANA; default "{default_calendar_tz_name()}").\n'
+    "- At most one create per message unless user clearly asks for multiple.\n"
     f"User message:\n{message.strip()[:4000]}\n"
   )
   model = os.getenv("AI_MODEL", "claude-sonnet-4-20250514")
+  create_kwargs: dict[str, Any] = {
+    "model": model,
+    "max_tokens": 800,
+    "messages": [{"role": "user", "content": prompt}],
+  }
+  if agent_system_prompt:
+    create_kwargs["system"] = agent_system_prompt
   try:
-    resp = client.messages.create(
-      model=model,
-      max_tokens=800,
-      messages=[{"role": "user", "content": prompt}],
-    )
+    resp = client.messages.create(**create_kwargs)
   except Exception:
     logger.exception("calendar plan LLM failed")
     return None
@@ -235,27 +216,6 @@ def _heuristic_calendar_plan(message: str) -> list[dict[str, Any]]:
       },
       "is_write": True,
     }]
-  delete_markers = (
-    "delete ",
-    "remove ",
-    "cancel the",
-    "cancel my",
-    "remove the",
-    "remove my",
-    "delete the",
-    "delete my",
-    "clear the event",
-    "clear my event",
-    "get rid of",
-    "drop the event",
-  )
-  if any(x in m for x in delete_markers) and any(w in m for w in ("event", "meeting", "invite", "calendar", "block", "focus", "standup", "reminder", "slot")):
-    return [{
-      "tool": TOOL_CAL_DELETE,
-      "args": {"title": message.strip()[:300]},
-      "is_write": True,
-    }]
-
   create_markers = (
     "schedule ",
     "book ",
@@ -265,16 +225,6 @@ def _heuristic_calendar_plan(message: str) -> list[dict[str, Any]]:
     "calendar invite",
     "put on my calendar",
     "set up a meeting",
-    "block time",
-    "block my",
-    "block some time",
-    "focus time",
-    "focus block",
-    "time block",
-    "create a calendar",
-    "add an event",
-    "add event",
-    "set up",
   )
   if any(x in m for x in create_markers):
     return [{
@@ -296,8 +246,8 @@ def _heuristic_calendar_plan(message: str) -> list[dict[str, Any]]:
   }]
 
 
-def plan_calendar_steps(message: str) -> list[dict[str, Any]]:
-  return _llm_calendar_plan(message) or _heuristic_calendar_plan(message)
+def plan_calendar_steps(message: str, agent_system_prompt: str | None = None) -> list[dict[str, Any]]:
+  return _llm_calendar_plan(message, agent_system_prompt) or _heuristic_calendar_plan(message)
 
 
 def _llm_communication_plan(message: str) -> list[dict[str, Any]] | None:
@@ -308,24 +258,16 @@ def _llm_communication_plan(message: str) -> list[dict[str, Any]] | None:
 
   prompt = (
     "Plan Gmail tools for the user message. Return **only** valid JSON: "
-    "{\"steps\": [ {\"tool\": \"<tool_name>\", \"args\": {}, \"is_write\": true|false } ] }.\n\n"
-    "TOOL SELECTION RULES (apply in order):\n\n"
-    "1. gmail_list_recent — use for: inbox, unread, recent mail, checking email, what arrived.\n"
-    "   Args: max_results (int 1–30, default 15), q (optional Gmail search string).\n"
-    "   is_write: false.\n\n"
-    "2. gmail_create_draft — use when the user says: 'draft', 'save as draft', 'draft for later',\n"
-    "   'I will send it later', 'save it', 'don't send yet', OR the recipient is not yet known.\n"
-    "   Also use when the message explicitly says 'Create a Gmail draft'.\n"
-    "   Args: to (str, may be empty if recipient not yet known), subject (str), body (str),\n"
-    "   cc (array, optional).\n"
-    "   is_write: true.\n\n"
-    "3. gmail_send_email — use ONLY when the user explicitly says 'send now' or 'send it'.\n"
-    "   Never use this for drafts or when the user wants to review first.\n"
-    "   Args: to (str, required), subject (str), body (str), cc (array), bcc (optional array),\n"
-    "   html_body (optional), thread_id (optional, for replies).\n"
-    "   is_write: true.\n\n"
-    "IMPORTANT: If the message says 'draft' or 'save' anywhere, always use gmail_create_draft, "
-    "never gmail_send_email.\n\n"
+    "{\"steps\": [ {\"tool\": \"gmail_list_recent\"|\"gmail_send_email\", "
+    "\"args\": object, \"is_write\": boolean } ] }.\n"
+    "Rules:\n"
+    "- Use gmail_list_recent for inbox, unread, recent mail, checking email, what arrived.\n"
+    "  Args: max_results (int 1–30, default 15), q (optional Gmail search).\n"
+    "  For general inbox / briefing scans omit q or use \"\" — the server applies a Primary + meeting-invite filter.\n"
+    "  Only set q for targeted search (from:, subject:, in:sent, in:spam, after:, newer_than:, etc.).\n"
+    "- Use gmail_send_email for sending mail. Args: to, subject, body, cc (array), "
+    "bcc (optional array), html_body (optional), thread_id (optional, for replies).\n"
+    "- gmail_send_email must have is_write true.\n"
     f"User message:\n{message.strip()[:4000]}\n"
   )
   model = os.getenv("AI_MODEL", "claude-sonnet-4-20250514")
@@ -388,25 +330,16 @@ def _heuristic_communication_plan(message: str) -> list[dict[str, Any]]:
     q = "is:unread" if "unread" in m else ""
     return [{"tool": TOOL_GMAIL_LIST, "args": {"max_results": 15, "q": q}, "is_write": False}]
 
-  draft_markers = (
-    "draft", "save as draft", "draft for later", "save it", "don't send",
-    "do not send", "send it later", "i'll send", "i will send",
-  )
   emails = _extract_emails_from_text(message)
   first_to = emails[0] if emails else ""
-
-  if any(x in m for x in draft_markers):
-    return [{
-      "tool": TOOL_GMAIL_DRAFT,
-      "args": {
-        "to": first_to,
-        "subject": "Draft",
-        "body": message.strip()[:8000] or "(empty)",
-        "cc": [],
-      },
-      "is_write": True,
-    }]
-
+  tone = "professional"
+  m = message.lower()
+  if any(k in m for k in ("friendly", "warm", "casual")):
+    tone = "friendly"
+  elif any(k in m for k in ("formal", "executive", "strictly professional")):
+    tone = "formal"
+  elif any(k in m for k in ("urgent", "asap", "immediately")):
+    tone = "urgent"
   return [{
     "tool": TOOL_GMAIL_SEND,
     "args": {
@@ -417,6 +350,7 @@ def _heuristic_communication_plan(message: str) -> list[dict[str, Any]]:
       "bcc": [],
       "html_body": "",
       "thread_id": "",
+      "tone": tone,
     },
     "is_write": True,
   }]
@@ -619,10 +553,6 @@ def assistant_action_brief_label(tool_name: str, payload: Any) -> str:
     )
     st = str(st).strip()
     return f"{t} · {st}" if st else t
-  if tool_name == TOOL_CAL_DELETE:
-    t = (payload.get("title") or payload.get("title_hint") or "Calendar event").strip()
-    d = str(payload.get("date") or payload.get("date_hint") or "").strip()
-    return f"Delete '{t}'" + (f" on {d[:10]}" if d else "")
   if tool_name == TOOL_GMAIL_SEND:
     subj = str(payload.get("subject") or "Draft email").strip()[:72]
     to_addr = str(payload.get("to") or "").strip()[:48]
@@ -918,9 +848,13 @@ def process_assistant_intent(
   agent_id = route.agent_id
 
   if agent_id == "calendar_agent":
-    ctx = _augment_user_text_for_agent(agent_doc, user_id, text)
-    # Use raw text for planning — augmented ctx contains memory/commitment blocks that confuse the LLM planner
-    steps = _filter_steps_for_agent(agent_id, plan_calendar_steps(text))
+    # Planner must see ONLY the raw user request; injecting MEM0/COMMITMENTS_DB
+    # context biases the LLM toward read-only tools (commitment_list / calendar_list_upcoming)
+    # instead of calendar_create_event for explicit create requests.
+    steps = _filter_steps_for_agent(
+      agent_id,
+      plan_calendar_steps(text, agent_doc.get("system_prompt") or None),
+    )
     for step in steps:
       tool = step["tool"]
       args = dict(step.get("args") or {})
@@ -955,24 +889,6 @@ def process_assistant_intent(
           "queued": True,
           "pending_id": pid,
           "note": "Awaiting approval before creating the event.",
-        })
-      elif tool == TOOL_CAL_DELETE:
-        if not user_id:
-          tool_results.append({"tool": tool, "error": "Sign in is required to delete calendar events."})
-          continue
-        pid = str(uuid.uuid4())
-        pending_rows.append((pid, agent_id, tool, args))
-        pending_meta.append({
-          "id": pid,
-          "tool_name": tool,
-          "status": "pending",
-          "brief_label": assistant_action_brief_label(tool, args),
-        })
-        tool_results.append({
-          "tool": tool,
-          "queued": True,
-          "pending_id": pid,
-          "note": "Awaiting approval before deleting the event.",
         })
       elif tool == TOOL_CAL_SLOTS:
         if not user_id:
@@ -1015,14 +931,14 @@ def process_assistant_intent(
     if pending_meta:
       if len(pending_meta) == 1:
         assistant_lines.append(
-          f"I queued a calendar change for you to okay first: {pending_meta[0].get('brief_label', 'event')}."
+          f"I drafted one calendar action: {pending_meta[0].get('brief_label', 'event')}. Please confirm before I execute it."
         )
       else:
         bits = [m.get("brief_label", "event") for m in pending_meta[:12]]
         assistant_lines.append(
-          f"I've got {len(pending_meta)} calendar items waiting on your thumbs-up: "
+          f"I drafted {len(pending_meta)} calendar actions pending your confirmation: "
           + "; ".join(bits)
-          + ". Say yes when you're good with them, or tell me to tweak or drop one."
+          + ". Tell me what to adjust, or confirm to proceed."
         )
     listed = next((t for t in tool_results if t.get("tool") == TOOL_CAL_LIST and "result" in t), None)
     if listed and "result" in listed:
@@ -1042,7 +958,7 @@ def process_assistant_intent(
       nc = int(com_li["result"].get("count") or 0)
       assistant_lines.append(f"{nc} reminders or tasks matched what you asked; details are attached.")
     if not assistant_lines:
-      assistant_lines.append("Calendar side looks handled—anything else on your mind?")
+      assistant_lines.append("Calendar request is prepared.")
     for tr in tool_results:
       if (
         tr.get("tool") == TOOL_CAL_LIST
@@ -1052,8 +968,9 @@ def process_assistant_intent(
         maybe_ingest_calendar_snapshot(user_id, tr["result"])
 
   elif agent_id in ("gmail_agent", "communication_agent"):
-    ctx = _augment_user_text_for_agent(agent_doc, user_id, text)
-    steps = _filter_steps_for_agent(agent_id, plan_communication_steps(ctx))
+    # Same reasoning as calendar_agent: pass raw user request so the planner picks
+    # gmail_send_email vs gmail_list_recent based on user intent, not recalled context.
+    steps = _filter_steps_for_agent(agent_id, plan_communication_steps(text))
     for step in steps:
       tool = step["tool"]
       args = dict(step.get("args") or {})
@@ -1082,6 +999,10 @@ def process_assistant_intent(
           })
           continue
         pid = str(uuid.uuid4())
+        # Preserve explicit tone/style request for downstream draft rendering.
+        tone = str(args.get("tone") or "").strip()
+        if tone:
+          args["tone"] = tone
         pending_rows.append((pid, agent_id, tool, args))
         pending_meta.append({
           "id": pid,
@@ -1121,14 +1042,14 @@ def process_assistant_intent(
 
     if pending_meta:
       assistant_lines.append(
-        "There's a draft email queued—give it a look and approve it when it feels right."
+        "I drafted the email and queued it for your confirmation before sending."
       )
     listed = next((t for t in tool_results if t.get("tool") == TOOL_GMAIL_LIST and "result" in t), None)
     if listed and "result" in listed:
       n = listed["result"].get("count", 0)
-      assistant_lines.append(f"Pulled {n} recent messages; the thread list is in results.")
+      assistant_lines.append(f"I pulled {n} recent emails and summarized the inbox context.")
     if not assistant_lines:
-      assistant_lines.append("Inbox run's done—I bundled what I found below.")
+      assistant_lines.append("Email request is ready.")
     for tr in tool_results:
       if (
         tr.get("tool") == TOOL_GMAIL_LIST
@@ -1402,9 +1323,6 @@ def approve_pending_action(pending_id: str, user_id: str) -> dict[str, Any]:
     if tool == TOOL_CAL_CREATE:
       result = calendar_create_from_payload(user_id, payload)
       result_blob = {"calendar": result}
-    elif tool == TOOL_CAL_DELETE:
-      result = calendar_delete_from_payload(user_id, payload)
-      result_blob = {"calendar_delete": result}
     elif tool == TOOL_GMAIL_SEND:
       result = gmail_send_from_payload(user_id, payload)
       result_blob = {"gmail": result}

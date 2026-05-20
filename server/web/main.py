@@ -43,6 +43,7 @@ from routes.commitments import router as commitments_router
 from routes.briefing import router as briefing_router
 from routes.admin_memory import router as admin_memory_router
 from routes.voice import router as voice_router
+from routes.pipecat_voice import router as pipecat_voice_router
 from routes.weather import router as weather_router
 from routes.tts import router as tts_router
 from auth import get_optional_user, resolve_actor_from_access_token
@@ -307,6 +308,7 @@ app.include_router(commitments_router, prefix="/api", tags=["commitments"])
 app.include_router(briefing_router, prefix="/api")
 app.include_router(admin_memory_router, prefix="/api")
 app.include_router(voice_router, prefix="/api/voice")
+app.include_router(pipecat_voice_router, prefix="/api/voice")
 app.include_router(weather_router, prefix="/api", tags=["weather"])
 app.include_router(tts_router, prefix="/api/tts", tags=["tts"])
 

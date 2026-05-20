@@ -4,8 +4,8 @@ uvicorn[standard]==0.27.0
 python-dotenv==1.0.1
 pydantic==2.10.6
 redis==5.0.1
-aiofiles==23.2.1
-websockets==12.0
+aiofiles>=24.1.0,<27
+websockets>=13.1,<16.0
 jinja2==3.1.3
 psutil==5.9.8
 python-multipart==0.0.6
@@ -24,3 +24,6 @@ alembic==1.15.2
 sqlalchemy==2.0.38
 slowapi==0.1.9
 mem0ai==2.0.2
+# Pipecat AI voice pipeline: STT (OpenAI Realtime) + LLM (GPT-4o) + TTS (OpenAI).
+# Requires websockets>=13.1 and aiofiles>=24.1.0.
+pipecat-ai[openai]==1.2.1

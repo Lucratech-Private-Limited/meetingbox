@@ -265,6 +265,8 @@ def test_realtime_tool_assistant_intent_mocked(tmp_path, monkeypatch):
     out = json.loads(res.json()["output"])
     assert out["assistant_message"] == "Mock reply"
     assert out["pending_actions"][0]["id"] == "pa-1"
+    assert out["truth_status"]["writes_committed"] is False
+    assert out["truth_status"]["pending_count"] == 1
 
 
 def test_realtime_tool_list_pending_empty(tmp_path, monkeypatch):
@@ -341,9 +343,9 @@ def test_realtime_session_mock_receives_turn_detection_fields(tmp_path, monkeypa
     outp = audio.get("output") or {}
     td = inp.get("turn_detection") or {}
     assert td.get("type") == "semantic_vad"
-    assert td.get("eagerness") == "high"
+    assert td.get("eagerness") == "low"
     assert td.get("create_response") is True
-    assert td.get("interrupt_response") is False
+    assert td.get("interrupt_response") is True
     nr = inp.get("noise_reduction") or {}
     assert nr.get("type") == "far_field"
     assert outp.get("voice") == "shimmer"
@@ -496,6 +498,136 @@ def test_navigate_device_ui_maps_inbox_to_emails(tmp_path, monkeypatch):
     assert res.status_code == 200
     body = json.loads(res.json()["output"])
     assert body.get("device_navigate") == "emails"
+
+
+def test_realtime_tool_approve_requires_explicit_confirmation(tmp_path, monkeypatch):
+    app, uid = _app_with_user(
+        tmp_path,
+        monkeypatch,
+        MEETINGBOX_REALTIME_VOICE_ENABLED="1",
+    )
+    import auth
+
+    token = auth.create_access_token({"sub": uid})
+    client = TestClient(app)
+    res = client.post(
+        "/api/voice/realtime/tools/invoke",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "call_id": "approve_1",
+            "name": "approve_pending_action",
+            "arguments": '{"pending_id":"x"}',
+        },
+    )
+    assert res.status_code == 200
+    out = json.loads(res.json()["output"])
+    assert out.get("error") == "confirmation_required"
+    assert out.get("truth_status", {}).get("writes_committed") is False
+
+
+def test_realtime_tool_approve_adds_truth_status_on_success(tmp_path, monkeypatch):
+    app, uid = _app_with_user(
+        tmp_path,
+        monkeypatch,
+        MEETINGBOX_REALTIME_VOICE_ENABLED="1",
+    )
+    import auth
+    import services.realtime_voice_tools as rv
+
+    monkeypatch.setattr(
+        rv,
+        "svc_approve_pending_action",
+        lambda _pid, _uid: {"id": "p1", "status": "completed", "result": {"ok": True}},
+    )
+
+    token = auth.create_access_token({"sub": uid})
+    client = TestClient(app)
+    res = client.post(
+        "/api/voice/realtime/tools/invoke",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "call_id": "approve_2",
+            "name": "approve_pending_action",
+            "arguments": '{"pending_id":"p1","confirmed_by_user":true,"confirmation_phrase":"yes go ahead"}',
+        },
+    )
+    assert res.status_code == 200
+    out = json.loads(res.json()["output"])
+    assert out.get("status") == "completed"
+    assert out.get("truth_status", {}).get("writes_committed") is True
+
+
+def test_realtime_tool_approve_autoselects_single_pending(tmp_path, monkeypatch):
+    app, uid = _app_with_user(
+        tmp_path,
+        monkeypatch,
+        MEETINGBOX_REALTIME_VOICE_ENABLED="1",
+    )
+    import auth
+    import services.realtime_voice_tools as rv
+
+    monkeypatch.setattr(
+        rv,
+        "list_pending_actions_for_user",
+        lambda _uid: [{"id": "auto-p1", "tool_name": "calendar_create_event", "brief_label": "Catch-up"}],
+    )
+    monkeypatch.setattr(
+        rv,
+        "svc_approve_pending_action",
+        lambda pid, _uid: {"id": pid, "status": "completed"},
+    )
+
+    token = auth.create_access_token({"sub": uid})
+    client = TestClient(app)
+    res = client.post(
+        "/api/voice/realtime/tools/invoke",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "call_id": "approve_auto_1",
+            "name": "approve_pending_action",
+            "arguments": '{"confirmed_by_user":true,"confirmation_phrase":"yes go ahead"}',
+        },
+    )
+    assert res.status_code == 200
+    out = json.loads(res.json()["output"])
+    assert out.get("id") == "auto-p1"
+    assert out.get("truth_status", {}).get("writes_committed") is True
+
+
+def test_realtime_tool_approve_requires_choice_when_multiple_pending(tmp_path, monkeypatch):
+    app, uid = _app_with_user(
+        tmp_path,
+        monkeypatch,
+        MEETINGBOX_REALTIME_VOICE_ENABLED="1",
+    )
+    import auth
+    import services.realtime_voice_tools as rv
+
+    monkeypatch.setattr(
+        rv,
+        "list_pending_actions_for_user",
+        lambda _uid: [
+            {"id": "p-a", "tool_name": "gmail_send_email", "brief_label": "Email Alice"},
+            {"id": "p-b", "tool_name": "calendar_create_event", "brief_label": "Catch-up block"},
+        ],
+    )
+
+    token = auth.create_access_token({"sub": uid})
+    client = TestClient(app)
+    res = client.post(
+        "/api/voice/realtime/tools/invoke",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "call_id": "approve_multi_1",
+            "name": "approve_pending_action",
+            "arguments": '{"confirmed_by_user":true,"confirmation_phrase":"yes"}',
+        },
+    )
+    assert res.status_code == 200
+    out = json.loads(res.json()["output"])
+    assert out.get("error") == "pending_id_required"
+    assert isinstance(out.get("pending_choices"), list)
+    assert len(out["pending_choices"]) == 2
 
 
 def test_e2e_realtime_get_briefing_user_asks_meetings_tomorrow_has_data(tmp_path, monkeypatch):

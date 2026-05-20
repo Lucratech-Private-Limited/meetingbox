@@ -21,7 +21,8 @@ async def system_status(current_user: Optional[dict] = Depends(get_optional_user
   if (os.getenv("MEETINGBOX_SYSTEM_STATUS_REQUIRE_AUTH", "") or "").strip() == "1":
     if not current_user:
       raise HTTPException(status_code=401, detail="Authentication required.")
-  cpu = psutil.cpu_percent(interval=0.5)
+  # Non-blocking sample keeps event loop responsive under concurrent requests.
+  cpu = psutil.cpu_percent(interval=None)
   mem = psutil.virtual_memory()
   disk = psutil.disk_usage("/")
 

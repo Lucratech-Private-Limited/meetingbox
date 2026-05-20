@@ -552,9 +552,9 @@ def send_email(
 
 def create_draft(
     credentials,
-    to: str = "",
-    subject: str = "",
-    body: str = "",
+    to: str,
+    subject: str,
+    body: str,
     cc: str | None = None,
 ) -> dict:
     """
@@ -638,6 +638,16 @@ def mark_message_unread(credentials, message_id: str) -> dict:
         userId="me",
         id=message_id,
         body={"addLabelIds": ["UNREAD"]},
+    ).execute()
+
+
+def mark_message_read(credentials, message_id: str) -> dict:
+    """Remove UNREAD label from a message (mark as read)."""
+    service = build("gmail", "v1", credentials=credentials, cache_discovery=False)
+    return service.users().messages().modify(
+        userId="me",
+        id=message_id,
+        body={"removeLabelIds": ["UNREAD"]},
     ).execute()
 
 

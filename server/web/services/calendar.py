@@ -68,7 +68,6 @@ def create_event(
     attendees: list[str] | None = None,
     location: str = "",
     timezone: str | None = None,
-    recurrence: list[str] | str | None = None,
     *,
     start_date: str | None = None,
     start_time_hhmm: str | None = None,
@@ -137,11 +136,6 @@ def create_event(
     if attendees:
         event_body["attendees"] = [{"email": e.strip()} for e in attendees if e and str(e).strip()]
 
-    if recurrence:
-        if isinstance(recurrence, str):
-            recurrence = [recurrence]
-        event_body["recurrence"] = [r if r.upper().startswith("RRULE:") else f"RRULE:{r}" for r in recurrence]
-
     result = (
         service.events()
         .insert(calendarId="primary", body=event_body, sendUpdates="all")
@@ -155,114 +149,6 @@ def create_event(
         result.get("htmlLink"),
     )
     return result
-
-
-def find_and_delete_event(
-    credentials,
-    *,
-    event_id: str | None = None,
-    title_hint: str | None = None,
-    date_hint: str | None = None,
-    timezone: str | None = None,
-) -> dict:
-    """
-    Find a calendar event and delete it.
-
-    Priority: event_id (direct) > title_hint + date_hint (search).
-    Returns: {"deleted": True, "event_id": ..., "summary": ..., "start": ...}
-    Raises: ValueError if no match found or multiple matches are ambiguous.
-    """
-    service = build("calendar", "v3", credentials=credentials, cache_discovery=False)
-    tz_name = (timezone or _default_tz_name()).strip() or _default_tz_name()
-    zone = _safe_zone(tz_name)
-
-    if event_id:
-        try:
-            ev = service.events().get(calendarId="primary", eventId=event_id).execute()
-            service.events().delete(calendarId="primary", eventId=event_id).execute()
-            logger.info("Calendar event deleted by id: %s", event_id)
-            return {"deleted": True, "event_id": event_id, "summary": ev.get("summary", ""), "start": ev.get("start", {})}
-        except Exception as exc:
-            raise ValueError(f"Could not delete event {event_id}: {exc}") from exc
-
-    # Search by title + date
-    if not title_hint:
-        raise ValueError("event_id or title_hint is required to delete an event")
-
-    # Build search window centred on the date hint
-    now_local = datetime.now(zone)
-    base = now_local  # default: today
-
-    if date_hint:
-        dh = date_hint.strip().lower()
-        if dh in ("today",):
-            base = now_local
-        elif dh in ("tomorrow",):
-            base = now_local + timedelta(days=1)
-        elif dh in ("yesterday",):
-            base = now_local - timedelta(days=1)
-        else:
-            try:
-                parsed = datetime.fromisoformat(date_hint.split("T")[0])
-                base = parsed.replace(tzinfo=zone)
-            except ValueError:
-                base = now_local  # fallback
-
-    # When a date is given, search only that exact day; otherwise use a ±3 day window
-    target_date_str = base.date().isoformat()  # always YYYY-MM-DD, resolved from any hint
-    if date_hint:
-        day_start = base.replace(hour=0, minute=0, second=0, microsecond=0)
-        day_end = base.replace(hour=23, minute=59, second=59, microsecond=0)
-        time_min = day_start.isoformat()
-        time_max = day_end.isoformat()
-    else:
-        time_min = (base - timedelta(days=1)).isoformat()
-        time_max = (base + timedelta(days=7)).isoformat()
-
-    result = (
-        service.events()
-        .list(
-            calendarId="primary",
-            timeMin=time_min,
-            timeMax=time_max,
-            singleEvents=True,
-            orderBy="startTime",
-            maxResults=50,
-        )
-        .execute()
-    )
-    events = result.get("items", [])
-
-    # Fuzzy match by title
-    title_lower = title_hint.strip().lower()
-    matches = [e for e in events if title_lower in (e.get("summary") or "").lower()]
-
-    if not matches:
-        raise ValueError(f"No event matching '{title_hint}' found near {date_hint or 'today'}.")
-    if len(matches) > 1:
-        # Narrow by resolved date (YYYY-MM-DD) — works for any date_hint phrasing
-        narrowed = [
-            e for e in matches
-            if (e.get("start") or {}).get("dateTime", (e.get("start") or {}).get("date", "")).startswith(target_date_str)
-        ]
-        if narrowed:
-            matches = narrowed
-
-    if len(matches) > 1:
-        summaries = ", ".join(
-            f"'{e.get('summary')}' on {(e.get('start') or {}).get('dateTime', (e.get('start') or {}).get('date', '?'))[:10]}"
-            for e in matches[:4]
-        )
-        raise ValueError(f"Multiple matching events found: {summaries}. Please be more specific.")
-
-    ev = matches[0]
-    ev_id = ev["id"]
-    summary = ev.get("summary", "")
-    start = ev.get("start", {})
-
-    service.events().delete(calendarId="primary", eventId=ev_id).execute()
-    logger.info("Calendar event deleted by search: id=%s title=%s", ev_id, summary)
-    return {"deleted": True, "event_id": ev_id, "summary": summary, "start": start}
 
 
 def list_upcoming_events(credentials, max_results: int = 10) -> list[dict]:

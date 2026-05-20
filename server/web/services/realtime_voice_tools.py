@@ -24,6 +24,7 @@ from services.mem0_service import (
     maybe_ingest_calendar_snapshot,
     maybe_ingest_gmail_snapshot,
     mem0_disabled_globally,
+    mem0_runtime_ready,
     search_context_for_prompt,
 )
 
@@ -113,87 +114,7 @@ def _fetch_weather_sync() -> dict:
 # ---------------------------------------------------------------------------
 # Web search helper (sync — called from run_in_executor)
 # Primary: Brave Search API (BRAVE_SEARCH_API_KEY env var, free tier 2000/mo)
-# ---------------------------------------------------------------------------
-# Google News RSS scraper (free, no key, returns real headlines)
-# ---------------------------------------------------------------------------
-
-def _fetch_google_news_rss_sync(query: str, num_results: int = 6) -> dict | None:
-    """Fetch news results from Google News RSS. Returns None on failure."""
-    try:
-        encoded = query.replace(" ", "+")
-        url = f"https://news.google.com/rss/search?q={encoded}&hl=en&gl=US&ceid=US:en"
-        with httpx.Client(timeout=8.0, follow_redirects=True) as client:
-            resp = client.get(url, headers={"User-Agent": "Mozilla/5.0"})
-            resp.raise_for_status()
-        root = ET.fromstring(resp.text)
-        channel = root.find("channel")
-        if channel is None:
-            return None
-        items = channel.findall("item")
-        results = []
-        for item in items[:num_results]:
-            title = (item.findtext("title") or "").strip()
-            link = (item.findtext("link") or "").strip()
-            source_el = item.find("{https://news.google.com}source") or item.find("source")
-            source_name = source_el.text.strip() if source_el is not None and source_el.text else ""
-            pub_date = (item.findtext("pubDate") or "").strip()
-            if title:
-                snippet = title
-                if source_name:
-                    snippet += f" ({source_name})"
-                if pub_date:
-                    snippet += f" — {pub_date[:22]}"
-                results.append({"title": title, "url": link, "snippet": snippet})
-        if not results:
-            return None
-        return {
-            "source": "google_news_rss",
-            "query": query,
-            "results": results,
-        }
-    except Exception as exc:
-        logger.warning("Google News RSS failed: %s", exc)
-        return None
-
-
-# ---------------------------------------------------------------------------
-# DuckDuckGo HTML scraper (free, no key, general web results)
-# ---------------------------------------------------------------------------
-
-def _fetch_ddg_html_sync(query: str, num_results: int = 5) -> dict | None:
-    """Scrape DuckDuckGo HTML search for snippet-level results. Returns None on failure."""
-    import re
-    try:
-        with httpx.Client(timeout=8.0, follow_redirects=True) as client:
-            resp = client.get(
-                "https://html.duckduckgo.com/html/",
-                params={"q": query},
-                headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"},
-            )
-            resp.raise_for_status()
-        html = resp.text
-        # Extract result snippets using regex on DDG HTML structure
-        snippets = re.findall(r'class="result__snippet"[^>]*>(.*?)</a>', html, re.DOTALL)
-        titles = re.findall(r'class="result__a"[^>]*>(.*?)</a>', html, re.DOTALL)
-        # Strip HTML tags from snippets
-        def strip_tags(s: str) -> str:
-            return re.sub(r"<[^>]+>", "", s).strip()
-        results = []
-        for i, snip in enumerate(snippets[:num_results]):
-            title = strip_tags(titles[i]) if i < len(titles) else ""
-            snippet = strip_tags(snip)
-            if snippet:
-                results.append({"title": title, "snippet": snippet})
-        if not results:
-            return None
-        return {"source": "duckduckgo_html", "query": query, "results": results}
-    except Exception as exc:
-        logger.warning("DDG HTML scrape failed: %s", exc)
-        return None
-
-
-# ---------------------------------------------------------------------------
-# Web search — Brave (paid) → Google News RSS → DDG HTML → DDG JSON instant
+# Fallback: DuckDuckGo Instant Answer API (no key, limited to factual answers)
 # ---------------------------------------------------------------------------
 
 def _fetch_web_search_sync(query: str, num_results: int = 5) -> dict:
@@ -241,25 +162,9 @@ def _fetch_web_search_sync(query: str, num_results: int = 5) -> dict:
         except Exception as exc:
             logger.warning("Brave search failed, falling back to DDG: %s", exc)
 
-    # Fallback 1: Google News RSS — best for any news/current-events query
-    news_kw = any(w in query.lower() for w in (
-        "news", "latest", "today", "recent", "update", "headline", "breaking",
-        "ipl", "cricket", "football", "match", "score", "politics", "election",
-        "market", "stock", "economy", "trump", "modi", "government",
-    ))
-    if news_kw:
-        gnews = _fetch_google_news_rss_sync(query, num_results)
-        if gnews:
-            return gnews
-
-    # Fallback 2: DuckDuckGo HTML scraper — general web results
-    ddg_html = _fetch_ddg_html_sync(query, num_results)
-    if ddg_html:
-        return ddg_html
-
-    # Fallback 3: DuckDuckGo Instant Answer JSON (factual lookups only)
+    # Fallback: DuckDuckGo Instant Answer API (facts/definitions only, no full web results)
     try:
-        with httpx.Client(timeout=6.0, follow_redirects=True) as client:
+        with httpx.Client(timeout=8.0, follow_redirects=True) as client:
             resp = client.get(
                 "https://api.duckduckgo.com/",
                 params={"q": query, "format": "json", "no_redirect": 1, "no_html": 1, "skip_disambig": 1},
@@ -279,27 +184,23 @@ def _fetch_web_search_sync(query: str, num_results: int = 5) -> dict:
             if text:
                 related.append({"snippet": text[:200]})
 
-        if quick or related:
+        if not quick and not related:
             return {
                 "source": "duckduckgo",
                 "query": query,
-                "quick_answer": quick,
-                "results": related,
+                "note": "No instant answer found. Set BRAVE_SEARCH_API_KEY for full web search.",
+                "results": [],
             }
+
+        return {
+            "source": "duckduckgo",
+            "query": query,
+            "quick_answer": quick,
+            "results": related,
+        }
     except Exception as exc:
-        logger.warning("DDG JSON fallback failed: %s", exc)
-
-    # Try Google News RSS for any query as last resort
-    gnews_any = _fetch_google_news_rss_sync(query, num_results)
-    if gnews_any:
-        return gnews_any
-
-    return {
-        "source": "unavailable",
-        "query": query,
-        "note": "All search backends failed. Add BRAVE_SEARCH_API_KEY for reliable results.",
-        "results": [],
-    }
+        logger.warning("DDG fallback also failed: %s", exc)
+        return {"error": "search_unavailable", "detail": str(exc)}
 
 
 # ---------------------------------------------------------------------------
@@ -345,6 +246,82 @@ def _fetch_news_sync(category: str = "top", limit: int = 6) -> dict:
 REALTIME_DEVICE_NAV_SCREENS = frozenset(
     {"home", "calendar", "emails", "meetings", "morning_brief", "settings", "mic_test"}
 )
+
+_SIDE_EFFECT_HINTS = (
+    "send",
+    "email",
+    "invite",
+    "calendar",
+    "schedule",
+    "remind",
+    "reminder",
+    "create",
+    "update",
+    "delete",
+    "cancel",
+    "book",
+)
+
+
+def _truth_status_for_assistant_intent(payload: dict[str, Any]) -> dict[str, Any]:
+    pending = payload.get("pending_actions")
+    rows = pending if isinstance(pending, list) else []
+    pending_ids = [
+        str(r.get("id") or "").strip()
+        for r in rows
+        if isinstance(r, dict) and str(r.get("id") or "").strip()
+    ]
+    committed = len(pending_ids) == 0
+    return {
+        "writes_committed": committed,
+        "pending_count": len(pending_ids),
+        "pending_ids": pending_ids,
+        "note": (
+            "Writes are queued only; none executed yet."
+            if not committed
+            else "No queued writes in this response."
+        ),
+    }
+
+
+def _resolve_pending_for_approval(user_id: str, requested_pending_id: str) -> tuple[str | None, dict[str, Any] | None]:
+    pid = (requested_pending_id or "").strip()
+    if pid:
+        return pid, None
+
+    pending = list_pending_actions_for_user(user_id)
+    if len(pending) == 1 and isinstance(pending[0], dict):
+        only = str(pending[0].get("id") or "").strip()
+        if only:
+            return only, None
+
+    if not pending:
+        return None, {
+            "error": "no_pending_actions",
+            "detail": "There are no queued actions to approve right now.",
+            "truth_status": {"writes_committed": False, "note": "No write executed."},
+        }
+
+    choices = []
+    for row in pending[:5]:
+        if not isinstance(row, dict):
+            continue
+        rid = str(row.get("id") or "").strip()
+        if not rid:
+            continue
+        choices.append(
+            {
+                "id": rid,
+                "brief_label": str(row.get("brief_label") or "").strip(),
+                "tool_name": str(row.get("tool_name") or "").strip(),
+            }
+        )
+    return None, {
+        "error": "pending_id_required",
+        "detail": "Multiple queued actions found; specify which one to approve.",
+        "pending_choices": choices,
+        "truth_status": {"writes_committed": False, "note": "No write executed."},
+    }
 
 # OpenAI Realtime function tools (JSON schema parameters).
 REALTIME_VOICE_TOOL_DEFINITIONS: list[dict[str, Any]] = [
@@ -464,8 +441,16 @@ REALTIME_VOICE_TOOL_DEFINITIONS: list[dict[str, Any]] = [
                     "type": "string",
                     "description": "The pending action UUID from the assistant queue.",
                 },
+                "confirmed_by_user": {
+                    "type": "boolean",
+                    "description": "Must be true only after explicit verbal confirmation.",
+                },
+                "confirmation_phrase": {
+                    "type": "string",
+                    "description": "Exact short confirmation heard from user (e.g. 'yes go ahead').",
+                },
             },
-            "required": ["pending_id"],
+            "required": ["pending_id", "confirmed_by_user", "confirmation_phrase"],
         },
     },
     {
@@ -563,7 +548,14 @@ def _http_exc_to_tool_json(exc: HTTPException) -> str:
             detail = json.dumps(detail)
         except TypeError:
             detail = str(detail)
-    return json.dumps({"error": "request_failed", "status": exc.status_code, "detail": detail[:4000]})
+    return json.dumps(
+        {
+            "error": "request_failed",
+            "status": exc.status_code,
+            "detail": detail[:4000],
+            "truth_status": {"writes_committed": False, "note": "No write executed."},
+        }
+    )
 
 
 def _assistant_intent_json(payload: dict[str, Any]) -> str:
@@ -593,6 +585,27 @@ def _assistant_intent_json(payload: dict[str, Any]) -> str:
     return json.dumps(slim2, default=str)[:_MAX_ASSISTANT_INTENT_JSON]
 
 
+def _needs_task_clarification(message: str) -> str | None:
+    m = " ".join((message or "").lower().split())
+    if not any(k in m for k in _SIDE_EFFECT_HINTS):
+        return None
+    # Calendar invite with missing core fields.
+    if any(k in m for k in ("invite", "calendar", "schedule", "book")):
+        has_time = any(k in m for k in ("tomorrow", "today", " at ", "am", "pm", "next ", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"))
+        has_title = any(k in m for k in ("about", "for ", "called ", "titled "))
+        if not has_time or not has_title:
+            return "I can do that. What time should I schedule it, and what should I title the invite?"
+    # Email send with no recipient hint.
+    if "email" in m or "send" in m:
+        if "@" not in m and not any(k in m for k in ("to ", "recipient", "cc ", "bcc ")):
+            return "Sure. Who should this email go to, and what tone should I use?"
+    # Reminder without time cue.
+    if "remind" in m or "reminder" in m:
+        if not any(k in m for k in ("at ", "tomorrow", "today", "next ", "on ", "in ")):
+            return "Got it. What should I remind you about, and when should I remind you?"
+    return None
+
+
 def execute_realtime_voice_tool(
     *,
     user_id: str,
@@ -613,7 +626,12 @@ def execute_realtime_voice_tool(
 
     try:
         if name == "memory_search":
-            if mem0_disabled_globally():
+            # Use the runtime-ready check (not just the disable-env check):
+            # if MEM0_API_KEY is missing or the Memory() client failed to
+            # initialize, we must report mem0_enabled=false so the model
+            # tells the user "memory is unavailable right now" instead of
+            # truthfully but misleadingly saying "I have nothing saved".
+            if not mem0_runtime_ready():
                 return json.dumps({"mem0_enabled": False, "snippet": None})
             q = str(args.get("query") or "").strip()
             if not q:
@@ -674,6 +692,17 @@ def execute_realtime_voice_tool(
             msg = str(args.get("message") or "").strip()
             if not msg:
                 return json.dumps({"error": "message_required"})
+            clarify = _needs_task_clarification(msg)
+            if clarify:
+                return json.dumps(
+                    {
+                        "assistant_message": clarify,
+                        "pending_actions": [],
+                        "tool_results": [],
+                        "requires_clarification": True,
+                    },
+                    default=str,
+                )
             mid = args.get("meeting_id")
             meeting_id = str(mid).strip() if mid else None
             payload = process_assistant_intent(
@@ -682,6 +711,8 @@ def execute_realtime_voice_tool(
                 meeting_id=meeting_id,
                 source="voice_realtime",
             )
+            if isinstance(payload, dict):
+                payload["truth_status"] = _truth_status_for_assistant_intent(payload)
             try:
                 maybe_ingest_assistant_turn(
                     user_id,
@@ -699,13 +730,44 @@ def execute_realtime_voice_tool(
             return json.dumps({"pending": rows, "count": len(rows)}, default=str)
 
         if name == "approve_pending_action":
-            pid = str(args.get("pending_id") or "").strip()
-            if not pid:
-                return json.dumps({"error": "pending_id_required"})
+            pid_raw = str(args.get("pending_id") or "").strip()
+            pid, resolve_err = _resolve_pending_for_approval(user_id, pid_raw)
+            if resolve_err:
+                return json.dumps(resolve_err, default=str)
+            if args.get("confirmed_by_user") is not True:
+                return json.dumps(
+                    {
+                        "error": "confirmation_required",
+                        "detail": "Explicit user confirmation is required before executing actions.",
+                        "truth_status": {
+                            "writes_committed": False,
+                            "note": "No write executed because confirmation is missing.",
+                        },
+                    }
+                )
+            phrase = str(args.get("confirmation_phrase") or "").strip().lower()
+            allowed = ("yes", "confirm", "go ahead", "approve", "do it", "send it")
+            if not phrase or not any(a in phrase for a in allowed):
+                return json.dumps(
+                    {
+                        "error": "confirmation_phrase_required",
+                        "detail": "Provide the user's explicit confirmation phrase.",
+                        "truth_status": {
+                            "writes_committed": False,
+                            "note": "No write executed because confirmation phrase was insufficient.",
+                        },
+                    }
+                )
             try:
                 out = svc_approve_pending_action(pid, user_id)
             except HTTPException as e:
                 return _http_exc_to_tool_json(e)
+            if isinstance(out, dict):
+                ok = str(out.get("status") or "").lower() == "completed"
+                out["truth_status"] = {
+                    "writes_committed": ok,
+                    "note": "Write executed successfully." if ok else "Write did not execute successfully.",
+                }
             return json.dumps(out, default=str)
 
         if name == "reject_pending_action":
