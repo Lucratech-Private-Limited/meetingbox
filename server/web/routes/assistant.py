@@ -44,10 +44,14 @@ async def post_intent(
   Requires a dashboard JWT or paired device token unless
   MEETINGBOX_ASSISTANT_ALLOW_ANON=1 (not recommended for production or demos on the public internet).
   """
+  import asyncio
   if not _ASSISTANT_ALLOW_ANON and current_actor is None:
     raise HTTPException(status_code=401, detail="Authentication required.")
   owner_id = current_actor["user"]["id"] if current_actor else None
-  return process_assistant_intent(
+  # Run in a thread so the long-running synchronous AI call does not block
+  # the entire FastAPI event loop (prevents cascading 502s on concurrent requests).
+  return await asyncio.to_thread(
+    process_assistant_intent,
     message=body.message,
     user_id=owner_id,
     meeting_id=body.meeting_id,

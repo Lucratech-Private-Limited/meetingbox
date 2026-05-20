@@ -824,6 +824,98 @@ async def install_update(current_user: Optional[dict] = Depends(get_optional_use
 
 
 # ======================================================================
+# AUDIO COMMAND LONG-POLL (cloud mode — no local Redis on device)
+# ======================================================================
+
+async def _wait_for_redis_command(redis_host: str, timeout: float) -> dict | None:
+    """Subscribe to the Redis 'commands' channel and wait up to *timeout* seconds."""
+    import redis.asyncio as aioredis
+    import asyncio
+
+    r = aioredis.Redis(host=redis_host, port=6379, decode_responses=True)
+    try:
+        async with r.pubsub() as pubsub:
+            await pubsub.subscribe("commands")
+            deadline = asyncio.get_event_loop().time() + timeout
+            while True:
+                left = deadline - asyncio.get_event_loop().time()
+                if left <= 0:
+                    return None
+                try:
+                    msg = await asyncio.wait_for(
+                        pubsub.get_message(ignore_subscribe_messages=True),
+                        timeout=min(left, 1.0),
+                    )
+                    if msg is not None:
+                        try:
+                            return json.loads(msg["data"])
+                        except (json.JSONDecodeError, TypeError, KeyError):
+                            continue
+                except asyncio.TimeoutError:
+                    pass
+    finally:
+        await r.aclose()
+
+
+@router.get("/audio-command/wait")
+async def audio_command_wait(
+    current_device: dict = Depends(get_current_device_row),
+):
+    """Long-poll: block up to 28 s waiting for the next recording/mic-test command.
+
+    The audio capture container on the device uses this when it cannot reach a
+    local Redis instance (cloud / remote-server deployment).  Returns 204 No
+    Content on timeout so the client can immediately re-poll.
+    """
+    from starlette.responses import Response
+
+    command = await _wait_for_redis_command(REDIS_HOST, timeout=28.0)
+    if command is None:
+        return Response(status_code=204)
+    return command
+
+
+# ======================================================================
+# APPLIANCE SYSTEM METRICS (device UI → server → web dashboard)
+# ======================================================================
+
+class ApplianceMetrics(BaseModel):
+    cpu_percent: float = 0.0
+    memory_percent: float = 0.0
+    memory_used_gb: float = 0.0
+    memory_total_gb: float = 0.0
+    disk_percent: float = 0.0
+    disk_used_gb: float = 0.0
+    disk_total_gb: float = 0.0
+
+
+_APPLIANCE_METRICS_KEY = "appliance:system_metrics"
+_APPLIANCE_METRICS_TTL = 300  # seconds — expire if device stops reporting
+
+
+@router.post("/system-metrics")
+async def post_system_metrics(
+    metrics: ApplianceMetrics,
+    current_device: dict = Depends(get_current_device_row),
+):
+    """Accept CPU/RAM/disk metrics pushed periodically by the device UI.
+
+    Stored in Redis with a 5-minute TTL so the web dashboard can display
+    live appliance health even when the device itself has no public IP.
+    Returns 200 silently on Redis errors (non-critical telemetry).
+    """
+    try:
+        _get_redis().setex(
+            _APPLIANCE_METRICS_KEY,
+            _APPLIANCE_METRICS_TTL,
+            json.dumps(metrics.model_dump()),
+        )
+    except Exception as exc:
+        logger.debug("Could not store appliance metrics in Redis: %s", exc)
+    return {"ok": True}
+
+
+# ======================================================================
 # INTEGRATIONS (delegates to /api/integrations router)
 # These thin wrappers exist because the frontend api/integrations.ts
 # and the device-ui api_client.py both call /api/device/integrations/*.

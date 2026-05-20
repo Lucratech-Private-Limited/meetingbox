@@ -76,10 +76,17 @@ def build_briefing_context_dict(
     user_id: str,
     days_ahead: int = 1,
     mem0_cap: int = 1200,
+    gmail_preview_max: int = 1,
+    mem0_briefing_query: str | None = None,
 ) -> dict:
     """
     Same payload shape as GET /api/briefing/context (without FastAPI types).
+
+    gmail_preview_max: Gmail rows to attach (Realtime voice uses >1; SPA default stays 1).
+    mem0_briefing_query: override Mem0 briefing search string (None = sensible default).
     """
+    # da=1 → today only. da=2 → today through tomorrow (included). Voice questions often mean
+    # "tomorrow" while the tool omitted days_ahead; Realtime tooling defaults da=2 in realtime_voice_tools.
     da = max(1, min(int(days_ahead), 14))
     cap = max(0, min(int(mem0_cap), 8000))
 
@@ -111,7 +118,10 @@ def build_briefing_context_dict(
 
     mem0_snippet: str | None = None
     if cap > 0:
-        blob = search_context_for_prompt(user_id, "briefing priorities follow-ups reminders")
+        mq = (mem0_briefing_query or "").strip() or (
+            "briefing priorities follow-ups reminders calendar email tasks meetings commitments inbox"
+        )
+        blob = search_context_for_prompt(user_id, mq)
         if blob and blob.strip():
             mem0_snippet = blob[:cap]
 
@@ -120,22 +130,37 @@ def build_briefing_context_dict(
     pending_out["count"] = pending_out.get("count_pending", 0)
     meetings_recent = recent_meetings_for_briefing(user_id, limit=8)
 
+    gmax = max(1, min(int(gmail_preview_max), 25))
+
     gmail_preview: dict | None = None
     creds_g = get_credentials_for_provider(user_id, "gmail")
     if creds_g:
         try:
-            msgs = list_recent_messages(creds_g, max_results=1, q="")
+            msgs = list_recent_messages(creds_g, max_results=gmax, q="")
             gmail_preview = {
                 "connected": True,
                 "top": msgs[0] if msgs else None,
+                "recent_messages": msgs,
+                "recent_count": len(msgs),
             }
         except HttpError as e:
-            gmail_preview = {"connected": True, "error": getattr(e, "reason", "gmail_error"), "top": None}
+            gmail_preview = {
+                "connected": True,
+                "error": getattr(e, "reason", "gmail_error"),
+                "top": None,
+                "recent_messages": [],
+                "recent_count": 0,
+            }
         except Exception:
             logger.debug("briefing gmail preview failed", exc_info=True)
-            gmail_preview = {"connected": True, "top": None}
+            gmail_preview = {
+                "connected": True,
+                "top": None,
+                "recent_messages": [],
+                "recent_count": 0,
+            }
     else:
-        gmail_preview = {"connected": False, "top": None}
+        gmail_preview = {"connected": False, "top": None, "recent_messages": [], "recent_count": 0}
 
     name = _user_display_name(actor)
     hour = datetime.now(zone).hour

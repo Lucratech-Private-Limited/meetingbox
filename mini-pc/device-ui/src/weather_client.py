@@ -29,7 +29,7 @@ import json
 import logging
 import threading
 import time
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -89,6 +89,11 @@ class WeatherSnapshot:
     label: str
     icon: str  # short key: "sun" | "cloud" | "rain" | "snow" | "thunder"
     fetched_at: float  # epoch seconds
+    hi_c: Optional[float] = None
+    lo_c: Optional[float] = None
+    humidity_pct: Optional[int] = None
+    wind_kmh: Optional[float] = None
+    aqi: Optional[int] = None
 
     def is_stale(self, max_age_s: float = 3600.0) -> bool:
         return (time.time() - self.fetched_at) > max_age_s
@@ -234,21 +239,63 @@ class WeatherClient:
                     params={
                         "latitude": loc["latitude"],
                         "longitude": loc["longitude"],
-                        "current": "temperature_2m,weather_code",
+                        "current": "temperature_2m,weather_code,relative_humidity_2m,wind_speed_10m",
+                        "daily": "temperature_2m_max,temperature_2m_min",
+                        "forecast_days": 1,
                         "temperature_unit": "celsius",
                         "timezone": "auto",
                     },
                 )
                 resp.raise_for_status()
                 data = resp.json()
+                # Air quality is served by a separate endpoint.
+                aqi = None
+                try:
+                    aqi_resp = await client.get(
+                        "https://air-quality-api.open-meteo.com/v1/air-quality",
+                        params={
+                            "latitude": loc["latitude"],
+                            "longitude": loc["longitude"],
+                            "current": "us_aqi",
+                            "timezone": "auto",
+                        },
+                    )
+                    aqi_resp.raise_for_status()
+                    aq_data = aqi_resp.json() or {}
+                    cur_aq = (aq_data.get("current") or {}).get("us_aqi")
+                    if cur_aq is not None:
+                        aqi = int(round(float(cur_aq)))
+                except Exception:
+                    aqi = None
         except Exception as exc:  # noqa: BLE001
             logger.warning("Open-Meteo forecast failed: %s", exc)
             return
         cur = (data or {}).get("current") or {}
+        daily = (data or {}).get("daily") or {}
         try:
             temp_c = float(cur.get("temperature_2m"))
         except (TypeError, ValueError):
             return
+        try:
+            hi_raw = (daily.get("temperature_2m_max") or [None])[0]
+            hi_c = float(hi_raw) if hi_raw is not None else None
+        except (TypeError, ValueError):
+            hi_c = None
+        try:
+            lo_raw = (daily.get("temperature_2m_min") or [None])[0]
+            lo_c = float(lo_raw) if lo_raw is not None else None
+        except (TypeError, ValueError):
+            lo_c = None
+        try:
+            hum_raw = cur.get("relative_humidity_2m")
+            humidity_pct = int(round(float(hum_raw))) if hum_raw is not None else None
+        except (TypeError, ValueError):
+            humidity_pct = None
+        try:
+            wind_raw = cur.get("wind_speed_10m")
+            wind_kmh = float(wind_raw) if wind_raw is not None else None
+        except (TypeError, ValueError):
+            wind_kmh = None
         try:
             code = int(cur.get("weather_code") or 0)
         except (TypeError, ValueError):
@@ -259,6 +306,11 @@ class WeatherClient:
             temp_c=temp_c,
             label=label,
             icon=icon,
+            hi_c=hi_c,
+            lo_c=lo_c,
+            humidity_pct=humidity_pct,
+            wind_kmh=wind_kmh,
+            aqi=aqi,
             fetched_at=time.time(),
         )
         self._publish(snap)

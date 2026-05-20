@@ -1,8 +1,9 @@
 """
 Route free-form user text to a specialist agent id (Phase 1 orchestrator).
 
-Uses trigger overlap from agent JSON first, then optional Anthropic classification.
-The meeting_agent is excluded from interactive routing (system pipeline only).
+1) Keyword overlap in agent JSON (fast path).
+2) LLM classification: OpenAI (when OPENAI_API_KEY is set) with optional Mem0 context + agent
+   descriptions; otherwise Anthropic (AI_MODEL). No hard-coded phrase routing.
 """
 
 from __future__ import annotations
@@ -40,6 +41,42 @@ def _get_anthropic():
 
     _anthropic_client = Anthropic(api_key=key)
   return _anthropic_client
+
+
+def _mem0_router_snippet(user_id: str | None, message: str) -> str:
+  """Short Mem0 recall for routing only (same store as assistant augment)."""
+  if not (user_id or "").strip():
+    return ""
+  try:
+    from services.mem0_service import search_context_for_prompt
+
+    blob = search_context_for_prompt(str(user_id).strip(), message, top_k=6)
+  except Exception:
+    logger.debug("Mem0 router context skipped", exc_info=True)
+    return ""
+  if not blob:
+    return ""
+  return (
+    "\nLong-term memory snippets for this user (reference only; may be incomplete):\n"
+    f"<<<MEM0\n{blob[:6000]}\nMEM0>>>\n"
+  )
+
+
+def _router_candidates() -> tuple[set[str], list[dict[str, Any]]]:
+  valid_ids: set[str] = set()
+  candidates: list[dict[str, Any]] = []
+  for agent in list_agents():
+    if agent["id"] in SYSTEM_ONLY_AGENTS:
+      continue
+    valid_ids.add(agent["id"])
+    candidates.append(
+        {
+          "id": agent["id"],
+          "name": agent.get("name"),
+          "description": (agent.get("description") or "")[:400],
+        }
+    )
+  return valid_ids, candidates
 
 
 def _score_triggers(message_lower: str, triggers: list[str]) -> int:
@@ -92,33 +129,78 @@ def _parse_classifier_json(text: str) -> dict[str, Any]:
   return json.loads(text)
 
 
-def route_with_llm(message: str) -> RouteResult | None:
+def _json_route_to_result(data: dict[str, Any], valid_ids: set[str]) -> RouteResult | None:
+  raw_id = str(data.get("agent_id") or "none").strip()
+  if raw_id == "none" or not raw_id:
+    return None
+  if raw_id not in valid_ids:
+    logger.warning("Router returned unknown agent_id %r", raw_id)
+    return None
+  return RouteResult(agent_id=raw_id, method="llm", rationale=str(data.get("rationale") or ""))
+
+
+def route_with_llm(message: str, user_id: str | None = None) -> RouteResult | None:
+  valid_ids, candidates = _router_candidates()
+  if not valid_ids:
+    return None
+
+  mem0_part = _mem0_router_snippet(user_id, message)
+  user_ask = (message or "").strip()[:4000]
+
+  instructions = (
+    "You route the user message to exactly one specialist agent, or none.\n"
+    "Return a JSON object with keys: \"agent_id\" (string, one of the listed ids or \"none\"), "
+    "\"rationale\" (one short sentence).\n"
+    "Use the candidate descriptions, the user message, and any memory context to infer intent.\n"
+    "Prefer a specialist whenever the user is asking about schedules, calendar, tasks, email, "
+    " Gmail, past meetings, transcripts, or device controls — even if phrasing is vague.\n"
+    "Use \"none\" only if the message has no plausible connection to any candidate's domain.\n"
+  )
+
+  # --- OpenAI (preferred when key present; matches TTS / Whisper stack) ---
+  oa_key = os.getenv("OPENAI_API_KEY", "").strip()
+  if oa_key:
+    try:
+      from openai import OpenAI
+
+      router_model = (os.getenv("OPENAI_ROUTER_MODEL") or "gpt-4o-mini").strip()
+      client = OpenAI(api_key=oa_key)
+      user_payload = (
+        f"Candidates (choose at most one id):\n{json.dumps(candidates, indent=2)}\n"
+        f"{mem0_part}\nUser message:\n{user_ask}\n"
+      )
+      resp = client.chat.completions.create(
+        model=router_model,
+        max_tokens=250,
+        response_format={"type": "json_object"},
+        messages=[
+          {"role": "system", "content": instructions},
+          {"role": "user", "content": user_payload},
+        ],
+      )
+      raw = (resp.choices[0].message.content or "").strip()
+      data = json.loads(raw)
+      hit = _json_route_to_result(data, valid_ids)
+      if hit:
+        hit = RouteResult(
+          agent_id=hit.agent_id,
+          method="openai",
+          rationale=hit.rationale,
+        )
+        return hit
+    except Exception:
+      logger.exception("OpenAI intent router failed; trying Anthropic if configured")
+
+  # --- Anthropic fallback ---
   client = _get_anthropic()
   if not client:
     return None
 
-  candidates: list[dict[str, Any]] = []
-  valid_ids: set[str] = set()
-  for agent in list_agents():
-    if agent["id"] in SYSTEM_ONLY_AGENTS:
-      continue
-    valid_ids.add(agent["id"])
-    candidates.append(
-      {
-        "id": agent["id"],
-        "name": agent.get("name"),
-        "description": (agent.get("description") or "")[:400],
-      }
-    )
-  if not valid_ids:
-    return None
-
   prompt = (
-    "You route user messages to at most one specialist agent.\n"
-    "Return **only** valid JSON: {\"agent_id\": \"<id>|none\", \"rationale\": \"one short sentence\"}\n"
-    "Pick \"none\" if no specialist fits.\n\n"
-    f"Candidates:\n{json.dumps(candidates, indent=2)}\n\n"
-    f"User message:\n{message.strip()[:4000]}\n"
+    instructions
+    + "\nReturn **only** valid JSON: {\"agent_id\": \"<id>|none\", \"rationale\": \"one short sentence\"}\n\n"
+    f"Candidates:\n{json.dumps(candidates, indent=2)}\n"
+    f"{mem0_part}\nUser message:\n{user_ask}\n"
   )
   model = os.getenv("AI_MODEL", "claude-sonnet-4-20250514")
   try:
@@ -128,7 +210,7 @@ def route_with_llm(message: str) -> RouteResult | None:
       messages=[{"role": "user", "content": prompt}],
     )
   except Exception:
-    logger.exception("Orchestrator LLM classification failed")
+    logger.exception("Anthropic intent router failed")
     return None
 
   block = resp.content[0]
@@ -136,18 +218,16 @@ def route_with_llm(message: str) -> RouteResult | None:
   try:
     data = _parse_classifier_json(text)
   except (json.JSONDecodeError, IndexError, TypeError):
-    logger.warning("Orchestrator LLM returned non-JSON: %s", text[:200])
+    logger.warning("Anthropic router returned non-JSON: %s", text[:200])
     return None
 
-  raw_id = str(data.get("agent_id") or "none").strip()
-  if raw_id == "none" or not raw_id:
-    return RouteResult(agent_id=None, method="llm", rationale=str(data.get("rationale") or ""))
-  if raw_id not in valid_ids:
-    return RouteResult(agent_id=None, method="llm", rationale="model returned unknown agent_id")
-  return RouteResult(agent_id=raw_id, method="llm", rationale=str(data.get("rationale") or ""))
+  hit = _json_route_to_result(data, valid_ids)
+  if hit:
+    return RouteResult(agent_id=hit.agent_id, method="anthropic", rationale=hit.rationale)
+  return None
 
 
-def route_intent(message: str) -> RouteResult:
+def route_intent(message: str, user_id: str | None = None) -> RouteResult:
   """Choose specialist agent id or none."""
   text = (message or "").strip()
   if not text:
@@ -157,8 +237,9 @@ def route_intent(message: str) -> RouteResult:
   if hit:
     return hit
 
-  llm_hit = route_with_llm(text)
+  llm_hit = route_with_llm(text, user_id=user_id)
   if llm_hit:
     return llm_hit
 
   return RouteResult(agent_id=None, method="none", rationale="no_trigger_no_llm_match")
+

@@ -1,0 +1,35 @@
+# MeetingBox self-hosted LiveKit server configuration.
+#
+# Notes
+# -----
+# * `keys` is read from the LIVEKIT_KEYS env var in docker-compose
+#   (format: "<api_key>: <api_secret>"). Do not commit secrets here.
+# * `port` is the signaling websocket port (HTTP). nginx proxies wss://host/rtc
+#   to http://livekit:7880.
+# * `rtc.tcp_port` is the WebRTC fallback for clients that cannot do UDP.
+# * `rtc.use_external_ip: true` makes LiveKit auto-detect the public IPv4 via
+#   STUN so ICE candidates work from devices outside the host's NAT.
+# * `rtc.port_range_start/end` controls the UDP port range advertised in ICE
+#   candidates. Bind this range in docker-compose so the host firewall lets
+#   media through.
+
+port: 7880
+
+bind_addresses:
+  - ""
+
+rtc:
+  tcp_port: 7881
+  port_range_start: 50000
+  port_range_end: 50099
+  use_external_ip: true
+
+logging:
+  level: info
+  pion_level: warn
+
+room:
+  empty_timeout: 60
+  enabled_codecs:
+    - mime: audio/opus
+    - mime: audio/red

@@ -8,12 +8,15 @@ import json
 import logging
 import os
 import sys
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException
 from openai import OpenAI
 from pydantic import BaseModel, Field
 
 from auth import get_current_actor
+from services.calendar import default_calendar_tz_name
 from services.realtime_voice_tools import (
     REALTIME_VOICE_TOOL_DEFINITIONS,
     execute_realtime_voice_tool,
@@ -48,7 +51,33 @@ _REALTIME_VOICE_ALLOWED = frozenset(
 )
 _REALTIME_VOICE_ALIASES = {"nova": "shimmer", "fable": "sage"}
 
-_REALTIME_INSTRUCTIONS = """You are MeetingBox — a fast, natural, always-on voice assistant powered by GPT-5. You are a full general-purpose AI with deep knowledge across every domain, plus live tools for the user's personal data and real-time information.
+def _build_realtime_instructions() -> str:
+    """Generate the session system prompt with live date/time/timezone injected."""
+    tz_name = default_calendar_tz_name()
+    try:
+        zone = ZoneInfo(tz_name)
+        now = datetime.now(zone)
+        day_name = now.strftime("%A")
+        date_str = now.strftime("%-d %B %Y") if sys.platform != "win32" else now.strftime("%#d %B %Y")
+        time_str = now.strftime("%I:%M %p").lstrip("0")
+        offset_hours = int(now.utcoffset().total_seconds() // 3600)
+        offset_mins = int(abs(now.utcoffset().total_seconds()) % 3600 // 60)
+        offset_str = f"UTC{offset_hours:+d}" if offset_mins == 0 else f"UTC{offset_hours:+d}:{offset_mins:02d}"
+        datetime_block = (
+            f"CONTEXT FACTS (silent — use only when relevant, do NOT announce at session start):\n"
+            f"  today = {day_name}, {date_str}\n"
+            f"  local_time_at_session_start = {time_str}\n"
+            f"  user_timezone = {tz_name} ({offset_str})\n"
+            f"Use these to answer date/time/timezone questions when asked, and to resolve "
+            f'relative dates like "tomorrow" or "next Monday". NEVER ask the user for their '
+            f"timezone or today's date. NEVER recite this block unprompted."
+        )
+    except Exception:
+        datetime_block = "CONTEXT FACTS: (date/time unavailable; call get_briefing_context to get timezone and today's date when needed)"
+
+    return f"""You are MeetingBox — a fast, natural, always-on voice assistant powered by GPT-5. You are a full general-purpose AI with deep knowledge across every domain, plus live tools for the user's personal data and real-time information.
+
+{datetime_block}
 
 ═══════════════════════════════════════
 CORE VOICE BEHAVIOUR
@@ -60,7 +89,7 @@ RESPOND IMMEDIATELY — never stay silent after the user speaks:
 - No markdown or bullet lists in spoken replies — flowing sentences only.
 - Vary rhythm. Never stack closers ("take care / let me know / anything else").
 - If interrupted: stop immediately and attend to the new utterance.
-- If the user says bye / done / thanks that's all: one short line, then stop.
+- end_session: ONLY call this when the user EXPLICITLY says goodbye/bye/good night/done/see you/that's all/I'm done/signing off. NEVER call it on short unclear fragments ("Are you?", "Ok", "Yeah"), garbled audio, or mid-task. If in doubt, stay in the session.
 
 LANGUAGE: English unless they explicitly ask for another. Keep proper nouns as-is.
 
@@ -68,7 +97,7 @@ LANGUAGE: English unless they explicitly ask for another. Keep proper nouns as-i
 WHAT YOU KNOW (answer directly, no tools needed)
 ═══════════════════════════════════════
 You have vast training knowledge — use it confidently and directly for:
-- Current date and time (your session context includes this — state it immediately)
+- Current date and time (provided in CONTEXT FACTS above — answer when asked, never ask the user; do NOT announce unprompted)
 - Science, mathematics, physics, chemistry, biology, medicine basics
 - History, geography, politics, economics, law fundamentals
 - Technology, software, coding, engineering
@@ -143,17 +172,22 @@ Step 1 — Gather (if not already given):
   "What's the message about?" (if no content)
   User may say "take down the context first, I'll give you the address later" — that's fine. Collect what's offered, ask for the rest after.
 
-Step 2 — Infer tone from context and user emotion if not specified:
+Step 2 — Tone:
+  If the user explicitly states a tone ("polite", "firm", "friendly", "formal", "casual", "requesting"), USE IT EXACTLY — do not override or blend with your own judgement.
+  If no tone is given, infer from context:
   - User sounds rushed or frustrated → concise and direct
   - User is excited → warm and enthusiastic
   - Topic is a complaint or escalation → formal, measured
   - Topic is casual follow-up → friendly and brief
   Say the tone you chose only if it's non-obvious: "I'll keep it professional since it's a vendor follow-up."
 
-Step 3 — Announce the draft:
-  Say: "Alright, I've drafted the email — [1-sentence summary of recipient + subject]. Want me to send it now or save it as a draft for later?"
+Step 3 — Read the draft aloud before saving/sending:
+  Read the full email body aloud (or a faithful 2–3 sentence summary for long emails) and ask:
+  "Here's the draft: [read body]. Does that sound right, or shall I adjust anything?"
+  Wait for the user's approval of the CONTENT before proceeding.
+  Only after content is approved: "Want me to send it now or save it as a draft for later?"
   — "Send now" → call assistant_intent with the send request, then ask for approval
-  — "Draft for later" / "Save it" / "I'll send it myself" → call assistant_intent with a *save as Gmail draft* request. Then call memory_remember with the key facts: "Drafted email to [name/address] about [subject] — saved to Gmail Drafts. User may want to send this later." so you can find and send it in a future session.
+  — "Draft for later" / "Save it" / "I'll send it myself" / recipient not yet known → call assistant_intent with a *save as Gmail draft* request (recipient may be empty). Then call memory_remember: "Drafted email about [subject] — saved to Gmail Drafts."
 
 Step 4 — Confirmation:
   For send: state recipient + subject, ask "Good to go?" Wait for verbal yes before approve_pending_action.
@@ -161,9 +195,10 @@ Step 4 — Confirmation:
 
 Email address rules — voice is lossy:
   - NEVER invent or guess an email address. If you didn't clearly hear the full address, ask for it.
-  - Spell back what you heard letter-by-letter before acting: "Got it — that's j-o-h-n at acme dot com, right?"
-  - If the user says "I'll give you the address later", draft the email content first (save to drafts with a placeholder or hold in conversation), then ask for the address when they're ready.
-  - When proposing the email, always read the recipient address aloud so they can catch errors.
+  - Spell back what you heard letter-by-letter before acting: "Got it — that's v-i-v-e-k at gmail dot com, right?"
+  - If the user says "I'll give you the address later", draft the email content first WITHOUT a recipient, save it as a Gmail draft, then ask for the address only when they're ready to send.
+  - Do NOT refuse to save a draft just because you don't have the recipient yet.
+  - When proposing to send, always read the recipient address aloud so they can catch errors.
 
 ── CALENDAR EVENT ─────────────────────
 Required: title, date/time (or relative like "tomorrow", "next Monday"), duration or end time.
@@ -331,7 +366,7 @@ async def create_realtime_voice_session(actor: dict = Depends(get_current_actor)
             session={
                 "type": "realtime",
                 "model": model,
-                "instructions": _REALTIME_INSTRUCTIONS,
+                "instructions": _build_realtime_instructions(),
                 "tools": REALTIME_VOICE_TOOL_DEFINITIONS,
                 "tool_choice": "auto",
                 "output_modalities": ["audio"],

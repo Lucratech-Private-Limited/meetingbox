@@ -208,9 +208,16 @@ def find_and_delete_event(
             except ValueError:
                 base = now_local  # fallback
 
-    # Wide window: -1 day to +21 days so we catch events near the hint
-    time_min = (base - timedelta(days=1)).isoformat()
-    time_max = (base + timedelta(days=21)).isoformat()
+    # When a date is given, search only that exact day; otherwise use a ±3 day window
+    target_date_str = base.date().isoformat()  # always YYYY-MM-DD, resolved from any hint
+    if date_hint:
+        day_start = base.replace(hour=0, minute=0, second=0, microsecond=0)
+        day_end = base.replace(hour=23, minute=59, second=59, microsecond=0)
+        time_min = day_start.isoformat()
+        time_max = day_end.isoformat()
+    else:
+        time_min = (base - timedelta(days=1)).isoformat()
+        time_max = (base + timedelta(days=7)).isoformat()
 
     result = (
         service.events()
@@ -232,12 +239,11 @@ def find_and_delete_event(
 
     if not matches:
         raise ValueError(f"No event matching '{title_hint}' found near {date_hint or 'today'}.")
-    if len(matches) > 1 and date_hint:
-        # Narrow by date
-        date_str = date_hint.split("T")[0]
+    if len(matches) > 1:
+        # Narrow by resolved date (YYYY-MM-DD) — works for any date_hint phrasing
         narrowed = [
             e for e in matches
-            if (e.get("start") or {}).get("dateTime", (e.get("start") or {}).get("date", "")).startswith(date_str)
+            if (e.get("start") or {}).get("dateTime", (e.get("start") or {}).get("date", "")).startswith(target_date_str)
         ]
         if narrowed:
             matches = narrowed

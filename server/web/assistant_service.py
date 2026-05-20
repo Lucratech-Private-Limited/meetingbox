@@ -308,16 +308,24 @@ def _llm_communication_plan(message: str) -> list[dict[str, Any]] | None:
 
   prompt = (
     "Plan Gmail tools for the user message. Return **only** valid JSON: "
-    "{\"steps\": [ {\"tool\": \"gmail_list_recent\"|\"gmail_send_email\", "
-    "\"args\": object, \"is_write\": boolean } ] }.\n"
-    "Rules:\n"
-    "- Use gmail_list_recent for inbox, unread, recent mail, checking email, what arrived.\n"
-    "  Args: max_results (int 1–30, default 15), q (optional Gmail search).\n"
-    "  For general inbox / briefing scans omit q or use \"\" — the server applies a Primary + meeting-invite filter.\n"
-    "  Only set q for targeted search (from:, subject:, in:sent, in:spam, after:, newer_than:, etc.).\n"
-    "- Use gmail_send_email for sending mail. Args: to, subject, body, cc (array), "
-    "bcc (optional array), html_body (optional), thread_id (optional, for replies).\n"
-    "- gmail_send_email must have is_write true.\n"
+    "{\"steps\": [ {\"tool\": \"<tool_name>\", \"args\": {}, \"is_write\": true|false } ] }.\n\n"
+    "TOOL SELECTION RULES (apply in order):\n\n"
+    "1. gmail_list_recent — use for: inbox, unread, recent mail, checking email, what arrived.\n"
+    "   Args: max_results (int 1–30, default 15), q (optional Gmail search string).\n"
+    "   is_write: false.\n\n"
+    "2. gmail_create_draft — use when the user says: 'draft', 'save as draft', 'draft for later',\n"
+    "   'I will send it later', 'save it', 'don't send yet', OR the recipient is not yet known.\n"
+    "   Also use when the message explicitly says 'Create a Gmail draft'.\n"
+    "   Args: to (str, may be empty if recipient not yet known), subject (str), body (str),\n"
+    "   cc (array, optional).\n"
+    "   is_write: true.\n\n"
+    "3. gmail_send_email — use ONLY when the user explicitly says 'send now' or 'send it'.\n"
+    "   Never use this for drafts or when the user wants to review first.\n"
+    "   Args: to (str, required), subject (str), body (str), cc (array), bcc (optional array),\n"
+    "   html_body (optional), thread_id (optional, for replies).\n"
+    "   is_write: true.\n\n"
+    "IMPORTANT: If the message says 'draft' or 'save' anywhere, always use gmail_create_draft, "
+    "never gmail_send_email.\n\n"
     f"User message:\n{message.strip()[:4000]}\n"
   )
   model = os.getenv("AI_MODEL", "claude-sonnet-4-20250514")
@@ -380,8 +388,25 @@ def _heuristic_communication_plan(message: str) -> list[dict[str, Any]]:
     q = "is:unread" if "unread" in m else ""
     return [{"tool": TOOL_GMAIL_LIST, "args": {"max_results": 15, "q": q}, "is_write": False}]
 
+  draft_markers = (
+    "draft", "save as draft", "draft for later", "save it", "don't send",
+    "do not send", "send it later", "i'll send", "i will send",
+  )
   emails = _extract_emails_from_text(message)
   first_to = emails[0] if emails else ""
+
+  if any(x in m for x in draft_markers):
+    return [{
+      "tool": TOOL_GMAIL_DRAFT,
+      "args": {
+        "to": first_to,
+        "subject": "Draft",
+        "body": message.strip()[:8000] or "(empty)",
+        "cc": [],
+      },
+      "is_write": True,
+    }]
+
   return [{
     "tool": TOOL_GMAIL_SEND,
     "args": {

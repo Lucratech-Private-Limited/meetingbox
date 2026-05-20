@@ -44,6 +44,7 @@ from routes.briefing import router as briefing_router
 from routes.admin_memory import router as admin_memory_router
 from routes.voice import router as voice_router
 from routes.weather import router as weather_router
+from routes.tts import router as tts_router
 from auth import get_optional_user, resolve_actor_from_access_token
 from routes.device import SetupCompleteBody, finalize_first_boot_setup
 from rate_limit import limiter
@@ -239,8 +240,22 @@ def _auto_delete_thread() -> None:
     time.sleep(INTERVAL)
 
 
+def _check_mem0_startup() -> None:
+  """Eagerly probe Mem0 at startup so the log shows whether it's ready or misconfigured."""
+  from services.mem0_service import mem0_disabled_globally, _memory
+  if mem0_disabled_globally():
+    logger.info("Mem0: disabled via MEETINGBOX_MEM0_DISABLE — skipping init")
+    return
+  m = _memory()
+  if m is None:
+    logger.warning("Mem0: initialization failed — assistant will run without long-term memory")
+  else:
+    logger.info("Mem0: initialized successfully — long-term memory is active")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):  # type: ignore[override]
+  _check_mem0_startup()
   loop = asyncio.get_running_loop()
   queue: asyncio.Queue = asyncio.Queue()
   thread = threading.Thread(target=_redis_listener_thread, args=(queue, loop), daemon=True)
@@ -293,6 +308,7 @@ app.include_router(briefing_router, prefix="/api")
 app.include_router(admin_memory_router, prefix="/api")
 app.include_router(voice_router, prefix="/api/voice")
 app.include_router(weather_router, prefix="/api", tags=["weather"])
+app.include_router(tts_router, prefix="/api/tts", tags=["tts"])
 
 
 @app.post("/api/device/setup-complete", tags=["device"])

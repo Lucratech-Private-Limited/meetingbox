@@ -83,7 +83,7 @@ def _get_user_id(actor: dict) -> Optional[str]:
 
 @router.get("/emails")
 async def list_emails(
-    filter: str = Query(default="all", description="all | today | unread"),
+    filter: str = Query(default="all", description="all | today | unread | sent | drafts"),
     limit: int = Query(default=20, ge=1, le=50),
     current_actor: Optional[dict] = Depends(get_optional_actor),
 ):
@@ -99,12 +99,17 @@ async def list_emails(
             detail="Gmail not connected. Connect Gmail from the Settings page.",
         )
 
-    # Same bounded window and q fragments as dashboard `listGmailRecent` (not raw `in:inbox` only).
+    # Build the Gmail query fragment for the requested filter.
+    # in:sent and in:drafts bypass the inbox merge (see gmail.py skip_tokens).
     q_fragment = ""
     if filter == "unread":
         q_fragment = "is:unread"
     elif filter == "today":
         q_fragment = "newer_than:1d"
+    elif filter == "sent":
+        q_fragment = "in:sent"
+    elif filter == "drafts":
+        q_fragment = "in:drafts"
 
     try:
         raw_messages = list_recent_messages(

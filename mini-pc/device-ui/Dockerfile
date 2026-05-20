@@ -36,6 +36,7 @@ RUN set -eux; \
             -o Acquire::Retries=5 \
             -o Acquire::http::Pipeline-Depth=0 \
         && apt_install \
+            ca-certificates \
             libsdl2-dev \
             libsdl2-image-dev \
             libsdl2-mixer-dev \
@@ -51,6 +52,7 @@ RUN set -eux; \
             libxrandr-dev \
             libmtdev1t64 \
             libportaudio2 \
+            libspeexdsp1 \
             build-essential \
             pkg-config \
             xdg-utils \

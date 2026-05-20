@@ -40,6 +40,8 @@ services:
         condition: service_started
     environment:
       - PYTHONUNBUFFERED=1
+      - WEB_CONCURRENCY=${WEB_CONCURRENCY:-6}
+      - MEETINGBOX_I_ACKNOWLEDGE_MULTI_WORKER_RECORDING=${MEETINGBOX_I_ACKNOWLEDGE_MULTI_WORKER_RECORDING:-1}
       - REDIS_HOST=redis
       - MEETINGBOX_REBOOT_HELPER=/usr/local/bin/meetingbox-host-reboot
       - MEETINGBOX_POWEROFF_HELPER=/usr/local/bin/meetingbox-host-poweroff
@@ -47,7 +49,18 @@ services:
       - RECORDINGS_DIR=/data/audio/recordings
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OPENAI_ROUTER_MODEL=${OPENAI_ROUTER_MODEL:-}
+      - MEM0_API_KEY=${MEM0_API_KEY:-}
       - OPENAI_TRANSCRIBE_MODEL=${OPENAI_TRANSCRIBE_MODEL:-whisper-1}
+      - OPENAI_TTS_VOICE=${OPENAI_TTS_VOICE:-shimmer}
+      - OPENAI_TTS_MODEL=${OPENAI_TTS_MODEL:-tts-1}
+      # Realtime voice: enable in server .env — device uses OpenAI WebSocket + /api/voice/tool invoke
+      - MEETINGBOX_REALTIME_VOICE_ENABLED=${MEETINGBOX_REALTIME_VOICE_ENABLED:-1}
+      - OPENAI_REALTIME_MODEL=${OPENAI_REALTIME_MODEL:-gpt-realtime-2}
+      # Mem0 ingest: keep calendar + Gmail in Mem0 so voice assistant can recall them
+      - MEETINGBOX_MEM0_INGEST_CALENDAR=${MEETINGBOX_MEM0_INGEST_CALENDAR:-1}
+      - MEETINGBOX_MEM0_INGEST_GMAIL=${MEETINGBOX_MEM0_INGEST_GMAIL:-1}
+      - MEETINGBOX_MEM0_INGEST_CHAT=${MEETINGBOX_MEM0_INGEST_CHAT:-}
       - AI_MODEL=${AI_MODEL:-claude-sonnet-4-20250514}
       - AI_REPORT_MAX_TOKENS=${AI_REPORT_MAX_TOKENS:-16384}
       - JWT_SECRET_KEY=${JWT_SECRET_KEY:?Set JWT_SECRET_KEY in .env}

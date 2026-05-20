@@ -492,6 +492,7 @@ async def integrations_calendar_events(
 
     slim = []
     for ev in raw:
+        org = ev.get("organizer") or {}
         slim.append({
             "id": ev.get("id"),
             "summary": ev.get("summary") or "(No title)",
@@ -499,6 +500,9 @@ async def integrations_calendar_events(
             "end": ev.get("end") or {},
             "htmlLink": ev.get("htmlLink"),
             "location": ev.get("location") or "",
+            "description": (ev.get("description") or "").strip(),
+            "organizer": (org.get("displayName") or org.get("email") or "").strip(),
+            "hangoutLink": (ev.get("hangoutLink") or "").strip(),
             "reminders": ev.get("reminders"),
             "eventType": ev.get("eventType"),
             "status": ev.get("status"),

@@ -3,7 +3,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from voice_assistant import VoiceCommandInterpreter
+from voice_assistant import VoiceCommandInterpreter, utterance_is_voice_farewell
 
 
 def _mk() -> VoiceCommandInterpreter:
@@ -118,3 +118,24 @@ def test_is_awaiting_command_after_wake():
     interpreter = _mk()
     interpreter.handle_transcript("hey tony", now=10.0)
     assert interpreter.is_awaiting_command(now=10.5) is True
+
+
+def test_farewell_detects_common_sign_offs():
+    wp = "hey tony"
+    assert utterance_is_voice_farewell(wp, "thanks bye") is True
+    assert utterance_is_voice_farewell(wp, "okay bye") is True
+    assert utterance_is_voice_farewell(wp, "bye") is True
+
+
+def test_farewell_not_triggered_on_scheduling_small_talk():
+    """Regression: substring farewells must not trip on scheduling / filler."""
+    wp = "hey tony"
+    assert utterance_is_voice_farewell(wp, "see ya know what I mean") is False
+    assert utterance_is_voice_farewell(wp, "see you later at five") is False
+    assert utterance_is_voice_farewell(wp, "tomorrow could have a good day") is False
+    assert utterance_is_voice_farewell(wp, "talk to you later about the budget") is False
+
+
+def test_farewell_see_you_later_short_utterance():
+    assert utterance_is_voice_farewell("hey tony", "see you later") is True
+    assert utterance_is_voice_farewell("hey tony", "ok see you later") is True

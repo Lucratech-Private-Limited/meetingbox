@@ -364,6 +364,28 @@ def init_database() -> None:
 
         cursor.execute(
             """
+            CREATE TABLE IF NOT EXISTS mem0_sqlite_ingest_log (
+              id TEXT PRIMARY KEY,
+              user_id TEXT NOT NULL,
+              kind TEXT NOT NULL,
+              ref_id TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              detail TEXT,
+              FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+            """
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_mem0_sqlite_ingest_user_created "
+            "ON mem0_sqlite_ingest_log(user_id, created_at)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_mem0_sqlite_ingest_kind_ref "
+            "ON mem0_sqlite_ingest_log(kind, ref_id)"
+        )
+
+        cursor.execute(
+            """
             CREATE TABLE IF NOT EXISTS user_commitments (
               id TEXT PRIMARY KEY,
               user_id TEXT NOT NULL,

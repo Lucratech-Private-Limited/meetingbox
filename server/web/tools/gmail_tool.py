@@ -1,11 +1,11 @@
-"""Gmail tool adapter — list + send via stored OAuth (communication agent)."""
+"""Gmail tool adapter — list + send + draft via stored OAuth (communication agent)."""
 
 from __future__ import annotations
 
 from typing import Any
 
 from routes.integrations import get_credentials_for_provider
-from services.gmail import list_recent_messages, send_email
+from services.gmail import create_draft, list_recent_messages, send_email
 from tools.base_tool import ToolError
 
 
@@ -61,3 +61,29 @@ def gmail_send_from_payload(user_id: str, payload: dict[str, Any]) -> dict[str, 
     bcc=bcc_str or None,
     thread_id=thread_id,
   )
+
+
+def gmail_draft_from_payload(user_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+  """Save email as a Gmail draft (does not send). Returns the draft id."""
+  if not user_id:
+    raise ToolError("Sign in is required to save drafts.")
+  creds = get_credentials_for_provider(user_id, "gmail")
+  if not creds:
+    raise ToolError("Gmail is not connected. Connect it in Settings.")
+  raw_to = payload.get("to")
+  if isinstance(raw_to, list):
+    to = ", ".join(str(x).strip() for x in raw_to if str(x).strip())
+  else:
+    to = str(raw_to or "").strip()
+  subject = str(payload.get("subject") or "(no subject)")
+  body = str(payload.get("body") or "")
+  cc = payload.get("cc")
+  cc_str = ", ".join(str(x) for x in cc) if isinstance(cc, list) else (str(cc) if cc else None)
+  result = create_draft(credentials=creds, to=to, subject=subject, body=body, cc=cc_str)
+  return {
+    "draft_id": result.get("id"),
+    "to": to,
+    "subject": subject,
+    "body_preview": body[:200],
+    "saved_to_gmail_drafts": True,
+  }

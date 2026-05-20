@@ -337,12 +337,12 @@ def _should_merge_inbox_scope(user_q: str) -> bool:
     skip_tokens = (
         "in:spam",
         "in:trash",
-        "in:drafts",
-        "in:sent",
         "in:all",
         "in:anywhere",
         "in:snoozed",
         "in:important",
+        "in:sent",
+        "in:drafts",
     )
     return not any(tok in lower for tok in skip_tokens)
 
@@ -552,9 +552,9 @@ def send_email(
 
 def create_draft(
     credentials,
-    to: str,
-    subject: str,
-    body: str,
+    to: str = "",
+    subject: str = "",
+    body: str = "",
     cc: str | None = None,
 ) -> dict:
     """

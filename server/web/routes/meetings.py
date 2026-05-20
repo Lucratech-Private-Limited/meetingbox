@@ -1051,10 +1051,11 @@ async def summarize_meeting(meeting_id: str, current_actor: Optional[dict] = Dep
       )
 
   try:
-    from services.mem0_service import maybe_ingest_meeting_summary
+    from services.mem0_service import maybe_ingest_meeting_summary, maybe_ingest_meeting_sqlite_artifacts
 
     uid_mem = meeting.get("user_id") or _actor_user_id(current_actor)
     maybe_ingest_meeting_summary(uid_mem, meeting_id, report_body)
+    maybe_ingest_meeting_sqlite_artifacts(uid_mem, meeting_id)
   except Exception:
     logger.debug("mem0 ingest after summarize failed", exc_info=True)
 

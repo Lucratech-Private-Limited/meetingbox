@@ -1104,6 +1104,11 @@ class CalendarScreen(BaseScreen):
         self._view_week_mon = today - timedelta(days=today.weekday())
         self._col_dates = [self._view_week_mon + timedelta(days=i) for i in range(7)]
         self._sel_date = today
+        cache_key = f"calendar_week:{self._view_week_mon.isoformat()}"
+        cached_week = self.app.ui_cache_get(cache_key)
+        if isinstance(cached_week, dict) and cached_week:
+            self._week_data = cached_week.get("days", {}) if "days" in cached_week else cached_week
+        self.app.ui_cache_subscribe(cache_key, self._on_cached_week)
 
         for i, lbl in enumerate(self._date_lbls):
             lbl.text = str(self._col_dates[i].day)
@@ -1116,23 +1121,36 @@ class CalendarScreen(BaseScreen):
         if self._datestr_lbl:
             self._datestr_lbl.text = _fmt_date(today)
 
-        if self._busy_lbl:
-            self._busy_lbl.text = "Loading calendar..."
-        if self._free_lbl:
-            self._free_lbl.text = ""
+        # Only show "Loading calendar..." when there is no cached data to display.
+        # If _week_data is already populated (e.g. returning from idle), keep the
+        # existing content visible and let _load_week() update it silently.
+        if not self._week_data:
+            if self._busy_lbl:
+                self._busy_lbl.text = "Loading calendar..."
+            if self._free_lbl:
+                self._free_lbl.text = ""
 
-        # Draw initial dots (all unfilled) while data is being fetched
+        # Draw dots from cached data immediately; _load_week() will refresh them.
         Clock.schedule_once(lambda _dt: self._rebuild_all_dots(), 0)
         Clock.schedule_once(lambda _dt: self._load_week(), 0)
         # Refresh meeting states every minute so glow follows the clock
         if self._refresh_event:
             self._refresh_event.cancel()
         self._refresh_event = Clock.schedule_interval(self._tick, 60)
+        # No per-screen polling; centralized app sync loop updates this cache.
 
     def on_leave(self) -> None:
+        if self._view_week_mon is not None:
+            self.app.ui_cache_unsubscribe(
+                f"calendar_week:{self._view_week_mon.isoformat()}",
+                self._on_cached_week,
+            )
         if self._refresh_event:
             self._refresh_event.cancel()
             self._refresh_event = None
+        if getattr(self, "_data_poll_event", None):
+            self._data_poll_event.cancel()
+            self._data_poll_event = None
 
     def _tick(self, _dt) -> None:
         """Called every minute — re-renders the day view to update glow/state."""
@@ -1144,6 +1162,19 @@ class CalendarScreen(BaseScreen):
                 vm = self._view_week_mon
                 if vm is None:
                     return
+                cache_key = f"calendar_week:{vm.isoformat()}"
+                cached = self.app.ui_cache_get(cache_key)
+                if isinstance(cached, dict) and cached:
+                    def _paint_cached(_dt):
+                        self._week_data = cached.get("days", {}) if "days" in cached else cached
+                        self._rebuild_all_dots()
+                        self._update_day_view(self._sel_date)
+                        self._update_header_summary()
+                    Clock.schedule_once(_paint_cached, 0)
+                if self.app.ui_cache_is_fresh(cache_key):
+                    return
+                if not self.app.ui_cache_mark_inflight(cache_key):
+                    return
                 end_d = vm + timedelta(days=6)
                 data = await self.backend.get_calendar_week(
                     vm.isoformat(),
@@ -1152,6 +1183,7 @@ class CalendarScreen(BaseScreen):
 
                 def _apply(_dt):
                     self._week_data = data.get("days", {}) if data else {}
+                    self.app.ui_cache_set(cache_key, dict(data or {}))
                     self._rebuild_all_dots()
                     self._update_day_view(self._sel_date)
                     self._update_header_summary()
@@ -1159,7 +1191,20 @@ class CalendarScreen(BaseScreen):
                 Clock.schedule_once(_apply, 0)
             except Exception as exc:
                 logger.debug("CalendarScreen: get_calendar_week failed: %s", exc)
+            finally:
+                if vm is not None:
+                    self.app.ui_cache_clear_inflight(f"calendar_week:{vm.isoformat()}")
         run_async(_fetch())
+
+    def _on_cached_week(self, payload: dict) -> None:
+        def _apply(_dt):
+            if self.manager and self.manager.current != self.name:
+                return
+            self._week_data = payload.get("days", {}) if isinstance(payload, dict) else {}
+            self._rebuild_all_dots()
+            self._update_day_view(self._sel_date)
+            self._update_header_summary()
+        Clock.schedule_once(_apply, 0)
 
     # ── Week navigation ────────────────────────────────────────────────────────
 

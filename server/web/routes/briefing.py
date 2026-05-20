@@ -12,6 +12,7 @@ from googleapiclient.errors import HttpError
 from auth import get_current_actor
 from routes.integrations import get_credentials_for_provider
 from services.briefing_context import build_briefing_context_dict
+from services.mem0_service import maybe_ingest_calendar_snapshot, maybe_ingest_gmail_snapshot
 from services.calendar import (
     build_days_map_for_range,
     default_calendar_tz_name,
@@ -21,6 +22,26 @@ from services.calendar import (
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["briefing"])
+
+
+def _ingest_briefing_bundle(user_id: str, bundle: dict) -> None:
+    """Best-effort Mem0 ingest of calendar and Gmail data from a briefing bundle."""
+    try:
+        days = bundle.get("days") or {}
+        cal_rows: list = []
+        for day in days.values():
+            cal_rows.extend(day.get("meetings") or day.get("events") or [])
+        maybe_ingest_calendar_snapshot(user_id, {"events": cal_rows, "count": len(cal_rows)})
+    except Exception:
+        logger.debug("briefing calendar ingest failed", exc_info=True)
+    try:
+        gp = bundle.get("gmail_preview") or {}
+        msgs = list(gp.get("recent_messages") or [])
+        if not msgs and gp.get("top"):
+            msgs = [gp["top"]]
+        maybe_ingest_gmail_snapshot(user_id, {"messages": msgs, "count": len(msgs)})
+    except Exception:
+        logger.debug("briefing gmail ingest failed", exc_info=True)
 
 
 @router.get("/calendar/week")
@@ -77,9 +98,12 @@ async def get_briefing_context(
     Single JSON bundle: calendar slice, commitments, recent DB meetings, Mem0 snippet,
     pending assistant queue, optional Gmail preview.
     """
-    return build_briefing_context_dict(
+    user_id = actor["user"]["id"]
+    bundle = build_briefing_context_dict(
         actor=actor,
-        user_id=actor["user"]["id"],
+        user_id=user_id,
         days_ahead=days_ahead,
         mem0_cap=mem0_cap,
     )
+    _ingest_briefing_bundle(user_id, bundle)
+    return bundle

@@ -11,7 +11,7 @@ import asyncio
 import logging
 import math
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from kivy.animation import Animation
 from kivy.clock import Clock
@@ -341,21 +341,64 @@ def _greeting_name(name: str) -> str:
 
 def _format_next_meeting(nm) -> tuple[str, str]:
     if not nm:
-        return "No focus loaded", ""
+        return "", ""
     title = (nm.get("title") or "Calendar event").strip() or "Calendar event"
+    tnorm = title.lower().replace("_", " ").strip()
+    if tnorm in ("schedule request", "schedule requested"):
+        return "", ""
     start = (nm.get("start") or "").strip()
     if not start:
-        return title, "Time not set"
+        return "", ""
     try:
         if "T" in start:
             dt = datetime.fromisoformat(start.replace("Z", "+00:00"))
-            line = to_display_local(dt).strftime("%I:%M %p").lstrip("0")
+            local_dt = to_display_local(dt)
+            if local_dt.date() != display_now().date():
+                return "", ""
+            line = local_dt.strftime("%I:%M %p").lstrip("0")
         else:
             d = datetime.strptime(start[:10], "%Y-%m-%d")
+            if d.date() != display_now().date():
+                return "", ""
             line = d.strftime("%b %d · all day")
         return title, line
     except Exception:
-        return title, start
+        return "", ""
+
+
+def _pick_next_today_meeting_from_week(week_payload: dict | None) -> dict | None:
+    """Pick the next meeting from today's calendar-week bucket."""
+    if not isinstance(week_payload, dict):
+        return None
+    days = week_payload.get("days")
+    if not isinstance(days, dict):
+        return None
+    today_key = display_now().date().isoformat()
+    rows = (days.get(today_key) or {}).get("meetings") or []
+    if not isinstance(rows, list) or not rows:
+        return None
+    now_local = display_now()
+    parsed: list[tuple[datetime, dict]] = []
+    for m in rows:
+        if not isinstance(m, dict):
+            continue
+        raw = (m.get("start") or m.get("start_time") or "").strip()
+        if not raw:
+            continue
+        try:
+            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            loc = to_display_local(dt)
+            parsed.append((loc, m))
+        except Exception:
+            continue
+    if not parsed:
+        return None
+    parsed.sort(key=lambda x: x[0])
+    for dt, row in parsed:
+        if dt >= now_local:
+            return row
+    # If all events are in the past, show today's latest one.
+    return parsed[-1][1]
 
 
 # ---------------------------------------------------------------------------
@@ -514,6 +557,7 @@ class HomeScreen(BaseScreen):
         self._footer_ip_event:   object | None = None
         self._voice_state_event: object | None = None
         self._summary_poll_event: object | None = None
+        self._home_cache_subscribed: bool = False
 
         # Voice interaction widgets and state
         self._listening_pill:    object | None = None  # the pill _Card
@@ -1165,7 +1209,7 @@ class HomeScreen(BaseScreen):
         # Time value "11:00"
         val_lbl = _lbl(
             "--:--", _FONT_SB, _ff(38.14), _WHITE,
-            size_hint=(110 / CW, 45 / CH),
+            size_hint=(230 / CW, 45 / CH),
             pos_hint={"x": (40.96 + 115.83) / CW,
                       "y": (CH - 16.95 - 45) / CH},
         )
@@ -1422,7 +1466,14 @@ class HomeScreen(BaseScreen):
         get_weather_client().subscribe(self._on_weather_snapshot)
         self._refresh_voice_pill()
         self._load_system_status()
-        self._load_home_summary()
+        if not self._home_cache_subscribed:
+            self.app.ui_cache_subscribe("home_summary_bundle", self._on_cached_home_summary)
+            self._home_cache_subscribed = True
+        cached_bundle = self.app.ui_cache_get("home_summary_bundle")
+        if isinstance(cached_bundle, dict):
+            self._apply_home_summary_bundle(cached_bundle)
+        if not self.app.ui_cache_is_fresh("home_summary_bundle"):
+            self._load_home_summary()
 
         if self._clock_event:
             self._clock_event.cancel()
@@ -1440,9 +1491,7 @@ class HomeScreen(BaseScreen):
         )
         if self._summary_poll_event:
             self._summary_poll_event.cancel()
-        self._summary_poll_event = Clock.schedule_interval(
-            lambda _dt: self._load_home_summary(), 30.0
-        )
+            self._summary_poll_event = None
 
     def on_leave(self):
         # Clean up listening state immediately when leaving home
@@ -1472,6 +1521,9 @@ class HomeScreen(BaseScreen):
         if self._summary_poll_event:
             self._summary_poll_event.cancel()
             self._summary_poll_event = None
+        if self._home_cache_subscribed:
+            self.app.ui_cache_unsubscribe("home_summary_bundle", self._on_cached_home_summary)
+            self._home_cache_subscribed = False
         try:
             get_weather_client().unsubscribe(self._on_weather_snapshot)
         except Exception:
@@ -1618,13 +1670,16 @@ class HomeScreen(BaseScreen):
     # -----------------------------------------------------------------------
 
     def _on_weather_snapshot(self, snap):
-        if self._health_label_offline:
-            return
+        # Always show temperature — weather comes from open-meteo, not the backend.
+        # Even if backend is offline the temperature should display.
         try:
             temp  = float(snap.temp_c)
             label = (snap.label or "--").strip()
             self.health_label.text       = f"{temp:.0f}°C"
-            self.health_label.color      = _WHITE
+            # Keep red color when backend is offline so connectivity is still indicated,
+            # but show the temperature value (not the word "Backend").
+            if not self._health_label_offline:
+                self.health_label.color  = _WHITE
             self._wx_condition.text      = label
             self._brief_wx_title.text    = f"Weather: {temp:.0f}°C"
             self._brief_wx_sub.text      = label
@@ -1683,6 +1738,60 @@ class HomeScreen(BaseScreen):
             self._soundwave_tick_ev = Clock.schedule_interval(
                 self._soundwave_tick, 1 / 30
             )
+
+    def set_voice_session_state(self, state: str) -> None:
+        """Update home screen visuals for the current Realtime session state.
+
+        Called from the main app whenever the RealtimeVoiceSession emits a state
+        change (listening / thinking / speaking / idle).
+
+        - listening : orb pulses, pill fades in ("Listening")
+        - thinking  : orb keeps pulsing, pill fades out
+        - speaking  : orb keeps pulsing, pill fades out
+        - idle      : full hide (orb back to 1.0x, pill out, soundwave off)
+        """
+        if state == "listening":
+            # User can speak — show the listening pill
+            self._listening_active = True
+            if self._listening_pill is not None:
+                Animation.cancel_all(self._listening_pill, 'opacity')
+                Animation(opacity=1.0, duration=0.22, t='out_cubic').start(
+                    self._listening_pill
+                )
+            # Keep orb pulsing (restart if stopped)
+            if self._voice_orb is not None:
+                Animation.cancel_all(self._voice_orb, 'orb_scale')
+                pulse = (
+                    Animation(orb_scale=1.3, duration=0.6, t='in_out_sine') +
+                    Animation(orb_scale=1.4, duration=0.6, t='in_out_sine')
+                )
+                pulse.repeat = True
+                pulse.start(self._voice_orb)
+            if self._soundwave_tick_ev is None and self._soundwave_wf is not None:
+                self._soundwave_tick_ev = Clock.schedule_interval(
+                    self._soundwave_tick, 1 / 30
+                )
+        elif state in ("thinking", "speaking"):
+            # Agent is busy — hide the pill but keep the orb animated
+            self._listening_active = False
+            self._current_amplitude = 0.0
+            if self._listening_pill is not None:
+                Animation.cancel_all(self._listening_pill, 'opacity')
+                Animation(opacity=0.0, duration=0.18, t='in_cubic').start(
+                    self._listening_pill
+                )
+            # Orb: slow gentle pulse so user knows session is alive
+            if self._voice_orb is not None:
+                Animation.cancel_all(self._voice_orb, 'orb_scale')
+                pulse = (
+                    Animation(orb_scale=1.15, duration=1.0, t='in_out_sine') +
+                    Animation(orb_scale=1.25, duration=1.0, t='in_out_sine')
+                )
+                pulse.repeat = True
+                pulse.start(self._voice_orb)
+        else:
+            # idle / unknown — full reset
+            self.hide_listening_state()
 
     def hide_listening_state(self) -> None:
         """End of voice interaction: scale orb back, fade out pill, stop soundwave."""
@@ -1753,15 +1862,13 @@ class HomeScreen(BaseScreen):
                 privacy  = getattr(self.app, "privacy_mode", False)
 
                 def _apply(_dt):
-                    online = wifi_ok or wired_ok
-                    self._health_label_offline = not online
-                    if not online:
-                        self.health_label.text  = "Offline"
-                        self.health_label.color = COLORS["red"]
-                    else:
-                        snap = get_weather_client().snapshot
-                        if snap is not None:
-                            self._on_weather_snapshot(snap)
+                    # Backend reachability is determined by API success above.
+                    # Do not gate weather text on local NIC flags (WiFi metadata can be empty
+                    # even when backend + weather are available).
+                    self._health_label_offline = False
+                    snap = get_weather_client().snapshot
+                    if snap is not None:
+                        self._on_weather_snapshot(snap)
                     self._footer_kwargs = {
                         "wifi_ok":    wifi_ok,
                         "free_gb":    free_gb,
@@ -1777,8 +1884,12 @@ class HomeScreen(BaseScreen):
             except Exception:
                 def _backend_offline(_dt):
                     self._health_label_offline = True
-                    self.health_label.text  = "Backend\nOffline"
+                    self.health_label.text  = "Backend"
                     self.health_label.color = COLORS["red"]
+                    # Schedule a retry so temperature recovers automatically when
+                    # the backend comes back — without the user having to
+                    # navigate away and back.
+                    Clock.schedule_once(lambda _dt2: self._load_system_status(), 30.0)
                 Clock.schedule_once(_backend_offline, 0)
 
         run_async(_fetch())
@@ -1789,6 +1900,9 @@ class HomeScreen(BaseScreen):
 
     def _load_home_summary(self):
         async def _fetch():
+            if self.app.ui_cache_is_fresh("home_summary_bundle"):
+                self._apply_home_summary_bundle(self.app.ui_cache_get("home_summary_bundle") or {})
+                return
             # Fetch Gmail, home summary, and latest meeting in parallel.
             async def _gmail():
                 gf = getattr(self.backend, "fetch_gmail_recent", None)
@@ -1816,72 +1930,18 @@ class HomeScreen(BaseScreen):
                 today_n  = int(data.get("pending_actions_today") or 0)
                 total_n  = int(data.get("pending_actions_total") or 0)
                 next_title, next_time = _format_next_meeting(data.get("next_meeting"))
-
-                def _apply(_dt):
-                    self.next_time_label.text  = next_time or "—"
-                    self.next_title_label.text = f"Now: {next_title}"
-                    self.more_label.text       = f"+{max(0, today_n)} more"
-
-                    self.schedule_card.value_label.text = (
-                        next_time.split(" ")[0] if next_time else "—"
-                    )
-                    self.schedule_card.text_label.text = f"Now: {next_title}"
-                    if self.schedule_card._more_label is not None:
-                        self.schedule_card._more_label.text = (
-                            f"+{today_n}" if today_n else ""
-                        )
-
-                    if latest:
-                        self._latest_meeting_id = latest.get("id")
-                        self.last_title_label.text = (
-                            latest.get("title") or "Untitled meeting"
-                        )
-                        try:
-                            raw = (latest.get("start_time")
-                                   or latest.get("created_at") or "")
-                            dt  = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-                            when = (to_display_local(dt)
-                                    .strftime("%b %d · %I:%M %p")
-                                    .replace(" 0", " "))
-                        except Exception:
-                            when = "Recent meeting"
-                        dur = int(latest.get("duration") or 0) // 60
-                        self.last_meta_label.text = (
-                            f"{when} · {dur} min" if dur else when
-                        )
-                        pa = int(latest.get("pending_actions") or 0)
-                        self.last_actions_label.text = (
-                            f"{pa} pending actions  ›" if pa else "Open summary  ›"
-                        )
-                    else:
-                        self._latest_meeting_id    = None
-                        self.last_title_label.text  = "No saved meetings yet"
-                        self.last_meta_label.text   = "Start a recording to build memory"
-                        self.last_actions_label.text = "Open meeting library  ›"
-
-                    # Same Gmail feed as dashboard Emails tab (`/api/integrations/gmail/recent`).
-                    if self.email_card is not None:
-                        self.email_card.value_label.text = str(gsum.get("unread_count") or 0)
-                    if self.brief_email_label is not None:
-                        self.brief_email_label.title_label.text = "email:  From:"
-                        self.brief_email_label.subtitle_label.text = str(
-                            gsum.get("brief_subtitle") or "Connect Gmail for updates"
-                        )
-
-                    if self.brief_calendar_label is not None:
-                        self.brief_calendar_label.title_label.text = (
-                            f"{max(0, today_n)} actions today"
-                            if today_n else "Briefing ready"
-                        )
-                        self.brief_calendar_label.subtitle_label.text = (
-                            f"First at {next_time}"
-                            if next_time and next_time != "Time not set"
-                            else "Ask Tony for focus"
-                        )
-
-                    self.tasks_card.value_label.text = str(total_n)
-
-                Clock.schedule_once(_apply, 0)
+                self.app.ui_cache_set(
+                    "home_summary_bundle",
+                    {
+                        "summary": dict(data or {}),
+                        "meetings": meetings if isinstance(meetings, list) else [],
+                        "gfeed": gfeed if isinstance(gfeed, dict) else {},
+                    },
+                )
+                Clock.schedule_once(
+                    lambda _dt: self._apply_home_summary_bundle(self.app.ui_cache_get("home_summary_bundle") or {}),
+                    0,
+                )
             except Exception:
                 Clock.schedule_once(
                     lambda _dt: setattr(
@@ -1892,6 +1952,114 @@ class HomeScreen(BaseScreen):
                 )
 
         run_async(_fetch())
+
+    def _on_cached_home_summary(self, payload: dict) -> None:
+        Clock.schedule_once(lambda _dt: self._apply_home_summary_bundle(payload or {}), 0)
+
+    def _apply_home_summary_bundle(self, payload: dict) -> None:
+        if not isinstance(payload, dict):
+            return
+        if self.manager and self.manager.current != self.name:
+            return
+        data = payload.get("summary") if isinstance(payload.get("summary"), dict) else {}
+        meetings = payload.get("meetings") if isinstance(payload.get("meetings"), list) else []
+        gfeed = payload.get("gfeed") if isinstance(payload.get("gfeed"), dict) else {}
+        latest = meetings[0] if meetings else None
+        today_n = int(data.get("pending_actions_today") or 0)
+        total_n = int(data.get("pending_actions_total") or 0)
+        next_title, next_time = _format_next_meeting(data.get("next_meeting"))
+        if not (next_title and next_time):
+            today = display_now().date()
+            monday = today - timedelta(days=today.weekday())
+            wk = self.app.ui_cache_get(f"calendar_week:{monday.isoformat()}")
+            picked = _pick_next_today_meeting_from_week(wk if isinstance(wk, dict) else {})
+            if isinstance(picked, dict):
+                next_title, next_time = _format_next_meeting(
+                    {"title": picked.get("title"), "start": picked.get("start") or picked.get("start_time")}
+                )
+        gsum = summarize_gmail_feed_for_home(gfeed)
+        has_meeting = bool((next_title or "").strip()) and bool((next_time or "").strip())
+
+        if has_meeting:
+            self.next_time_label.text = next_time
+            self.next_title_label.text = f"Now: {next_title}"
+        else:
+            self.next_time_label.text = "Free today"
+            self.next_title_label.text = ""
+            # Vertically center "Free today" within schedule card while preserving
+            # existing font/color/size and horizontal alignment.
+            try:
+                lbl = self.schedule_card.value_label
+                lbl.pos_hint = {
+                    "x": (40.96 + 115.83) / 509.93,
+                    "y": (144.08 - 50.0 - 45) / 144.08,
+                }
+            except Exception:
+                pass
+        self.more_label.text = f"+{max(0, today_n)} more"
+
+        if has_meeting:
+            self.schedule_card.value_label.text = next_time.split(" ")[0] if next_time else "—"
+            self.schedule_card.text_label.text = f"Now: {next_title}"
+            try:
+                lbl = self.schedule_card.value_label
+                lbl.pos_hint = {
+                    "x": (40.96 + 115.83) / 509.93,
+                    "y": (144.08 - 16.95 - 45) / 144.08,
+                }
+            except Exception:
+                pass
+        else:
+            self.schedule_card.value_label.text = "Free today"
+            self.schedule_card.text_label.text = ""
+        if self.schedule_card._more_label is not None:
+            self.schedule_card._more_label.text = f"+{today_n}" if (today_n and has_meeting) else ""
+
+        if latest:
+            self._latest_meeting_id = latest.get("id")
+            self.last_title_label.text = latest.get("title") or "Untitled meeting"
+            try:
+                raw = (latest.get("start_time") or latest.get("created_at") or "")
+                dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+                when = (to_display_local(dt)
+                        .strftime("%b %d · %I:%M %p")
+                        .replace(" 0", " "))
+            except Exception:
+                when = "Recent meeting"
+            dur = int(latest.get("duration") or 0) // 60
+            self.last_meta_label.text = f"{when} · {dur} min" if dur else when
+            pa = int(latest.get("pending_actions") or 0)
+            self.last_actions_label.text = (
+                f"{pa} pending actions  ›" if pa else "Open summary  ›"
+            )
+        else:
+            self._latest_meeting_id = None
+            self.last_title_label.text = "No saved meetings yet"
+            self.last_meta_label.text = "Start a recording to build memory"
+            self.last_actions_label.text = "Open meeting library  ›"
+
+        if self.email_card is not None:
+            self.email_card.value_label.text = str(gsum.get("unread_count") or 0)
+        if self.brief_email_label is not None:
+            unread = int(gsum.get("unread_count") or 0)
+            self.brief_email_label.title_label.text = (
+                f"Email  •  {unread} unread" if unread else "Email"
+            )
+            self.brief_email_label.subtitle_label.text = str(
+                gsum.get("brief_subtitle") or "Connect Gmail for updates"
+            )
+
+        if self.brief_calendar_label is not None:
+            self.brief_calendar_label.title_label.text = (
+                f"{max(0, today_n)} actions today" if today_n else "Briefing ready"
+            )
+            self.brief_calendar_label.subtitle_label.text = (
+                f"First at {next_time}"
+                if next_time and next_time != "Time not set"
+                else "Ask Tony for focus"
+            )
+
+        self.tasks_card.value_label.text = str(total_n)
 
 
 # ---------------------------------------------------------------------------
