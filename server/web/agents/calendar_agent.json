@@ -1,4 +1,4 @@
-﻿{
+{
   "id": "calendar_agent",
   "name": "Calendar Agent",
   "description": "Calendar (Google), free-time suggestions, and local commitments/reminders (SQLite + Mem0). Requires Calendar OAuth for Google reads/writes.",
