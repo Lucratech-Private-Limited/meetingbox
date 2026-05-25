@@ -15,8 +15,10 @@ import subprocess
 import sys
 import threading
 import time
-from datetime import datetime
+import traceback
+from datetime import datetime, timedelta
 from pathlib import Path
+from collections import defaultdict
 
 import httpx
 
@@ -220,6 +222,7 @@ from config import (
     LOCAL_REDIS_PORT,
     LOCAL_REDIS_ENABLED,
     display_now,
+    resolve_device_config_dir,
     setup_complete_marker_paths_for_read,
     get_device_auth_token,
     clear_stored_device_auth_token,
@@ -235,7 +238,7 @@ from hardware import (
 )
 from network_util import linux_ethernet_ready
 from profile_store import get_active_profile, clear_active_profile_selection
-from voice_assistant import VoiceAssistant, VoiceIntent
+from voice_assistant import VoiceAssistant, VoiceIntent, utterance_is_voice_farewell
 
 try:
     from realtime_voice_session import REALTIME_VOICE_IMPLEMENTED
@@ -268,11 +271,32 @@ from screens.idle import IdleScreen
 from screens.settings import SettingsScreen
 from screens.auto_delete_picker import AutoDeletePickerScreen
 from screens.brightness_picker import BrightnessPickerScreen
+from screens.brightness_slider import BrightnessSliderScreen
 from screens.speech_volume_picker import SpeechVolumePickerScreen
+from screens.notification_volume_picker import NotificationVolumePickerScreen
+from screens.mic_gain_picker import MicGainPickerScreen
 from screens.idle_timeout_picker import IdleTimeoutPickerScreen
 from screens.mic_test import MicTestScreen
 from screens.update_check import UpdateCheckScreen
 from screens.update_install import UpdateInstallScreen
+from screens.update_channel_picker import UpdateChannelPickerScreen
+from screens.timezone_picker import TimezonePickerScreen
+from screens.font_size_picker import FontSizePickerScreen
+from screens.audio_sink_picker import AudioSinkPickerScreen
+from screens.audio_source_picker import AudioSourcePickerScreen
+from screens.wifi_forget_screen import WiFiForgetScreen
+from screens.bluetooth_screen import BluetoothScreen
+from screens.datetime_screen import DateTimeScreen
+from screens.storage_breakdown import StorageBreakdownScreen
+from screens.diagnostic_logs import DiagnosticLogsScreen
+from screens.about_screen import AboutScreen
+from screens.send_feedback import SendFeedbackScreen
+from screens.notifications_settings import NotificationsSettingsScreen
+from screens.security_settings import SecuritySettingsScreen
+from screens.integration_detail import IntegrationDetailScreen
+from screens.usb_info import UsbInfoScreen
+from screens.room_label_screen import RoomLabelScreen
+from screens.connectivity_check import ConnectivityCheckScreen
 
 # Retained screens (still useful)
 from screens.meetings import MeetingsScreen
@@ -379,6 +403,41 @@ def _recording_start_error_screen_args(exc: BaseException) -> tuple[str, str]:
     return ("Recording failed", msg)
 
 
+def _tts_tail_silence_seconds() -> float:
+    """After TTS playback, wait this long before reopening the mic (speaker tail / echo)."""
+    raw = (os.getenv("MEETINGBOX_TTS_TAIL_SILENCE_SEC") or "").strip()
+    if not raw:
+        return 1.15
+    try:
+        v = float(raw)
+    except ValueError:
+        return 1.15
+    return max(0.25, min(5.0, v))
+
+
+def _post_tts_wake_guard_seconds() -> float:
+    """After the mic reopens, suppress wake-word for this long (TTS still bleeding into mic)."""
+    raw = (os.getenv("MEETINGBOX_POST_TTS_WAKE_GUARD_SEC") or "").strip()
+    if not raw:
+        return 0.42
+    try:
+        v = float(raw)
+    except ValueError:
+        return 0.6
+    return max(0.0, min(4.0, v))
+
+
+def _tts_aplay_device_argv() -> list[str]:
+    """
+    Extra aplay argv for ALSA playback device (speaker). Prefer default card unless
+    the appliance needs e.g. -D pulse or -D plughw:CARD=X,DEV=Y (see MEETINGBOX_APLAY_DEVICE).
+    """
+    dev = (os.getenv("MEETINGBOX_APLAY_DEVICE") or "").strip()
+    if dev:
+        return ["-D", dev]
+    return []
+
+
 def _xauth_cookie_has_display(xauth_bin: str, auth_path: str, disp: str) -> bool:
     """True if xauth reports a cookie for this DISPLAY (matches X11, not our string heuristics)."""
     variants = [disp]
@@ -462,6 +521,68 @@ def _diagnose_xauthority_for_docker():
         logger.debug("xauthority diagnose: %s", ex)
 
 
+def _tts_english_child_env() -> dict:
+    """Force English defaults for espeak-ng / Piper subprocesses (locale skew → wrong language)."""
+    e = os.environ.copy()
+    loc = (os.getenv("MEETINGBOX_TTS_LOCALE") or "en_US.UTF-8").strip()
+    if loc:
+        e["LANG"] = loc
+        e["LC_ALL"] = loc
+        e["LC_MESSAGES"] = loc
+        e["LANGUAGE"] = "en_US:en"
+    return e
+
+
+def _pick_english_piper_model_path() -> str | None:
+    """
+    English-only Piper ONNX. Do not glob arbitrary **/*.onnx — first hit may be non‑English.
+    Override with MEETINGBOX_PIPER_MODEL (full path).
+    """
+    import glob as _glob
+
+    explicit = (os.getenv("MEETINGBOX_PIPER_MODEL") or "").strip()
+    if explicit and os.path.isfile(explicit):
+        return explicit
+
+    for p in (
+        "/usr/share/piper/voices/en_US-amy-medium.onnx",
+        "/usr/share/piper/voices/en_US-lessac-medium.onnx",
+        "/usr/share/piper/voices/en_US-ryan-medium.onnx",
+        "/usr/local/share/piper/en_US-amy-medium.onnx",
+    ):
+        if os.path.isfile(p):
+            return p
+
+    found: list[str] = []
+    seen: set[str] = set()
+    for pattern in (
+        "/usr/share/piper/voices/en_US*.onnx",
+        "/usr/share/piper/voices/en-us*.onnx",
+        "/usr/share/piper/voices/en_*-*.onnx",
+        "/usr/share/piper/voices/en-*-*.onnx",
+        "/usr/local/share/piper/voices/en_US*.onnx",
+        "/usr/local/share/piper/voices/en_*-*.onnx",
+    ):
+        for fp in _glob.glob(pattern):
+            norm = os.path.normpath(fp)
+            if os.path.isfile(norm) and norm not in seen:
+                seen.add(norm)
+                found.append(norm)
+
+    def _key(path: str) -> tuple[int, str]:
+        bn = os.path.basename(path).lower()
+        if bn.startswith("en_us") or bn.startswith("en-us"):
+            return (0, bn)
+        if bn.startswith("en_gb") or bn.startswith("en-gb"):
+            return (5, bn)
+        if bn.startswith(("en_", "en-")):
+            return (10, bn)
+        return (50, bn)
+
+    found.sort(key=_key)
+    return found[0] if found else None
+
+
 # ==================================================================
 # Application
 # ==================================================================
@@ -526,20 +647,46 @@ class MeetingBoxApp(App):
 
         # Restore processing UI if summary/transcript-ready arrived before the processing screen.
         self._processing_summary_cache = {}
+        # Lightweight shared data cache for instant screen paint (stale-while-refresh).
+        self._ui_data_cache: dict = {}
+        self._ui_data_cache_ts: dict[str, float] = {}
+        self._ui_data_cache_ttl: dict[str, float] = {
+            "emails_inbox": 45.0,
+            "emails_sent": 120.0,
+            "emails_drafts": 120.0,
+            "calendar_week": 45.0,
+            "morning_brief_context": 45.0,
+            "morning_brief_gmail": 45.0,
+            "home_summary_bundle": 30.0,
+        }
+        self._ui_cache_inflight: set[str] = set()
+        self._ui_cache_subscribers: dict[str, list] = defaultdict(list)
+        self._ui_sync_event = None
+        self._ui_sync_inflight = False
+        # Local read/unread overrides to prevent temporary Gmail lag from
+        # flipping home unread counts back and forth.
+        self._email_read_overrides: dict[str, bool] = {}
 
         # WebSocket
         self.ws_task = None
         self._pairing_poll = None
 
-        # Local Redis subscriber (audio_level / mic_test_level from audio container)
+        # Local Redis subscriber (audio_level / mic_test_level from audio process)
         self._local_redis_thread = None
         self._local_redis_stop = threading.Event()
+
+        # Optional in-process audio capture child (MEETINGBOX_SPAWN_AUDIO=1, the
+        # default inside the merged docker image). Replaces the separate audio
+        # container / systemd unit. Never enable simultaneously with another
+        # audio_capture instance — they would race for the mic and Redis topics.
+        from audio_supervisor import maybe_create_from_env as _maybe_audio
+        self._audio_supervisor = _maybe_audio()
 
         # Idle screen timeout (seconds; 0 = never).
         # Replaces the older display-off timer: instead of cutting the
         # backlight we navigate to the dedicated `idle` screen, which is
         # itself dismissed by any touch (back to home).
-        self._idle_timeout_seconds = 30
+        self._idle_timeout_seconds = 600
         self._idle_event = None
 
         # Manual user pause for the wake-word assistant (toggled from the
@@ -551,6 +698,7 @@ class MeetingBoxApp(App):
 
         # Voice UI / feedback
         self.root_layout = None
+        self._transcript_overlay = None
         self.voice_indicator = None
         self._voice_indicator_override = None
         self._voice_indicator_reset_ev = None
@@ -559,6 +707,7 @@ class MeetingBoxApp(App):
         self._voice_pending_confirmation: VoiceIntent | None = None
         self._voice_confirmation_reset_ev = None
         self._voice_confirmation_timeout = 8.0
+        self._voice_recording_suspended = False
         self._recording_elapsed_started_at = None
         self._recording_elapsed_before_pause = 0.0
         self.voice_confirmation_text = (
@@ -581,17 +730,258 @@ class MeetingBoxApp(App):
         self._realtime_session_pending = False
         self._realtime_session_start_monotonic = None
         self._realtime_connected_ok = False
+        self._realtime_mic_acquired = False
+        self._voice_runtime_state = "idle"
         self.voice_realtime_assistant = False
         # Sync interpreter to the UI default immediately so wake works before
         # async device-settings load (VoiceAssistant env-var default is "hey tony").
-        self.voice_wake_phrase_display = "Hey buddy"
-        self.voice_assistant.apply_server_settings(wake_phrase="hey buddy")
+        self.voice_wake_phrase_display = "Hey Tony"
+        self.voice_assistant.apply_server_settings(wake_phrase="hey tony")
         self.voice_assistant_enabled = True
         self.assistant_speech_volume = 85
         # Realtime may only start when _handle_voice_wake_phrase sets this True (one-shot).
         self._realtime_launch_permitted = False
         # Limits cloud NL replies per wake/mic activation (local wake listening unaffected).
         self._voice_cloud_qa_budget = 0
+        # Serialises TTS calls — overlapping replies are dropped, not stacked
+        self._speaking_lock = threading.Lock()
+        # Monotonic timestamp of when the last TTS finished playing.
+        # Used to suppress wake-phrase re-detection for a few seconds after the
+        # assistant speaks (prevents TTS audio echo from restarting the loop).
+        self._last_tts_end_monotonic: float = 0.0
+        # OpenAI Realtime plays via aplay (not _speak_text_blocking); extend the same
+        # idea so speaker tail / room echo does not immediately re-trigger wake.
+        self._wake_suppress_until_monotonic: float = 0.0
+
+        # One-shot startup diagnostics overlay (see _run_startup_self_test_overlay).
+        self._startup_self_test_started = False
+
+    # ==================================================================
+    # SHARED UI CACHE (stale-while-refresh)
+    # ==================================================================
+    def ui_cache_get(self, key: str):
+        return self._ui_data_cache.get(key)
+
+    def ui_cache_set(self, key: str, value):
+        self._ui_data_cache[key] = value
+        self._ui_data_cache_ts[key] = time.time()
+        self._ui_cache_persist_to_disk()
+        for cb in list(self._ui_cache_subscribers.get(key, [])):
+            try:
+                cb(value)
+            except Exception:
+                logger.debug("ui_cache subscriber failed for %s", key, exc_info=True)
+
+    def ui_cache_is_fresh(self, key: str, ttl_s: float | None = None) -> bool:
+        ts = self._ui_data_cache_ts.get(key)
+        if ts is None:
+            return False
+        ttl = float(ttl_s if ttl_s is not None else self._ui_data_cache_ttl.get(key, 60.0))
+        return (time.time() - ts) <= ttl
+
+    def ui_cache_subscribe(self, key: str, callback):
+        if callback not in self._ui_cache_subscribers[key]:
+            self._ui_cache_subscribers[key].append(callback)
+
+    def ui_cache_unsubscribe(self, key: str, callback):
+        try:
+            self._ui_cache_subscribers[key].remove(callback)
+        except Exception:
+            pass
+
+    def ui_cache_mark_inflight(self, key: str) -> bool:
+        if key in self._ui_cache_inflight:
+            return False
+        self._ui_cache_inflight.add(key)
+        return True
+
+    def ui_cache_clear_inflight(self, key: str):
+        self._ui_cache_inflight.discard(key)
+
+    def ui_set_email_read_override(self, email_id: str, is_read: bool):
+        if not email_id:
+            return
+        self._email_read_overrides[str(email_id)] = bool(is_read)
+
+    def ui_apply_email_read_overrides(self, feed: dict) -> dict:
+        if not isinstance(feed, dict):
+            return feed
+        rows = feed.get("messages")
+        if not isinstance(rows, list):
+            return feed
+        changed = False
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            mid = row.get("id")
+            if not mid:
+                continue
+            if mid in self._email_read_overrides:
+                want_read = self._email_read_overrides[mid]
+                cur_read = bool(row.get("is_read", True))
+                if cur_read != want_read:
+                    row["is_read"] = want_read
+                    changed = True
+                else:
+                    # Backend has caught up to local override; stop forcing.
+                    self._email_read_overrides.pop(mid, None)
+        return feed if changed else feed
+
+    def _ui_cache_file_path(self) -> Path:
+        return resolve_device_config_dir() / "ui_data_cache.json"
+
+    def _ui_cache_persist_to_disk(self) -> None:
+        try:
+            payload = {
+                "saved_at": time.time(),
+                "cache": self._ui_data_cache,
+            }
+            p = self._ui_cache_file_path()
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(json.dumps(payload), encoding="utf-8")
+        except Exception:
+            logger.debug("ui cache persist skipped", exc_info=True)
+
+    def _ui_cache_load_from_disk(self) -> None:
+        try:
+            p = self._ui_cache_file_path()
+            if not p.is_file():
+                return
+            payload = json.loads(p.read_text(encoding="utf-8"))
+            cache = payload.get("cache") if isinstance(payload, dict) else None
+            if not isinstance(cache, dict):
+                return
+            now = time.time()
+            for k, v in cache.items():
+                # Trust persisted cache for fast first paint; network refresh follows.
+                self._ui_data_cache[k] = v
+                self._ui_data_cache_ts[k] = now
+            logger.info("Loaded UI cache from disk (%d keys)", len(cache))
+        except Exception:
+            logger.debug("ui cache load skipped", exc_info=True)
+
+    async def _ui_cache_bootstrap_async(self) -> None:
+        """Prewarm cold-start data so first screen opens are near-instant."""
+        if USE_MOCK_BACKEND:
+            return
+        try:
+            if self.ui_cache_mark_inflight("emails_inbox"):
+                try:
+                    data = await self.backend.fetch_gmail_recent(
+                        max_results=50,
+                        days=90,
+                        q="",
+                        folder="all",
+                    )
+                    rows = data.get("messages") or []
+                    if isinstance(rows, list):
+                        self.ui_cache_set("emails_inbox", list(rows))
+                finally:
+                    self.ui_cache_clear_inflight("emails_inbox")
+        except Exception:
+            logger.debug("emails bootstrap prewarm failed", exc_info=True)
+
+        try:
+            monday = display_now().date() - timedelta(days=display_now().date().weekday())
+            key = f"calendar_week:{monday.isoformat()}"
+            if self.ui_cache_mark_inflight(key):
+                try:
+                    end_d = monday + timedelta(days=6)
+                    data = await self.backend.get_calendar_week(
+                        monday.isoformat(),
+                        end_d.isoformat(),
+                    )
+                    if isinstance(data, dict):
+                        self.ui_cache_set(key, dict(data))
+                finally:
+                    self.ui_cache_clear_inflight(key)
+        except Exception:
+            logger.debug("calendar bootstrap prewarm failed", exc_info=True)
+
+        try:
+            if self.ui_cache_mark_inflight("morning_brief_context"):
+                try:
+                    ctx = await self.backend.get_briefing_context(days_ahead=1)
+                    if isinstance(ctx, dict):
+                        self.ui_cache_set("morning_brief_context", dict(ctx))
+                finally:
+                    self.ui_cache_clear_inflight("morning_brief_context")
+        except Exception:
+            logger.debug("morning brief context prewarm failed", exc_info=True)
+
+        try:
+            if self.ui_cache_mark_inflight("morning_brief_gmail"):
+                try:
+                    gf = await self.backend.fetch_gmail_recent(
+                        max_results=40,
+                        days=90,
+                        q="",
+                        folder="all",
+                    )
+                    if isinstance(gf, dict):
+                        self.ui_cache_set("morning_brief_gmail", dict(gf))
+                finally:
+                    self.ui_cache_clear_inflight("morning_brief_gmail")
+        except Exception:
+            logger.debug("morning brief gmail prewarm failed", exc_info=True)
+
+    async def _ui_cache_refresh_once(self) -> None:
+        """Unified realtime-ish refresh: fetch once, fan out to all UI caches."""
+        if USE_MOCK_BACKEND:
+            return
+        today = display_now().date()
+        monday = today - timedelta(days=today.weekday())
+        week_key = f"calendar_week:{monday.isoformat()}"
+        end_d = monday + timedelta(days=6)
+        try:
+            results = await asyncio.gather(
+                self.backend.fetch_gmail_recent(max_results=50, days=90, q="", folder="all"),
+                self.backend.get_calendar_week(monday.isoformat(), end_d.isoformat()),
+                self.backend.get_briefing_context(days_ahead=1),
+                self.backend.get_home_summary(),
+                self.backend.get_meetings(limit=1),
+                return_exceptions=True,
+            )
+            gfeed = results[0] if not isinstance(results[0], BaseException) else {}
+            week = results[1] if not isinstance(results[1], BaseException) else {}
+            brief = results[2] if not isinstance(results[2], BaseException) else {}
+            home_summary = results[3] if not isinstance(results[3], BaseException) else {}
+            meetings = results[4] if not isinstance(results[4], BaseException) else []
+
+            if isinstance(gfeed, dict):
+                gfeed = self.ui_apply_email_read_overrides(dict(gfeed))
+                rows = gfeed.get("messages") or []
+                if isinstance(rows, list):
+                    self.ui_cache_set("emails_inbox", list(rows))
+                self.ui_cache_set("morning_brief_gmail", dict(gfeed))
+            if isinstance(week, dict):
+                self.ui_cache_set(week_key, dict(week))
+            if isinstance(brief, dict):
+                self.ui_cache_set("morning_brief_context", dict(brief))
+            if isinstance(home_summary, dict):
+                self.ui_cache_set(
+                    "home_summary_bundle",
+                    {
+                        "summary": dict(home_summary),
+                        "meetings": meetings if isinstance(meetings, list) else [],
+                        "gfeed": gfeed if isinstance(gfeed, dict) else {},
+                    },
+                )
+        except Exception:
+            logger.debug("ui cache unified refresh failed", exc_info=True)
+
+    def _ui_cache_sync_tick(self, _dt) -> None:
+        if self._ui_sync_inflight:
+            return
+        self._ui_sync_inflight = True
+
+        async def _go():
+            try:
+                await self._ui_cache_refresh_once()
+            finally:
+                self._ui_sync_inflight = False
+
+        run_async(_go())
 
     # ==================================================================
     # BUILD
@@ -650,11 +1040,32 @@ class MeetingBoxApp(App):
         self.screen_manager.add_widget(SettingsScreen(name='settings'))
         self.screen_manager.add_widget(AutoDeletePickerScreen(name='auto_delete_picker'))
         self.screen_manager.add_widget(BrightnessPickerScreen(name='brightness_picker'))
+        self.screen_manager.add_widget(BrightnessSliderScreen(name='brightness_slider'))
         self.screen_manager.add_widget(SpeechVolumePickerScreen(name='speech_volume_picker'))
+        self.screen_manager.add_widget(NotificationVolumePickerScreen(name='notification_volume_picker'))
+        self.screen_manager.add_widget(MicGainPickerScreen(name='mic_gain_picker'))
         self.screen_manager.add_widget(IdleTimeoutPickerScreen(name='idle_timeout_picker'))
         self.screen_manager.add_widget(MicTestScreen(name='mic_test'))
         self.screen_manager.add_widget(UpdateCheckScreen(name='update_check'))
         self.screen_manager.add_widget(UpdateInstallScreen(name='update_install'))
+        self.screen_manager.add_widget(UpdateChannelPickerScreen(name='update_channel_picker'))
+        self.screen_manager.add_widget(TimezonePickerScreen(name='timezone_picker'))
+        self.screen_manager.add_widget(FontSizePickerScreen(name='font_size_picker'))
+        self.screen_manager.add_widget(AudioSinkPickerScreen(name='audio_output_picker'))
+        self.screen_manager.add_widget(AudioSourcePickerScreen(name='audio_input_picker'))
+        self.screen_manager.add_widget(WiFiForgetScreen(name='wifi_forget_screen'))
+        self.screen_manager.add_widget(BluetoothScreen(name='bluetooth_screen'))
+        self.screen_manager.add_widget(DateTimeScreen(name='datetime_screen'))
+        self.screen_manager.add_widget(StorageBreakdownScreen(name='storage_breakdown'))
+        self.screen_manager.add_widget(DiagnosticLogsScreen(name='diagnostic_logs'))
+        self.screen_manager.add_widget(AboutScreen(name='about_screen'))
+        self.screen_manager.add_widget(SendFeedbackScreen(name='send_feedback'))
+        self.screen_manager.add_widget(NotificationsSettingsScreen(name='notifications_settings'))
+        self.screen_manager.add_widget(SecuritySettingsScreen(name='security_settings'))
+        self.screen_manager.add_widget(IntegrationDetailScreen(name='integration_detail'))
+        self.screen_manager.add_widget(UsbInfoScreen(name='usb_info'))
+        self.screen_manager.add_widget(RoomLabelScreen(name='room_label_screen'))
+        self.screen_manager.add_widget(ConnectivityCheckScreen(name='connectivity_check'))
 
         self.screen_manager.add_widget(MeetingsScreen(name='meetings'))
         self.screen_manager.add_widget(MeetingDetailScreen(name='meeting_detail'))
@@ -680,6 +1091,14 @@ class MeetingBoxApp(App):
         # via their ``if not self.voice_indicator`` guards.
         self._sync_voice_assistant_state()
         self._refresh_voice_indicator()
+
+        # Transcript overlay — floats above everything, starts hidden.
+        try:
+            from components.transcription_overlay import TranscriptionOverlay
+            self._transcript_overlay = TranscriptionOverlay()
+            self.root_layout.add_widget(self._transcript_overlay)
+        except Exception:
+            logger.exception("TranscriptionOverlay failed to load")
 
         if SHOW_FPS:
             Clock.schedule_interval(self._log_fps, 1.0)
@@ -800,6 +1219,12 @@ class MeetingBoxApp(App):
 
     def on_start(self):
         logger.info("MeetingBox UI started")
+        self._ui_cache_load_from_disk()
+        if self._audio_supervisor is not None:
+            try:
+                self._audio_supervisor.start()
+            except Exception:
+                logger.exception("Failed to start in-process audio supervisor")
         self.voice_assistant.start()
         self._sync_voice_assistant_state()
         if not USE_MOCK_BACKEND:
@@ -807,7 +1232,8 @@ class MeetingBoxApp(App):
             tok = get_device_auth_token().strip()
             if tok:
                 self.backend.set_device_auth_header(tok)
-        Clock.schedule_once(self._check_backend, 2.0)
+        # Defer only until Kivy/async loop are up; reach API quickly after boot/restart.
+        Clock.schedule_once(self._check_backend, 0.35)
         # Idle + home both consume weather; start the singleton refresh loop
         # once here so it's running by the time those screens are entered.
         try:
@@ -831,6 +1257,47 @@ class MeetingBoxApp(App):
             Clock.schedule_once(lambda _dt: self._push_appliance_metrics_tick(0), 6.0)
         else:
             self._metrics_push = None
+
+        # After boot-time API bursts settle, run connectivity / mic / model checks once.
+        # A slightly later start avoids transient false-negatives during initial network churn.
+        Clock.schedule_once(self._run_startup_self_test_overlay, 8.0)
+        # Cold-start prewarm for instant first-open calendar/emails.
+        Clock.schedule_once(lambda _dt: run_async(self._ui_cache_bootstrap_async()), 0.8)
+        # Centralized sync loop to keep caches hot across all screens.
+        if self._ui_sync_event:
+            self._ui_sync_event.cancel()
+        self._ui_sync_event = Clock.schedule_interval(self._ui_cache_sync_tick, 5.0)
+        Clock.schedule_once(lambda _dt: self._ui_cache_sync_tick(0), 1.6)
+
+    def _run_startup_self_test_overlay(self, _dt):
+        """Boot-time self-test modal (disable with MEETINGBOX_STARTUP_SELF_TEST=0)."""
+        raw = (os.environ.get("MEETINGBOX_STARTUP_SELF_TEST") or "1").strip().lower()
+        if raw in ("0", "false", "no", "off"):
+            return
+        # Do not interrupt active user navigation. If the user has already
+        # left home during boot, skip this one-shot overlay entirely.
+        try:
+            cur = self.screen_manager.current if self.screen_manager is not None else ""
+            if cur and cur != "home":
+                logger.info(
+                    "Skipping startup self-test overlay (current screen=%s, user already navigating).",
+                    cur,
+                )
+                return
+        except Exception:
+            pass
+        if self._startup_self_test_started:
+            return
+        self._startup_self_test_started = True
+        try:
+            from components.startup_self_test_overlay import StartupSelfTestOverlay
+
+            overlay = StartupSelfTestOverlay()
+            self.root_layout.add_widget(overlay)
+            overlay.run(self)
+        except Exception:
+            self._startup_self_test_started = False
+            logger.exception("Startup self-test overlay failed to load")
 
     def _push_appliance_metrics_tick(self, _dt):
         if USE_MOCK_BACKEND:
@@ -866,6 +1333,11 @@ class MeetingBoxApp(App):
     def on_stop(self):
         logger.info("MeetingBox UI stopping")
         self.voice_assistant.stop()
+        if self._audio_supervisor is not None:
+            try:
+                self._audio_supervisor.stop()
+            except Exception:
+                logger.exception("Audio supervisor stop failed")
         self._local_redis_stop.set()
         if getattr(self, '_setup_poll', None):
             self._setup_poll.cancel()
@@ -875,15 +1347,30 @@ class MeetingBoxApp(App):
         if getattr(self, '_metrics_push', None):
             self._metrics_push.cancel()
             self._metrics_push = None
+        if getattr(self, "_ui_sync_event", None):
+            self._ui_sync_event.cancel()
+            self._ui_sync_event = None
         if self.ws_task and not self.ws_task.done():
             self.ws_task.cancel()
         run_async(self.backend.close())
 
     def _check_backend(self, _dt):
         async def _health():
-            ok = await self.backend.health_check()
+            ok = False
+            for attempt in range(6):
+                ok = await self.backend.health_check()
+                if ok:
+                    break
+                if attempt < 5:
+                    await asyncio.sleep(0.35 * (attempt + 1))
             if not ok:
-                logger.error("Backend health check failed")
+                logger.error(
+                    "Backend health check failed (base_url=%s) — check BACKEND_URL / network",
+                    getattr(self.backend, "base_url", ""),
+                )
+                local_idle = self._load_local_idle_timeout()
+                if local_idle is not None:
+                    self._apply_idle_timeout(local_idle)
                 return
             try:
                 settings = await self.backend.get_settings()
@@ -896,7 +1383,7 @@ class MeetingBoxApp(App):
                 # Backend stores the value as seconds (or "never"). Default
                 # 30s matches the idle picker default.
                 self._apply_idle_timeout(
-                    settings.get('idle_screen_timeout', '30'))
+                    settings.get('idle_screen_timeout', '600'))
                 privacy = settings.get('privacy_mode', False)
                 self.privacy_mode = privacy
                 auto_record = settings.get('auto_record', False)
@@ -912,8 +1399,8 @@ class MeetingBoxApp(App):
                     vae = str(vae).strip().lower() in ("1", "true", "yes", "on")
                 self.voice_assistant_enabled = bool(vae)
 
-                vwp = (settings.get("voice_wake_phrase") or "hey buddy").strip()
-                self.voice_wake_phrase_display = vwp[:1].upper() + vwp[1:] if vwp else "Hey buddy"
+                vwp = (settings.get("voice_wake_phrase") or "hey tony").strip().lower() or "hey tony"
+                self.voice_wake_phrase_display = vwp[:1].upper() + vwp[1:] if vwp else "Hey Tony"
                 try:
                     sv = settings.get("assistant_speech_volume", 85)
                     if isinstance(sv, str):
@@ -1052,7 +1539,10 @@ class MeetingBoxApp(App):
             logger.info("WebSocket listener cancelled")
         except Exception as e:
             logger.error(f"WebSocket error: {e}")
-            await asyncio.sleep(2)
+            # Reset reconnect counter before the outer restart so the next
+            # subscribe_events() run gets a full 10 fresh attempts.
+            self.backend._ws_reconnect_attempts = 0
+            await asyncio.sleep(1)
             Clock.schedule_once(lambda _: self.start_websocket_listener(), 0)
 
     # ==================================================================
@@ -1169,8 +1659,7 @@ class MeetingBoxApp(App):
         self._transcript_cta_poll_meeting_id = None
         self.recording_state.update(active=True, paused=False, elapsed=0)
         self._reset_recording_elapsed_clock()
-        self._announce_voice_start_success()
-        Clock.schedule_once(lambda _: self._sync_voice_assistant_state(), 0)
+        Clock.schedule_once(lambda _: self._suspend_voice_assistant_for_recording(), 0)
         Clock.schedule_once(lambda _: self.goto_screen('recording', 'fade'), 0)
 
     def _kick_post_stop_meeting_polls(self, sid):
@@ -1190,7 +1679,7 @@ class MeetingBoxApp(App):
         self._kick_post_stop_meeting_polls(sid)
         self._voice_start_in_flight = False
         self._clear_recording_elapsed_clock()
-        Clock.schedule_once(lambda _: self._sync_voice_assistant_state(), 0)
+        Clock.schedule_once(lambda _: self._resume_voice_assistant_after_recording(), 0)
         Clock.schedule_once(lambda _: self.goto_screen('processing', 'fade'), 0)
 
     def on_recording_paused(self, data):
@@ -1580,6 +2069,8 @@ class MeetingBoxApp(App):
         async def _start():
             last_exc: BaseException | None = None
             max_attempts = 3
+            Clock.schedule_once(lambda _: self._suspend_voice_assistant_for_recording(), 0)
+            await asyncio.sleep(0.35)
             for attempt in range(max_attempts):
                 if attempt > 0:
                     delay = 2.0 * attempt
@@ -1596,8 +2087,7 @@ class MeetingBoxApp(App):
                     self.recording_state.update(active=True, paused=False, elapsed=0)
                     self._voice_start_in_flight = False
                     self._reset_recording_elapsed_clock()
-                    Clock.schedule_once(lambda _: self._announce_voice_start_success(), 0)
-                    Clock.schedule_once(lambda _: self._sync_voice_assistant_state(), 0)
+                    Clock.schedule_once(lambda _: self._suspend_voice_assistant_for_recording(), 0)
                     Clock.schedule_once(
                         lambda _: self.goto_screen('recording', 'fade'), 0)
                     return
@@ -1617,6 +2107,7 @@ class MeetingBoxApp(App):
                     break
             self._voice_start_in_flight = False
             self._voice_start_confirmation_pending = False
+            self._voice_recording_suspended = False
             Clock.schedule_once(lambda _: self._clear_voice_indicator_override(), 0)
             Clock.schedule_once(lambda _: self._sync_voice_assistant_state(), 0)
             title, message = _recording_start_error_screen_args(
@@ -1639,7 +2130,7 @@ class MeetingBoxApp(App):
                 self.recording_state['active'] = False
                 self._voice_start_in_flight = False
                 self._clear_recording_elapsed_clock()
-                Clock.schedule_once(lambda _: self._sync_voice_assistant_state(), 0)
+                Clock.schedule_once(lambda _: self._resume_voice_assistant_after_recording(), 0)
                 logger.info("Recording stopped successfully")
                 # Device-initiated stop never goes through on_recording_stopped (Redis/WS).
                 self._kick_post_stop_meeting_polls(sid)
@@ -1697,13 +2188,46 @@ class MeetingBoxApp(App):
         'idle',
     })
 
+    # ------------------------------------------------------------------
+    # Local settings cache helpers (survive backend outages across restarts)
+    # ------------------------------------------------------------------
+
+    def _local_ui_settings_path(self) -> Path:
+        from config import resolve_device_config_dir
+        return resolve_device_config_dir() / "local_ui_settings.json"
+
+    def _persist_local_idle_timeout(self, value: str) -> None:
+        try:
+            path = self._local_ui_settings_path()
+            existing: dict = {}
+            if path.is_file():
+                try:
+                    existing = json.loads(path.read_text(encoding="utf-8"))
+                except Exception:
+                    pass
+            existing["idle_screen_timeout"] = value
+            path.write_text(json.dumps(existing), encoding="utf-8")
+        except Exception as exc:
+            logger.debug("Could not persist idle timeout locally: %s", exc)
+
+    def _load_local_idle_timeout(self) -> str | None:
+        try:
+            path = self._local_ui_settings_path()
+            if path.is_file():
+                data = json.loads(path.read_text(encoding="utf-8"))
+                val = data.get("idle_screen_timeout")
+                if val is not None:
+                    return str(val)
+        except Exception:
+            pass
+        return None
+
     def _apply_idle_timeout(self, value: str):
         """Configure idle-screen timeout.
 
-        Accepts seconds as a string (``"30"``, ``"60"``, ``"120"``, ``"300"``)
-        or ``"never"``. The legacy ``screen_timeout`` value (which was in
-        minutes — ``"5"``, ``"10"``) is interpreted as minutes for backward
-        compatibility so existing devices don't break on first read.
+        Accepts seconds as a string (``"30"``, ``"60"``, ``"120"``, ``"300"``,
+        ``"1800"``) or ``"never"``. Also persists the value to a local cache
+        file so the setting survives backend outages across device restarts.
         """
         if self._idle_event:
             self._idle_event.cancel()
@@ -1712,22 +2236,19 @@ class MeetingBoxApp(App):
         v = (value or '').strip().lower()
         if v in ('', 'never', 'off', '0'):
             self._idle_timeout_seconds = 0
+            self._persist_local_idle_timeout('never')
             return
 
         try:
             n = int(v)
         except ValueError:
-            self._idle_timeout_seconds = 30
+            self._idle_timeout_seconds = 600
+            self._persist_local_idle_timeout('600')
             self._reset_idle_timer()
             return
-        # Legacy `screen_timeout` was in minutes; treat very small numbers as
-        # minutes so a stored "5" still means "5 minutes" rather than 5s.
-        if n <= 30:
-            self._idle_timeout_seconds = n
-        elif n <= 60:
-            self._idle_timeout_seconds = n  # 60s sits in the new bucket
-        else:
-            self._idle_timeout_seconds = n
+
+        self._idle_timeout_seconds = n
+        self._persist_local_idle_timeout(value)
         self._reset_idle_timer()
 
     def _reset_idle_timer(self, *_args):
@@ -1771,7 +2292,14 @@ class MeetingBoxApp(App):
             return False
         if not getattr(self, "voice_assistant_enabled", True):
             return False
-        if getattr(self, "_realtime_voice_session", None) is not None:
+        if getattr(self, "_voice_recording_suspended", False):
+            return False
+        if self.recording_state.get("active"):
+            return False
+        if (
+            getattr(self, "_realtime_voice_session", None) is not None
+            and getattr(self, "_realtime_mic_acquired", False)
+        ):
             return False
         if self._voice_start_in_flight:
             return False
@@ -1789,8 +2317,43 @@ class MeetingBoxApp(App):
             'setup_progress',
             'all_set',
             'mic_test',
+            # 'recording' blocks the wake-word listener while a meeting is being
+            # recorded. The listener uses sd.RawInputStream on PortAudio's
+            # default device, which on this hardware routes to the USB mic via
+            # PulseAudio/PipeWire. Holding it open starves audio_capture.py
+            # (the recorder) — it falls back to the silent built-in mic, so the
+            # WAV ends up silent and the on-screen waveform stays flat. Pausing
+            # here triggers _close_stream(), releasing the mic for the recorder.
+            'recording',
         }
         return self.screen_manager.current not in blocked
+
+    def _suspend_voice_assistant_for_recording(self) -> None:
+        """Guarantee meeting audio is not mixed with assistant mic/speaker use."""
+        self._voice_recording_suspended = True
+        self._voice_start_confirmation_pending = False
+        self._voice_start_in_flight = False
+        self._clear_voice_indicator_override()
+        try:
+            if getattr(self, "voice_assistant", None) is not None:
+                self.voice_assistant.set_paused(True)
+                self.voice_assistant.clear_confirmation()
+                self.voice_assistant.exit_command_window()
+        except Exception:
+            logger.exception("Failed to pause local voice assistant for recording")
+        if getattr(self, "_realtime_voice_session", None) is not None or self._realtime_session_pending:
+            try:
+                logger.info("Recording active — stopping Realtime voice assistant")
+                self._end_realtime_voice_session()
+            except Exception:
+                logger.exception("Failed to stop Realtime voice session for recording")
+        self._set_voice_runtime_state("idle")
+        self._sync_voice_assistant_state()
+        self._refresh_voice_indicator()
+
+    def _resume_voice_assistant_after_recording(self) -> None:
+        self._voice_recording_suspended = False
+        self._sync_voice_assistant_state()
 
     def _sync_voice_assistant_state(self) -> None:
         if not getattr(self, 'voice_assistant', None):
@@ -1805,8 +2368,18 @@ class MeetingBoxApp(App):
             state, message = self._voice_indicator_override
             self.voice_indicator.set_state(state, message)
             return
+        rt = getattr(self, "_voice_runtime_state", "idle")
+        if rt in ("listening", "thinking", "speaking"):
+            if rt == "listening":
+                self.voice_indicator.set_state("wake", "Listening…")
+            elif rt == "thinking":
+                self.voice_indicator.set_state("wake", "Thinking…")
+            else:
+                self.voice_indicator.set_state("speaking", "Speaking…")
+            return
         if self.voice_assistant.available and self._voice_assistant_should_listen():
-            self.voice_indicator.set_state("idle", 'Say "Hey Tony"')
+            wkd = getattr(self, "voice_wake_phrase_display", None) or "Hey Tony"
+            self.voice_indicator.set_state("idle", f'Say "{wkd}"')
             return
         self.voice_indicator.set_state("hidden")
 
@@ -1817,6 +2390,20 @@ class MeetingBoxApp(App):
         self._voice_indicator_override = None
         self._refresh_voice_indicator()
         self._sync_voice_assistant_state()
+
+    def _set_voice_runtime_state(self, state: str) -> None:
+        self._voice_runtime_state = (state or "idle").strip().lower()
+        self._refresh_voice_indicator()
+
+    def _voice_mark_post_realtime_wake_suppression(self) -> None:
+        """Realtime PCM uses aplay, not _speak_text_blocking — apply same tail/guard timeline."""
+        import time as _time
+
+        deadline = _time.monotonic() + (
+            _tts_tail_silence_seconds() + _post_tts_wake_guard_seconds()
+        )
+        prev = float(getattr(self, "_wake_suppress_until_monotonic", 0.0) or 0.0)
+        self._wake_suppress_until_monotonic = max(prev, deadline)
 
     def _set_voice_indicator_override(
         self,
@@ -1840,14 +2427,48 @@ class MeetingBoxApp(App):
         Arms at most one cloud Q&A reply for this wake. OpenAI Realtime may only start
         when voice_realtime_assistant is on and `_realtime_launch_permitted` is set here.
         """
+        import logging as _logging
+        import time as _time
+
+        nowm = _time.monotonic()
+        # Local espeak TTS marks _last_tts_end_monotonic; Realtime marks _wake_suppress_until_monotonic.
+        quiet_until = max(
+            getattr(self, "_wake_suppress_until_monotonic", 0.0),
+            getattr(self, "_last_tts_end_monotonic", 0.0) + _post_tts_wake_guard_seconds(),
+        )
+        if nowm < quiet_until:
+            _logging.getLogger(__name__).debug(
+                "Wake phrase suppressed (post-voice-output quiet period, %.1fs remaining)",
+                quiet_until - nowm,
+            )
+            return
+
         if getattr(self, "voice_assistant_enabled", True):
-            self._voice_cloud_qa_budget = 1
+            # During an active meeting recording, suppress cloud Q&A so the
+            # ambient conversation is not sent to the AI. Local commands
+            # (stop/pause/resume meeting etc.) still work.
+            if self.recording_state.get("active"):
+                self._voice_cloud_qa_budget = 0
+            else:
+                will_use_realtime = (
+                    getattr(self, "voice_realtime_assistant", False)
+                    and REALTIME_VOICE_IMPLEMENTED
+                    and bool(get_device_auth_token().strip())
+                    and not USE_MOCK_BACKEND
+                    and not WAKE_LOCAL_VOICE_ONLY
+                )
+                # OpenAI Realtime handles the whole spoken turn. If we leave the
+                # HTTP /assistant/intent "QA" budget at 1, Vosk often delivers
+                # wake + question in one Result() and fires on_conversation_turn
+                # in the same callback as on_wake_phrase — parallel to Realtime
+                # mint — so the user hears the wrong pipeline and Realtime feels broken.
+                self._voice_cloud_qa_budget = 0 if will_use_realtime else 1
         else:
             self._voice_cloud_qa_budget = 0
         self._realtime_launch_permitted = False
 
         timeout = max(2.0, self.voice_assistant.command_timeout_seconds)
-        lbl = getattr(self, "voice_wake_phrase_display", "Hey buddy") or "Hey buddy"
+        lbl = getattr(self, "voice_wake_phrase_display", "Hey Tony") or "Hey Tony"
 
         def _wake_ui(_dt):
             self._set_voice_indicator_override(
@@ -1919,6 +2540,15 @@ class MeetingBoxApp(App):
             self.voice_assistant.simulate_wake()
         except Exception:
             logger.exception("simulate_wake after wake phrase failed")
+        # Wake cleared QA budget when Realtime was armed; restore one HTTP reply
+        # for this mic window when we actually fell back to local listening.
+        if (
+            getattr(self, "voice_realtime_assistant", False)
+            and getattr(self, "voice_assistant_enabled", True)
+            and not self.recording_state.get("active")
+            and getattr(self, "_voice_cloud_qa_budget", 0) < 1
+        ):
+            self._voice_cloud_qa_budget = 1
         timeout = max(2.0, self.voice_assistant.command_timeout_seconds)
         if (
             self.screen_manager is not None
@@ -1934,23 +2564,43 @@ class MeetingBoxApp(App):
             except Exception:
                 pass
 
+    def _finalize_voice_exchange_idle(self) -> None:
+        """User said goodbye — stop HTTP Q&A follow-up; no extra TTS or API call."""
+        self._voice_cloud_qa_budget = 0
+        try:
+            self.voice_assistant.exit_command_window()
+        except Exception:
+            logger.exception("exit_command_window after farewell failed")
+        Clock.schedule_once(lambda _dt: self._hide_home_listening_state(), 0)
+        self._clear_voice_indicator_override()
+        self._refresh_voice_indicator()
+
     def _handle_voice_conversation_turn(self, text: str) -> None:
         """Cloud assistant Q&A for speech that is not a rigid local intent (person-like dialogue)."""
         if not getattr(self, "voice_assistant_enabled", True):
             return
         if self._voice_pending_confirmation:
             return
+        phrase = (text or "").strip()
+        if phrase and utterance_is_voice_farewell(self.voice_assistant.wake_phrase, phrase):
+            self._finalize_voice_exchange_idle()
+            return
         if getattr(self, "_voice_cloud_qa_budget", 0) <= 0:
             logger.debug("Cloud assistant Q&A skipped (no budget for this wake cycle)")
             return
-        phrase = (text or "").strip()
-        if len(phrase) < 6:
+        norm_p = "".join((phrase or "").lower().split())
+        if len(norm_p) < 4:
             return
 
         self._voice_cloud_qa_budget -= 1
 
         async def _go():
-            self._set_voice_indicator_override("wake", "Thinking…", duration=None)
+            # Always use Clock.schedule_once for Kivy UI ops — this coroutine
+            # runs on the asyncio background thread, not the Kivy main thread.
+            Clock.schedule_once(
+                lambda _dt: self._set_voice_indicator_override("wake", "Thinking…", duration=None),
+                0,
+            )
             try:
                 if not USE_MOCK_BACKEND and not get_device_auth_token().strip():
                     if getattr(self, "voice_assistant_enabled", True):
@@ -1972,16 +2622,26 @@ class MeetingBoxApp(App):
                 logger.warning("Assistant conversation failed: %s", e)
                 if getattr(self, "voice_assistant_enabled", True):
                     Clock.schedule_once(
-                        lambda _dt: self._voice_reply_and_extend_listening(
-                            "Cannot reach the server. Check your network or ask an admin to restart the server.",
-                            error=True,
+                        lambda _dt: self._set_voice_indicator_override(
+                            "error", "No server connection", 2.5
                         ),
                         0,
                     )
-            finally:
-                Clock.schedule_once(lambda _dt: self._clear_voice_indicator_override(), 0)
+            # Do not schedule _clear_voice_indicator_override here: it races with delay=0
+            # callbacks above and cancels the timers _voice_reply just created, so the
+            # orb/text clears while audio plays (or labels the assistant as silent).
 
-        run_async(_go())
+        fut = run_async(_go())
+        if fut is None:
+            logger.error("Assistant Q&A skipped: background asyncio loop is not running")
+            self._voice_cloud_qa_budget += 1
+            Clock.schedule_once(
+                lambda _dt: self._voice_reply_and_extend_listening(
+                    "Voice assistant is not ready. Please restart the app.",
+                    error=True,
+                ),
+                0,
+            )
 
     def _hide_home_listening_state(self, *_args) -> None:
         """Called after wake-word timeout to restore the home screen to idle."""
@@ -2013,7 +2673,30 @@ class MeetingBoxApp(App):
             except Exception:
                 pass
 
+    def _realtime_voice_navigate(self, screen: str) -> None:
+        """Open a main UI screen when the cloud Realtime model calls navigate_device_ui."""
+        s = (screen or "").strip()
+        routes = {
+            "home": ("home", "fade"),
+            "calendar": ("calendar", "slide_left"),
+            "emails": ("emails", "slide_left"),
+            "meetings": ("meetings", "slide_left"),
+            "morning_brief": ("morning_brief", "slide_left"),
+            "settings": ("settings", "slide_left"),
+            "mic_test": ("mic_test", "slide_left"),
+        }
+        pair = routes.get(s)
+        if not pair:
+            return
+        name, tr = pair
+        try:
+            self.goto_screen(name, tr)
+        except Exception:
+            logger.exception("Realtime navigate to %s failed", name)
+
     def _end_realtime_voice_session(self) -> None:
+        self._realtime_mic_acquired = False
+        self._set_voice_runtime_state("idle")
         sess = self._realtime_voice_session
         started = getattr(self, "_realtime_session_start_monotonic", None)
         connected = getattr(self, "_realtime_connected_ok", False)
@@ -2027,11 +2710,18 @@ class MeetingBoxApp(App):
             and not connected
             and (time.monotonic() - float(started)) < 30.0
         )
+        if connected:
+            self._voice_mark_post_realtime_wake_suppression()
         self._realtime_session_start_monotonic = None
         self._realtime_connected_ok = False
         self._realtime_voice_session = None
         self._realtime_session_pending = False
         self._sync_voice_assistant_state()
+        if self.recording_state.get("active"):
+            self._clear_voice_indicator_override()
+            self._hide_home_listening_state()
+            self._refresh_voice_indicator()
+            return
         if short_failed:
             # Do not hide listening here — local fallback re-shows it for the full timeout.
             Clock.schedule_once(
@@ -2043,6 +2733,9 @@ class MeetingBoxApp(App):
         self._refresh_voice_indicator()
 
     def _start_realtime_voice_session(self) -> None:
+        if self.recording_state.get("active"):
+            logger.info("Realtime voice session blocked while recording is active")
+            return
         if self._realtime_voice_session is not None:
             logger.info(
                 "Ending prior Realtime voice session before starting a new one"
@@ -2081,14 +2774,53 @@ class MeetingBoxApp(App):
         )
 
         async def _go():
+            def _friendly_realtime_failure(exc: BaseException) -> str:
+                if isinstance(exc, httpx.HTTPStatusError):
+                    code = exc.response.status_code
+                    detail = ""
+                    try:
+                        body = exc.response.json()
+                        if isinstance(body, dict) and body.get("detail"):
+                            detail = str(body["detail"])
+                    except Exception:
+                        detail = (exc.response.text or "").strip()[:240]
+                    if code == 503:
+                        return "Realtime voice is off or not configured on the server."
+                    if code == 502:
+                        return "Could not start cloud assistant session. Try again later."
+                    if code in (401, 403):
+                        return "Device not authorized — check pairing."
+                    tail = (detail or "").strip()
+                    if tail:
+                        return f"Assistant unavailable ({code}): {tail[:200]}"
+                    return f"Assistant unavailable ({code})."
+                if isinstance(
+                    exc,
+                    (
+                        httpx.ConnectError,
+                        httpx.ConnectTimeout,
+                        httpx.ReadTimeout,
+                        httpx.RemoteProtocolError,
+                        httpx.HTTPError,
+                    ),
+                ):
+                    return "Network error — could not reach the assistant."
+                return "Cloud assistant unavailable."
+
             try:
                 data = await self.backend.create_realtime_voice_session()
             except Exception as e:
                 logger.warning("Realtime voice session request failed: %s", e)
                 self._realtime_session_pending = False
-                Clock.schedule_once(lambda _dt: self._clear_voice_indicator_override(), 0)
+                label = _friendly_realtime_failure(e)
                 Clock.schedule_once(
-                    lambda _dt: self._begin_local_voice_command_session(), 0
+                    lambda _dt: self._set_voice_indicator_override(
+                        "wake", label, duration=5.5
+                    ),
+                    0,
+                )
+                Clock.schedule_once(
+                    lambda _dt: self._begin_local_voice_command_session(), 5.6
                 )
                 return
             Clock.schedule_once(lambda _dt, d=data: self._run_realtime_voice_session(d), 0)
@@ -2097,8 +2829,15 @@ class MeetingBoxApp(App):
 
     def _run_realtime_voice_session(self, data: dict) -> None:
         self._realtime_session_pending = False
+        if self.recording_state.get("active"):
+            logger.info("Realtime voice session launch cancelled because recording is active")
+            self._sync_voice_assistant_state()
+            return
         try:
-            from realtime_voice_session import RealtimeVoiceSession
+            from realtime_voice_session import (
+                RealtimeVoiceSession,
+                extract_realtime_output_voice,
+            )
         except ImportError:
             logger.exception("realtime_voice_session module missing")
             self._clear_voice_indicator_override()
@@ -2110,6 +2849,10 @@ class MeetingBoxApp(App):
 
         secret = (data.get("client_secret") or "").strip()
         model = (data.get("model") or "").strip()
+        sess_blob = data.get("session")
+        rt_voice = ""
+        if isinstance(sess_blob, dict):
+            rt_voice = extract_realtime_output_voice(sess_blob)
         if not secret or not model:
             self._clear_voice_indicator_override()
             self._sync_voice_assistant_state()
@@ -2117,8 +2860,61 @@ class MeetingBoxApp(App):
             return
         tok = get_device_auth_token().strip()
 
+        def _before_realtime_mic() -> None:
+            # Run from Realtime asyncio thread — do NOT block on Kivy Clock/Event:
+            # schedule_once + threading.Event.wait is unreliable across threads on
+            # some installs and causes on_before_open_mic timeouts → mic opens while
+            # Vosk still holds ALSA → Realtime failures and silent assistant.
+            self._realtime_mic_acquired = True
+            try:
+                self.voice_assistant.exit_command_window()
+            except Exception:
+                logger.exception("exit_command_window before realtime mic failed")
+            try:
+                self.voice_assistant.set_paused(True)
+            except Exception:
+                logger.exception("pause local Vosk before Realtime mic failed")
+
+            def _ui_refresh(_dt):
+                try:
+                    self._refresh_voice_indicator()
+                except Exception:
+                    logger.debug("voice indicator refresh after Realtime mic handoff failed", exc_info=True)
+
+            try:
+                Clock.schedule_once(_ui_refresh, 0)
+            except Exception:
+                logger.debug("Clock.schedule_once for voice indicator skipped", exc_info=True)
+
         def _end() -> None:
-            Clock.schedule_once(lambda _dt: self._end_realtime_voice_session(), 0)
+            # If the session ended unexpectedly (WS dropped, OpenAI hit the
+            # ~15-60 min hard session cap), immediately start a fresh session
+            # so the user doesn't have to re-say the wake word mid-thought.
+            sess = self._realtime_voice_session
+            unexpected = False
+            try:
+                if sess is not None and hasattr(sess, "ended_unexpectedly"):
+                    unexpected = bool(sess.ended_unexpectedly())
+            except Exception:
+                unexpected = False
+
+            def _after_end(_dt):
+                self._end_realtime_voice_session()
+                if unexpected:
+                    logger.info("Realtime session ended unexpectedly; auto-reconnecting.")
+                    # Re-arm the launch permission (normally set by the wake
+                    # word) so the reconnect bypasses the arming check.
+                    self._realtime_launch_permitted = True
+
+                    def _reconnect(_dt2):
+                        try:
+                            self._start_realtime_voice_session()
+                        except Exception:
+                            logger.exception("Realtime auto-reconnect failed")
+
+                    Clock.schedule_once(_reconnect, 0.3)
+
+            Clock.schedule_once(_after_end, 0)
 
         def _err(msg: str) -> None:
             logger.error("Realtime voice error: %s", msg)
@@ -2126,14 +2922,10 @@ class MeetingBoxApp(App):
             Clock.schedule_once(lambda _dt: self._end_realtime_voice_session(), 0)
 
         def _on_rt_connected() -> None:
-            # Run on Realtime worker thread — release Vosk mic before opening Realtime input.
-            try:
-                self.voice_assistant.set_paused(True)
-            except Exception:
-                logger.exception("pause local voice for Realtime failed")
-
+            # Vosk is paused from on_before_open_mic right before ALSA opens for Realtime.
             def _ui(_dt):
                 self._realtime_connected_ok = True
+                self._set_voice_runtime_state("listening")
                 self._clear_voice_indicator_override()
                 self._set_voice_indicator_override(
                     "assistant_live",
@@ -2141,8 +2933,54 @@ class MeetingBoxApp(App):
                     duration=None,
                 )
                 self._sync_voice_assistant_state()
+                # Clear previous session's transcript on new connection
+                if self._transcript_overlay is not None:
+                    self._transcript_overlay.clear_session()
 
             Clock.schedule_once(_ui, 0)
+
+        def _on_rt_state(state: str) -> None:
+            self._set_voice_runtime_state(state)
+
+            def _update_home(_dt):
+                if (self.screen_manager is not None
+                        and self.screen_manager.current == 'home'):
+                    try:
+                        home = self.screen_manager.get_screen('home')
+                        home.set_voice_session_state(state)
+                    except Exception:
+                        pass
+
+            Clock.schedule_once(_update_home, 0)
+
+        def _on_user_transcript(text: str) -> None:
+            overlay = self._transcript_overlay
+            if overlay is None:
+                return
+            msg_id = overlay.add_user_message(text)
+            if not overlay._dismissed:
+                overlay.show()
+            # Background thread: correct grammar, then update the bubble
+            _backend = BACKEND_URL
+            _token = tok
+
+            def _correct_and_update():
+                from api_client import correct_transcript_sync
+                corrected = correct_transcript_sync(_backend, _token, text)
+                if corrected and corrected != text:
+                    Clock.schedule_once(
+                        lambda _dt: overlay.update_user_message(msg_id, corrected), 0
+                    )
+
+            threading.Thread(target=_correct_and_update, daemon=True).start()
+
+        def _on_ai_transcript(text: str) -> None:
+            overlay = self._transcript_overlay
+            if overlay is None:
+                return
+            overlay.add_ai_message(text)
+            if not overlay._dismissed:
+                overlay.show()
 
         try:
             self._realtime_connected_ok = False
@@ -2155,12 +2993,20 @@ class MeetingBoxApp(App):
                 on_session_end=_end,
                 on_error=_err,
                 on_connected=_on_rt_connected,
+                on_device_navigate=self._realtime_voice_navigate,
+                output_voice=rt_voice or None,
+                on_before_open_mic=_before_realtime_mic,
+                on_state_change=_on_rt_state,
+                on_user_transcript=_on_user_transcript,
+                on_ai_transcript=_on_ai_transcript,
             )
             self._sync_voice_assistant_state()
             self._realtime_voice_session.start()
         except Exception:
             logger.exception("Realtime voice session failed to start")
             self._realtime_voice_session = None
+            self._realtime_mic_acquired = False
+            self._set_voice_runtime_state("idle")
             self._realtime_session_pending = False
             self._clear_voice_indicator_override()
             self._sync_voice_assistant_state()
@@ -2175,126 +3021,245 @@ class MeetingBoxApp(App):
         v = max(0, min(100, v))
         return max(0, min(200, int(round(v * 2))))
 
+    def _speak_via_openai_tts(self, text: str) -> bool:
+        """
+        Call the server's /api/tts/speak endpoint (backed by OpenAI TTS).
+        Returns True if audio was played successfully.
+        Falls through silently on any error so espeak-ng can take over.
+        """
+        try:
+            from config import BACKEND_URL
+            token = get_device_auth_token().strip()
+            if not token:
+                return False
+
+            resp = httpx.post(
+                f"{BACKEND_URL}/api/tts/speak",
+                json={"text": text, "voice": os.environ.get("OPENAI_TTS_VOICE", "shimmer")},
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=20.0,
+            )
+            if resp.status_code != 200:
+                logger.debug("OpenAI TTS server returned %s: %s", resp.status_code, resp.text[:200])
+                return False
+
+            audio_bytes = resp.content
+            if not audio_bytes:
+                return False
+
+            aplay = shutil.which("aplay")
+            if not aplay:
+                logger.debug("aplay not found — cannot play OpenAI TTS audio")
+                return False
+
+            import tempfile
+            with tempfile.NamedTemporaryFile(suffix=".pcm", delete=False) as tmp:
+                tmp.write(audio_bytes)
+                tmp_path = tmp.name
+
+            try:
+                r_play = subprocess.run(
+                    [aplay, "-q", *_tts_aplay_device_argv(), "-r", "24000", "-f", "S16_LE", "-c", "1", tmp_path],
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=60,
+                )
+                if r_play.returncode != 0:
+                    logger.debug("OpenAI TTS aplay exited %s", r_play.returncode)
+                    return False
+                return True
+            finally:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+
+        except Exception as exc:
+            logger.debug("OpenAI TTS failed, falling back to espeak: %s", exc)
+            return False
+
     def _speak_text_blocking(self, text: str) -> bool:
         phrase = (text or "").strip()
         if not phrase:
             return False
-        amp_n = self._espeak_amplitude()
-        if amp_n <= 0:
-            return True
-        amp = str(amp_n)
 
-        # --- 1. piper (neural TTS — best quality, fully offline) ---
-        # Usage: echo "text" | piper --model MODEL --output_file /tmp/piper_out.wav && aplay /tmp/piper_out.wav
-        piper = shutil.which("piper")
-        aplay = shutil.which("aplay")
-        if piper and aplay:
-            import glob as _glob
-            model_candidates = [
-                "/usr/share/piper/voices/en_US-amy-medium.onnx",
-                "/usr/share/piper/voices/en_US-lessac-medium.onnx",
-                "/usr/share/piper/voices/en_US-ryan-medium.onnx",
-                "/usr/local/share/piper/en_US-amy-medium.onnx",
-            ]
-            # Also search dynamically
-            model_candidates += _glob.glob("/usr/share/piper/voices/en_US-*.onnx")
-            model_candidates += _glob.glob("/usr/local/share/piper/**/*.onnx", recursive=True)
-            piper_model = next((m for m in model_candidates if os.path.isfile(m)), None)
-            if piper_model:
-                try:
-                    import tempfile
-                    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-                        tmp_path = tmp.name
-                    proc = subprocess.run(
-                        [piper, "--model", piper_model, "--output_file", tmp_path],
-                        input=phrase.encode(),
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        timeout=15,
-                        check=False,
-                    )
-                    if proc.returncode == 0 and os.path.getsize(tmp_path) > 0:
-                        subprocess.run(
-                            [aplay, "-q", tmp_path],
-                            check=False,
+        # Drop this reply if another TTS call is already in progress.
+        # Prevents multiple overlapping voices when the cloud returns
+        # a reply while a previous one is still playing.
+        if not self._speaking_lock.acquire(blocking=False):
+            logger.debug("_speak_text_blocking: skipping (already speaking)")
+            return False
+
+        va = getattr(self, "voice_assistant", None)
+        try:
+            # Suppress Vosk mic input while speaker is active so the
+            # device's own voice is not picked up and re-processed.
+            if va is not None:
+                va.set_tts_active(True)
+
+            # --- 0. OpenAI TTS via server (natural AI voice — best quality) ---
+            if self._speak_via_openai_tts(phrase):
+                return True
+
+            amp_n = self._espeak_amplitude()
+            if amp_n <= 0:
+                # UI can be slid to 0%; still attempt quiet offline fallback when cloud failed.
+                amp_n = max(72, int(round(40 * 2)))
+            amp = str(amp_n)
+
+            # --- 1. piper (neural TTS — best quality, fully offline) ---
+            piper = shutil.which("piper")
+            aplay = shutil.which("aplay")
+            if piper and aplay:
+                piper_model = _pick_english_piper_model_path()
+                if piper_model:
+                    try:
+                        import tempfile
+                        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                            tmp_path = tmp.name
+                        proc = subprocess.run(
+                            [piper, "--model", piper_model, "--output_file", tmp_path],
+                            input=phrase.encode(),
                             stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL,
-                            timeout=30,
+                            timeout=15,
+                            check=False,
+                            env=_tts_english_child_env(),
                         )
+                        if proc.returncode == 0 and os.path.getsize(tmp_path) > 0:
+                            r_ap = subprocess.run(
+                                [aplay, "-q", *_tts_aplay_device_argv(), tmp_path],
+                                check=False,
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL,
+                                timeout=30,
+                            )
+                            try:
+                                os.unlink(tmp_path)
+                            except OSError:
+                                pass
+                            if r_ap.returncode == 0:
+                                return True
                         try:
                             os.unlink(tmp_path)
                         except OSError:
                             pass
-                        return True
-                    try:
-                        os.unlink(tmp_path)
-                    except OSError:
-                        pass
-                except Exception as e:
-                    logger.debug("piper TTS failed: %s", e)
+                    except Exception as e:
+                        logger.debug("piper TTS failed: %s", e)
 
-        # --- 2. mimic3 (Mycroft neural TTS — good quality) ---
-        mimic3 = shutil.which("mimic3")
-        if mimic3:
-            try:
-                result = subprocess.run(
-                    [mimic3, "--voice", "en_US/vctk_low#p236", phrase],
-                    check=False,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    timeout=20,
-                )
-                if result.returncode == 0:
-                    return True
-            except Exception as e:
-                logger.debug("mimic3 TTS failed: %s", e)
-
-        # --- 3. espeak-ng / espeak with natural voice settings ---
-        # Use en-us+f3 (natural American English female, variant 3)
-        # -p 46 = moderate pitch, -s 125 = comfortable speed, -g 3 = small word gap
-        for exe_name, voice in (("espeak-ng", "en-us+f3"), ("espeak", "en")):
-            exe = shutil.which(exe_name)
-            if not exe:
-                continue
-            try:
-                subprocess.run(
-                    [exe, "-v", voice, "-s", "125", "-p", "46", "-g", "3", "-a", amp, phrase],
-                    check=False,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    timeout=15,
-                )
-                return True
-            except Exception as e:
-                logger.warning("Voice feedback via %s failed: %s", exe, e)
-
-        # --- 4. espeak-ng --stdout | aplay (last resort) ---
-        esng = shutil.which("espeak-ng")
-        if esng and aplay:
-            try:
-                proc = subprocess.Popen(
-                    [esng, "-v", "en-us+f3", "-s", "125", "-p", "46", "-g", "3", "-a", amp, phrase, "--stdout"],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.DEVNULL,
-                )
+            # --- 2. mimic3 (Mycroft neural TTS — good quality) ---
+            mimic3 = shutil.which("mimic3")
+            if mimic3:
                 try:
-                    subprocess.run(
-                        [aplay, "-q"],
-                        stdin=proc.stdout,
+                    result = subprocess.run(
+                        [mimic3, "--voice", "en_US/vctk_low#p236", phrase],
+                        check=False,
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL,
-                        check=False,
-                        timeout=30,
+                        timeout=20,
+                        env=_tts_english_child_env(),
                     )
-                finally:
-                    if proc.stdout:
-                        proc.stdout.close()
-                    proc.wait(timeout=30)
-                return True
-            except Exception as e:
-                logger.warning("Voice feedback via espeak-ng stdout | aplay failed: %s", e)
-        logger.warning("Voice feedback unavailable: no TTS engine found")
-        return False
+                    if result.returncode == 0:
+                        return True
+                except Exception as e:
+                    logger.debug("mimic3 TTS failed: %s", e)
+
+            # --- 3. espeak-ng / espeak ---
+            # IMPORTANT: use a SINGLE attempt per binary — the cascade previously
+            # tried multiple voice flags, and if en-us+f3 played audio but returned
+            # non-zero (voice data not installed), the next variant would ALSO play
+            # the same text (double/triple voice loop).  One attempt per binary;
+            # only fall through to the stdout|aplay pipe if the binary couldn't run
+            # at all (exception raised), not merely if it returned non-zero.
+            esng = shutil.which("espeak-ng")
+            esp = shutil.which("espeak")
+            _espeak_ran = False
+            for exe, voice_flags in [
+                (esng, ["-v", "en-us", "-s", "130"]),
+                (esp,  ["-v", "en",    "-s", "130"]),
+            ]:
+                if not exe:
+                    continue
+                try:
+                    result = subprocess.run(
+                        [exe, *voice_flags, "-a", amp, phrase],
+                        check=False,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=20,
+                        env=_tts_english_child_env(),
+                    )
+                    _espeak_ran = True
+                    if result.returncode == 0:
+                        return True
+                    # Non-zero exit but subprocess ran — audio may already have been
+                    # produced (voice-data fallback).  Do NOT try the next variant;
+                    # stop here to prevent the same text being spoken twice.
+                    logger.debug("espeak returncode=%s (stopping cascade to avoid double-speak)",
+                                 result.returncode)
+                    break
+                except Exception as e:
+                    logger.debug("espeak attempt failed (%s): %s", voice_flags, e)
+
+            # --- 4. espeak-ng --stdout | aplay (only when binary couldn't run at all) ---
+            if esng and aplay and not _espeak_ran:
+                try:
+                    proc = subprocess.Popen(
+                        [esng, "-v", "en-us", "-s", "130", "-a", amp, phrase, "--stdout"],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.DEVNULL,
+                        env=_tts_english_child_env(),
+                    )
+                    r_ap = None
+                    es_rc = 1
+                    try:
+                        r_ap = subprocess.run(
+                            [aplay, "-q", *_tts_aplay_device_argv()],
+                            stdin=proc.stdout,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            check=False,
+                            timeout=30,
+                        )
+                    finally:
+                        if proc.stdout:
+                            proc.stdout.close()
+                        try:
+                            es_rc = proc.wait(timeout=5)
+                        except Exception:
+                            proc.kill()
+                            try:
+                                es_rc = int(proc.wait(timeout=2))
+                            except Exception:
+                                es_rc = 1
+                    if (
+                        r_ap is not None
+                        and r_ap.returncode == 0
+                        and es_rc == 0
+                    ):
+                        return True
+                except Exception as e:
+                    logger.warning("Voice feedback via espeak-ng stdout | aplay failed: %s", e)
+
+            logger.warning("Voice feedback unavailable: no TTS engine found")
+            return False
+
+        finally:
+            # Pause before mic on — avoids TTS tail / room echo triggering Vosk.
+            import time as _time
+            _time.sleep(_tts_tail_silence_seconds())
+            # Wake suppression extends a bit longer (see _handle_voice_wake_phrase).
+            self._last_tts_end_monotonic = _time.monotonic()
+            try:
+                if va is not None:
+                    va.set_tts_active(False)
+            except Exception:
+                pass
+            try:
+                self._speaking_lock.release()
+            except RuntimeError:
+                pass
 
     def _speak_text_async(self, text: str) -> None:
         threading.Thread(
@@ -2312,6 +3277,13 @@ class MeetingBoxApp(App):
     def _voice_reply(self, text: str, state: str = "speaking", duration: float | None = None) -> None:
         if not text:
             return
+        if self.recording_state.get("active"):
+            logger.debug("Voice reply suppressed while recording is active")
+            return
+        # Keep realtime voice identity consistent: do not play local fallback TTS
+        # while a realtime session is active.
+        if getattr(self, "_realtime_voice_session", None) is not None:
+            return
         self._set_voice_indicator_override(
             state,
             text,
@@ -2321,11 +3293,39 @@ class MeetingBoxApp(App):
 
     def _voice_reply_and_extend_listening(self, message: str, *, error: bool = False) -> None:
         """Speak assistant text; next question requires another wake phrase or mic tap."""
-        msg = self._trim_voice_text(message, 450)
+        # Strip markdown before TTS so symbols like ** aren't read aloud by espeak.
+        clean = self._strip_markdown(message)
+        clean = self._trim_realtime_reply(clean)
+        msg = self._trim_voice_text(clean, 450)
         words = max(1, len(msg.split()))
         dur = min(45.0, max(2.5, words * 0.42))
         st = "error" if error else "speaking"
         self._voice_reply(msg, state=st, duration=dur)
+
+    @staticmethod
+    def _trim_realtime_reply(text: str) -> str:
+        """Remove repetitive closers and keep speech concise."""
+        s = " ".join((text or "").split())
+        if not s:
+            return s
+        lowers = s.lower()
+        closers = (
+            "let me know if there is anything else",
+            "let me know if you need anything else",
+            "anything else i can help with",
+            "take care",
+            "all good",
+        )
+        for c in closers:
+            pos = lowers.find(c)
+            if pos > 0:
+                s = s[:pos].rstrip(" ,.;:-")
+                break
+        # Keep default spoken output short unless user asks for detail.
+        parts = [p.strip() for p in s.replace("?", ".").split(".") if p.strip()]
+        if len(parts) > 3:
+            s = ". ".join(parts[:3]).strip() + "."
+        return s
 
     @staticmethod
     def _format_voice_duration(seconds: int) -> str:
@@ -2340,6 +3340,29 @@ class MeetingBoxApp(App):
         if rem or not parts:
             parts.append(f"{rem} second" + ("s" if rem != 1 else ""))
         return " ".join(parts[:2])
+
+    @staticmethod
+    def _strip_markdown(text: str) -> str:
+        """Remove common markdown symbols so espeak does not read them aloud."""
+        import re as _re
+        s = text or ""
+        # Bold/italic markers: **text**, *text*, __text__, _text_
+        s = _re.sub(r"\*{1,3}([^*]+)\*{1,3}", r"\1", s)
+        s = _re.sub(r"_{1,3}([^_]+)_{1,3}", r"\1", s)
+        # Inline code / backtick
+        s = _re.sub(r"`([^`]+)`", r"\1", s)
+        # Markdown links [text](url) → text
+        s = _re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", s)
+        # Bare URLs
+        s = _re.sub(r"https?://\S+", "", s)
+        # Headings: # text
+        s = _re.sub(r"^#{1,6}\s+", "", s, flags=_re.MULTILINE)
+        # Bullet/numbered list markers
+        s = _re.sub(r"^\s*[-*•]\s+", "", s, flags=_re.MULTILINE)
+        s = _re.sub(r"^\s*\d+\.\s+", "", s, flags=_re.MULTILINE)
+        # Collapse extra whitespace
+        s = " ".join(s.split())
+        return s
 
     @staticmethod
     def _trim_voice_text(text: str, max_chars: int = 220) -> str:
@@ -2413,6 +3436,9 @@ class MeetingBoxApp(App):
         }.get(topic or "", "I can't do that yet.")
 
     def _announce_voice_start_success(self) -> None:
+        if self.recording_state.get("active"):
+            self._voice_start_confirmation_pending = False
+            return
         if not self._voice_start_confirmation_pending:
             return
         self._voice_start_confirmation_pending = False
@@ -2422,6 +3448,22 @@ class MeetingBoxApp(App):
         Clock.schedule_once(lambda _dt, iv=intent: self._process_voice_intent(iv), 0)
 
     def _process_voice_intent(self, intent: VoiceIntent) -> None:
+        # When OpenAI Realtime is on it handles the whole spoken turn.
+        # Vosk often delivers wake-phrase + the follow-up question in a
+        # single Result(), which fires this intent callback in parallel
+        # with the Realtime mint. Without this guard the device plays
+        # an espeak reply ("Opening inbox.") on top of Realtime's audio.
+        if (
+            getattr(self, "voice_realtime_assistant", False)
+            and REALTIME_VOICE_IMPLEMENTED
+            and bool(get_device_auth_token().strip())
+            and not USE_MOCK_BACKEND
+            and not WAKE_LOCAL_VOICE_ONLY
+            # confirm/cancel are answers to a local prompt, not new commands
+            and intent.name not in ("confirm", "cancel")
+        ):
+            return
+
         if intent.name == "confirm":
             if not self._voice_pending_confirmation:
                 self._voice_reply("There is nothing to confirm right now.", duration=3.0)
@@ -2872,6 +3914,26 @@ class MeetingBoxApp(App):
             self._voice_reply("Opening settings.", duration=2.5)
             return
 
+        if intent.name == "show_emails":
+            self.goto_screen("emails", "slide_left")
+            self._voice_reply("Opening inbox.", duration=2.5)
+            return
+
+        if intent.name == "show_calendar":
+            self.goto_screen("calendar", "slide_left")
+            self._voice_reply("Opening calendar.", duration=2.5)
+            return
+
+        if intent.name == "morning_brief":
+            self.goto_screen("morning_brief", "slide_left")
+            self._voice_reply("Opening your morning briefing.", duration=3.0)
+            return
+
+        if intent.name == "show_tasks":
+            self.goto_screen("meetings", "slide_left")
+            self._voice_reply("Opening meetings and action items.", duration=3.0)
+            return
+
         if intent.name == "show_meetings":
             self.goto_screen("meetings", "slide_left")
             self._voice_reply("Opening meetings.", duration=2.5)
@@ -3010,7 +4072,11 @@ class MeetingBoxApp(App):
 # ==================================================================
 
 def main():
-    print(f"[MeetingBox] Starting Device UI", flush=True)
+    _boot_ts = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+    print(
+        f"[MeetingBox] Starting Device UI (pid={os.getpid()}, time={_boot_ts})",
+        flush=True,
+    )
     disp = os.environ.get('DISPLAY', '(not set)')
     print(f"[MeetingBox] DISPLAY={disp}", flush=True)
     print(f"[MeetingBox] FULLSCREEN={os.environ.get('FULLSCREEN', '(not set)')}", flush=True)
@@ -3065,6 +4131,10 @@ def main():
     _diagnose_xauthority_for_docker()
 
     logger.info("Starting MeetingBox Device UI")
+    print(
+        f"[MeetingBox] Kivy UI starting — full log: {LOG_FILE}",
+        flush=True,
+    )
     try:
         app = MeetingBoxApp()
         app.run()
@@ -3072,7 +4142,15 @@ def main():
         logger.info("Interrupted by user")
         sys.exit(0)
     except Exception as e:
-        print(f"[MeetingBox] FATAL: {e}", flush=True)
+        tb_str = "".join(traceback.format_exception(type(e), e, e.__traceback__))
+        print(
+            f"[MeetingBox] FATAL: {type(e).__name__}: {e!r}",
+            flush=True,
+        )
+        print("[MeetingBox] Traceback:", flush=True)
+        for _line in tb_str.rstrip().splitlines():
+            print(f"[MeetingBox]   {_line}", flush=True)
+        sys.stdout.flush()
         logger.exception(f"Fatal error: {e}")
         sys.exit(1)
 

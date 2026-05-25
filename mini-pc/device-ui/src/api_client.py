@@ -27,12 +27,73 @@ from config import (
     WS_MAX_RECONNECT_ATTEMPTS,
     get_device_auth_token,
     persist_device_auth_token,
+    _strip_trailing_rest_api_path,
 )
 
 logger = logging.getLogger(__name__)
 
+
+def _response_ok_json_api(resp: httpx.Response) -> bool:
+    """True when the response looks like our JSON API, not SPA index.html (nginx mis-route)."""
+    if resp.status_code != 200:
+        return False
+    ct = (resp.headers.get("content-type") or "").lower()
+    if "text/html" in ct:
+        return False
+    if "json" in ct:
+        return True
+    sample = (resp.text or "")[:512].lstrip()
+    return sample.startswith("{") or sample.startswith("[")
+
+
 # Match dashboard Emails tab (`frontend/src/pages/Emails.tsx`).
 _GMAIL_RECENT_DAYS = 90
+
+
+def _meetings_to_calendar_days(meetings: list, start_date: str, end_date: str) -> dict:
+    """
+    Convert a list of local recorded meetings into the calendar/week dict format:
+      {"days": {"YYYY-MM-DD": {"meetings": [...]}}}
+    Used as a fallback when Google Calendar is not connected.
+    """
+    from datetime import date as _date
+    try:
+        d_start = _date.fromisoformat(start_date)
+        d_end = _date.fromisoformat(end_date)
+    except ValueError:
+        return {"days": {}}
+
+    days: dict = {}
+    for m in meetings:
+        # start_time may be in various formats
+        raw_start = m.get("start_time") or m.get("started_at") or m.get("created_at") or ""
+        if not raw_start:
+            continue
+        try:
+            if raw_start.endswith("Z"):
+                raw_start = raw_start[:-1] + "+00:00"
+            dt = datetime.fromisoformat(raw_start)
+            day_str = dt.date().isoformat()
+        except ValueError:
+            continue
+        try:
+            meeting_date = _date.fromisoformat(day_str)
+        except ValueError:
+            continue
+        if not (d_start <= meeting_date <= d_end):
+            continue
+
+        event = {
+            "id": m.get("id", ""),
+            "title": m.get("title") or "Meeting",
+            "start": m.get("start_time") or raw_start,
+            "end": m.get("end_time") or m.get("stop_time") or m.get("start_time") or raw_start,
+            "status": m.get("status", "completed"),
+            "source": "local",
+        }
+        days.setdefault(day_str, {"meetings": []})["meetings"].append(event)
+
+    return {"days": days}
 
 
 def _parse_sender_display(raw: str) -> str:
@@ -194,6 +255,70 @@ def build_websocket_url(base_ws_url: str) -> str:
     )
 
 
+def invoke_realtime_tool_sync(
+    base_url: str,
+    bearer_token: str,
+    *,
+    call_id: str,
+    name: str,
+    arguments: str = "{}",
+    timeout: float = 90.0,
+) -> str:
+    """
+    POST /api/voice/realtime/tools/invoke (blocking).
+    Used by the Realtime WebSocket worker thread; mirrors BackendClient.invoke_realtime_tool.
+    """
+    root = _strip_trailing_rest_api_path((base_url or "").strip().rstrip("/"))
+    tok = (bearer_token or "").strip()
+    if not root or not tok:
+        return json.dumps({"error": "missing_backend_or_token"})
+    url = f"{root}/api/voice/realtime/tools/invoke"
+    headers = {"Authorization": f"Bearer {tok}"}
+    payload = {
+        "call_id": (call_id or "").strip(),
+        "name": (name or "").strip(),
+        "arguments": arguments if arguments is not None else "{}",
+    }
+    try:
+        with httpx.Client(timeout=timeout) as client:
+            resp = client.post(url, json=payload, headers=headers)
+            resp.raise_for_status()
+            body = resp.json()
+        if isinstance(body, dict) and "output" in body:
+            return str(body["output"])
+        return ""
+    except Exception as e:
+        logger.warning("invoke_realtime_tool_sync failed: %s", e)
+        return json.dumps({"error": "invoke_failed", "detail": str(e)})
+
+
+def correct_transcript_sync(
+    base_url: str,
+    bearer_token: str,
+    text: str,
+    timeout: float = 10.0,
+) -> str:
+    """POST /api/voice/correct-text (blocking). Returns corrected text or original on failure."""
+    root = _strip_trailing_rest_api_path((base_url or "").strip().rstrip("/"))
+    tok = (bearer_token or "").strip()
+    if not root or not tok or not (text or "").strip():
+        return text
+    url = f"{root}/api/voice/correct-text"
+    try:
+        with httpx.Client(timeout=timeout) as client:
+            resp = client.post(
+                url,
+                json={"text": text.strip()},
+                headers={"Authorization": f"Bearer {tok}"},
+            )
+            resp.raise_for_status()
+            body = resp.json()
+        return body.get("corrected") or text
+    except Exception as exc:
+        logger.debug("correct_transcript_sync failed: %s", exc)
+        return text
+
+
 class BackendClient:
     """
     Client for MeetingBox backend API.
@@ -221,15 +346,30 @@ class BackendClient:
     """
 
     def __init__(self, base_url: str = BACKEND_URL):
-        self.base_url = base_url.rstrip('/')
+        self.base_url = _strip_trailing_rest_api_path(base_url.rstrip("/"))
         self.ws_url = BACKEND_WS_URL
-        headers = {}
-        token = get_device_auth_token()
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
-        self.client = httpx.AsyncClient(timeout=API_TIMEOUT, headers=headers)
+        # Short connect timeout so unreachable hosts fail fast; read/write use API_TIMEOUT.
+        self.client = httpx.AsyncClient(
+            timeout=httpx.Timeout(
+                float(API_TIMEOUT),
+                connect=min(10.0, float(API_TIMEOUT)),
+            ),
+        )
+        self._refresh_auth_header()
         self.ws_connection = None
         self._ws_reconnect_attempts = 0
+
+    def _refresh_auth_header(self) -> None:
+        """Re-read the device auth token and update the httpx client header.
+
+        Called at init and after claim_device so the token is always current
+        without requiring a full client restart.
+        """
+        token = (get_device_auth_token() or "").strip()
+        if token:
+            self.client.headers["Authorization"] = f"Bearer {token}"
+        else:
+            self.client.headers.pop("Authorization", None)
 
     async def close(self):
         await self.client.aclose()
@@ -272,7 +412,7 @@ class BackendClient:
         if not access:
             raise ValueError("Claim response missing access_token")
         persist_device_auth_token(access)
-        self.set_device_auth_header(access)
+        self._refresh_auth_header()
         return data
 
     # ==================================================================
@@ -353,10 +493,7 @@ class BackendClient:
     async def get_meetings(self, limit: int = 20, offset: int = 0) -> List[Dict]:
         """
         GET /api/meetings/?limit=&offset=
-        Returns list of meeting dicts.
-        Backend shape: { id, title, start_time, end_time, duration, status,
-                         audio_path, created_at }
-        We normalise to the shape the UI expects.
+        Returns list of meeting dicts. Returns [] on any error so callers never crash.
         """
         try:
             resp = await self.client.get(
@@ -365,13 +502,17 @@ class BackendClient:
             )
             resp.raise_for_status()
             meetings = resp.json()
-            # Normalise: add pending_actions=0 if missing
+            if not isinstance(meetings, list):
+                return []
             for m in meetings:
                 m.setdefault('pending_actions', 0)
             return meetings
+        except httpx.HTTPStatusError as e:
+            logger.warning("get_meetings HTTP %s: %s", e.response.status_code, e.response.text[:200])
+            return []
         except Exception as e:
-            logger.error(f"Failed to fetch meetings: {e}")
-            raise
+            logger.warning("get_meetings failed: %s", e)
+            return []
 
     async def get_meeting_detail(self, meeting_id: str) -> Dict:
         """
@@ -529,21 +670,20 @@ class BackendClient:
             message: str,
             meeting_id: Optional[str] = None,
     ) -> Dict:
-        """POST /api/assistant/intent — route a natural-language request."""
-        try:
-            payload: Dict = {"message": message}
-            if meeting_id:
-                payload["meeting_id"] = meeting_id
-            resp = await self.client.post(
-                f"{self.base_url}/api/assistant/intent",
-                json=payload,
-                timeout=120.0,
-            )
-            resp.raise_for_status()
-            return resp.json()
-        except Exception as e:
-            logger.error("Assistant intent failed: %s", e)
-            raise
+        """POST /api/assistant/intent — route a natural-language request.
+        Raises on failure so callers (voice assistant) can distinguish network
+        errors from empty responses.
+        """
+        payload: Dict = {"message": message}
+        if meeting_id:
+            payload["meeting_id"] = meeting_id
+        resp = await self.client.post(
+            f"{self.base_url}/api/assistant/intent",
+            json=payload,
+            timeout=120.0,
+        )
+        resp.raise_for_status()
+        return resp.json()
 
     async def approve_assistant_pending(self, pending_id: str) -> Dict:
         """POST /api/assistant/pending-actions/{id}/approve"""
@@ -696,23 +836,31 @@ class BackendClient:
         """GET /api/calendar/week?start=YYYY-MM-DD&end=YYYY-MM-DD
 
         Returns meetings grouped by date:
-        {
-          "days": {
-            "2026-05-04": {"meetings": [{id, title, start, end, ...}]},
-            ...
-          }
-        }
+          {"days": {"2026-05-04": {"meetings": [{id, title, start, end, ...}]}}}
+
+        Falls back to local recorded meetings when Google Calendar is not connected.
         """
+        # --- Primary: Google Calendar via server ---
         try:
             resp = await self.client.get(
                 f"{self.base_url}/api/calendar/week",
                 params={"start": start_date, "end": end_date},
             )
             resp.raise_for_status()
-            return resp.json()
+            data = resp.json()
+            if isinstance(data, dict) and "days" in data:
+                return data
         except Exception as e:
-            logger.debug("get_calendar_week failed: %s", e)
-            return {"days": {}}
+            logger.debug("get_calendar_week google failed: %s — using meetings fallback", e)
+
+        # --- Fallback: build calendar view from local recorded meetings ---
+        try:
+            meetings = await self.get_meetings(limit=100)
+            return _meetings_to_calendar_days(meetings, start_date, end_date)
+        except Exception as e:
+            logger.debug("get_calendar_week fallback failed: %s", e)
+
+        return {"days": {}}
 
     async def get_briefing_context(self, days_ahead: int = 1) -> Dict:
         """GET /api/briefing/context — calendar slice, tasks, mem0, Gmail preview."""
@@ -749,6 +897,28 @@ class BackendClient:
         resp.raise_for_status()
         return resp.json()
 
+    async def invoke_realtime_tool(
+        self,
+        *,
+        call_id: str,
+        name: str,
+        arguments: str = "{}",
+    ) -> str:
+        """POST /api/voice/realtime/tools/invoke — Mem0 / briefing tools for Realtime voice."""
+        resp = await self.client.post(
+            f"{self.base_url}/api/voice/realtime/tools/invoke",
+            json={
+                "call_id": (call_id or "").strip(),
+                "name": (name or "").strip(),
+                "arguments": arguments if (arguments is not None) else "{}",
+            },
+        )
+        resp.raise_for_status()
+        body = resp.json()
+        if isinstance(body, dict) and "output" in body:
+            return str(body["output"])
+        return ""
+
     # ==================================================================
     # GMAIL (same feed as dashboard: GET /api/integrations/gmail/recent)
     # ==================================================================
@@ -759,16 +929,18 @@ class BackendClient:
             max_results: int = 40,
             days: int = _GMAIL_RECENT_DAYS,
             q: str = "",
+            folder: str = "all",
     ) -> Dict:
         """
-        Fetch Gmail inbox. Tries the dedicated /api/emails endpoint first (purpose-built
-        for device + user Bearer), then falls back to /api/integrations/gmail/recent.
+        Fetch Gmail messages. folder= "all"|"today"|"unread"|"sent"|"drafts".
+        Tries the dedicated /api/emails endpoint first (purpose-built for device
+        + user Bearer), then falls back to /api/integrations/gmail/recent.
         """
         # --- Primary: /api/emails (returns list directly) ---
         try:
             resp = await self.client.get(
                 f"{self.base_url}/api/emails",
-                params={"filter": "all", "limit": int(max_results)},
+                params={"filter": folder, "limit": int(max_results)},
             )
             resp.raise_for_status()
             rows = resp.json()
@@ -795,18 +967,33 @@ class BackendClient:
             data = resp.json()
             if not isinstance(data, dict):
                 return {"connected": False, "messages": [], "error": "Invalid response"}
-            return data
-        except httpx.HTTPStatusError as e:
-            logger.warning(
-                "fetch_gmail_recent HTTP %s: %s",
-                e.response.status_code,
-                (e.response.text or "")[:300],
-            )
+            # This endpoint returns raw Gmail API format (from/date/snippet keys).
+            # Pre-map to device format here so callers always receive shaped data.
+            raw_msgs = data.get("messages") or []
+            mapped = [
+                _map_gmail_recent_row(m)
+                for m in raw_msgs
+                if isinstance(m, dict) and m.get("id")
+            ]
             return {
-                "connected": False,
-                "messages": [],
-                "error": f"HTTP {e.response.status_code}",
+                "connected": bool(data.get("connected")),
+                "messages": mapped,
+                "count": len(mapped),
+                "error": data.get("error"),
             }
+        except httpx.HTTPStatusError as e:
+            sc = e.response.status_code
+            logger.warning("fetch_gmail_recent HTTP %s: %s", sc, (e.response.text or "")[:300])
+            if sc == 401:
+                error_msg = "HTTP 401 — not authenticated"
+            elif sc == 403:
+                error_msg = "HTTP 403 — Gmail not connected"
+            else:
+                error_msg = f"HTTP {sc}"
+            return {"connected": False, "messages": [], "error": error_msg}
+        except httpx.TimeoutException as e:
+            logger.warning("fetch_gmail_recent timeout: %s", e)
+            return {"connected": False, "messages": [], "error": "timeout — network or server issue"}
         except Exception as e:
             logger.warning("fetch_gmail_recent failed: %s", e)
             return {"connected": False, "messages": [], "error": str(e)}
@@ -852,6 +1039,20 @@ class BackendClient:
                 return resp.json()
             except Exception as e:
                 logger.debug("mark_email_unread %s failed: %s", url, e)
+        return {}
+
+    async def mark_email_read(self, email_id: str) -> Dict:
+        """POST /api/emails/{id}/mark-read (falls back to integrations route)."""
+        for url in (
+            f"{self.base_url}/api/emails/{email_id}/mark-read",
+            f"{self.base_url}/api/integrations/gmail/messages/{email_id}/mark-read",
+        ):
+            try:
+                resp = await self.client.post(url)
+                resp.raise_for_status()
+                return resp.json()
+            except Exception as e:
+                logger.debug("mark_email_read %s failed: %s", url, e)
         return {}
 
     async def archive_email(self, email_id: str) -> Dict:
@@ -1025,7 +1226,13 @@ class BackendClient:
         while True:
             try:
                 ws_connect_url = build_websocket_url(self.ws_url)
-                async with websockets.connect(ws_connect_url) as ws:
+                async with websockets.connect(
+                    ws_connect_url,
+                    open_timeout=12,
+                    ping_interval=20,
+                    ping_timeout=20,
+                    max_size=None,
+                ) as ws:
                     logger.info("WebSocket connected")
                     self._ws_reconnect_attempts = 0
                     self.ws_connection = ws
@@ -1056,9 +1263,237 @@ class BackendClient:
         if self._ws_reconnect_attempts > WS_MAX_RECONNECT_ATTEMPTS:
             logger.error("Max WS reconnect attempts reached")
             raise ConnectionError("Failed to reconnect to backend WebSocket")
-        delay = min(WS_RECONNECT_DELAY * (2 ** self._ws_reconnect_attempts), 30)
+        exp = max(0, self._ws_reconnect_attempts - 1)
+        delay = min(WS_RECONNECT_DELAY * (2**exp), 30)
         logger.info(f"Reconnecting WS in {delay}s (attempt {self._ws_reconnect_attempts})")
         await asyncio.sleep(delay)
+
+    # ==================================================================
+    # NEW DEVICE SETTINGS ENDPOINTS
+    # ==================================================================
+
+    async def wifi_radio(self, enabled: bool) -> Dict:
+        """POST /api/device/wifi/radio — toggle WiFi radio on/off."""
+        try:
+            resp = await self.client.post(
+                f"{self.base_url}/api/device/wifi/radio",
+                json={"enabled": enabled},
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.error("wifi_radio failed: %s", e)
+            raise
+
+    async def wifi_saved(self) -> Dict:
+        """GET /api/device/wifi/saved — list saved WiFi connection names."""
+        try:
+            resp = await self.client.get(f"{self.base_url}/api/device/wifi/saved")
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.error("wifi_saved failed: %s", e)
+            raise
+
+    async def wifi_forget(self, connection_name: str) -> Dict:
+        """POST /api/device/wifi/forget — delete a saved WiFi profile by NM connection name."""
+        try:
+            resp = await self.client.post(
+                f"{self.base_url}/api/device/wifi/forget",
+                json={"connection_name": connection_name},
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.error("wifi_forget failed: %s", e)
+            raise
+
+    async def bluetooth_radio(self, enabled: bool) -> Dict:
+        """POST /api/device/bluetooth/radio — toggle Bluetooth on/off."""
+        try:
+            resp = await self.client.post(
+                f"{self.base_url}/api/device/bluetooth/radio",
+                json={"enabled": enabled},
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.error("bluetooth_radio failed: %s", e)
+            raise
+
+    async def bluetooth_devices(self) -> Dict:
+        """GET /api/device/bluetooth/devices — list paired Bluetooth devices."""
+        try:
+            resp = await self.client.get(f"{self.base_url}/api/device/bluetooth/devices")
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.error("bluetooth_devices failed: %s", e)
+            raise
+
+    async def bluetooth_pair(self, mac: str) -> Dict:
+        """POST /api/device/bluetooth/pair — pair a Bluetooth device by MAC."""
+        try:
+            resp = await self.client.post(
+                f"{self.base_url}/api/device/bluetooth/pair",
+                json={"mac": mac},
+                timeout=60.0,
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.error("bluetooth_pair failed: %s", e)
+            raise
+
+    async def set_timezone(self, tz: str) -> Dict:
+        """POST /api/device/system/timezone — set system timezone."""
+        try:
+            resp = await self.client.post(
+                f"{self.base_url}/api/device/system/timezone",
+                json={"timezone": tz},
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.error("set_timezone failed: %s", e)
+            raise
+
+    async def set_datetime(self, *, iso: str = "", ntp: Optional[bool] = None) -> Dict:
+        """POST /api/device/system/datetime — set date/time manually (iso_datetime field).
+        NTP toggle is handled separately via timedatectl on the device side; the backend
+        endpoint only accepts iso_datetime for a manual time set.
+        """
+        try:
+            if ntp is not None and not iso:
+                # NTP toggle only — not supported by the backend endpoint; handled locally
+                return {"ok": True, "ntp_only": True}
+            payload: Dict = {"iso_datetime": iso.strip()}
+            resp = await self.client.post(
+                f"{self.base_url}/api/device/system/datetime",
+                json=payload,
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.error("set_datetime failed: %s", e)
+            raise
+
+    async def storage_breakdown(self) -> Dict:
+        """GET /api/device/storage-breakdown — disk usage by category."""
+        try:
+            resp = await self.client.get(f"{self.base_url}/api/device/storage-breakdown")
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.error("storage_breakdown failed: %s", e)
+            raise
+
+    async def clear_cache(self) -> Dict:
+        """POST /api/device/clear-cache — delete temp/cache files."""
+        try:
+            resp = await self.client.post(f"{self.base_url}/api/device/clear-cache")
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.error("clear_cache failed: %s", e)
+            raise
+
+    async def clear_all_recordings(self) -> Dict:
+        """POST /api/device/recordings/clear-all — bulk delete all recordings."""
+        try:
+            resp = await self.client.post(
+                f"{self.base_url}/api/device/recordings/clear-all"
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.error("clear_all_recordings failed: %s", e)
+            raise
+
+    async def clear_all_transcripts(self) -> Dict:
+        """POST /api/device/transcripts/clear-all — bulk delete all transcript files."""
+        try:
+            resp = await self.client.post(
+                f"{self.base_url}/api/device/transcripts/clear-all"
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.error("clear_all_transcripts failed: %s", e)
+            raise
+
+    async def connectivity_check(self) -> Dict:
+        """GET /api/device/connectivity — HTTP probe to check backend + internet."""
+        try:
+            resp = await self.client.get(
+                f"{self.base_url}/api/device/connectivity",
+                timeout=20.0,
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.error("connectivity_check failed: %s", e)
+            raise
+
+    async def diagnostic_log(self, lines: int = 100) -> Dict:
+        """GET /api/device/diagnostic-log — recent journalctl lines."""
+        try:
+            resp = await self.client.get(
+                f"{self.base_url}/api/device/diagnostic-log",
+                params={"lines": int(lines)},
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.error("diagnostic_log failed: %s", e)
+            raise
+
+    async def send_diagnostic_report(self) -> Dict:
+        """POST /api/device/diagnostic-report — fetch last 200 log lines, then submit."""
+        try:
+            log_text = ""
+            try:
+                log_data = await self.diagnostic_log(lines=200)
+                log_text = (log_data.get("lines") or "")[:2000]
+            except Exception:
+                log_text = "(could not retrieve log lines)"
+            message = log_text or "(no log output)"
+            resp = await self.client.post(
+                f"{self.base_url}/api/device/diagnostic-report",
+                json={"message": message},
+                timeout=30.0,
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.error("send_diagnostic_report failed: %s", e)
+            raise
+
+    async def send_feedback(self, message: str) -> Dict:
+        """POST /api/device/feedback — submit user feedback."""
+        try:
+            resp = await self.client.post(
+                f"{self.base_url}/api/device/feedback",
+                json={"message": message},
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.error("send_feedback failed: %s", e)
+            raise
+
+    async def integration_sync(self, integration_id: str) -> Dict:
+        """POST /api/device/integrations/{id}/sync — request manual re-sync."""
+        try:
+            resp = await self.client.post(
+                f"{self.base_url}/api/device/integrations/{integration_id}/sync",
+                timeout=30.0,
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.error("integration_sync failed: %s", e)
+            raise
 
     # ==================================================================
     # HEALTH CHECK
@@ -1066,14 +1501,44 @@ class BackendClient:
 
     async def health_check(self) -> bool:
         """
-        GET /health  (note: no /api prefix)
-        Returns True if backend is up.
+        Reachability probe: many deployments only reverse-proxy ``/api/*`` to FastAPI, so
+        ``GET {base}/health`` never hits the API (404) or returns SPA HTML (200 + wrong body).
+        Try ``/health`` first, then ``/api/system/status`` (usually proxied; optional auth off by default).
+
+        Uses a dedicated one-shot client so the probe is never blocked waiting for a connection
+        from the shared pool (which may be busy with concurrent startup requests or long-polls).
         """
-        try:
-            resp = await self.client.get(
-                f"{self.base_url}/health", timeout=5)
-            return resp.status_code == 200
-        except Exception as e:
-            logger.error(f"Health check failed: {e}")
-            return False
+        probes = (
+            f"{self.base_url}/health",
+            f"{self.base_url}/api/system/status",
+        )
+        last_err: Exception | None = None
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=12.0, read=15.0, write=8.0, pool=8.0),
+            follow_redirects=True,
+        ) as probe_client:
+            for url in probes:
+                for attempt in range(2):
+                    try:
+                        resp = await probe_client.get(url)
+                        if _response_ok_json_api(resp):
+                            return True
+                        logger.warning(
+                            "Health probe not OK: %s → HTTP %s (not JSON API)",
+                            url,
+                            resp.status_code,
+                        )
+                    except Exception as e:
+                        last_err = e
+                        logger.warning(
+                            "Health probe failed: %s (attempt %d/2) — %s",
+                            url,
+                            attempt + 1,
+                            e,
+                        )
+                        if attempt == 0:
+                            await asyncio.sleep(0.5)
+        if last_err is not None:
+            logger.error("All health probes failed (last error: %s)", last_err)
+        return False
 
