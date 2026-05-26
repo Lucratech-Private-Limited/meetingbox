@@ -333,9 +333,22 @@ def _realtime_session_audio(voice: str) -> dict:
             "turn_detection": _REALTIME_TURN_DETECTION,
             # Enable user-speech transcription at session creation so the
             # conversation.item.input_audio_transcription.completed event fires.
-            # The device's session.update also requests this as a belt-and-suspenders
-            # fallback, but the initial config is the reliable path.
-            "transcription": {"model": "gpt-4o-mini-transcribe"},
+            # gpt-4o-transcribe (full model) is markedly more accurate than
+            # the mini variant on short conversational phrases that were
+            # being misheard (e.g. "alright thanks" -> "Aller"). The prompt
+            # biases the model toward the kinds of utterances this device
+            # actually receives (calendar/email questions, farewells).
+            "transcription": {
+                "model": "gpt-4o-transcribe",
+                "language": "en",
+                "prompt": (
+                    "Conversational English with a MeetingBox voice "
+                    "assistant. Common phrases include: alright thanks, "
+                    "okay bye, thank you, goodbye, see you later, that's "
+                    "all, yes please, no thanks, what's on my calendar, "
+                    "show me my emails, schedule a meeting, set a reminder."
+                ),
+            },
         },
         "output": {
             "format": {"type": "audio/pcm", "rate": 24000},

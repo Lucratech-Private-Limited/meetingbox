@@ -698,6 +698,7 @@ class MeetingBoxApp(App):
         # Voice UI / feedback
         self.root_layout = None
         self._transcript_overlay = None
+        self._pending_user_msg_id: str | None = None
         self.voice_indicator = None
         self._voice_indicator_override = None
         self._voice_indicator_reset_ev = None
@@ -2714,6 +2715,7 @@ class MeetingBoxApp(App):
 
     def _end_realtime_voice_session(self) -> None:
         self._realtime_mic_acquired = False
+        self._pending_user_msg_id = None
         self._set_voice_runtime_state("idle")
         if self._transcript_overlay is not None:
             self._transcript_overlay.hide()
@@ -2975,12 +2977,31 @@ class MeetingBoxApp(App):
 
             Clock.schedule_once(_update_home, 0)
 
+        # When VAD detects the user has finished speaking, drop in an
+        # instant placeholder so the overlay reacts within a frame instead
+        # of waiting ~1-2s for transcription. The placeholder is then
+        # replaced in place when the real transcript / partial deltas arrive.
+        def _on_user_speech_stopped() -> None:
+            overlay = self._transcript_overlay
+            if overlay is None:
+                return
+            # Re-use existing placeholder if we're mid-utterance (defensive)
+            if not getattr(self, "_pending_user_msg_id", None):
+                self._pending_user_msg_id = overlay.add_user_message("…")
+
         def _on_user_transcript(text: str) -> None:
             overlay = self._transcript_overlay
             if overlay is None:
                 return
-            # add_user_message automatically calls show() and appends to history
-            msg_id = overlay.add_user_message(text)
+            pending = getattr(self, "_pending_user_msg_id", None)
+            if pending:
+                # Replace the "…" placeholder in place
+                overlay.update_user_message(pending, text)
+                msg_id = pending
+            else:
+                msg_id = overlay.add_user_message(text)
+            self._pending_user_msg_id = None
+
             # Background thread: correct grammar, then update the bubble
             _backend = BACKEND_URL
             _token = tok
@@ -3032,6 +3053,7 @@ class MeetingBoxApp(App):
                 on_user_transcript=_on_user_transcript,
                 on_ai_transcript=_on_ai_transcript,
                 on_ai_transcript_delta=_on_ai_transcript_delta,
+                on_user_speech_stopped=_on_user_speech_stopped,
             )
             self._sync_voice_assistant_state()
             self._realtime_voice_session.start()

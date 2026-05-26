@@ -95,8 +95,19 @@ _SESSION_IDLE_CLOSE_S = 40.0
 
 _REALTIME_OUTPUT_VOICE_FALLBACK = "marin"
 
-# Fast, low-cost STT for the farewell-detection-only transcript stream.
-_DEFAULT_INPUT_TRANSCRIPTION_MODEL = "gpt-4o-mini-transcribe"
+# STT model for the user-speech transcript stream (used by the UI
+# overlay, farewell detection, and grammar correction). The full
+# gpt-4o-transcribe is significantly more accurate than the mini
+# variant on short conversational phrases that were being misheard
+# (e.g. "alright thanks" -> "Aller"), at the cost of a small extra
+# latency that we hide behind the speech-stopped placeholder.
+_DEFAULT_INPUT_TRANSCRIPTION_MODEL = "gpt-4o-transcribe"
+_INPUT_TRANSCRIPTION_PROMPT = (
+    "Conversational English with a MeetingBox voice assistant. Common "
+    "phrases include: alright thanks, okay bye, thank you, goodbye, "
+    "see you later, that's all, yes please, no thanks, what's on my "
+    "calendar, show me my emails, schedule a meeting, set a reminder."
+)
 
 
 # ---------------------------------------------------------------------------
@@ -269,6 +280,7 @@ class RealtimeVoiceSession:
         on_user_transcript=None,
         on_ai_transcript=None,
         on_ai_transcript_delta=None,
+        on_user_speech_stopped=None,
     ):
         self._client_secret = (client_secret or "").strip()
         self._model = (model or "").strip()
@@ -283,6 +295,7 @@ class RealtimeVoiceSession:
         self._on_user_transcript_cb = on_user_transcript
         self._on_ai_transcript_cb = on_ai_transcript
         self._on_ai_transcript_delta_cb = on_ai_transcript_delta
+        self._on_user_speech_stopped_cb = on_user_speech_stopped
         self._output_voice = (
             (output_voice or "").strip().lower()
             or _REALTIME_OUTPUT_VOICE_FALLBACK
@@ -453,6 +466,17 @@ class RealtimeVoiceSession:
             Clock.schedule_once(
                 lambda _dt: self._safe_call(cb, item_id, accumulated), 0
             )
+
+    def _emit_user_speech_stopped(self) -> None:
+        """Fired the moment VAD decides the user has finished speaking.
+
+        The UI uses this to drop in an instant placeholder bubble so the
+        user gets visual confirmation right away, hiding the second or
+        two needed for the transcription model to finish.
+        """
+        cb = self._on_user_speech_stopped_cb
+        if cb:
+            Clock.schedule_once(lambda _dt: self._safe_call(cb), 0)
 
     def _emit_device_navigation(self, tool_output_json: str) -> None:
         cb = self._on_device_navigate_cb
@@ -947,8 +971,30 @@ class RealtimeVoiceSession:
                 elif t == "input_audio_buffer.speech_stopped":
                     self._touch()
                     self._emit_state("thinking")
+                    # Tell the UI to drop in a placeholder user bubble
+                    # right away so the gap before transcription/AI is
+                    # filled with immediate visual feedback.
+                    self._emit_user_speech_stopped()
 
-                # ---- User transcript -----------
+                # ---- User transcript (streaming partial) ----------------
+                # Newer API versions emit partial transcripts as deltas so
+                # the user's words appear character-by-character. Forward
+                # whatever text they contain so the UI can update the
+                # placeholder bubble live.
+                elif t in (
+                    "conversation.item.input_audio_transcription.delta",
+                    "input_audio_buffer.transcription.delta",
+                ):
+                    self._touch()
+                    partial = self._extract_transcript(msg)
+                    if not partial:
+                        delta = msg.get("delta")
+                        if isinstance(delta, str):
+                            partial = delta.strip()
+                    if partial:
+                        self._emit_user_transcript(partial)
+
+                # ---- User transcript (final) ---------------------------
                 elif t in (
                     "conversation.item.input_audio_transcription.completed",
                     "input_audio_buffer.transcription.completed",
@@ -1149,6 +1195,8 @@ class RealtimeVoiceSession:
                         "input": {
                             "transcription": {
                                 "model": _DEFAULT_INPUT_TRANSCRIPTION_MODEL,
+                                "language": "en",
+                                "prompt": _INPUT_TRANSCRIPTION_PROMPT,
                             },
                         },
                     },
