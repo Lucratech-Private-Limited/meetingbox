@@ -49,6 +49,15 @@ from tools.gmail_tool import (
   gmail_update_draft_from_payload,
 )
 from tools.memory_tool import memory_fetch_meeting, memory_search_meetings
+from tools.research_tool import (
+  research_currency_convert_from_payload,
+  research_deep_research_from_payload,
+  research_news_from_payload,
+  research_sports_score_from_payload,
+  research_stock_price_from_payload,
+  research_weather_from_payload,
+  research_web_search_from_payload,
+)
 
 from services.device_assistant import (
   DEVICE_TOOLS,
@@ -97,6 +106,23 @@ TOOL_GMAIL_ARCHIVE = "gmail_archive_email"
 TOOL_GMAIL_DELETE = "gmail_delete_email"
 TOOL_MEMORY_SEARCH = "memory_search_meetings"
 TOOL_MEMORY_FETCH = "memory_fetch_meeting"
+TOOL_RES_WEB = "research_web_search"
+TOOL_RES_NEWS = "research_news"
+TOOL_RES_WEATHER = "research_weather"
+TOOL_RES_CURRENCY = "research_currency_convert"
+TOOL_RES_STOCK = "research_stock_price"
+TOOL_RES_SPORTS = "research_sports_score"
+TOOL_RES_DEEP = "research_deep_research"
+
+RESEARCH_TOOLS = frozenset({
+  TOOL_RES_WEB,
+  TOOL_RES_NEWS,
+  TOOL_RES_WEATHER,
+  TOOL_RES_CURRENCY,
+  TOOL_RES_STOCK,
+  TOOL_RES_SPORTS,
+  TOOL_RES_DEEP,
+})
 
 GMAIL_TOOLS = frozenset({
   TOOL_GMAIL_LIST,
@@ -640,6 +666,120 @@ def _heuristic_memory_plan(message: str) -> list[dict[str, Any]]:
 
 def plan_memory_steps(message: str) -> list[dict[str, Any]]:
   return _llm_memory_plan(message) or _heuristic_memory_plan(message)
+
+
+def _llm_research_plan(message: str) -> list[dict[str, Any]] | None:
+  """LLM-backed tool selection for the research agent."""
+  client = _get_anthropic()
+  if not client:
+    return None
+  import os
+
+  rules_block = _agent_guidelines_block("research_agent")
+  if not rules_block:
+    logger.warning("research_agent guidelines missing; falling back to heuristic plan")
+    return None
+
+  prompt = (
+    "You are the Research Agent. Pick ONE best tool call for the user message and return JSON.\n\n"
+    "Return ONLY valid JSON (no markdown, no explanation):\n"
+    "{\"steps\": [ {\"tool\": \"<exact_tool_name>\", \"args\": {<required fields>}, \"is_write\": false} ]}\n\n"
+    "CRITICAL RULES — read before anything else:\n"
+    "- 'weather / temperature / rain / forecast / humidity / aqi / air quality / pollution' -> research_weather. Extract the city if mentioned ('weather in Mumbai' -> args.city='Mumbai').\n"
+    "- 'news / headlines / latest news' WITHOUT a specific topic -> research_news with args.category in {top, world, business, technology, science, health}. WITH a topic -> research_news with args.query=<topic>.\n"
+    "- 'convert N X to Y / how much is N X in Y / what is N dollars in rupees' -> research_currency_convert with args.amount=N, args.from=<source code>, args.to=<target code>. Normalize 'dollar/dollars/$' -> USD, 'rupee/rupees/₹/Rs' -> INR, 'euro/€' -> EUR, 'pound/£' -> GBP, 'yen/¥' -> JPY.\n"
+    "- 'stock price of X / X stock / X share price / how is X doing (a company)' -> research_stock_price with args.ticker=<the ticker symbol or company name>. For Indian stocks, use NSE format like 'RELIANCE.NS' or 'INFY.NS' if obvious; otherwise pass the company name and let the search do the rest.\n"
+    "- 'score / live score / match result / who is winning / latest match between X and Y' (a sport) -> research_sports_score with args.query=<free-form match query>.\n"
+    "- 'deep research / deep dive / exhaustive research / comprehensive research / thorough research on X' -> research_deep_research with args.topic=<topic>, args.depth='deep' for 'deep dive/exhaustive/comprehensive', 'medium' for 'thorough/in-depth/detailed research on', 'shallow' otherwise. Pass args.original_message=<the user's exact message> so depth can be auto-classified if depth is omitted.\n"
+    "- For everything else (general factual lookup, definitions, explanations, 'who is X', 'where is X', 'tell me about Y', 'look up Z', 'search for W') -> research_web_search with args.query=<the user's question or topic>, args.num_results=5.\n\n"
+    "Pick the MOST SPECIFIC tool. Never call research_web_search when a specialized tool clearly fits.\n"
+    "Never queue, never ask for approval, never set is_write=true — all research tools are read-only and execute directly.\n"
+    "Never ask clarifying questions; if the request is vague, default to research_web_search with the user's text as the query.\n\n"
+    "FULL TOOL REFERENCE:\n\n"
+    f"{rules_block}\n\n"
+    f"User message: {message.strip()[:3000]}\n"
+  )
+  model = os.getenv("AI_MODEL", "claude-sonnet-4-20250514")
+  try:
+    resp = client.messages.create(
+      model=model,
+      max_tokens=600,
+      messages=[{"role": "user", "content": prompt}],
+    )
+  except Exception:
+    logger.exception("research plan LLM failed")
+    return None
+  text = getattr(resp.content[0], "text", "") or ""
+  try:
+    data = _parse_json_loose(text)
+  except json.JSONDecodeError:
+    logger.warning("research plan not JSON: %s", text[:200])
+    return None
+  steps = data.get("steps") if isinstance(data, dict) else None
+  if not isinstance(steps, list) or not steps:
+    return None
+  normalized: list[dict[str, Any]] = []
+  for step in steps:
+    if not isinstance(step, dict):
+      continue
+    tool = str(step.get("tool") or "").strip()
+    if tool not in RESEARCH_TOOLS:
+      continue
+    args = step.get("args") if isinstance(step.get("args"), dict) else {}
+    normalized.append({"tool": tool, "args": args, "is_write": False})
+  return normalized or None
+
+
+def _heuristic_research_plan(message: str) -> list[dict[str, Any]]:
+  """Cheap fallback when the LLM planner is unavailable. Defaults to web_search."""
+  m = (message or "").lower()
+  if any(k in m for k in ("weather", "temperature", "rain", "forecast", "humidity", "aqi", "air quality", "pollution")):
+    # Try to pluck a city after "in"
+    city = None
+    mt = re.search(r"\b(?:in|at|for)\s+([A-Z][a-zA-Z\-]+(?:\s+[A-Z][a-zA-Z\-]+)?)", message or "")
+    if mt:
+      city = mt.group(1).strip()
+    return [{"tool": TOOL_RES_WEATHER, "args": ({"city": city} if city else {}), "is_write": False}]
+
+  # Currency: 'convert 100 usd to inr' / '100 dollars in rupees'
+  mc = re.search(
+    r"(\d+(?:[\.,]\d+)?)\s*([a-zA-Z₹$€£¥]+)\s+(?:to|in|into)\s+([a-zA-Z₹$€£¥]+)",
+    message or "",
+    re.IGNORECASE,
+  )
+  if mc:
+    amt = float(mc.group(1).replace(",", ""))
+    return [{
+      "tool": TOOL_RES_CURRENCY,
+      "args": {"amount": amt, "from": mc.group(2), "to": mc.group(3)},
+      "is_write": False,
+    }]
+
+  # Stock: 'X stock', 'X share price'
+  if any(k in m for k in ("stock", "share price", "stock price", "ticker", "nifty", "sensex", "nasdaq")):
+    return [{"tool": TOOL_RES_STOCK, "args": {"ticker": (message or "").strip()[:100]}, "is_write": False}]
+
+  # Sports
+  if any(k in m for k in ("live score", "match score", "cricket score", "football score", "ipl", "premier league", "champions league", "world cup")):
+    return [{"tool": TOOL_RES_SPORTS, "args": {"query": (message or "").strip()[:200]}, "is_write": False}]
+
+  # Deep research
+  if any(k in m for k in ("deep research", "deep dive", "exhaustive", "comprehensive research", "thorough research")):
+    depth = "deep" if any(k in m for k in ("deep dive", "exhaustive", "comprehensive")) else "medium"
+    return [{
+      "tool": TOOL_RES_DEEP,
+      "args": {"topic": (message or "").strip()[:600], "depth": depth, "original_message": message},
+      "is_write": False,
+    }]
+
+  if any(k in m for k in ("news", "headline", "headlines", "latest news", "breaking news")):
+    return [{"tool": TOOL_RES_NEWS, "args": {"category": "top", "limit": 6, "query": (message or "").strip()[:200] or None}, "is_write": False}]
+
+  return [{"tool": TOOL_RES_WEB, "args": {"query": (message or "").strip()[:500], "num_results": 5}, "is_write": False}]
+
+
+def plan_research_steps(message: str) -> list[dict[str, Any]]:
+  return _llm_research_plan(message) or _heuristic_research_plan(message)
 
 
 def _memory_tools_blob(tool_results: list[dict[str, Any]]) -> str:
@@ -1550,6 +1690,136 @@ def _dispatch_single_agent(
       assistant_lines.append(syn)
     else:
       assistant_lines.append(_memory_fallback_reply(tool_results))
+
+  elif agent_id == "research_agent":
+    # All research tools are read-only and execute directly. No approval queue.
+    steps = _filter_steps_for_agent(agent_id, plan_research_steps(text))
+    _research_executors: dict[str, Any] = {
+      TOOL_RES_WEB: research_web_search_from_payload,
+      TOOL_RES_NEWS: research_news_from_payload,
+      TOOL_RES_WEATHER: research_weather_from_payload,
+      TOOL_RES_CURRENCY: research_currency_convert_from_payload,
+      TOOL_RES_STOCK: research_stock_price_from_payload,
+      TOOL_RES_SPORTS: research_sports_score_from_payload,
+      TOOL_RES_DEEP: research_deep_research_from_payload,
+    }
+    for step in steps:
+      tool = str(step.get("tool") or "")
+      args = dict(step.get("args") or {})
+      executor = _research_executors.get(tool)
+      if executor is None:
+        tool_results.append({"tool": tool, "error": "Unknown research tool"})
+        continue
+      try:
+        res = executor(args)
+        tool_results.append({"tool": tool, "result": res})
+      except ToolError as e:
+        tool_results.append({"tool": tool, "error": str(e)})
+      except Exception as e:
+        logger.exception("research tool %s failed", tool)
+        tool_results.append({"tool": tool, "error": f"Tool error: {e}"})
+
+    # Compose a short natural-language summary so the chat reply is not just JSON.
+    for tr in tool_results:
+      t = tr.get("tool")
+      if not isinstance(t, str) or t not in RESEARCH_TOOLS:
+        continue
+      if tr.get("error"):
+        assistant_lines.append(f"Couldn't complete that lookup — {tr.get('error')}")
+        continue
+      r = tr.get("result") or {}
+      if t == TOOL_RES_WEATHER:
+        city = r.get("city") or "your location"
+        temp = r.get("temperature_c")
+        feels = r.get("feels_like_c")
+        cond = r.get("condition")
+        hi = r.get("high_c")
+        lo = r.get("low_c")
+        aqi = r.get("aqi")
+        bits: list[str] = []
+        if temp is not None:
+          bits.append(f"{temp}°C")
+        if cond and cond != "Unknown":
+          bits.append(str(cond).lower())
+        if feels is not None and feels != temp:
+          bits.append(f"feels like {feels}°C")
+        if hi is not None and lo is not None:
+          bits.append(f"H {hi}° / L {lo}°")
+        if aqi is not None:
+          bits.append(f"AQI {aqi}")
+        line = f"{city}: " + (", ".join(bits) if bits else "weather data unavailable.")
+        assistant_lines.append(line)
+      elif t == TOOL_RES_NEWS:
+        heads = r.get("headlines") or r.get("results") or []
+        if not heads:
+          assistant_lines.append("No headlines came back for that.")
+        else:
+          top = heads[:5]
+          lines = [f"Top {len(top)} {('on ' + r.get('query')) if r.get('query') else r.get('category', 'headlines')}:"]
+          for h in top:
+            ttitle = h.get("title") or h.get("snippet") or ""
+            url = h.get("url") or ""
+            lines.append(f"• {ttitle}" + (f" ({url})" if url else ""))
+          assistant_lines.append("\n".join(lines))
+      elif t == TOOL_RES_CURRENCY:
+        if r.get("error"):
+          assistant_lines.append(f"Currency conversion failed — {r.get('error')}.")
+        else:
+          assistant_lines.append(
+            f"{r.get('amount')} {r.get('from')} ≈ {r.get('converted')} {r.get('to')} "
+            f"(rate {r.get('rate')}, {r.get('as_of', '')})."
+          )
+      elif t == TOOL_RES_STOCK:
+        qa = r.get("quick_answer")
+        results = r.get("results") or []
+        ticker = r.get("ticker", "")
+        if qa:
+          assistant_lines.append(f"{ticker}: {qa[:300]}")
+        elif results:
+          first = results[0]
+          assistant_lines.append(f"{ticker}: {first.get('title') or ''} — {first.get('snippet', '')[:240]}")
+        else:
+          assistant_lines.append(f"No live quote came back for {ticker}.")
+      elif t == TOOL_RES_SPORTS:
+        qa = r.get("quick_answer")
+        results = r.get("results") or []
+        if qa:
+          assistant_lines.append(qa[:400])
+        elif results:
+          first = results[0]
+          assistant_lines.append(f"{first.get('title') or ''} — {first.get('snippet', '')[:240]}")
+        else:
+          assistant_lines.append("No live score came back for that match.")
+      elif t == TOOL_RES_WEB:
+        qa = r.get("quick_answer")
+        results = r.get("results") or []
+        if qa:
+          assistant_lines.append(qa[:500])
+        if results:
+          lines = [f"Top {min(3, len(results))} hit{'s' if len(results) > 1 else ''}:"]
+          for hit in results[:3]:
+            title = hit.get("title") or ""
+            snippet = (hit.get("snippet") or "")[:200]
+            url = hit.get("url") or ""
+            lines.append(f"• {title}: {snippet}" + (f" ({url})" if url else ""))
+          assistant_lines.append("\n".join(lines))
+        if not qa and not results:
+          assistant_lines.append("No web results came back for that. Try rephrasing the query.")
+      elif t == TOOL_RES_DEEP:
+        synth = r.get("synthesis") or ""
+        sources = r.get("sources") or []
+        depth = r.get("depth") or "shallow"
+        line = f"[{depth} research, {len(sources)} sources, {r.get('elapsed_ms', 0)}ms]\n{synth}"
+        if sources:
+          line += "\n\nSources:"
+          for i, s in enumerate(sources[:10], 1):
+            title = s.get("title") or ""
+            url = s.get("url") or ""
+            line += f"\n[{i}] {title}" + (f" — {url}" if url else "")
+        assistant_lines.append(line)
+
+    if not assistant_lines:
+      assistant_lines.append("Nothing came back from that lookup.")
 
   elif agent_id == "device_agent":
     if not assistant_device_tools_enabled():
