@@ -331,6 +331,11 @@ def _realtime_session_audio(voice: str) -> dict:
             # Table / room mic; improves VAD vs near_field (headset) on device hardware.
             "noise_reduction": {"type": "far_field"},
             "turn_detection": _REALTIME_TURN_DETECTION,
+            # Enable user-speech transcription at session creation so the
+            # conversation.item.input_audio_transcription.completed event fires.
+            # The device's session.update also requests this as a belt-and-suspenders
+            # fallback, but the initial config is the reliable path.
+            "transcription": {"model": "gpt-4o-mini-transcribe"},
         },
         "output": {
             "format": {"type": "audio/pcm", "rate": 24000},

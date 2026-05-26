@@ -2695,6 +2695,8 @@ class MeetingBoxApp(App):
     def _end_realtime_voice_session(self) -> None:
         self._realtime_mic_acquired = False
         self._set_voice_runtime_state("idle")
+        if self._transcript_overlay is not None:
+            self._transcript_overlay.hide()
         sess = self._realtime_voice_session
         started = getattr(self, "_realtime_session_start_monotonic", None)
         connected = getattr(self, "_realtime_connected_ok", False)
@@ -2931,9 +2933,10 @@ class MeetingBoxApp(App):
                     duration=None,
                 )
                 self._sync_voice_assistant_state()
-                # Clear previous session's transcript on new connection
+                # Clear previous session's transcript and show overlay
                 if self._transcript_overlay is not None:
                     self._transcript_overlay.clear_session()
+                    self._transcript_overlay.show()
 
             Clock.schedule_once(_ui, 0)
 
@@ -2955,9 +2958,8 @@ class MeetingBoxApp(App):
             overlay = self._transcript_overlay
             if overlay is None:
                 return
+            # add_user_message automatically calls show() and appends to history
             msg_id = overlay.add_user_message(text)
-            if not overlay._dismissed:
-                overlay.show()
             # Background thread: correct grammar, then update the bubble
             _backend = BACKEND_URL
             _token = tok
@@ -2976,9 +2978,8 @@ class MeetingBoxApp(App):
             overlay = self._transcript_overlay
             if overlay is None:
                 return
+            # add_ai_message automatically calls show() and appends to history
             overlay.add_ai_message(text)
-            if not overlay._dismissed:
-                overlay.show()
 
         try:
             self._realtime_connected_ok = False
