@@ -66,19 +66,17 @@ python3 -m venv .venv && source .venv/bin/activate && pip install -r requirement
 ./run_audio_capture.sh
 ```
 
-**UI + Docker mic** — `redis` and `audio` are gated by the **`docker-audio`** profile. Either set in `.env`:
+**UI + audio (merged image)** — audio capture lives inside the device-ui container; the Redis container still runs separately for IPC. Both start with the `mini-pc` profile:
 
 ```env
-COMPOSE_PROFILES=mini-pc,docker-audio
+COMPOSE_PROFILES=mini-pc
 ```
-
-or pass profiles on the CLI:
 
 ```bash
-docker compose --profile mini-pc --profile docker-audio up -d --build
+docker compose --profile mini-pc up -d --build
 ```
 
-If you only set `COMPOSE_PROFILES=mini-pc`, the mic and Redis containers **will not start** (by design).
+`device-ui` reads `MEETINGBOX_SPAWN_AUDIO=1` (the default in `docker-compose.yml`) and spawns `mini-pc/audio/audio_capture.py` via `audio_supervisor.py`. The supervisor auto-restarts the child if it crashes and tears it down on container stop. There is no longer a separate `audio` service — set `MEETINGBOX_SPAWN_AUDIO=0` only when running the host script (`audio/run_audio_capture.sh`) or a custom systemd unit.
 
 ## Kiosk: fullscreen UI + start on boot
 

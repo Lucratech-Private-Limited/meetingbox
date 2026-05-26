@@ -36,6 +36,7 @@ RUN set -eux; \
             -o Acquire::Retries=5 \
             -o Acquire::http::Pipeline-Depth=0 \
         && apt_install \
+            ca-certificates \
             libsdl2-dev \
             libsdl2-image-dev \
             libsdl2-mixer-dev \
@@ -51,6 +52,10 @@ RUN set -eux; \
             libxrandr-dev \
             libmtdev1t64 \
             libportaudio2 \
+            portaudio19-dev \
+            libasound2-dev \
+            python3-dev \
+            libspeexdsp1 \
             build-essential \
             pkg-config \
             xdg-utils \
@@ -64,6 +69,10 @@ RUN set -eux; \
             alsa-utils \
             network-manager \
             sudo \
+            bluez \
+            pulseaudio-utils \
+            pipewire \
+            wireplumber \
         ; then \
             success=1; \
             break; \
@@ -83,6 +92,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY . .
 
+# Pull mini-pc/audio/ into /app/audio so device-ui's audio_supervisor can spawn
+# audio_capture.py as a child process. ``audio`` is provided via Compose
+# ``additional_contexts`` (see ../docker-compose.yml device-ui service).
+COPY --from=audio . /app/audio/
+
 RUN chmod +x /app/docker-entrypoint.sh
 
 # Create non-root user with host-matching groups for device access
@@ -91,7 +105,7 @@ RUN groupadd -g 44 video 2>/dev/null || true \
     && groupadd -g 105 input 2>/dev/null || true \
     && useradd -m -u 1000 -s /bin/bash -G video,input,audio uiuser \
     && chown -R uiuser:uiuser /app \
-    && printf '%s\n' 'uiuser ALL=(root) NOPASSWD: /usr/local/bin/meetingbox-host-reboot, /usr/local/bin/meetingbox-host-poweroff, /bin/sh /usr/local/bin/meetingbox-host-reboot, /bin/sh /usr/local/bin/meetingbox-host-poweroff' > /etc/sudoers.d/meetingbox-host-power \
+    && printf '%s\n' 'uiuser ALL=(root) NOPASSWD: /usr/local/bin/meetingbox-host-reboot, /usr/local/bin/meetingbox-host-poweroff, /bin/sh /usr/local/bin/meetingbox-host-reboot, /bin/sh /usr/local/bin/meetingbox-host-poweroff, /bin/sh /usr/local/bin/meetingbox-bluetooth *, /bin/sh /usr/local/bin/meetingbox-timedatectl *, /usr/bin/tee /sys/class/backlight/*/brightness, /usr/bin/tee /sys/class/backlight/*/bl_power, /usr/bin/nmcli, /usr/bin/bluetoothctl, /usr/bin/rfkill, /usr/sbin/rfkill, /sbin/rfkill' > /etc/sudoers.d/meetingbox-host-power \
     && chmod 0440 /etc/sudoers.d/meetingbox-host-power \
     && visudo -cf /etc/sudoers.d/meetingbox-host-power
 

@@ -12,12 +12,19 @@ aiofiles>=23.2.1
 # Image handling
 Pillow>=10.2.0
 
-# Audio capture (mic test)
+# Audio capture (mic test + in-process audio_capture.py child)
 numpy>=1.24.0
 sounddevice>=0.4.6
 vosk>=0.3.45
+# Real mic capture + VAD pipeline (formerly in mini-pc/audio/requirements.txt;
+# pulled in here so the merged device-ui image can also spawn audio_capture.py).
+pyaudio==0.2.14
+webrtcvad==2.0.10
+pyyaml>=6.0.1
+# webrtcvad needs pkg_resources at runtime; bare slim Python 3.12+ images drop it.
+setuptools>=69.0.0
 
-# Local Redis (receive audio_level from audio container on same Docker network)
+# Local Redis (receive audio_level from the in-process audio child)
 redis>=5.0.0
 
 # QR Code generation

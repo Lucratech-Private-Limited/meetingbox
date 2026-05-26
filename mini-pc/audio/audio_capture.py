@@ -16,6 +16,11 @@ import redis
 import webrtcvad
 import yaml
 
+try:
+  import sounddevice as sd
+except ImportError:
+  sd = None
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
 logger = logging.getLogger("meetingbox.audio")
 
@@ -78,6 +83,20 @@ class AudioCaptureService:
       self.upload_audio_timeout_seconds = max(60, int(os.getenv("UPLOAD_AUDIO_TIMEOUT_SECONDS", "1200")))
     except ValueError:
       self.upload_audio_timeout_seconds = 1200
+    try:
+      self.input_gain = max(1.0, float(os.getenv("AUDIO_INPUT_GAIN", "1")))
+    except ValueError:
+      self.input_gain = 1.0
+    if self.input_gain > 1.0:
+      logger.info("Applying AUDIO_INPUT_GAIN=%sx to captured microphone samples", self.input_gain)
+    self.capture_backend = os.getenv("AUDIO_CAPTURE_BACKEND", "pyaudio").strip().lower()
+    if self.capture_backend not in ("pyaudio", "sounddevice"):
+      logger.warning("Unknown AUDIO_CAPTURE_BACKEND=%r; using pyaudio", self.capture_backend)
+      self.capture_backend = "pyaudio"
+    if self.capture_backend == "sounddevice" and sd is None:
+      logger.warning("AUDIO_CAPTURE_BACKEND=sounddevice requested but sounddevice is unavailable; using pyaudio")
+      self.capture_backend = "pyaudio"
+    logger.info("Audio capture backend: %s", self.capture_backend)
     # Same token as device-ui: paired device Bearer so uploads/command polling
     # keep working after pairing without copying the token into .env manually.
     self._upload_auth_token = _load_device_auth_token()
@@ -94,6 +113,91 @@ class AudioCaptureService:
 
   # --- Device handling -------------------------------------------------
 
+  def _using_sounddevice(self) -> bool:
+    return self.capture_backend == "sounddevice" and sd is not None
+
+  def _open_input_stream(self, mic_index):
+    if self._using_sounddevice():
+      stream = sd.RawInputStream(
+        samplerate=self.RATE,
+        blocksize=self.CHUNK,
+        channels=self.CAPTURE_CHANNELS,
+        dtype="int16",
+        device=mic_index,
+      )
+      stream.start()
+      return stream
+
+    return self.audio.open(
+      format=self.FORMAT,
+      channels=self.CAPTURE_CHANNELS,
+      rate=self.RATE,
+      input=True,
+      input_device_index=mic_index,
+      frames_per_buffer=self.CHUNK,
+    )
+
+  def _read_input_chunk(self) -> bytes:
+    if self._using_sounddevice():
+      data, overflowed = self.stream.read(self.CHUNK)
+      if overflowed:
+        logger.debug("sounddevice input overflow")
+      return bytes(data)
+    return self.stream.read(self.CHUNK, exception_on_overflow=False)
+
+  def _stop_close_stream(self) -> None:
+    if not self.stream:
+      return
+    try:
+      if self._using_sounddevice():
+        self.stream.stop()
+      else:
+        self.stream.stop_stream()
+    except Exception:
+      pass
+    try:
+      self.stream.close()
+    except Exception:
+      pass
+    self.stream = None
+
+  def _sample_width_bytes(self) -> int:
+    if self._using_sounddevice():
+      return 2
+    return self.audio.get_sample_size(self.FORMAT)
+
+  def _reinit_portaudio(self) -> None:
+    """Re-enumerate audio devices via PortAudio so USB hot-plug is picked up.
+
+    PortAudio (and therefore PyAudio) snapshots the ALSA device list at
+    ``Pa_Initialize()``. Without this re-init, unplugging and re-plugging the
+    USB mic leaves the cached list stale and ``find_mic_device`` keeps picking
+    the gone device / the wrong default — currently a restart of the container
+    is the only workaround. We tear down PortAudio (no active stream at this
+    point) and create a new ``PyAudio`` instance so the next ``get_device_*``
+    call reflects the current kernel state.
+    """
+    if self.stream is not None:
+      try:
+        self.stream.stop_stream()
+      except Exception:
+        logger.debug("PortAudio reinit: stop_stream failed", exc_info=True)
+      try:
+        self.stream.close()
+      except Exception:
+        logger.debug("PortAudio reinit: stream.close failed", exc_info=True)
+      self.stream = None
+    try:
+      self.audio.terminate()
+    except Exception:
+      logger.debug("PortAudio reinit: terminate failed", exc_info=True)
+    self.audio = pyaudio.PyAudio()
+    try:
+      count = self.audio.get_device_count()
+    except Exception:
+      count = -1
+    logger.info("PortAudio re-initialized (device_count=%s)", count)
+
   def find_mic_device(self) -> int | None:
     """
     Auto-detect the best available input device.
@@ -101,15 +205,23 @@ class AudioCaptureService:
     Strategy (no hardcoded mic names):
       1. If AUDIO_INPUT_DEVICE_INDEX is set, use that index directly.
       2. If AUDIO_INPUT_DEVICE_NAME is set, use first device whose name contains it.
-      3. Enumerate all input-capable devices.
+      3. Re-enumerate the PortAudio device list (hot-plug support).
       4. Test each one to see if it actually supports our sample rate.
-      5. Prefer USB / external devices over built-in ones (they're almost
-         always the meeting mic).
+      5. Prefer USB / external devices over built-in ones (and when any USB
+         device is detected, ignore non-USB devices entirely unless
+         ``MEETINGBOX_USB_MIC_STRICT=0`` is set).
       6. If nothing passes the sample-rate test, return None (system default).
 
     This way any USB mic -- ReSpeaker, Jabra, Samson, cheap USB dongle,
-    etc. -- works automatically without code changes.
+    etc. -- works automatically without code changes, and a re-plug of the
+    USB mic during runtime is picked up on the next ``start_recording`` /
+    ``start_mic_test`` instead of requiring a container restart.
     """
+    if self._using_sounddevice():
+      return self.find_sounddevice_mic_device()
+
+    # Force PortAudio to re-scan ALSA before any device-list read below.
+    self._reinit_portaudio()
     self.CAPTURE_CHANNELS = self.TARGET_CHANNELS
 
     def supports_rate(dev: dict, rate: int, channels: int) -> bool:
@@ -263,6 +375,28 @@ class AudioCaptureService:
     for c in candidates:
       logger.info("  [%d] %s  (rate=%s)", c['index'], c['name'], c['info'].get('defaultSampleRate'))
 
+    # Strict USB-only mode: when any USB-like candidate is present, drop
+    # non-USB candidates entirely so we never silently fall back to the
+    # built-in/HDMI/loopback mic. Disable with MEETINGBOX_USB_MIC_STRICT=0
+    # to restore the legacy "prefer USB, fall back to built-in" behavior.
+    strict_usb_raw = (os.getenv("MEETINGBOX_USB_MIC_STRICT") or "1").strip().lower()
+    strict_usb = strict_usb_raw not in ("0", "false", "no", "off")
+    if strict_usb:
+      usb_keywords = (
+        "usb", "uac", "respeaker", "jabra", "samson", "blue", "yeti",
+        "rode", "fifine", "tonor", "boya", "maono", "external",
+      )
+      usb_candidates = [
+        c for c in candidates
+        if any(kw in c["name"].lower() for kw in usb_keywords)
+      ]
+      if usb_candidates:
+        logger.info(
+          "MEETINGBOX_USB_MIC_STRICT=1 → restricting to %d USB-like device(s)",
+          len(usb_candidates),
+        )
+        candidates = usb_candidates
+
     # Sort: concrete USB/external first, built-ins next, generic aliases last.
     # This avoids choosing wrappers like "sysdefault" over the actual USB device.
     candidates.sort(key=lambda c: classify_device(c["name"]))
@@ -300,6 +434,60 @@ class AudioCaptureService:
 
     logger.warning("No usable input device found. Falling back to system default.")
     return None
+
+  def find_sounddevice_mic_device(self) -> int | None:
+    """Find a sounddevice input device. Used when PyAudio cannot see USB ALSA capture devices."""
+    assert sd is not None
+
+    self.CAPTURE_CHANNELS = self.TARGET_CHANNELS
+    self.RATE = self.TARGET_RATE
+    self.CHUNK = self.config["audio"]["chunk_size"]
+
+    devices = []
+    for idx, dev in enumerate(sd.query_devices()):
+      if int(dev.get("max_input_channels") or 0) <= 0:
+        continue
+      devices.append((idx, dev))
+
+    logger.info("Found %d sounddevice input device(s):", len(devices))
+    for idx, dev in devices:
+      logger.info("  [%d] %s  (rate=%s)", idx, dev.get("name") or "", dev.get("default_samplerate"))
+
+    idx_s = os.getenv("AUDIO_INPUT_DEVICE_INDEX", "").strip()
+    if idx_s.isdigit():
+      return int(idx_s)
+
+    name_pattern = os.getenv("AUDIO_INPUT_DEVICE_NAME", "").strip().lower()
+    if name_pattern:
+      for idx, dev in devices:
+        if name_pattern in (dev.get("name") or "").lower():
+          self._configure_sounddevice_rate(dev)
+          logger.info("Using AUDIO_INPUT_DEVICE_NAME match via sounddevice: [%d] %s", idx, dev.get("name") or "")
+          return idx
+
+    usb_keywords = ("usb", "uac", "respeaker", "jabra", "samson", "blue", "yeti", "rode", "fifine", "tonor", "boya", "maono", "external", "webcam", "camera")
+    for idx, dev in devices:
+      name = dev.get("name") or ""
+      if any(keyword in name.lower() for keyword in usb_keywords):
+        self._configure_sounddevice_rate(dev)
+        logger.info("Selected sounddevice USB/external input [%d]: %s", idx, name)
+        return idx
+
+    if devices:
+      idx, dev = devices[0]
+      self._configure_sounddevice_rate(dev)
+      logger.info("Selected first sounddevice input [%d]: %s", idx, dev.get("name") or "")
+      return idx
+
+    logger.warning("No sounddevice input device found. Falling back to system default.")
+    return None
+
+  def _configure_sounddevice_rate(self, dev: dict) -> None:
+    native_rate = int(float(dev.get("default_samplerate") or self.TARGET_RATE))
+    max_channels = int(dev.get("max_input_channels") or self.TARGET_CHANNELS)
+    self.CAPTURE_CHANNELS = self.TARGET_CHANNELS if max_channels >= self.TARGET_CHANNELS else max_channels
+    self.RATE = native_rate if native_rate > 0 else self.TARGET_RATE
+    self.CHUNK = int(self.config["audio"]["chunk_size"] * self.RATE / self.TARGET_RATE)
 
   # --- Resampling ------------------------------------------------------
 
@@ -351,20 +539,13 @@ class AudioCaptureService:
 
     try:
       mic_index = self.find_mic_device()
-      self.stream = self.audio.open(
-        format=self.FORMAT,
-        channels=self.CAPTURE_CHANNELS,
-        rate=self.RATE,
-        input=True,
-        input_device_index=mic_index,
-        frames_per_buffer=self.CHUNK,
-      )
+      self.stream = self._open_input_stream(mic_index)
 
       output_path = self.recordings_dir / f"{session_id}.wav"
       output_path.parent.mkdir(parents=True, exist_ok=True)
       wav_writer = wave.open(str(output_path), "wb")
       wav_writer.setnchannels(self.TARGET_CHANNELS)
-      wav_writer.setsampwidth(self.audio.get_sample_size(self.FORMAT))
+      wav_writer.setsampwidth(self._sample_width_bytes())
       wav_writer.setframerate(self.TARGET_RATE)
       self._output_path = output_path
       self._wav_writer = wav_writer
@@ -488,10 +669,7 @@ class AudioCaptureService:
         self._recording_thread.join(timeout=5.0)
       self._recording_thread = None
 
-    if self.stream:
-      self.stream.stop_stream()
-      self.stream.close()
-      self.stream = None
+    self._stop_close_stream()
 
     if self._wav_writer is not None:
       self._wav_writer.close()
@@ -546,14 +724,7 @@ class AudioCaptureService:
       return True
 
     mic_index = self.find_mic_device()
-    self.stream = self.audio.open(
-      format=self.FORMAT,
-      channels=self.CAPTURE_CHANNELS,
-      rate=self.RATE,
-      input=True,
-      input_device_index=mic_index,
-      frames_per_buffer=self.CHUNK,
-    )
+    self.stream = self._open_input_stream(mic_index)
     self.is_mic_test = True
     logger.info("Mic test started")
     return True
@@ -569,21 +740,16 @@ class AudioCaptureService:
         self._mic_test_thread.join(timeout=2.0)
       self._mic_test_thread = None
 
-    if self.stream:
-      try:
-        self.stream.stop_stream()
-        self.stream.close()
-      except Exception:
-        pass
-      self.stream = None
+    self._stop_close_stream()
     logger.info("Mic test stopped")
 
   def mic_test_loop(self) -> None:
     try:
       while self.is_mic_test and not self.is_recording:
         assert self.stream is not None
-        chunk = self.stream.read(self.CHUNK, exception_on_overflow=False)
+        chunk = self._read_input_chunk()
         audio_bytes = self._prepare_audio_bytes(chunk)
+        audio_bytes = self._apply_input_gain(audio_bytes)
 
         now = time.monotonic()
         if now - self._last_level_emit_at >= 0.08:
@@ -629,6 +795,15 @@ class AudioCaptureService:
       return self.vad.is_speech(vad_chunk, vad_rate)
     except Exception:
       return True  # Assume speech on VAD error
+
+  def _apply_input_gain(self, audio_bytes: bytes) -> bytes:
+    """Apply optional digital gain for quiet USB headset/dongle microphones."""
+    if self.input_gain <= 1.0 or not audio_bytes:
+      return audio_bytes
+    samples = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32)
+    samples *= self.input_gain
+    samples = np.clip(samples, -32768, 32767).astype(np.int16)
+    return samples.tobytes()
 
   def _check_silent_audio(self, audio_bytes: bytes, segment_num: int) -> None:
     """Warn if the captured audio appears to be silent (wrong device or muted mic)."""
@@ -689,10 +864,11 @@ class AudioCaptureService:
     try:
       while self.is_recording:
         assert self.stream is not None
-        chunk = self.stream.read(self.CHUNK, exception_on_overflow=False)
+        chunk = self._read_input_chunk()
         if self.is_paused:
           continue
         audio_bytes = self._prepare_audio_bytes(chunk)
+        audio_bytes = self._apply_input_gain(audio_bytes)
 
         # Emit near-real-time audio level for UI waveform (throttled).
         now = time.monotonic()

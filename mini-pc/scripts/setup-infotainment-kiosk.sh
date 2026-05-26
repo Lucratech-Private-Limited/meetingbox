@@ -3,7 +3,7 @@
 # Runs: install-gdm-kiosk-session.sh + install-boot-service.sh
 #
 #   cd ~/meetingbox-mini-pc-release
-#   cp .env.example .env && nano .env   # BACKEND_URL, COMPOSE_PROFILES=mini-pc,docker-audio, etc.
+#   cp .env.example .env && nano .env   # BACKEND_URL, COMPOSE_PROFILES=mini-pc, etc.
 #   sudo usermod -aG docker meetingbox && newgrp docker   # or re-login once
 #   sudo bash scripts/setup-infotainment-kiosk.sh
 #   sudo reboot

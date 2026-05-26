@@ -1,804 +1,412 @@
-"""Recording screen — Figma `408:657` (yJqcY4KovVjJ11vjysW533).
+"""Recording screen — Figma `863:626` (VelsLhL4YHeVRZSCEmCrGw).
 
-Layout:
-- Header row: back button (round) | recording status + meeting info | Listening pill
-- Center: circular wave-ring background with vertical waveform bars in the middle
-- Below center: timer (HH:MM:SS) + "Recording in progress" caption
-- Bottom row: pause button (round) | "Stop recording" pill | settings gear (round)
+Composes the screen from PNG assets exported from Figma + Kivy Labels for the
+dynamic text (timer, start time, meeting title).  Layout lives in
+``frame19_layout.py`` and matches the Figma absolute coordinates 1:1.
 
-The screen preserves the underlying recording state machine (timer, audio
-level handling, pause/resume/stop wiring) — only the visuals were rebuilt
-to match the Figma design.
+Lifecycle hooks (called from main.py): on_enter / on_leave, on_paused /
+on_resumed, on_audio_level, on_audio_segment.
 """
 
 from __future__ import annotations
 
 import logging
+import math
+import random
 import time
-from collections import deque
-from datetime import datetime
 
-from kivy.animation import Animation
 from kivy.clock import Clock
-from kivy.graphics import Color, Ellipse, Line, Rectangle, RoundedRectangle
+from kivy.graphics import Color, Ellipse, Rectangle, RoundedRectangle
 from kivy.uix.anchorlayout import AnchorLayout
 from kivy.uix.behaviors import ButtonBehavior
-from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.floatlayout import FloatLayout
 from kivy.uix.image import Image
 from kivy.uix.label import Label
 from kivy.uix.widget import Widget
 
-from async_helper import run_async
-from config import (
-    ASSETS_DIR,
-    COLORS,
-    FONT_SIZES,
-    SPACING,
-    display_now,
-    other_screen_horizontal_scale,
-    other_screen_vertical_scale,
+from config import ASSETS_DIR, display_now
+from frame19_layout import (
+    BACK_BTN,
+    BG_RGB,
+    BTN_PAUSE,
+    BTN_SETTINGS,
+    COL_GLOW_BLUE,
+    COL_MUTED,
+    COL_REC_DOT_GREY,
+    COL_REC_DOT_RED,
+    COL_WHITE,
+    LEFT_VEC,
+    REC_DOT,
+    REC_LABEL,
+    REC_LABEL_FS_RATIO,
+    RIGHT_VEC,
+    RING_DARK,
+    RING_GLOW,
+    RING_GRADIENT,
+    STARTED_FS_RATIO,
+    STARTED_LABEL,
+    STATUS,
+    STATUS_FS_RATIO,
+    STOP_PILL,
+    TIMER,
+    TIMER_FS_RATIO,
+    WAVEBAR,
+    font_px,
+    kivy_hints,
+    scaled_canvas,
 )
 from screens.base_screen import BaseScreen
 
 logger = logging.getLogger(__name__)
 
-_REC_ASSETS = ASSETS_DIR / "recording"
+_FIGMA = ASSETS_DIR / "recording" / "figma"
+_BG = (BG_RGB[0] / 255, BG_RGB[1] / 255, BG_RGB[2] / 255, 1.0)
+_FONT_BOLD = "42dot-Sans"
+
+# Centre Frame 19 image layers (back → front).
+# `frame19_ring_glow.png` is handled separately in ``_build_ui`` so its
+# greyscale halo can be tinted blue at runtime via ``Image.color``.
+_FRAME19_IMAGES: tuple[tuple[str, dict], ...] = (
+    ("frame19_ring_dark.png", RING_DARK),
+    ("frame19_ring_gradient.png", RING_GRADIENT),
+    ("frame19_vector_left.png", LEFT_VEC),
+    ("frame19_vector_right.png", RIGHT_VEC),
+)
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _rw_suv(px):
-    v = other_screen_vertical_scale()
-    return max(1, int(round(float(px) * v)))
-
-
-def _rw_suh(px):
-    h = other_screen_horizontal_scale()
-    return max(1, int(round(float(px) * h)))
-
-
-def _rw_suf(fs):
-    v = other_screen_vertical_scale()
-    return max(6, int(round(float(fs) * v)))
-
-
-def _rec_png(name: str) -> str:
-    p = _REC_ASSETS / name
+def _png(name: str) -> str:
+    p = _FIGMA / name
     return str(p) if p.is_file() else ""
 
 
-_BG_NAVY = (0.004, 0.031, 0.102, 1)        # #01081a
-_BORDER = (0.247, 0.259, 0.325, 1)          # #3F4253
-_TEXT_MUTED = (0.714, 0.729, 0.949, 1)      # #B6BAF2
-_BLUE = (0.000, 0.420, 0.976, 1)            # #006bf9
-_RED = (0.96, 0.27, 0.30, 1)
+class _ImgBtn(ButtonBehavior, Image):
+    """Tappable PNG button."""
 
 
-class _ImageButton(ButtonBehavior, Image):
-    """Image that also fires on_press / on_release like a Button."""
+class _Wavebar(Widget):
+    """Voice waveform indicator — Figma node ``863:561`` (Group 46).
 
+    Draws ``n_bars`` vertical rounded bars that react to live microphone
+    levels fed in via :meth:`feed_level`. A small idle ripple keeps it
+    "alive" even when the user is silent so they can see the screen is
+    actively listening; speech amplifies the centre bars more than the
+    edges to mimic the bell-shaped voice envelope in the Figma reference.
 
-class _CircleButton(ButtonBehavior, FloatLayout):
-    """Round bordered surface used for the back / pause / settings buttons.
-
-    Replicates the Figma circle (#020c26 fill, 0.8px #3F4253 border, ~80px
-    radius). The icon is added by the caller via ``add_widget``.
+    Animation runs on Kivy's main thread via ``Clock.schedule_interval``.
+    Call :meth:`start` / :meth:`stop` from on_enter / on_leave (and on
+    pause / resume) so we never burn CPU when the screen is hidden.
     """
 
-    def __init__(self, fill=(0.008, 0.043, 0.149, 1), **kwargs):
-        kwargs.setdefault("size_hint", (None, None))
+    def __init__(
+        self,
+        *,
+        n_bars: int = 21,
+        color: tuple = (0.0, 107 / 255, 249 / 255, 1.0),  # #006BF9
+        idle_color: tuple = (0.0, 107 / 255, 249 / 255, 0.85),
+        **kwargs,
+    ):
         super().__init__(**kwargs)
-        with self.canvas.before:
-            Color(*fill)
-            self._bg = Ellipse(pos=self.pos, size=self.size)
-            Color(*_BORDER)
-            self._stroke = Line(circle=(self.center_x, self.center_y, max(self.width, self.height) / 2), width=1.0)
-        self.bind(pos=self._sync, size=self._sync)
-
-    def _sync(self, *_args):
-        self._bg.pos = self.pos
-        self._bg.size = self.size
-        self._stroke.circle = (
-            self.center_x,
-            self.center_y,
-            max(self.width, self.height) / 2,
-        )
-
-
-class _StopRecordingPill(ButtonBehavior, FloatLayout):
-    """Big "Stop recording" pill in the center of the bottom controls.
-
-    Implements the Figma gradient pill (#02123c → #000a26) with a square
-    blue stop-icon and the bold white text. The square + label are added
-    in __init__ so callers don't have to compose them manually.
-    """
-
-    def __init__(self, **kwargs):
-        kwargs.setdefault("size_hint", (None, None))
-        super().__init__(**kwargs)
-        with self.canvas.before:
-            # Vertical Kivy gradient is non-trivial (no built-in); two flat
-            # rectangles read close enough at thumb size.
-            Color(0.008, 0.071, 0.235, 1.0)  # ~#02123c (top)
-            self._bg_top = RoundedRectangle(pos=self.pos, size=self.size, radius=[_rw_suv(116)])
-            Color(0.000, 0.039, 0.149, 1.0)  # ~#000a26 (bottom)
-            self._bg_bottom = RoundedRectangle(
-                pos=self.pos, size=(self.width, self.height * 0.6), radius=[0, 0, _rw_suv(116), _rw_suv(116)]
-            )
-            Color(*_BORDER)
-            self._stroke = Line(rounded_rectangle=(self.x, self.y, self.width, self.height, _rw_suv(116)), width=1.0)
-        self.bind(pos=self._sync, size=self._sync)
-
-        # Stop square (blue)
-        self._stop_square = Widget(
-            size_hint=(None, None),
-            size=(_rw_suv(27), _rw_suv(27)),
-            pos_hint={"center_y": 0.5, "x": 0.18},
-        )
-        with self._stop_square.canvas:
-            Color(*_BLUE)
-            self._stop_rect = RoundedRectangle(
-                pos=self._stop_square.pos, size=self._stop_square.size, radius=[_rw_suv(4)]
-            )
-        self._stop_square.bind(
-            pos=lambda w, _v: setattr(self._stop_rect, "pos", w.pos),
-            size=lambda w, _v: setattr(self._stop_rect, "size", w.size),
-        )
-        self.add_widget(self._stop_square)
-
-        # Label
-        self._label = Label(
-            text="Stop recording",
-            font_size=_rw_suf(28),
-            bold=True,
-            color=COLORS["white"],
-            halign="left",
-            valign="middle",
-            size_hint=(None, None),
-            size=(_rw_suh(280), _rw_suv(40)),
-            pos_hint={"center_y": 0.5, "x": 0.30},
-        )
-        self._label.bind(size=self._label.setter("text_size"))
-        self.add_widget(self._label)
-
-    def _sync(self, *_args):
-        radius = _rw_suv(116)
-        self._bg_top.pos = self.pos
-        self._bg_top.size = self.size
-        self._bg_top.radius = [radius]
-        self._bg_bottom.pos = self.pos
-        self._bg_bottom.size = (self.width, self.height * 0.6)
-        self._bg_bottom.radius = [0, 0, radius, radius]
-        self._stroke.rounded_rectangle = (self.x, self.y, self.width, self.height, radius)
-
-
-class _ListeningPill(FloatLayout):
-    """Top-right "Listening" pill used in the header.
-
-    Static at this layer — the inner state (active/idle) is driven by
-    voice_assistant in main.py. The pill's purpose here is purely
-    visual feedback: "the device is currently listening for wake word".
-    """
-
-    def __init__(self, **kwargs):
-        kwargs.setdefault("size_hint", (None, None))
-        super().__init__(**kwargs)
-        with self.canvas.before:
-            Color(0.000, 0.060, 0.200, 1.0)  # ~#000f33
-            self._bg = RoundedRectangle(pos=self.pos, size=self.size, radius=[_rw_suv(28)])
-            Color(0.129, 0.157, 0.294, 1.0)  # ~#21284b border
-            self._stroke = Line(
-                rounded_rectangle=(self.x, self.y, self.width, self.height, _rw_suv(28)),
-                width=1.0,
-            )
-        self.bind(pos=self._sync, size=self._sync)
-
-        # Blue dot
-        dot_path = _rec_png("icon_listening_dot.png")
-        if dot_path:
-            self.add_widget(Image(
-                source=dot_path,
-                size_hint=(None, None),
-                size=(_rw_suv(14), _rw_suv(14)),
-                pos_hint={"center_y": 0.5, "x": 0.10},
-                fit_mode="contain",
-                allow_stretch=True,
-            ))
-        # Label
-        lbl = Label(
-            text="Listening",
-            font_size=_rw_suf(20),
-            bold=True,
-            color=COLORS["white"],
-            halign="left",
-            valign="middle",
-            size_hint=(None, None),
-            size=(_rw_suh(110), _rw_suv(28)),
-            pos_hint={"center_y": 0.5, "x": 0.22},
-        )
-        lbl.bind(size=lbl.setter("text_size"))
-        self.add_widget(lbl)
-        # Soundwave glyph
-        sw_path = _rec_png("icon_soundwave.png")
-        if sw_path:
-            self.add_widget(Image(
-                source=sw_path,
-                size_hint=(None, None),
-                size=(_rw_suv(28), _rw_suv(28)),
-                pos_hint={"center_y": 0.5, "right": 0.94},
-                fit_mode="contain",
-                allow_stretch=True,
-                color=_BLUE,
-            ))
-
-    def _sync(self, *_args):
-        radius = _rw_suv(28)
-        self._bg.pos = self.pos
-        self._bg.size = self.size
-        self._bg.radius = [radius]
-        self._stroke.rounded_rectangle = (self.x, self.y, self.width, self.height, radius)
-
-
-# ---------------------------------------------------------------------------
-# Waveform — vertical bars (kept similar to old impl, just slightly tuned)
-# ---------------------------------------------------------------------------
-
-class _Waveform(Widget):
-    NUM_BARS = 28
-
-    def __init__(self, **kwargs):
-        self.BAR_WIDTH = _rw_suh(4)
-        self.BAR_SPACING = _rw_suh(4)
-        self.MAX_H = _rw_suv(80)
-        bar_extent_w = (
-            self.NUM_BARS * self.BAR_WIDTH
-            + (self.NUM_BARS - 1) * self.BAR_SPACING
-        )
-        kwargs.setdefault("size_hint", (None, None))
-        kwargs.setdefault("size", (bar_extent_w, self.MAX_H * 2))
-        super().__init__(**kwargs)
-        self._levels = [2] * self.NUM_BARS
-        self._active = False
-        self.bind(pos=self._draw, size=self._draw)
-
-    def set_active(self, active: bool):
-        self._active = active
-
-    def set_levels(self, levels: list):
-        self._levels = levels
-        self._draw()
-
-    def _draw(self, *_args):
-        self.canvas.clear()
-        extent_w = (
-            self.NUM_BARS * self.BAR_WIDTH
-            + (self.NUM_BARS - 1) * self.BAR_SPACING
-        )
-        start_x = self.x + (self.width - extent_w) / 2
-        mid_y = self.center_y
+        self.n_bars = n_bars
+        self._color_active = color
+        self._color_idle = idle_color
+        self._bar_min_ratio = 0.10  # height when totally silent
+        self._bar_max_ratio = 0.96  # height at peak voice
+        self._levels = [0.0] * n_bars
+        self._latest_audio = 0.0
+        self._phase = 0.0
+        self._anim_event: object | None = None
+        self._is_active = False  # set by start_voice / stop_voice
+        self._jitter = [random.uniform(0.65, 1.0) for _ in range(n_bars)]
 
         with self.canvas:
-            for i, h in enumerate(self._levels):
-                half = max(1, h / 2)
-                Color(0.30, 0.56, 0.98, 1)
-                bx = start_x + i * (self.BAR_WIDTH + self.BAR_SPACING)
-                RoundedRectangle(
-                    pos=(bx, mid_y - half),
-                    size=(self.BAR_WIDTH, half * 2),
-                    radius=[max(1, _rw_suv(2))],
-                )
+            self._color_inst = Color(*self._color_idle)
+            self._bars = [
+                RoundedRectangle(pos=(0, 0), size=(1, 1), radius=[1])
+                for _ in range(n_bars)
+            ]
+
+        self.bind(pos=lambda *_: self._redraw(), size=lambda *_: self._redraw())
+
+    # ----- public API --------------------------------------------------
+    def feed_level(self, level: float) -> None:
+        """Push the latest mic amplitude (expected range ~0-1)."""
+        try:
+            v = float(level)
+        except (TypeError, ValueError):
+            return
+        if v < 0.0:
+            v = 0.0
+        elif v > 1.0:
+            v = 1.0
+        # Light attack so a single loud sample doesn't spike for one frame.
+        self._latest_audio = max(self._latest_audio * 0.55, v)
+
+    def start(self) -> None:
+        if self._anim_event is None:
+            self._anim_event = Clock.schedule_interval(self._tick, 1 / 30.0)
+
+    def stop(self) -> None:
+        if self._anim_event is not None:
+            self._anim_event.cancel()
+            self._anim_event = None
+
+    def start_voice(self) -> None:
+        """Indicate that recording is live (full-amplitude colour)."""
+        self._is_active = True
+        self._color_inst.rgba = self._color_active
+
+    def stop_voice(self) -> None:
+        """Indicate that recording is paused (dimmed colour, no audio decay)."""
+        self._is_active = False
+        self._latest_audio = 0.0
+        self._color_inst.rgba = self._color_idle
+
+    # ----- tick / draw -------------------------------------------------
+    def _tick(self, dt: float) -> None:
+        self._phase += dt * 4.5
+        n = self.n_bars
+        if n <= 1:
+            return
+        centre = (n - 1) / 2.0
+        amp = self._latest_audio if self._is_active else 0.0
+        for i in range(n):
+            d = (i - centre) / centre  # -1..1
+            # Bell-shaped envelope — centre bars are loudest.
+            bell = max(0.0, math.cos(d * math.pi / 2.0))
+            # Gentle idle ripple so the screen never looks dead.
+            idle = 0.04 + 0.06 * math.sin(self._phase + i * 0.55)
+            voice = amp * (0.35 + 0.65 * bell) * self._jitter[i]
+            target = max(idle if self._is_active else 0.02, voice)
+            self._levels[i] += (target - self._levels[i]) * 0.4
+        # Audio decays if no fresh level arrives so the bars settle.
+        self._latest_audio *= 0.93
+        # Reshuffle a couple of jitter weights each frame for organic look.
+        if random.random() < 0.18:
+            idx = random.randrange(n)
+            self._jitter[idx] = random.uniform(0.55, 1.0)
+        self._redraw()
+
+    def _redraw(self) -> None:
+        w, h = self.size
+        if w <= 0 or h <= 0:
+            return
+        n = self.n_bars
+        # Allocate 45% of the total width to bars, 55% to gaps — matches
+        # the airy look in the Figma reference.
+        bar_w = max(1.0, (w * 0.45) / n)
+        total_bars = bar_w * n
+        gap = (w - total_bars) / max(1, n - 1)
+        max_h = h * self._bar_max_ratio
+        min_h = max(2.0, h * self._bar_min_ratio)
+        cy = self.y + h / 2.0
+        radius = bar_w / 2.0
+        for i, rect in enumerate(self._bars):
+            bar_h = min_h + (max_h - min_h) * self._levels[i]
+            x = self.x + i * (bar_w + gap)
+            rect.pos = (x, cy - bar_h / 2.0)
+            rect.size = (bar_w, bar_h)
+            rect.radius = [radius]
 
 
-# ---------------------------------------------------------------------------
-# Recording Screen
-# ---------------------------------------------------------------------------
+class _StatusDot(Widget):
+    """Solid recording-status dot drawn with Kivy primitives.
+
+    The Figma export `icon_rec_dot_red.png` is a solid-black bitmap (the
+    red colour was lost in the export pipeline), so the dot is drawn here
+    with `Color` + `Ellipse` instead. Two colours: red while recording,
+    grey while paused — toggled via :meth:`set_recording`.
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._active_color = COL_REC_DOT_RED
+        self._idle_color = COL_REC_DOT_GREY
+        with self.canvas:
+            self._color_inst = Color(*self._active_color)
+            self._ellipse = Ellipse(pos=self.pos, size=self.size)
+        self.bind(pos=self._sync, size=self._sync)
+
+    def _sync(self, *_args):
+        self._ellipse.pos = self.pos
+        self._ellipse.size = self.size
+
+    def set_recording(self, active: bool) -> None:
+        self._color_inst.rgba = self._active_color if active else self._idle_color
+
 
 class RecordingScreen(BaseScreen):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.elapsed_seconds = 0
         self.timer_event = None
-        self.waveform_event = None
         self._is_paused = False
-        self._level_history = deque([0.0] * _Waveform.NUM_BARS, maxlen=_Waveform.NUM_BARS)
-        self._last_audio_level_ts = 0.0
         self._rec_base_elapsed = 0.0
         self._rec_active_start = None
-        self._meeting_title = "Recording"
-        self._participant_count = 0
-        self._meeting_provider = ""
-        self._started_at_str = ""
         self._build_ui()
 
-    # ------------------------------------------------------------------
-    # BUILD
-    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------ UI
     def _build_ui(self):
-        self.root_layout = FloatLayout()
-        with self.root_layout.canvas.before:
-            Color(*_BG_NAVY)
-            self._bg = Rectangle(pos=self.root_layout.pos, size=self.root_layout.size)
-        self.root_layout.bind(
+        self._root = FloatLayout(size_hint=(1, 1))
+        with self._root.canvas.before:
+            Color(*_BG)
+            self._bg = Rectangle(pos=self._root.pos, size=self._root.size)
+        self._root.bind(
             pos=lambda w, _v: setattr(self._bg, "pos", w.pos),
-            size=lambda w, _v: setattr(self._bg, "size", w.size),
+            size=self._on_root_resize,
         )
 
-        col = BoxLayout(
-            orientation="vertical",
-            size_hint=(1, 1),
-            padding=[
-                _rw_suh(SPACING["screen_padding"]),
-                _rw_suv(SPACING["screen_padding"]),
-                _rw_suh(SPACING["screen_padding"]),
-                _rw_suv(SPACING["screen_padding"]),
-            ],
-            spacing=_rw_suv(8),
+        anchor = AnchorLayout(anchor_x="center", anchor_y="center", size_hint=(1, 1))
+        self._root.add_widget(anchor)
+        self._canvas = FloatLayout(size_hint=(None, None))
+        anchor.add_widget(self._canvas)
+
+        # Centre — Frame 19 graphic (back → front).
+        # The glow halo PNG is greyscale; multiplying its texture by the
+        # blue tint produces the visible blue halo that the Figma design
+        # calls for, without needing a re-export.
+        glow_img = self._add_image("frame19_ring_glow.png", RING_GLOW)
+        if glow_img is not None:
+            glow_img.color = COL_GLOW_BLUE
+        for filename, box in _FRAME19_IMAGES:
+            self._add_image(filename, box)
+
+        # Voice wavebar (Group 46) — sits inside the orb and animates with
+        # mic input fed via on_audio_level().
+        self.wavebar = _Wavebar(**kivy_hints(WAVEBAR))
+        self._canvas.add_widget(self.wavebar)
+
+        # Timer + status caption (centred in Frame 19)
+        self.timer_label = self._add_label(
+            "00 : 00 : 00", TIMER, TIMER_FS_RATIO, COL_WHITE, bold=True,
+        )
+        self.status_label = self._add_label(
+            "Recording in progress", STATUS, STATUS_FS_RATIO, COL_MUTED, bold=True,
         )
 
-        # ---- Header ----
-        header = BoxLayout(
-            orientation="horizontal",
-            size_hint=(1, None),
-            height=_rw_suv(64),
-            spacing=_rw_suh(12),
+        # Top-left — back button (composite PNG)
+        self._add_img_btn("btn_back.png", BACK_BTN, on_release=lambda *_: self.go_back())
+
+        # Top-left — recording status group (status dot + Recording... + Started at ...)
+        self.status_dot = _StatusDot(**kivy_hints(REC_DOT))
+        self._canvas.add_widget(self.status_dot)
+        self.rec_label = self._add_label(
+            "Recording...", REC_LABEL, REC_LABEL_FS_RATIO, COL_WHITE, bold=True, halign="left",
+        )
+        self.started_label = self._add_label(
+            "Started at --:-- --", STARTED_LABEL, STARTED_FS_RATIO, COL_MUTED, halign="left",
         )
 
-        # Back button (round)
-        back_size = _rw_suv(54)
-        self.back_btn = _CircleButton(size=(back_size, back_size))
-        back_arrow_path = _rec_png("icon_back_arrow.png")
-        if back_arrow_path:
-            arrow = Image(
-                source=back_arrow_path,
-                size_hint=(None, None),
-                size=(_rw_suv(28), _rw_suv(28)),
-                pos_hint={"center_x": 0.5, "center_y": 0.5},
-                fit_mode="contain",
-                allow_stretch=True,
-            )
-            self.back_btn.add_widget(arrow)
-        else:
-            self.back_btn.add_widget(Label(
-                text="<",
-                font_size=_rw_suf(24),
-                bold=True,
-                color=COLORS["white"],
-                pos_hint={"center_x": 0.5, "center_y": 0.5},
-            ))
-        self.back_btn.bind(on_release=lambda *_: self.go_back())
-        header.add_widget(self.back_btn)
-
-        # Recording status (left of center)
-        rec_status_col = BoxLayout(
-            orientation="vertical",
-            size_hint=(None, 1),
-            width=_rw_suh(190),
-            spacing=2,
-            padding=[_rw_suh(8), 0, 0, 0],
+        # Bottom row — pause | stop recording pill | settings
+        self._add_img_btn("btn_pause.png", BTN_PAUSE, on_release=self._on_pause)
+        self._add_img_btn("stop_recording_pill.png", STOP_PILL, on_release=self._on_stop)
+        self._add_img_btn(
+            "btn_settings.png",
+            BTN_SETTINGS,
+            on_release=lambda *_: self.goto("settings", transition="slide_left"),
         )
-        rec_top_row = BoxLayout(orientation="horizontal", size_hint=(1, None), height=_rw_suv(26), spacing=_rw_suh(6))
-        red_dot = _rec_png("icon_recording_dot.png")
-        if red_dot:
-            rec_top_row.add_widget(Image(
-                source=red_dot,
-                size_hint=(None, 1),
-                width=_rw_suv(14),
-                fit_mode="contain",
-                allow_stretch=True,
-            ))
-        else:
-            rec_top_row.add_widget(Label(
-                text="●",
-                font_size=_rw_suf(16),
-                color=_RED,
-                size_hint=(None, 1),
-                width=_rw_suv(14),
-            ))
-        self.rec_state_label = Label(
-            text="Recording...",
-            font_size=_rw_suf(20),
-            bold=True,
-            color=COLORS["white"],
-            halign="left",
+
+        self.add_widget(self._root)
+        Clock.schedule_once(lambda _dt: self._on_root_resize(self._root, self._root.size), 0)
+
+    # --------------------------------------------------------------- helpers
+    def _add_image(self, filename: str, box: dict) -> Image | None:
+        src = _png(filename)
+        if not src:
+            return None
+        img = Image(
+            source=src,
+            allow_stretch=True,
+            keep_ratio=True,
+            fit_mode="contain",
+            **kivy_hints(box),
+        )
+        self._canvas.add_widget(img)
+        return img
+
+    def _add_img_btn(self, filename: str, box: dict, *, on_release) -> _ImgBtn | None:
+        src = _png(filename)
+        if not src:
+            return None
+        btn = _ImgBtn(
+            source=src,
+            allow_stretch=True,
+            keep_ratio=True,
+            fit_mode="contain",
+            **kivy_hints(box),
+        )
+        btn.bind(on_release=on_release)
+        self._canvas.add_widget(btn)
+        return btn
+
+    def _add_label(
+        self,
+        text: str,
+        box: dict,
+        fs_ratio: float,
+        color: tuple,
+        *,
+        bold: bool = False,
+        halign: str = "center",
+    ) -> Label:
+        lbl = Label(
+            text=text,
+            font_name=_FONT_BOLD,
+            bold=bold,
+            color=color,
+            halign=halign,
             valign="middle",
-            size_hint=(1, 1),
+            **kivy_hints(box),
         )
-        self.rec_state_label.bind(size=self.rec_state_label.setter("text_size"))
-        rec_top_row.add_widget(self.rec_state_label)
-        rec_status_col.add_widget(rec_top_row)
-        self.started_at_label = Label(
-            text="Started at --:-- --",
-            font_size=_rw_suf(14),
-            color=_TEXT_MUTED,
-            halign="left",
-            valign="top",
-            size_hint=(1, None),
-            height=_rw_suv(18),
-        )
-        self.started_at_label.bind(size=self.started_at_label.setter("text_size"))
-        rec_status_col.add_widget(self.started_at_label)
-        header.add_widget(rec_status_col)
+        lbl.bind(size=lbl.setter("text_size"))
+        lbl._fs_ratio = fs_ratio  # noqa: SLF001 — resize hook
+        self._canvas.add_widget(lbl)
+        return lbl
 
-        # Center: meeting info (title + participants/provider)
-        meet_col = BoxLayout(orientation="vertical", size_hint=(1, 1), spacing=2)
-        meet_top = BoxLayout(orientation="horizontal", size_hint=(1, None), height=_rw_suv(28), spacing=_rw_suh(8), padding=[0, _rw_suv(2), 0, 0])
-        meet_top.add_widget(Widget())  # left flex spacer to center the row
-        people = _rec_png("icon_people.png")
-        if people:
-            meet_top.add_widget(Image(
-                source=people,
-                size_hint=(None, 1),
-                width=_rw_suv(28),
-                fit_mode="contain",
-                allow_stretch=True,
-            ))
-        self.meeting_title_label = Label(
-            text="Recording",
-            font_size=_rw_suf(20),
-            bold=True,
-            color=COLORS["white"],
-            halign="left",
-            valign="middle",
-            size_hint=(None, 1),
-            shorten=True,
-        )
-        self.meeting_title_label.bind(
-            size=self.meeting_title_label.setter("text_size"),
-            texture_size=lambda inst, _v: setattr(inst, "width", min(inst.texture_size[0] + _rw_suh(8), _rw_suh(360))),
-        )
-        meet_top.add_widget(self.meeting_title_label)
-        meet_top.add_widget(Widget())
-        meet_col.add_widget(meet_top)
+    def _on_root_resize(self, _root, size):
+        self._bg.size = size
+        w, h = scaled_canvas(size[0], size[1])
+        self._canvas.size = (w, h)
+        for lbl in (
+            self.timer_label,
+            self.status_label,
+            self.rec_label,
+            self.started_label,
+        ):
+            if lbl is not None:
+                lbl.font_size = font_px(lbl._fs_ratio, h)  # noqa: SLF001
 
-        meet_sub = BoxLayout(orientation="horizontal", size_hint=(1, None), height=_rw_suv(20), spacing=_rw_suh(14))
-        meet_sub.add_widget(Widget())
-        self.participants_label = Label(
-            text="",
-            font_size=_rw_suf(14),
-            bold=True,
-            color=_BLUE,
-            halign="center",
-            valign="middle",
-            size_hint=(None, 1),
-            width=_rw_suh(120),
-        )
-        self.participants_label.bind(size=self.participants_label.setter("text_size"))
-        meet_sub.add_widget(self.participants_label)
-        provider_row = BoxLayout(orientation="horizontal", size_hint=(None, 1), width=_rw_suh(180), spacing=_rw_suh(6))
-        video = _rec_png("icon_video.png")
-        if video:
-            provider_row.add_widget(Image(
-                source=video,
-                size_hint=(None, 1),
-                width=_rw_suv(18),
-                fit_mode="contain",
-                allow_stretch=True,
-            ))
-        self.provider_label = Label(
-            text="",
-            font_size=_rw_suf(14),
-            color=_TEXT_MUTED,
-            halign="left",
-            valign="middle",
-            size_hint=(1, 1),
-        )
-        self.provider_label.bind(size=self.provider_label.setter("text_size"))
-        provider_row.add_widget(self.provider_label)
-        meet_sub.add_widget(provider_row)
-        meet_sub.add_widget(Widget())
-        meet_col.add_widget(meet_sub)
-        meet_col.add_widget(Widget())
-        header.add_widget(meet_col)
-
-        # Right: Listening pill
-        self.listening_pill = _ListeningPill(size=(_rw_suh(214), _rw_suv(54)))
-        listen_anchor = AnchorLayout(size_hint=(None, 1), width=_rw_suh(220), anchor_x="right", anchor_y="center")
-        listen_anchor.add_widget(self.listening_pill)
-        header.add_widget(listen_anchor)
-        col.add_widget(header)
-
-        # ---- Center waveform inside circular bg ----
-        center_anchor = AnchorLayout(size_hint=(1, 1), anchor_x="center", anchor_y="center")
-        center_stack = FloatLayout(size_hint=(None, None), size=(_rw_suh(420), _rw_suv(280)))
-        wave_bg_path = _rec_png("wave_circle_bg.png")
-        if wave_bg_path:
-            center_stack.add_widget(Image(
-                source=wave_bg_path,
-                size_hint=(None, None),
-                size=(_rw_suh(420), _rw_suv(260)),
-                pos_hint={"center_x": 0.5, "center_y": 0.55},
-                fit_mode="contain",
-                allow_stretch=True,
-            ))
-        self.waveform = _Waveform(pos_hint={"center_x": 0.5, "center_y": 0.55})
-        center_stack.add_widget(self.waveform)
-
-        # Timer + caption sit just below the wave bowl.
-        self.timer_label = Label(
-            text="00 : 00 : 00",
-            font_size=_rw_suf(36),
-            bold=True,
-            color=COLORS["white"],
-            halign="center",
-            valign="middle",
-            size_hint=(None, None),
-            size=(_rw_suh(360), _rw_suv(46)),
-            pos_hint={"center_x": 0.5, "y": 0.06},
-        )
-        self.timer_label.bind(size=self.timer_label.setter("text_size"))
-        center_stack.add_widget(self.timer_label)
-
-        self.elapsed_sub = Label(
-            text="Recording in progress",
-            font_size=_rw_suf(18),
-            color=_TEXT_MUTED,
-            halign="center",
-            valign="middle",
-            size_hint=(None, None),
-            size=(_rw_suh(360), _rw_suv(26)),
-            pos_hint={"center_x": 0.5, "y": -0.02},
-        )
-        self.elapsed_sub.bind(size=self.elapsed_sub.setter("text_size"))
-        center_stack.add_widget(self.elapsed_sub)
-        center_anchor.add_widget(center_stack)
-        col.add_widget(center_anchor)
-
-        # ---- Bottom controls ----
-        controls = BoxLayout(
-            orientation="horizontal",
-            size_hint=(1, None),
-            height=_rw_suv(82),
-            spacing=_rw_suh(20),
-            padding=[0, 0, 0, _rw_suv(6)],
-        )
-
-        # Pause (round)
-        pause_size = _rw_suv(72)
-        self.pause_btn = _CircleButton(size=(pause_size, pause_size))
-        # Two vertical blue bars inside the button (Figma 412:828/829)
-        bars_wrap = FloatLayout(size_hint=(1, 1))
-        bar_h = _rw_suv(26)
-        bar_w = _rw_suv(8)
-        for x_hint in (0.39, 0.58):
-            bar = Widget(
-                size_hint=(None, None),
-                size=(bar_w, bar_h),
-                pos_hint={"center_x": x_hint, "center_y": 0.5},
-            )
-            with bar.canvas:
-                Color(*_BLUE)
-                rect = RoundedRectangle(pos=bar.pos, size=bar.size, radius=[_rw_suv(2)])
-            bar.bind(
-                pos=lambda w, _v, r=rect: setattr(r, "pos", w.pos),
-                size=lambda w, _v, r=rect: setattr(r, "size", w.size),
-            )
-            bars_wrap.add_widget(bar)
-        # Single Play triangle (when paused) — toggled in on_paused/on_resumed
-        self._pause_bars_wrap = bars_wrap
-        self.pause_btn.add_widget(bars_wrap)
-        self.pause_btn.bind(on_release=self._on_pause)
-        pause_anchor = AnchorLayout(size_hint=(None, 1), width=_rw_suh(120), anchor_x="center", anchor_y="center")
-        pause_anchor.add_widget(self.pause_btn)
-        controls.add_widget(pause_anchor)
-
-        # Stop pill (center)
-        stop_anchor = AnchorLayout(size_hint=(1, 1), anchor_x="center", anchor_y="center")
-        self.stop_pill = _StopRecordingPill(size=(_rw_suh(458), _rw_suv(72)))
-        self.stop_pill.bind(on_release=self._on_stop)
-        stop_anchor.add_widget(self.stop_pill)
-        controls.add_widget(stop_anchor)
-
-        # Settings gear (round)
-        gear_size = _rw_suv(72)
-        self.gear_btn = _CircleButton(size=(gear_size, gear_size))
-        gear_path = _rec_png("icon_settings_gear.png")
-        if gear_path:
-            self.gear_btn.add_widget(Image(
-                source=gear_path,
-                size_hint=(None, None),
-                size=(_rw_suv(40), _rw_suv(40)),
-                pos_hint={"center_x": 0.5, "center_y": 0.5},
-                fit_mode="contain",
-                allow_stretch=True,
-            ))
-        self.gear_btn.bind(on_release=lambda *_: self.goto("settings", transition="slide_left"))
-        gear_anchor = AnchorLayout(size_hint=(None, 1), width=_rw_suh(120), anchor_x="center", anchor_y="center")
-        gear_anchor.add_widget(self.gear_btn)
-        controls.add_widget(gear_anchor)
-
-        col.add_widget(controls)
-        self.root_layout.add_widget(col)
-
-        # ---- Paused overlay (kept simple — no Figma reference for paused state) ----
-        self.paused_overlay = FloatLayout(
-            size_hint=(1, 1),
-            pos_hint={"x": 0, "y": 0},
-            opacity=0,
-        )
-        with self.paused_overlay.canvas.before:
-            Color(0.004, 0.031, 0.102, 0.95)
-            self._ov_bg = Rectangle(pos=self.paused_overlay.pos, size=self.paused_overlay.size)
-        self.paused_overlay.bind(
-            pos=lambda w, _v: setattr(self._ov_bg, "pos", w.pos),
-            size=lambda w, _v: setattr(self._ov_bg, "size", w.size),
-        )
-
-        ov_card = BoxLayout(
-            orientation="vertical",
-            size_hint=(None, None),
-            size=(_rw_suh(560), _rw_suv(360)),
-            pos_hint={"center_x": 0.5, "center_y": 0.5},
-            spacing=_rw_suv(12),
-            padding=[_rw_suh(28), _rw_suv(28), _rw_suh(28), _rw_suv(28)],
-        )
-        with ov_card.canvas.before:
-            Color(0.012, 0.043, 0.169, 1.0)
-            self._ov_card_bg = RoundedRectangle(pos=ov_card.pos, size=ov_card.size, radius=[_rw_suv(20)])
-            Color(*_BORDER)
-            self._ov_card_stroke = Line(
-                rounded_rectangle=(ov_card.x, ov_card.y, ov_card.width, ov_card.height, _rw_suv(20)),
-                width=1.0,
-            )
-        ov_card.bind(
-            pos=lambda w, _v: self._sync_ov_card(w),
-            size=lambda w, _v: self._sync_ov_card(w),
-        )
-
-        self.paused_title = Label(
-            text="Paused at --:--",
-            font_size=_rw_suf(40),
-            bold=True,
-            color=COLORS["white"],
-            halign="center",
-            valign="middle",
-            size_hint=(1, None),
-            height=_rw_suv(54),
-        )
-        self.paused_title.bind(size=self.paused_title.setter("text_size"))
-        ov_card.add_widget(self.paused_title)
-        self.ov_meeting_label = Label(
-            text="Recording",
-            font_size=_rw_suf(22),
-            bold=True,
-            color=_BLUE,
-            halign="center",
-            valign="middle",
-            size_hint=(1, None),
-            height=_rw_suv(30),
-            shorten=True,
-        )
-        self.ov_meeting_label.bind(size=self.ov_meeting_label.setter("text_size"))
-        ov_card.add_widget(self.ov_meeting_label)
-        self.paused_duration = Label(
-            text="Meeting duration: 00:00",
-            font_size=_rw_suf(18),
-            color=_TEXT_MUTED,
-            halign="center",
-            valign="middle",
-            size_hint=(1, None),
-            height=_rw_suv(28),
-        )
-        self.paused_duration.bind(size=self.paused_duration.setter("text_size"))
-        ov_card.add_widget(self.paused_duration)
-        ov_card.add_widget(Widget())
-        self.ov_room_label = Label(
-            text="MeetingBox",
-            font_size=_rw_suf(14),
-            color=_TEXT_MUTED,
-            halign="center",
-            valign="middle",
-            size_hint=(1, None),
-            height=_rw_suv(20),
-        )
-        self.ov_room_label.bind(size=self.ov_room_label.setter("text_size"))
-        ov_card.add_widget(self.ov_room_label)
-        self.paused_overlay.add_widget(ov_card)
-
-        self.add_widget(self.root_layout)
-
-    def _sync_ov_card(self, w):
-        self._ov_card_bg.pos = w.pos
-        self._ov_card_bg.size = w.size
-        self._ov_card_bg.radius = [_rw_suv(20)]
-        self._ov_card_stroke.rounded_rectangle = (
-            w.x, w.y, w.width, w.height, _rw_suv(20)
-        )
-
-    # ------------------------------------------------------------------
-    # LIFECYCLE
-    # ------------------------------------------------------------------
+    # ------------------------------------------------------------- lifecycle
     def on_enter(self):
         if self.timer_event:
             self.timer_event.cancel()
             self.timer_event = None
-        if self.waveform_event:
-            self.waveform_event.cancel()
-            self.waveform_event = None
 
         self._is_paused = False
         self.elapsed_seconds = 0
         self._rec_base_elapsed = 0.0
         self._rec_active_start = time.monotonic()
         self.timer_label.text = "00 : 00 : 00"
-        self.elapsed_sub.text = "Recording in progress"
-        self.rec_state_label.text = "Recording..."
-        self.rec_state_label.color = COLORS["white"]
-        self.waveform.set_active(True)
-        self._level_history = deque([0.0] * _Waveform.NUM_BARS, maxlen=_Waveform.NUM_BARS)
-        self._last_audio_level_ts = 0.0
-        if self.paused_overlay.parent is self.root_layout:
-            self.root_layout.remove_widget(self.paused_overlay)
+        self.status_label.text = "Recording in progress"
+        self.rec_label.text = "Recording..."
+        self.status_dot.set_recording(True)
 
-        # Started at + meeting metadata
         now = display_now()
-        self._started_at_str = now.strftime("%I:%M %p").lstrip("0")
-        self.started_at_label.text = f"Started at {self._started_at_str}"
-        self.meeting_title_label.text = "Recording"
-        self.participants_label.text = ""
-        self.provider_label.text = ""
-
-        sid = getattr(self.app, "current_session_id", None)
-        if sid:
-            self._fetch_meeting_metadata(sid)
+        self.started_label.text = f"Started at {now.strftime('%I:%M %p').lstrip('0')}"
 
         self.timer_event = Clock.schedule_interval(self._tick_timer, 0.5)
-        self.waveform_event = Clock.schedule_interval(self._tick_waveform, 0.08)
+
+        # Voice wavebar — start animating and mark it as live so it reacts
+        # at full amplitude to incoming audio_level events from Redis.
+        self.wavebar.start()
+        self.wavebar.start_voice()
 
     def on_leave(self):
         if self.timer_event:
             self.timer_event.cancel()
             self.timer_event = None
-        if self.waveform_event:
-            self.waveform_event.cancel()
-            self.waveform_event = None
+        self.wavebar.stop()
 
-    # ------------------------------------------------------------------
-    # Meeting metadata (live title / participants / provider)
-    # ------------------------------------------------------------------
-    def _fetch_meeting_metadata(self, meeting_id: str):
-        async def _run():
-            try:
-                detail = await self.backend.get_meeting_detail(meeting_id)
-            except Exception as exc:  # noqa: BLE001
-                logger.debug("recording: meeting detail fetch failed: %s", exc)
-                return
-            title = (detail.get("title") or "Recording").strip() or "Recording"
-            # Backend doesn't ship participant_count / provider on every row;
-            # fall back to "—" so the UI never shows "0 Participants".
-            try:
-                participants = int(detail.get("participant_count") or detail.get("attendee_count") or 0)
-            except (TypeError, ValueError):
-                participants = 0
-            provider = (
-                (detail.get("source") or "")
-                or (detail.get("calendar_source") or "")
-                or ""
-            ).strip()
-
-            def _apply(_dt):
-                self._meeting_title = title
-                self._participant_count = participants
-                self._meeting_provider = provider
-                self.meeting_title_label.text = title
-                if participants:
-                    self.participants_label.text = (
-                        f"{participants} Participants" if participants != 1 else "1 Participant"
-                    )
-                else:
-                    self.participants_label.text = ""
-                self.provider_label.text = provider
-                self.ov_meeting_label.text = title
-
-            Clock.schedule_once(_apply, 0)
-
-        run_async(_run())
-
-    # ------------------------------------------------------------------
-    # TIMER
-    # ------------------------------------------------------------------
+    # ---------------------------------------------------------------- timer
     def _elapsed_from_monotonic(self) -> int:
         if self._is_paused or self._rec_active_start is None:
             return int(self._rec_base_elapsed)
@@ -809,20 +417,22 @@ class RecordingScreen(BaseScreen):
         self.timer_label.text = self._fmt_time(self.elapsed_seconds)
 
     @staticmethod
-    def _fmt_time(secs):
+    def _fmt_time(secs: int) -> str:
         h = secs // 3600
         m = (secs % 3600) // 60
         s = secs % 60
         return f"{h:02d} : {m:02d} : {s:02d}"
 
-    # ------------------------------------------------------------------
-    # PAUSE / RESUME
-    # ------------------------------------------------------------------
+    # ------------------------------------------------------------ pause/stop
     def _on_pause(self, _inst):
         if self._is_paused:
             self.app.resume_recording()
         else:
             self.app.pause_recording()
+
+    def _on_stop(self, _inst):
+        logger.info("Stop recording pressed (duration: %s)", self._fmt_time(self.elapsed_seconds))
+        self.app.stop_recording()
 
     def on_paused(self):
         if self._is_paused:
@@ -831,84 +441,33 @@ class RecordingScreen(BaseScreen):
         if self._rec_active_start is not None:
             self._rec_base_elapsed += time.monotonic() - self._rec_active_start
             self._rec_active_start = None
-
-        if self.timer_event:
-            self.timer_event.cancel()
-            self.timer_event = None
-        if self.waveform_event:
-            self.waveform_event.cancel()
-            self.waveform_event = None
-
-        self.waveform.set_active(False)
-        self.waveform.set_levels([2] * _Waveform.NUM_BARS)
-        self.rec_state_label.text = "Paused"
-        self.elapsed_sub.text = "Recording paused"
-
-        now = display_now()
-        self.paused_title.text = f"Paused at {now.strftime('%I:%M %p').lstrip('0')}"
-        self.paused_duration.text = f"Meeting duration: {self._fmt_time(self.elapsed_seconds)}"
-        self.ov_room_label.text = getattr(self.app, "device_name", "MeetingBox")
-        self.ov_meeting_label.text = self._meeting_title or "Recording"
-
-        if self.paused_overlay.parent is not self.root_layout:
-            self.root_layout.add_widget(self.paused_overlay)
-        self.paused_overlay.opacity = 0
-        Animation(opacity=1, duration=0.25).start(self.paused_overlay)
+        self.rec_label.text = "Paused"
+        self.status_label.text = "Recording paused"
+        self.status_dot.set_recording(False)
+        # Freeze the wavebar at idle so the user can see we stopped reading
+        # the mic while paused.
+        self.wavebar.stop_voice()
 
     def on_resumed(self):
         if not self._is_paused:
             return
         self._is_paused = False
         self._rec_active_start = time.monotonic()
-
-        Animation(opacity=0, duration=0.2).start(self.paused_overlay)
-        Clock.schedule_once(self._hide_paused_overlay, 0.25)
-
-        self.waveform.set_active(True)
-        self.rec_state_label.text = "Recording..."
-        self.elapsed_sub.text = "Recording in progress"
-        if self.timer_event:
-            self.timer_event.cancel()
-        if self.waveform_event:
-            self.waveform_event.cancel()
-        self.timer_event = Clock.schedule_interval(self._tick_timer, 1.0)
-        self.waveform_event = Clock.schedule_interval(self._tick_waveform, 0.08)
-
-    def _hide_paused_overlay(self, _dt):
-        if self.paused_overlay.parent is self.root_layout:
-            self.root_layout.remove_widget(self.paused_overlay)
+        self.rec_label.text = "Recording..."
+        self.status_label.text = "Recording in progress"
+        self.status_dot.set_recording(True)
+        self.wavebar.start_voice()
 
     def on_audio_level(self, level: float):
-        if self._is_paused:
-            return
-        # Noise gate so bars remain still in quiet rooms.
-        gated = 0.0 if level < 0.015 else min(1.0, level)
-        self._level_history.append(gated)
-        self._last_audio_level_ts = datetime.now().timestamp()
+        """Feed live mic amplitude (0-1) into the wavebar visualiser.
 
-    def _tick_waveform(self, _dt):
-        if self._is_paused:
-            return
-        now_ts = datetime.now().timestamp()
-        if now_ts - self._last_audio_level_ts > 0.25:
-            self._level_history = deque([v * 0.82 for v in self._level_history], maxlen=_Waveform.NUM_BARS)
-        levels = [max(2, int(v * self.waveform.MAX_H)) for v in self._level_history]
-        self.waveform.set_levels(levels)
+        Called by ``main.py.on_audio_level`` once Redis delivers an
+        ``audio_level`` event from the audio-capture process. Wiring this
+        up is what makes the user *see* their voice — the audio pipeline
+        itself was already running but the recording UI was discarding the
+        level.
+        """
+        self.wavebar.feed_level(level)
 
-    # ------------------------------------------------------------------
-    # STOP
-    # ------------------------------------------------------------------
-    def _on_stop(self, _inst):
-        logger.info("End Meeting pressed (duration: %s)", self._fmt_time(self.elapsed_seconds))
-        self.app.stop_recording()
-
-    # ------------------------------------------------------------------
-    # External events called from main.py
-    # ------------------------------------------------------------------
     def on_audio_segment(self, segment_num: int):
-        if self._participant_count == 0 and segment_num >= 0:
-            # Fallback: surface a count from segment activity when the
-            # backend hasn't returned an explicit attendee_count.
-            pc = max(1, segment_num + 1)
-            self._participant_count = pc
-            self.participants_label.text = f"{pc} Participants" if pc != 1 else "1 Participant"
+        del segment_num

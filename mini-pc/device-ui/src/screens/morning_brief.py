@@ -27,7 +27,6 @@ from kivy.uix.widget import Widget
 from async_helper import run_async
 from api_client import (
     _GMAIL_RECENT_DAYS,
-    _map_gmail_recent_row,
     summarize_gmail_feed_for_home,
 )
 from config import ASSETS_DIR, DISPLAY_HEIGHT, DISPLAY_WIDTH, display_now
@@ -446,6 +445,14 @@ class MorningBriefScreen(BaseScreen):
         arr_src = _asset("icon_arrow_right.png")
         if arr_src:
             card.add_widget(_img(arr_src, CW, CH, 597.51, 22.6, 19.78, 39.55))
+        class _CalendarLink(ButtonBehavior, FloatLayout):
+            pass
+        cal_tap = _CalendarLink(
+            size_hint=(220 / CW, 44 / CH),
+            pos_hint={"x": 395.0 / CW, "y": (CH - 18.0 - 44) / CH},
+        )
+        cal_tap.bind(on_release=lambda *_: self.goto("calendar", transition="slide_left"))
+        card.add_widget(cal_tap)
 
         # Horizontal dividers
         for div_y in (81.93, 162.44, 242.96):
@@ -455,9 +462,9 @@ class MorningBriefScreen(BaseScreen):
         # Each row: time (left, blue) · dot (centre) · title · duration (right)
         self._sched_rows = []
         for row_meta in [
-            ("10:00 AM", "Product Roadmap Sync",  "45 min", 111.59, 118.65),
-            ("1:00 PM",  "Client Review Meeting", "60 min", 193.52, 200.58),
-            ("4:00 PM",  "Design Discussion",     "30 min", 271.21, 278.27),
+            ("—", "Loading...",  "", 111.59, 118.65),
+            ("—", "",            "", 193.52, 200.58),
+            ("—", "",            "", 271.21, 278.27),
         ]:
             time_s, title_s, dur_s, row_y, dot_y = row_meta
             lt = _lbl(
@@ -697,7 +704,21 @@ class MorningBriefScreen(BaseScreen):
             self._on_weather_snapshot(wc.snapshot)
         else:
             wc.refresh_now()
-        Clock.schedule_once(lambda _dt: self._load_briefing_backend(), 0)
+        self.app.ui_cache_subscribe("morning_brief_context", self._on_cached_briefing_context)
+        self.app.ui_cache_subscribe("morning_brief_gmail", self._on_cached_briefing_gmail)
+        cached_ctx = self.app.ui_cache_get("morning_brief_context")
+        cached_gmail = self.app.ui_cache_get("morning_brief_gmail")
+        if isinstance(cached_ctx, dict) or isinstance(cached_gmail, dict):
+            self._apply_briefing_data(
+                cached_ctx if isinstance(cached_ctx, dict) else {},
+                cached_gmail if isinstance(cached_gmail, dict) else {},
+            )
+        # Central sync loop keeps both briefing caches refreshed.
+        if (
+            not self.app.ui_cache_is_fresh("morning_brief_context")
+            or not self.app.ui_cache_is_fresh("morning_brief_gmail")
+        ):
+            Clock.schedule_once(lambda _dt: self._load_briefing_backend(), 0)
 
     def on_leave(self) -> None:
         if self._weather_unsub:
@@ -706,6 +727,26 @@ class MorningBriefScreen(BaseScreen):
             except Exception:
                 pass
             self._weather_unsub = None
+        self.app.ui_cache_unsubscribe("morning_brief_context", self._on_cached_briefing_context)
+        self.app.ui_cache_unsubscribe("morning_brief_gmail", self._on_cached_briefing_gmail)
+        ev = getattr(self, "_refresh_ev", None)
+        if ev:
+            ev.cancel()
+            self._refresh_ev = None
+
+    def _on_cached_briefing_context(self, payload: dict) -> None:
+        def _apply(_dt):
+            if self.manager and self.manager.current != self.name:
+                return
+            self._apply_briefing_data(payload or {}, self.app.ui_cache_get("morning_brief_gmail") or {})
+        Clock.schedule_once(_apply, 0)
+
+    def _on_cached_briefing_gmail(self, payload: dict) -> None:
+        def _apply(_dt):
+            if self.manager and self.manager.current != self.name:
+                return
+            self._apply_briefing_data(self.app.ui_cache_get("morning_brief_context") or {}, payload or {})
+        Clock.schedule_once(_apply, 0)
 
     def _load_briefing_backend(self) -> None:
         async def _go():
@@ -721,6 +762,22 @@ class MorningBriefScreen(BaseScreen):
             results = await asyncio.gather(_briefing(), _gmail(), return_exceptions=True)
             data  = results[0] if not isinstance(results[0], BaseException) else {}
             gfeed = results[1] if not isinstance(results[1], BaseException) else {}
+            if (
+                self.app.ui_cache_is_fresh("morning_brief_context")
+                and self.app.ui_cache_is_fresh("morning_brief_gmail")
+            ):
+                Clock.schedule_once(
+                    lambda dt: self._apply_briefing_data(
+                        self.app.ui_cache_get("morning_brief_context") or {},
+                        self.app.ui_cache_get("morning_brief_gmail") or {},
+                    ),
+                    0,
+                )
+                return
+            if isinstance(data, dict):
+                self.app.ui_cache_set("morning_brief_context", dict(data))
+            if isinstance(gfeed, dict):
+                self.app.ui_cache_set("morning_brief_gmail", dict(gfeed))
             Clock.schedule_once(
                 lambda dt: self._apply_briefing_data(data or {}, gfeed),
                 0,
@@ -831,12 +888,13 @@ class MorningBriefScreen(BaseScreen):
             gsum = summarize_gmail_feed_for_home(gfeed or {})
             top_raw = gsum.get("top_raw")
             if isinstance(top_raw, dict) and self._em_sender and self._em_subject:
-                row = _map_gmail_recent_row(top_raw)
-                self._em_sender.text = (row.get("sender") or "—")[:42]
+                # top_raw from summarize_gmail_feed_for_home is already mapped in
+                # BackendClient.fetch_gmail_recent(), so consume it directly.
+                self._em_sender.text = (top_raw.get("sender") or "—")[:42]
                 self._em_subject.text = (
-                    (row.get("subject") or row.get("preview") or "—")[:64]
+                    (top_raw.get("subject") or top_raw.get("preview") or "—")[:64]
                 )
-                self._em_time.text = (row.get("time") or "—")[:12]
+                self._em_time.text = (top_raw.get("time") or "—")[:12]
             elif top and self._em_sender and self._em_subject:
                 self._em_sender.text = (top.get("from") or "—")[:42]
                 self._em_subject.text = (top.get("subject") or top.get("snippet") or "—")[:64]

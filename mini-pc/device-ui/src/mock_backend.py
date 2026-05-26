@@ -47,6 +47,16 @@ class MockBackendClient:
         """No secret from mock — device UI falls back to local Vosk commands."""
         return {"client_secret": "", "model": "", "expires_at": 0, "session": {}}
 
+    async def invoke_realtime_tool(
+        self,
+        *,
+        call_id: str,
+        name: str,
+        arguments: str = "{}",
+    ) -> str:
+        """Mock tool output for Realtime (parity with BackendClient)."""
+        return "{}"
+
     # ==================================================================
     # MOCK DATA
     # ==================================================================
@@ -508,7 +518,9 @@ class MockBackendClient:
         return {"days": days}
 
     async def post_assistant_intent(
-        self, message: str, meeting_id: str | None = None
+        self,
+        message: str,
+        meeting_id: str | None = None,
     ) -> Dict:
         await asyncio.sleep(0.2)
         text = (message or "").strip()

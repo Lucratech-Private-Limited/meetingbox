@@ -103,9 +103,10 @@ cd "$APPLIANCE_DIR"
 export MEETINGBOX_X11_COOKIE="$XAUTH_COPY"
 export DEVICE_UI_DISPLAY="$disp_num"
 # Services are gated by Compose profiles; if .env omits COMPOSE_PROFILES, plain ``up -d``
-# starts no device-ui/redis/audio. Default only when .env does not define the variable.
+# starts no device-ui/redis. Audio capture is merged into device-ui; do not default to
+# the legacy docker-audio profile or it will race device-ui for the microphone.
 if [[ ! -f "$APPLIANCE_DIR/.env" ]] || ! grep -qE '^[[:space:]]*COMPOSE_PROFILES=' "$APPLIANCE_DIR/.env"; then
-  export COMPOSE_PROFILES="${COMPOSE_PROFILES:-mini-pc,docker-audio}"
+  export COMPOSE_PROFILES="${COMPOSE_PROFILES:-mini-pc}"
 fi
 # One shot only — do not ``--force-recreate device-ui`` here; that stops the UI right after
 # the first start and looks like “fullscreen then closes and opens again” on the panel.

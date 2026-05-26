@@ -1,4 +1,4 @@
-# MeetingBox appliance — device-ui + audio (+ Redis for Docker audio only).
+# MeetingBox appliance — device-ui (includes audio capture) + Redis.
 # Use this folder as its own git repo on the mini PC, or as part of the monorepo.
 #
 # Copy .env.example → .env and set BACKEND_URL / UPLOAD_AUDIO_API_URL for your cloud API.
@@ -6,11 +6,9 @@
 #   docker compose up -d --build
 #
 # Profiles (set COMPOSE_PROFILES in .env — see .env.example):
-#   mini-pc, screen  — Kivy container (needs X11)
-#   docker-audio      — Redis + audio container (omitted unless profile is active!)
+#   mini-pc, screen  — Kivy container (needs X11); also runs audio_capture.py as a child.
 #
-# One-shot without editing .env:
-#   docker compose --profile mini-pc --profile docker-audio up -d --build
+# Redis runs as its own container (default on with profile ``mini-pc``).
 
 name: meetingbox-appliance
 
@@ -19,7 +17,7 @@ services:
     image: redis:7-alpine
     container_name: meetingbox-appliance-redis
     restart: unless-stopped
-    profiles: ["docker-audio"]
+    profiles: ["mini-pc"]
     ports:
       - "127.0.0.1:6379:6379"
     volumes:
@@ -27,45 +25,14 @@ services:
     networks:
       - appliance-net
 
-  audio:
-    build:
-      context: ./audio
-    container_name: meetingbox-appliance-audio
-    restart: unless-stopped
-    profiles: ["docker-audio"]
-    depends_on:
-      redis:
-        condition: service_started
-    user: "1000:1000"
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    environment:
-      - PYTHONUNBUFFERED=1
-      - REDIS_HOST=redis
-      # Empty / unset → audio_capture uses HTTP long-poll if DEVICE_AUTH_TOKEN is set, else Redis.
-      - AUDIO_COMMAND_SOURCE=${AUDIO_COMMAND_SOURCE:-}
-      - AUDIO_POLL_BASE_URL=${AUDIO_POLL_BASE_URL:-}
-      - RECORDINGS_DIR=/data/audio/recordings
-      - TEMP_SEGMENTS_DIR=/data/audio/temp
-      - AUDIO_INPUT_DEVICE_INDEX=${AUDIO_INPUT_DEVICE_INDEX:-}
-      - AUDIO_INPUT_DEVICE_NAME=${AUDIO_INPUT_DEVICE_NAME:-}
-      - UPLOAD_AUDIO_ON_STOP=${UPLOAD_AUDIO_ON_STOP:-1}
-      - UPLOAD_AUDIO_API_URL=${UPLOAD_AUDIO_API_URL:-http://host.docker.internal:8000/api/meetings/upload-audio}
-      - UPLOAD_AUDIO_TIMEOUT_SECONDS=${UPLOAD_AUDIO_TIMEOUT_SECONDS:-1200}
-      - DEVICE_AUTH_TOKEN=${DEVICE_AUTH_TOKEN:-}
-    volumes:
-      - ./data/audio:/data/audio
-      - ./data/config:/data/config:ro
-    devices:
-      - /dev/snd:/dev/snd
-    group_add:
-      - audio
-    networks:
-      - appliance-net
-
   device-ui:
     build:
       context: ./device-ui
+      # mini-pc/audio is exposed to the device-ui build via a named context so the
+      # Dockerfile can ``COPY --from=audio . /app/audio/``. Audio is now a child
+      # process of device-ui (audio_supervisor), not a separate container.
+      additional_contexts:
+        audio: ./audio
     container_name: meetingbox-appliance-ui
     user: "1000:1000"
     restart: unless-stopped
@@ -111,6 +78,36 @@ services:
       - MOCK_BACKEND=${MOCK_BACKEND:-0}
       - AUDIO_INPUT_DEVICE_INDEX=${AUDIO_INPUT_DEVICE_INDEX:-}
       - AUDIO_INPUT_DEVICE_NAME=${AUDIO_INPUT_DEVICE_NAME:-}
+      - ALSA_CARD=${ALSA_CARD:-}
+      - AUDIO_INPUT_GAIN=${AUDIO_INPUT_GAIN:-1}
+      - AUDIO_CAPTURE_BACKEND=${AUDIO_CAPTURE_BACKEND:-pyaudio}
+      - AUDIO_OUTPUT_DEVICE=${AUDIO_OUTPUT_DEVICE:-}
+      # Explicit ALSA output device for the speaker (aplay -D). Leave unset to
+      # auto-detect: if a USB device has both mic and speaker on the same card
+      # (e.g. a conference puck), it is automatically used for both.
+      # Example: AUDIO_OUTPUT_DEVICE_NAME=plughw:1,0
+      - AUDIO_OUTPUT_DEVICE_NAME=${AUDIO_OUTPUT_DEVICE_NAME:-}
+<<<<<<< Updated upstream
+=======
+      # Fallback ALSA output when no USB speaker is found. Defaults to plughw:0,0
+      # (internal speaker). Change to plughw:0,3 for HDMI, or plughw:0,7 for HDMI 1, etc.
+      - AUDIO_OUTPUT_FALLBACK_DEVICE=${AUDIO_OUTPUT_FALLBACK_DEVICE:-plughw:0,0}
+>>>>>>> Stashed changes
+>>>>>>> Stashed changes
+      # --- Merged audio capture (formerly the standalone "audio" container) ---
+      # device-ui spawns mini-pc/audio/audio_capture.py via audio_supervisor.py.
+      # Set MEETINGBOX_SPAWN_AUDIO=0 if you reintroduce a separate audio process.
+      - MEETINGBOX_SPAWN_AUDIO=${MEETINGBOX_SPAWN_AUDIO:-1}
+      - REDIS_HOST=${REDIS_HOST:-127.0.0.1}
+      - REDIS_PORT=${REDIS_PORT:-6379}
+      - AUDIO_COMMAND_SOURCE=${AUDIO_COMMAND_SOURCE:-}
+      - AUDIO_POLL_BASE_URL=${AUDIO_POLL_BASE_URL:-}
+      - RECORDINGS_DIR=${RECORDINGS_DIR:-/data/audio/recordings}
+      - TEMP_SEGMENTS_DIR=${TEMP_SEGMENTS_DIR:-/data/audio/temp}
+      - UPLOAD_AUDIO_ON_STOP=${UPLOAD_AUDIO_ON_STOP:-1}
+      - UPLOAD_AUDIO_API_URL=${UPLOAD_AUDIO_API_URL:-http://127.0.0.1:8000/api/meetings/upload-audio}
+      - UPLOAD_AUDIO_TIMEOUT_SECONDS=${UPLOAD_AUDIO_TIMEOUT_SECONDS:-1200}
+      - DEVICE_AUTH_TOKEN=${DEVICE_AUTH_TOKEN:-}
       # Match physical panel (e.g. ultrawide 3520x1080). Kivy reads these before Window is created.
       # Defaults are 1024×600 — without overrides, home-screen scaling stays at the small baseline.
       - DISPLAY_WIDTH=${DISPLAY_WIDTH:-1024}
@@ -122,15 +119,38 @@ services:
       - MEETINGBOX_LOCAL_POWEROFF_CMD=${MEETINGBOX_LOCAL_POWEROFF_CMD:-}
       - MEETINGBOX_LOCAL_REBOOT_HELPER=${MEETINGBOX_LOCAL_REBOOT_HELPER:-}
       - MEETINGBOX_LOCAL_POWEROFF_HELPER=${MEETINGBOX_LOCAL_POWEROFF_HELPER:-}
+      # Audio control: these env vars let pactl/wpctl inside the container reach
+      # the host PipeWire/PulseAudio daemon via the mounted sockets below.
+      # PULSE_SERVER must NOT appear in this list when unset — even an empty string
+      # causes "pa_context_connect() failed: Invalid server" in pactl.
+      # Auto-discovery via XDG_RUNTIME_DIR / PULSE_RUNTIME_PATH is correct.
+      # To force a specific server, set PULSE_SERVER directly in your .env file.
+      - XDG_RUNTIME_DIR=/run/user/1000
+      - PULSE_RUNTIME_PATH=/run/user/1000/pulse
+      - PIPEWIRE_RUNTIME_DIR=/run/user/1000
     volumes:
+      # Backlight sysfs on the appliance — brightness slider touches the physical panel (rw; needs privileged or matching perms).
+      - /sys/class/backlight:/sys/class/backlight
+      # PulseAudio compat socket (PipeWire-pulse) — used by pactl for volume control.
+      - ${MEETINGBOX_HOST_PULSE:-/run/user/1000/pulse}:/run/user/1000/pulse
+      # PipeWire native socket — used by wpctl for volume control (preferred over pactl).
+      - /run/user/1000/pipewire-0:/run/user/1000/pipewire-0
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
       # X11 cookie: boot script sets MEETINGBOX_X11_COOKIE (not in .env) so it wins over XAUTHORITY_HOST.
       - ${MEETINGBOX_X11_COOKIE:-${XAUTHORITY_HOST:-${HOME}/.Xauthority}}:/home/uiuser/.Xauthority:ro
       - ./data/config:/data/config
+      # Recordings + temp segments (previously owned by the audio container).
+      - ./data/audio:/data/audio
       # Host reboot/poweroff from Settings (nsenter PID 1 — needs cap_add below).
       - ./scripts/meetingbox-host-reboot:/usr/local/bin/meetingbox-host-reboot:ro
       - ./scripts/meetingbox-host-poweroff:/usr/local/bin/meetingbox-host-poweroff:ro
-      # nmcli in the container talks to the host NetworkManager (WiFi from Home / Settings).
+      # WiFi nmcli via nsenter — bypasses polkit "Not authorized to control networking".
+      - ./scripts/meetingbox-wifi-nmcli:/usr/local/bin/meetingbox-wifi-nmcli:ro
+      # Bluetooth control via nsenter into host namespace — bypasses polkit for power on/off.
+      - ./scripts/meetingbox-bluetooth:/usr/local/bin/meetingbox-bluetooth:ro
+      # Date/Time and Timezone: timedatectl via nsenter into host (systemd-timedated on host).
+      - ./scripts/meetingbox-timedatectl:/usr/local/bin/meetingbox-timedatectl:ro
+      # nmcli/bluetoothctl in the container talks to host NetworkManager / BlueZ via D-Bus.
       - /run/dbus/system_bus_socket:/run/dbus/system_bus_socket
     devices:
       - /dev/dri:/dev/dri
@@ -143,6 +163,7 @@ services:
       - video
       - audio
       - input
+      - bluetooth
     # nsenter into host PID 1 for Settings → Restart/Power off. cap_add alone is NOT enough:
     # Docker returns "reassociate to namespaces failed: Operation not permitted" without this.
     privileged: true

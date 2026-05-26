@@ -59,7 +59,7 @@ echo ""
 
 echo "--- .env compose profiles (device-ui needs mini-pc or screen) ---"
 if [[ -f "$REL/.env" ]]; then
-  grep -E '^[[:space:]]*COMPOSE_PROFILES=' "$REL/.env" || echo "(no COMPOSE_PROFILES= — kiosk-compose-up.sh now defaults to mini-pc,docker-audio if absent)"
+  grep -E '^[[:space:]]*COMPOSE_PROFILES=' "$REL/.env" || echo "(no COMPOSE_PROFILES= — kiosk-compose-up.sh now defaults to mini-pc if absent)"
 else
   echo "MISSING $REL/.env — copy .env.example to .env"
 fi

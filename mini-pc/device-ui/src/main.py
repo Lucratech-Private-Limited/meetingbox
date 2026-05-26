@@ -281,7 +281,6 @@ from screens.update_check import UpdateCheckScreen
 from screens.update_install import UpdateInstallScreen
 from screens.update_channel_picker import UpdateChannelPickerScreen
 from screens.timezone_picker import TimezonePickerScreen
-from screens.font_size_picker import FontSizePickerScreen
 from screens.audio_sink_picker import AudioSinkPickerScreen
 from screens.audio_source_picker import AudioSourcePickerScreen
 from screens.wifi_forget_screen import WiFiForgetScreen
@@ -1050,7 +1049,6 @@ class MeetingBoxApp(App):
         self.screen_manager.add_widget(UpdateInstallScreen(name='update_install'))
         self.screen_manager.add_widget(UpdateChannelPickerScreen(name='update_channel_picker'))
         self.screen_manager.add_widget(TimezonePickerScreen(name='timezone_picker'))
-        self.screen_manager.add_widget(FontSizePickerScreen(name='font_size_picker'))
         self.screen_manager.add_widget(AudioSinkPickerScreen(name='audio_output_picker'))
         self.screen_manager.add_widget(AudioSourcePickerScreen(name='audio_input_picker'))
         self.screen_manager.add_widget(WiFiForgetScreen(name='wifi_forget_screen'))

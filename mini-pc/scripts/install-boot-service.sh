@@ -40,30 +40,7 @@ if ! id -nG "$RUN_AS_USER" | tr ' ' '\n' | grep -qx docker; then
 fi
 
 SERVICE_PATH=/etc/systemd/system/meetingbox-appliance.service
-AUDIO_SERVICE=/etc/systemd/system/meetingbox-docker-audio.service
-
-# Redis + mic: start at multi-user.target so they run even if GDM/kiosk/X never comes up.
-cat >"$AUDIO_SERVICE" <<EOF
-[Unit]
-Description=MeetingBox Redis + audio (Docker, no display required)
-# Use network.target only — After=network-online.target can stall boot for minutes
-# (systemd-networkd-wait-online / bad DNS) while the panel already shows a desktop.
-After=docker.service network.target
-Wants=docker.service
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-User=$RUN_AS_USER
-Group=$RUN_AS_USER
-WorkingDirectory=$APPLIANCE_DIR
-Environment=HOME=$RUN_AS_HOME
-ExecStart=/usr/bin/docker compose --profile docker-audio up -d redis audio
-TimeoutStartSec=120
-
-[Install]
-WantedBy=multi-user.target
-EOF
+LEGACY_AUDIO_SERVICE=/etc/systemd/system/meetingbox-docker-audio.service
 
 # Full stack after graphical session (cookie + device-ui).
 cat >"$SERVICE_PATH" <<EOF
@@ -72,7 +49,7 @@ Description=MeetingBox appliance (Docker Compose + UI)
 Documentation=https://github.com/
 # Do not order After=network-online.target — it can delay the kiosk UI for minutes with no
 # user-visible progress. Docker / BACKEND_URL retries inside the app are enough for WAN.
-After=docker.service network.target display-manager.service meetingbox-docker-audio.service graphical.target
+After=docker.service network.target display-manager.service graphical.target
 Wants=docker.service
 
 [Service]
@@ -92,9 +69,13 @@ WantedBy=graphical.target
 EOF
 
 systemctl daemon-reload
-systemctl enable meetingbox-docker-audio.service meetingbox-appliance.service
+systemctl disable --now meetingbox-docker-audio.service 2>/dev/null || true
+rm -f "$LEGACY_AUDIO_SERVICE"
+systemctl daemon-reload
+systemctl enable meetingbox-appliance.service
 echo "Installed and enabled:"
-echo "  $AUDIO_SERVICE  (multi-user — redis + audio always)"
-echo "  $SERVICE_PATH   (graphical — full stack + UI)"
-echo "Start now:  sudo systemctl start meetingbox-docker-audio meetingbox-appliance"
-echo "Logs:       journalctl -u meetingbox-docker-audio -u meetingbox-appliance -b"
+echo "  $SERVICE_PATH   (graphical — device-ui + Redis; audio is supervised inside device-ui)"
+echo "Disabled legacy separate audio service if present:"
+echo "  $LEGACY_AUDIO_SERVICE"
+echo "Start now:  sudo systemctl start meetingbox-appliance"
+echo "Logs:       journalctl -u meetingbox-appliance -b"
