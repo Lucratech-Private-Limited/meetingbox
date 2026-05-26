@@ -26,6 +26,11 @@
     "read my emails",
     "reply to",
     "reply all",
+    "reply-all",
+    "reply all on",
+    "reply everyone",
+    "reply to everyone",
+    "respond to the thread",
     "forward",
     "forward email",
     "forward the email",
@@ -36,7 +41,10 @@
     "add to the email",
     "add to the draft",
     "remove from the email",
-    "remove from the draft"
+    "remove from the draft",
+    "thread",
+    "in the thread",
+    "on the thread"
   ],
   "system_prompt": "Email Operations Agent. See guidelines for the source-of-truth purpose, behavior rules, search rules, tool selection, and priorities. Outbound and destructive operations are queued for user approval; draft-editing operations execute directly with a clear confirmation in the reply.",
   "guidelines": {
@@ -137,7 +145,7 @@
   },
   "requires_approval": true,
   "background": false,
-  "priority": 4,
+  "priority": 5,
   "memory_context": true,
   "max_tool_calls": 8,
   "system_only": false

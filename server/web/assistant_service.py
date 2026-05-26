@@ -398,11 +398,32 @@ def _llm_communication_plan(message: str) -> list[dict[str, Any]] | None:
     return None
 
   prompt = (
+<<<<<<< Updated upstream
     "Plan Gmail tools for the user message. Return **only** valid JSON:\n"
     "{\"steps\": [ {\"tool\": \"<tool_name>\", \"args\": {}, \"is_write\": true|false } ] }\n\n"
     "TOOL SELECTION RULES (apply in order):\n\n"
     f"{rules_block}\n\n"
     f"User message:\n{message.strip()[:4000]}\n"
+=======
+    "You are the Email Operations Agent. Your ONLY job is to select the single best Gmail tool for the user message and return it as JSON.\n\n"
+    "Return ONLY valid JSON — no explanation, no markdown:\n"
+    "{\"steps\": [ {\"tool\": \"<exact_tool_name>\", \"args\": {<required fields>}, \"is_write\": true|false} ]}\n\n"
+    "CRITICAL RULES — read before anything else:\n"
+    "- NEVER default to gmail_list_recent unless the user explicitly asks to check, list, search, or read emails.\n"
+    "- If the user says 'draft', 'write', 'compose', or 'prepare' an email → use gmail_create_draft.\n"
+    "- If the user says 'send', 'email to', 'shoot a message' → use gmail_send_email.\n"
+    "- If the user says 'reply all' or 'reply to everyone' → use gmail_reply_all.\n"
+    "- If the user says 'reply' or 'respond' (not reply all) → use gmail_reply_to_thread.\n"
+    "- If the user says 'forward' → use gmail_forward_email.\n"
+    "- If the user says 'archive' → use gmail_archive_email.\n"
+    "- If the user says 'delete', 'trash', 'remove' (an email) → use gmail_delete_email.\n"
+    "- If the user says 'update the draft', 'change the draft' → use gmail_update_draft.\n"
+    "- If the user says 'add ... to the draft/email' (a person) → use gmail_add_recipients.\n"
+    "- If the user says 'remove ... from the draft/email' (a person) → use gmail_remove_recipients.\n\n"
+    "FULL TOOL REFERENCE:\n\n"
+    f"{rules_block}\n\n"
+    f"User message: {message.strip()[:3000]}\n"
+>>>>>>> Stashed changes
   )
   model = os.getenv("AI_MODEL", "claude-sonnet-4-20250514")
   try:
@@ -1119,8 +1140,15 @@ def _dispatch_single_agent(
         maybe_ingest_calendar_snapshot(user_id, tr["result"])
 
   elif agent_id in ("gmail_agent", "communication_agent"):
+<<<<<<< Updated upstream
     ctx = _augment_user_text_for_agent(agent_doc, user_id, text)
     steps = _filter_steps_for_agent(agent_id, plan_communication_steps(ctx))
+=======
+    # Plan tool selection using original text only — memory blobs must NOT bias which
+    # Gmail tool to pick (e.g. past reply-all conversations would cause the planner to
+    # plan gmail_reply_all for unrelated requests like "check my inbox").
+    steps = _filter_steps_for_agent(agent_id, plan_communication_steps(text))
+>>>>>>> Stashed changes
 
     # Direct-execute table for Gmail tools that don't go through the approval queue.
     # Keys are tool names; values are the *_from_payload adapters in tools/gmail_tool.py.
