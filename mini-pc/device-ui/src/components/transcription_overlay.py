@@ -371,6 +371,16 @@ class TranscriptionOverlay(FloatLayout):
 
             # Always make the overlay visible when new content arrives
             self.show()
+
+            logger.info(
+                "TranscriptionOverlay: added %s bubble #%d (compact=%s, "
+                "total_msgs=%d, chat_children=%d)",
+                "USER" if is_user else "AI",
+                self._msg_counter,
+                self._compact,
+                len(self._messages),
+                len(self._chat_box.children),
+            )
             return msg_id
         except Exception:
             logger.exception("TranscriptionOverlay._add_message failed")

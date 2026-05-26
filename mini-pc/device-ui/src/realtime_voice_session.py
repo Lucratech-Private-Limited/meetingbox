@@ -347,6 +347,11 @@ class RealtimeVoiceSession:
         self._aec_near_buf = bytearray()
         self._aec_buf_lock = threading.Lock()
 
+        # Streaming buffer for AI audio transcript deltas. We flush it
+        # on the matching .done event, or on response.done as a fallback
+        # when the API never emits .done at all.
+        self._ai_transcript_buf: str = ""
+
         # Tools we received from the server in session.created. Cached so
         # we can re-send them in session.update with end_session appended.
         self._server_tools: list[dict] = []
@@ -953,12 +958,33 @@ class RealtimeVoiceSession:
                             break
 
                 # ---- AI audio transcript (text of what assistant said) ----
-                elif t == "response.audio_transcript.done":
+                # OpenAI renamed these events in newer API versions, mirroring
+                # the audio event rename (response.audio.* -> response.output_audio.*).
+                # Accept BOTH names so we don't silently miss assistant text
+                # on whichever version the server is on today.
+                elif t in (
+                    "response.audio_transcript.done",
+                    "response.output_audio_transcript.done",
+                ):
                     self._touch()
                     ai_text = self._extract_transcript(msg)
+                    # Fall back to whatever we accumulated from delta events
+                    if not ai_text:
+                        ai_text = self._ai_transcript_buf.strip()
+                    self._ai_transcript_buf = ""
                     if ai_text:
                         logger.info("AI said: %r", ai_text)
                         self._emit_ai_transcript(ai_text)
+
+                # Accumulate streamed transcript chunks as a fallback in
+                # case .done never arrives (some API versions skip it).
+                elif t in (
+                    "response.audio_transcript.delta",
+                    "response.output_audio_transcript.delta",
+                ):
+                    delta = msg.get("delta")
+                    if isinstance(delta, str) and delta:
+                        self._ai_transcript_buf += delta
 
                 # ---- Model response lifecycle -------------------------
                 elif t in ("response.created", "response.started"):
@@ -995,6 +1021,13 @@ class RealtimeVoiceSession:
 
                 elif t == "response.done":
                     self._touch()
+                    # If the .done transcript event never arrived but we
+                    # accumulated deltas, flush them now.
+                    leftover = self._ai_transcript_buf.strip()
+                    self._ai_transcript_buf = ""
+                    if leftover:
+                        logger.info("AI said (flushed from deltas): %r", leftover)
+                        self._emit_ai_transcript(leftover)
                     await self._handle_response_done(ws, msg)
                     self._response_in_progress = False
                     self._active_audio_item_id = None
