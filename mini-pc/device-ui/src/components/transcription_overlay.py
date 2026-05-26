@@ -1,15 +1,25 @@
 """
 Transcription Overlay
 
-Persistent full-screen chat panel that shows the live conversation between the
-user and the AI assistant for the entire voice session.
+Two display modes:
 
-AI messages appear as bubbles on the left; user messages on the right.
-The overlay is always visible while the voice session is active.
-Tap ✕ to dismiss; it reappears automatically on the next transcript.
+  full (used on the home screen)
+    Whole-screen WhatsApp-style chat with a scrollable history of every
+    user / AI turn since the voice session started. Tap ✕ to dismiss.
+
+  compact (used on every other screen)
+    A small floating strip at the bottom of the screen showing only the
+    most recent line of dialog so the user can still see what the assistant
+    said while reading the current screen. Touches outside the strip pass
+    through to the screen below.
+
+The full conversation history is always retained internally — switching
+between modes is purely a presentation change.
 """
 
 from __future__ import annotations
+
+import logging
 
 from kivy.animation import Animation
 from kivy.clock import Clock
@@ -21,27 +31,33 @@ from kivy.uix.scrollview import ScrollView
 
 from config import COLORS, FONT_SIZES, DISPLAY_WIDTH, DISPLAY_HEIGHT
 
+logger = logging.getLogger(__name__)
+
 # ── Bubble geometry ──────────────────────────────────────────────────────────
-_BUBBLE_MAX_FRACTION = 0.70          # fraction of overlay width
+_BUBBLE_MAX_FRACTION = 0.70
 _BUBBLE_PADDING_H = 14
 _BUBBLE_PADDING_V = 10
 _BUBBLE_RADIUS = 16
 
 # ── Colours ───────────────────────────────────────────────────────────────────
-_BG_COLOR        = (0.04, 0.04, 0.06, 0.93)
-_AI_BUBBLE       = (0.20, 0.20, 0.22, 1.0)   # dark charcoal
-_USER_BUBBLE     = (0.13, 0.56, 0.34, 1.0)   # WhatsApp-green
-_HEADER_BG       = (0.08, 0.08, 0.10, 1.0)
-_TEXT_COLOR      = COLORS['white']
-_HEADER_TEXT     = COLORS['white']
-_CLOSE_COLOR     = COLORS['gray_400']
-_SPEAKER_COLOR   = COLORS['gray_500']
+_BG_COLOR       = (0.04, 0.04, 0.06, 0.93)
+_AI_BUBBLE      = (0.20, 0.20, 0.22, 1.0)
+_USER_BUBBLE    = (0.13, 0.56, 0.34, 1.0)
+_HEADER_BG      = (0.08, 0.08, 0.10, 1.0)
+_COMPACT_BG     = (0.06, 0.06, 0.08, 0.92)
+_TEXT_COLOR     = COLORS['white']
+_HEADER_TEXT    = COLORS['white']
+_CLOSE_COLOR    = COLORS['gray_400']
+_SPEAKER_COLOR  = COLORS['gray_500']
+_COMPACT_LABEL  = COLORS['gray_400']
 
 # ── Typography ────────────────────────────────────────────────────────────────
 _FONT_BUBBLE  = FONT_SIZES.get('medium', 16)
 _FONT_SPEAKER = FONT_SIZES.get('tiny', 10) + 1
 _FONT_HEADER  = FONT_SIZES.get('title', 18)
+_FONT_COMPACT = FONT_SIZES.get('medium', 16)
 _HEADER_H     = 52
+_COMPACT_H    = 78
 
 
 def _attach_bg(widget, color: tuple, radius: int = 0):
@@ -71,6 +87,7 @@ class _Bubble(BoxLayout):
             spacing=0,
             **kw,
         )
+        self._is_user = is_user
         max_w = (overlay_width or DISPLAY_WIDTH) * _BUBBLE_MAX_FRACTION
         self.width = max_w
         _attach_bg(self, _USER_BUBBLE if is_user else _AI_BUBBLE,
@@ -102,14 +119,13 @@ class _BubbleRow(FloatLayout):
 
     def __init__(self, bubble: _Bubble, **kw):
         super().__init__(size_hint=(1, None), **kw)
-        is_user = bubble._is_user
-        if is_user:
+        self._bubble = bubble
+        if bubble._is_user:
             bubble.pos_hint = {'right': 1.0 - self._MARGIN / DISPLAY_WIDTH}
         else:
             bubble.pos_hint = {'x': self._MARGIN / DISPLAY_WIDTH}
         self.add_widget(bubble)
         bubble.bind(height=lambda b, h: setattr(self, 'height', h + 8))
-        self._bubble = bubble
 
     def update_text(self, text: str):
         self._bubble.update_text(text)
@@ -140,21 +156,23 @@ class _SpeakerLabel(BoxLayout):
 
 class TranscriptionOverlay(FloatLayout):
     """
-    Persistent full-screen transcript panel.
+    Persistent transcript panel with two display modes (full / compact).
 
     Public API
     ----------
-    show()                         — make visible (animates in)
-    hide()                         — animate out
-    clear_session()                — remove all messages (call at session start)
-    add_ai_message(text) -> str    — append AI bubble; returns msg_id
-    add_user_message(text) -> str  — append user bubble; returns msg_id
-    update_user_message(id, text)  — replace user bubble text (grammar fix)
+    show()                          — make visible (animates in)
+    hide()                          — animate out
+    clear_session()                 — remove all messages (call at session start)
+    add_ai_message(text) -> str     — append AI bubble; returns msg_id
+    add_user_message(text) -> str   — append user bubble; returns msg_id
+    update_user_message(id, text)   — replace user bubble text (grammar fix)
+    set_compact(bool)               — toggle between full and compact modes
     """
 
     def __init__(self, **kw):
         super().__init__(size_hint=(1, 1), **kw)
         self._visible = False
+        self._compact = False
         self._messages: dict[str, _BubbleRow] = {}
         self._msg_counter = 0
         self.opacity = 0
@@ -163,10 +181,11 @@ class TranscriptionOverlay(FloatLayout):
     # ── Build ─────────────────────────────────────────────────────────────────
 
     def _build_ui(self):
-        # Full-screen background
-        _attach_bg(self, _BG_COLOR)
+        # ── FULL view container (dark backdrop + header + scroll list) ────
+        self._full_view = FloatLayout(size_hint=(1, 1))
+        _attach_bg(self._full_view, _BG_COLOR)
 
-        # ── ScrollView (added FIRST → drawn behind header) ─────────────────
+        # ScrollView added first so the header (added later) paints on top
         self._scroll = ScrollView(
             size_hint=(1, 1),
             pos_hint={'x': 0, 'y': 0},
@@ -181,14 +200,13 @@ class TranscriptionOverlay(FloatLayout):
             orientation='vertical',
             size_hint=(1, None),
             spacing=4,
-            # top padding reserves space for the header bar
             padding=[0, _HEADER_H + 12, 0, 20],
         )
         self._chat_box.bind(minimum_height=self._chat_box.setter('height'))
         self._scroll.add_widget(self._chat_box)
-        self.add_widget(self._scroll)   # ← behind header
+        self._full_view.add_widget(self._scroll)
 
-        # ── Header bar (added SECOND → drawn on top of scroll view) ────────
+        # Header bar
         header = BoxLayout(
             orientation='horizontal',
             size_hint=(1, None),
@@ -223,8 +241,54 @@ class TranscriptionOverlay(FloatLayout):
         close_btn.bind(size=close_btn.setter('text_size'))
         close_btn.bind(on_touch_down=self._on_close_touch)
         header.add_widget(close_btn)
+        self._full_view.add_widget(header)
 
-        self.add_widget(header)         # ← on top of scroll view
+        self.add_widget(self._full_view)
+
+        # ── COMPACT view (bottom strip, no full backdrop) ─────────────────
+        self._compact_view = BoxLayout(
+            orientation='horizontal',
+            size_hint=(1, None),
+            height=_COMPACT_H,
+            pos_hint={'x': 0, 'y': 0},
+            padding=[16, 10, 16, 12],
+            spacing=10,
+        )
+        _attach_bg(self._compact_view, _COMPACT_BG)
+
+        self._compact_speaker = Label(
+            text='AI',
+            font_size=_FONT_SPEAKER,
+            bold=True,
+            color=_SPEAKER_COLOR,
+            size_hint=(None, 1),
+            width=36,
+            halign='left',
+            valign='top',
+        )
+        self._compact_speaker.bind(
+            size=self._compact_speaker.setter('text_size')
+        )
+        self._compact_view.add_widget(self._compact_speaker)
+
+        self._compact_label = Label(
+            text='',
+            font_size=_FONT_COMPACT,
+            color=_TEXT_COLOR,
+            size_hint=(1, 1),
+            halign='left',
+            valign='top',
+            shorten=False,
+        )
+        self._compact_label.bind(
+            size=lambda w, _s: setattr(
+                w, 'text_size', (w.width, w.height)
+            )
+        )
+        self._compact_view.add_widget(self._compact_label)
+
+        self._compact_view.opacity = 0
+        self.add_widget(self._compact_view)
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -246,6 +310,8 @@ class TranscriptionOverlay(FloatLayout):
         self._chat_box.clear_widgets()
         self._messages.clear()
         self._msg_counter = 0
+        self._compact_label.text = ''
+        self._compact_speaker.text = 'AI'
 
     def add_ai_message(self, text: str) -> str:
         return self._add_message(text, is_user=False)
@@ -257,26 +323,58 @@ class TranscriptionOverlay(FloatLayout):
         row = self._messages.get(msg_id)
         if row is not None:
             row.update_text(corrected)
+        # Also refresh compact view if this is the message currently shown
+        if self._compact_label.text and self._compact_speaker.text == 'You':
+            self._compact_label.text = corrected
+
+    def set_compact(self, compact: bool):
+        """Switch between full-screen and bottom-strip presentation."""
+        if compact == self._compact:
+            return
+        self._compact = compact
+        Animation.cancel_all(self._full_view, 'opacity')
+        Animation.cancel_all(self._compact_view, 'opacity')
+        if compact:
+            self._full_view.opacity = 0
+            self._full_view.disabled = True
+            self._compact_view.opacity = 1
+        else:
+            self._full_view.opacity = 1
+            self._full_view.disabled = False
+            self._compact_view.opacity = 0
 
     # ── Internals ─────────────────────────────────────────────────────────────
 
     def _add_message(self, text: str, is_user: bool) -> str:
-        self._msg_counter += 1
-        msg_id = f"msg_{self._msg_counter}"
+        try:
+            self._msg_counter += 1
+            msg_id = f"msg_{self._msg_counter}"
 
-        self._chat_box.add_widget(_SpeakerLabel(is_user=is_user))
-        bubble = _Bubble(text=text, is_user=is_user,
-                         overlay_width=self.width or DISPLAY_WIDTH)
-        row = _BubbleRow(bubble=bubble)
-        self._chat_box.add_widget(row)
-        self._messages[msg_id] = row
+            self._chat_box.add_widget(_SpeakerLabel(is_user=is_user))
+            bubble = _Bubble(
+                text=text,
+                is_user=is_user,
+                overlay_width=self.width or DISPLAY_WIDTH,
+            )
+            row = _BubbleRow(bubble=bubble)
+            self._chat_box.add_widget(row)
+            self._messages[msg_id] = row
 
-        # Scroll to bottom so the newest message is always visible
-        Clock.schedule_once(lambda _dt: setattr(self._scroll, 'scroll_y', 0), 0.15)
+            # Update compact strip to show this newest message
+            self._compact_speaker.text = 'You' if is_user else 'AI'
+            self._compact_label.text = text
 
-        # Always show when new content arrives (reappears even after dismiss)
-        self.show()
-        return msg_id
+            # Scroll to bottom (full-mode list)
+            Clock.schedule_once(
+                lambda _dt: setattr(self._scroll, 'scroll_y', 0), 0.15
+            )
+
+            # Always make the overlay visible when new content arrives
+            self.show()
+            return msg_id
+        except Exception:
+            logger.exception("TranscriptionOverlay._add_message failed")
+            return ""
 
     def _on_close_touch(self, widget, touch):
         if widget.collide_point(*touch.pos):
@@ -285,8 +383,17 @@ class TranscriptionOverlay(FloatLayout):
         return False
 
     def on_touch_down(self, touch):
-        """Consume all touches while visible so underlying screen stays inactive."""
+        """Consume touches only where the visible chrome actually is, so the
+        underlying screen stays interactive elsewhere (especially in compact
+        mode where most of the screen should remain usable)."""
         if self.opacity < 0.05:
             return False
+        if self._compact:
+            # Pass touches through everywhere except the bottom strip
+            if self._compact_view.collide_point(*touch.pos):
+                super().on_touch_down(touch)
+                return True
+            return False
+        # Full mode — consume everything (modal)
         super().on_touch_down(touch)
         return True

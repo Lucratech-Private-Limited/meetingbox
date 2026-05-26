@@ -1095,6 +1095,11 @@ class MeetingBoxApp(App):
             from components.transcription_overlay import TranscriptionOverlay
             self._transcript_overlay = TranscriptionOverlay()
             self.root_layout.add_widget(self._transcript_overlay)
+            # Switch between full-screen mode (on home) and compact bottom-
+            # strip mode (on every other screen) whenever the user navigates.
+            self.screen_manager.bind(
+                current=lambda _sm, name: self._sync_transcript_overlay_mode(name)
+            )
         except Exception:
             logger.exception("TranscriptionOverlay failed to load")
 
@@ -2692,6 +2697,21 @@ class MeetingBoxApp(App):
         except Exception:
             logger.exception("Realtime navigate to %s failed", name)
 
+    def _sync_transcript_overlay_mode(self, screen_name: str | None = None) -> None:
+        """Toggle the overlay between full-screen and compact bottom-strip.
+
+        Full mode is used only on the home screen so the user gets the whole
+        WhatsApp-style conversation history. On every other screen we shrink
+        to a small bar at the bottom so the screen content stays readable.
+        """
+        overlay = self._transcript_overlay
+        if overlay is None:
+            return
+        name = screen_name or (
+            self.screen_manager.current if self.screen_manager else None
+        )
+        overlay.set_compact(name != 'home')
+
     def _end_realtime_voice_session(self) -> None:
         self._realtime_mic_acquired = False
         self._set_voice_runtime_state("idle")
@@ -2936,6 +2956,7 @@ class MeetingBoxApp(App):
                 # Clear previous session's transcript and show overlay
                 if self._transcript_overlay is not None:
                     self._transcript_overlay.clear_session()
+                    self._sync_transcript_overlay_mode()
                     self._transcript_overlay.show()
 
             Clock.schedule_once(_ui, 0)
