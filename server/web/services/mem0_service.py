@@ -2,12 +2,52 @@
 
 from __future__ import annotations
 
+import concurrent.futures as _cf
 import json
 import logging
 import os
+import time
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+# All blocking mem0 API calls run through this executor so they can be
+# given a hard timeout rather than blocking indefinitely on retries.
+_MEM0_EXECUTOR = _cf.ThreadPoolExecutor(max_workers=2, thread_name_prefix="mem0")
+
+# If a mem0 API call doesn't finish within this many seconds, we abandon
+# it and return empty/None so the voice tool responds immediately instead
+# of leaving the user waiting forever during rate-limit retry storms.
+_MEM0_TIMEOUT_S = 5.0
+
+# Circuit-breaker: after this many consecutive timeouts/errors, suspend
+# all mem0 calls for _MEM0_CB_COOLDOWN_S seconds to let the API recover.
+_MEM0_CB_THRESHOLD = 3
+_MEM0_CB_COOLDOWN_S = 120.0
+_mem0_cb_errors: int = 0
+_mem0_cb_open_until: float = 0.0
+
+
+def _cb_record_error() -> None:
+    global _mem0_cb_errors, _mem0_cb_open_until
+    _mem0_cb_errors += 1
+    if _mem0_cb_errors >= _MEM0_CB_THRESHOLD:
+        _mem0_cb_open_until = time.monotonic() + _MEM0_CB_COOLDOWN_S
+        logger.warning(
+            "mem0 circuit-breaker OPEN for %.0fs after %d consecutive errors",
+            _MEM0_CB_COOLDOWN_S, _mem0_cb_errors,
+        )
+
+
+def _cb_record_ok() -> None:
+    global _mem0_cb_errors
+    _mem0_cb_errors = 0
+
+
+def _cb_is_open() -> bool:
+    if time.monotonic() < _mem0_cb_open_until:
+        return True
+    return False
 
 # Normalized metadata.source values for Mem0 rows (admin filtering / audits).
 SOURCE_MEETING_SUMMARY = "meeting_summary"
@@ -97,14 +137,31 @@ def _memory():
 
 
 def _mem0_search_raw(user_id: str, query: str, top_k: int) -> Any:
+    if _cb_is_open():
+        logger.debug("mem0 circuit-breaker open, skipping search for user=%s", user_id)
+        return None
     m = _memory()
     if not m:
         return None
-    return m.search(
+    fut = _MEM0_EXECUTOR.submit(
+        m.search,
         (query or "").strip() or "preferences facts",
         filters={"user_id": str(user_id)},
         top_k=max(1, min(int(top_k), 50)),
     )
+    try:
+        result = fut.result(timeout=_MEM0_TIMEOUT_S)
+        _cb_record_ok()
+        return result
+    except _cf.TimeoutError:
+        logger.warning("mem0 search timed out (%.1fs) user=%s — circuit error %d/%d",
+                       _MEM0_TIMEOUT_S, user_id, _mem0_cb_errors + 1, _MEM0_CB_THRESHOLD)
+        _cb_record_error()
+        return None
+    except Exception:
+        logger.warning("mem0 search failed user=%s", user_id, exc_info=True)
+        _cb_record_error()
+        return None
 
 
 def search_context_for_prompt(user_id: str | None, query: str, top_k: int = 8) -> str:
@@ -161,6 +218,7 @@ def _optional_ingest(
         or mem0_disabled_globally()
         or mem0_writes_disabled()
         or not _env_ingest_enabled(env_name)
+        or _cb_is_open()
     ):
         return
     body = (text or "").strip()
@@ -170,10 +228,16 @@ def _optional_ingest(
     if not m:
         return
     meta = {"source": source, **{k: v for k, v in metadata.items() if v is not None}}
-    try:
-        m.add(body[:12000], user_id=str(user_id), metadata=meta, infer=True)
-    except Exception:
-        logger.exception("mem0 add failed source=%s", source)
+
+    def _do_add():
+        try:
+            m.add(body[:12000], user_id=str(user_id), metadata=meta, infer=True)
+        except Exception:
+            logger.debug("mem0 background add failed source=%s", source, exc_info=True)
+            _cb_record_error()
+
+    # Fire-and-forget: submit but don't block the caller.
+    _MEM0_EXECUTOR.submit(_do_add)
 
 
 def maybe_ingest_meeting_summary(user_id: str | None, meeting_id: str, summary_text: str) -> None:
@@ -324,15 +388,25 @@ def ingest_voice_explicit_memory(
     if cn:
         blob = f"{blob}\n(Context: {cn[:4000]})"
     blob = blob[:12000]
+    if _cb_is_open():
+        return {"stored": False, "mem0_enabled": True, "error": "rate_limited"}
+    fut = _MEM0_EXECUTOR.submit(
+        m.add,
+        blob,
+        user_id=str(uid),
+        metadata={"source": SOURCE_VOICE_MEMORY, "kind": "explicit_fact"},
+        infer=True,
+    )
     try:
-        m.add(
-            blob,
-            user_id=str(uid),
-            metadata={"source": SOURCE_VOICE_MEMORY, "kind": "explicit_fact"},
-            infer=True,
-        )
+        fut.result(timeout=_MEM0_TIMEOUT_S)
+        _cb_record_ok()
+    except _cf.TimeoutError:
+        logger.warning("mem0 ingest_voice_explicit_memory timed out user=%s", uid)
+        _cb_record_error()
+        return {"stored": False, "mem0_enabled": True, "error": "timed_out"}
     except Exception:
-        logger.exception("mem0 ingest_voice_explicit_memory failed")
+        logger.warning("mem0 ingest_voice_explicit_memory failed user=%s", uid, exc_info=True)
+        _cb_record_error()
         return {"stored": False, "mem0_enabled": True, "error": "add_failed"}
     return {"stored": True, "mem0_enabled": True}
 

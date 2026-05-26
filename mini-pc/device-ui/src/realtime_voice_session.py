@@ -935,10 +935,22 @@ class RealtimeVoiceSession:
                     if spoken:
                         logger.info("User said: %r", spoken)
                         self._emit_user_transcript(spoken)
-                    # End-of-session is now decided by the model via the
-                    # end_session tool (handled in _handle_response_done).
-                    # Server's create_response: true handles every other
-                    # user turn automatically — nothing else for us here.
+                        # Client-side farewell fallback: if the transcript is
+                        # a clear goodbye phrase, close the session immediately
+                        # without waiting for the model to call end_session.
+                        # This ensures farewell always works even if the model
+                        # is busy with a slow tool call (e.g. mem0 rate-limit).
+                        if _is_farewell(spoken):
+                            logger.info(
+                                "Realtime: client-side farewell detected %r — closing.", spoken
+                            )
+                            self._user_ended = True
+                            self._stop.set()
+                            try:
+                                await ws.close()
+                            except Exception:
+                                pass
+                            break
 
                 # ---- AI audio transcript (text of what assistant said) ----
                 elif t == "response.audio_transcript.done":
@@ -1039,11 +1051,12 @@ class RealtimeVoiceSession:
         session.created) with the client-only end_session tool.
 
         We override:
-          - input.turn_detection.eagerness = "high" (server default is
-            "low" for legacy hardware with no echo cancellation; with
-            external mic + AEC we want snappy end-of-turn detection).
           - input.transcription.model — enables a transcript stream of
-            user speech (also used as a fallback farewell heuristic).
+            user speech (used for farewell detection and the transcript
+            overlay). We do NOT override eagerness — the server deliberately
+            sets "low" for device hardware that lacks echo cancellation;
+            overriding to "high" caused speaker-echo false triggers and
+            mid-sentence self-interruptions.
           - tools — server tools + end_session.
 
         create_response and interrupt_response stay TRUE.
@@ -1058,12 +1071,6 @@ class RealtimeVoiceSession:
                         "input": {
                             "transcription": {
                                 "model": _DEFAULT_INPUT_TRANSCRIPTION_MODEL,
-                            },
-                            "turn_detection": {
-                                "type": "semantic_vad",
-                                "eagerness": "high",
-                                "create_response": True,
-                                "interrupt_response": True,
                             },
                         },
                     },
