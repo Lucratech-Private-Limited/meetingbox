@@ -15,6 +15,10 @@ Two display modes:
 
 The full conversation history is always retained internally — switching
 between modes is purely a presentation change.
+
+AI transcripts arrive as a stream of deltas; `stream_ai_message(item_id,
+accumulated_text)` upserts the active assistant bubble in place so the
+text grows word-by-word in sync with the audio playback.
 """
 
 from __future__ import annotations
@@ -28,6 +32,7 @@ from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.floatlayout import FloatLayout
 from kivy.uix.label import Label
 from kivy.uix.scrollview import ScrollView
+from kivy.uix.widget import Widget
 
 from config import COLORS, FONT_SIZES, DISPLAY_WIDTH, DISPLAY_HEIGHT
 
@@ -38,6 +43,8 @@ _BUBBLE_MAX_FRACTION = 0.70
 _BUBBLE_PADDING_H = 14
 _BUBBLE_PADDING_V = 10
 _BUBBLE_RADIUS = 16
+_ROW_GAP = 8                  # vertical gap below each bubble row
+_ROW_SIDE_PAD = 12            # horizontal padding inside a row
 
 # ── Colours ───────────────────────────────────────────────────────────────────
 _BG_COLOR       = (0.04, 0.04, 0.06, 0.93)
@@ -49,7 +56,6 @@ _TEXT_COLOR     = COLORS['white']
 _HEADER_TEXT    = COLORS['white']
 _CLOSE_COLOR    = COLORS['gray_400']
 _SPEAKER_COLOR  = COLORS['gray_500']
-_COMPACT_LABEL  = COLORS['gray_400']
 
 # ── Typography ────────────────────────────────────────────────────────────────
 _FONT_BUBBLE  = FONT_SIZES.get('medium', 16)
@@ -78,6 +84,8 @@ def _attach_bg(widget, color: tuple, radius: int = 0):
 # ── Bubble ────────────────────────────────────────────────────────────────────
 
 class _Bubble(BoxLayout):
+    """A single chat bubble that auto-sizes to its text content."""
+
     def __init__(self, text: str, is_user: bool, overlay_width: float, **kw):
         super().__init__(
             orientation='vertical',
@@ -90,6 +98,11 @@ class _Bubble(BoxLayout):
         self._is_user = is_user
         max_w = (overlay_width or DISPLAY_WIDTH) * _BUBBLE_MAX_FRACTION
         self.width = max_w
+        # Initial height is irrelevant — _sync_height resets it as soon
+        # as the label has measured its texture. Set something non-zero
+        # so the surrounding BoxLayout reserves a sensible slot until then.
+        self.height = _BUBBLE_PADDING_V * 2 + _FONT_BUBBLE * 2
+
         _attach_bg(self, _USER_BUBBLE if is_user else _AI_BUBBLE,
                    radius=_BUBBLE_RADIUS)
 
@@ -111,27 +124,48 @@ class _Bubble(BoxLayout):
         self.height = ts[1] + _BUBBLE_PADDING_V * 2
 
     def update_text(self, text: str):
+        """Replace the visible text. Triggers a height recompute via texture_size."""
         self._label.text = text
 
 
-class _BubbleRow(FloatLayout):
-    _MARGIN = 12
+class _BubbleRow(BoxLayout):
+    """Horizontal row that aligns a bubble left (AI) or right (user) using
+    a transparent flex spacer Widget. This is far more reliable than the
+    FloatLayout + pos_hint approach for chat-style layouts inside a
+    vertical BoxLayout (which is how _chat_box stacks rows)."""
 
     def __init__(self, bubble: _Bubble, **kw):
-        super().__init__(size_hint=(1, None), **kw)
+        super().__init__(
+            orientation='horizontal',
+            size_hint=(1, None),
+            padding=[_ROW_SIDE_PAD, 0, _ROW_SIDE_PAD, 0],
+            spacing=0,
+            **kw,
+        )
         self._bubble = bubble
         if bubble._is_user:
-            bubble.pos_hint = {'right': 1.0 - self._MARGIN / DISPLAY_WIDTH}
+            # User: spacer absorbs left side, bubble hugs the right edge
+            self.add_widget(Widget(size_hint=(1, 1)))
+            self.add_widget(bubble)
         else:
-            bubble.pos_hint = {'x': self._MARGIN / DISPLAY_WIDTH}
-        self.add_widget(bubble)
-        bubble.bind(height=lambda b, h: setattr(self, 'height', h + 8))
+            # AI: bubble hugs left edge, spacer absorbs the right side
+            self.add_widget(bubble)
+            self.add_widget(Widget(size_hint=(1, 1)))
+
+        # Row height tracks the bubble height (plus a small gap below).
+        bubble.bind(height=self._on_bubble_height)
+        self.height = bubble.height + _ROW_GAP
+
+    def _on_bubble_height(self, _bubble, h):
+        self.height = h + _ROW_GAP
 
     def update_text(self, text: str):
         self._bubble.update_text(text)
 
 
 class _SpeakerLabel(BoxLayout):
+    """Tiny 'You' / 'AI' label aligned to the same side as its bubble."""
+
     def __init__(self, is_user: bool, **kw):
         super().__init__(
             orientation='horizontal',
@@ -160,13 +194,15 @@ class TranscriptionOverlay(FloatLayout):
 
     Public API
     ----------
-    show()                          — make visible (animates in)
-    hide()                          — animate out
-    clear_session()                 — remove all messages (call at session start)
-    add_ai_message(text) -> str     — append AI bubble; returns msg_id
-    add_user_message(text) -> str   — append user bubble; returns msg_id
-    update_user_message(id, text)   — replace user bubble text (grammar fix)
-    set_compact(bool)               — toggle between full and compact modes
+    show()                                — fade in
+    hide()                                — fade out
+    clear_session()                       — wipe all messages (call at session start)
+    add_user_message(text) -> str         — append user bubble
+    add_ai_message(text) -> str           — append AI bubble (non-streaming)
+    stream_ai_message(item_id, accumulated_text) -> str
+                                          — upsert the active AI bubble for this item_id
+    update_user_message(msg_id, text)     — replace user bubble text (grammar fix)
+    set_compact(bool)                     — full-screen vs bottom-strip
     """
 
     def __init__(self, **kw):
@@ -175,6 +211,10 @@ class TranscriptionOverlay(FloatLayout):
         self._compact = False
         self._messages: dict[str, _BubbleRow] = {}
         self._msg_counter = 0
+        # item_id (from realtime API) -> msg_id of the AI bubble currently
+        # being streamed for that response. Cleared whenever a new user
+        # message lands or a response ends.
+        self._active_ai_msg_ids: dict[str, str] = {}
         self.opacity = 0
         self._build_ui()
 
@@ -281,9 +321,7 @@ class TranscriptionOverlay(FloatLayout):
             shorten=False,
         )
         self._compact_label.bind(
-            size=lambda w, _s: setattr(
-                w, 'text_size', (w.width, w.height)
-            )
+            size=lambda w, _s: setattr(w, 'text_size', (w.width, w.height))
         )
         self._compact_view.add_widget(self._compact_label)
 
@@ -309,22 +347,52 @@ class TranscriptionOverlay(FloatLayout):
     def clear_session(self):
         self._chat_box.clear_widgets()
         self._messages.clear()
+        self._active_ai_msg_ids.clear()
         self._msg_counter = 0
         self._compact_label.text = ''
         self._compact_speaker.text = 'AI'
 
+    def add_user_message(self, text: str) -> str:
+        # A new user turn ends any in-flight AI bubble streaming.
+        self._active_ai_msg_ids.clear()
+        return self._add_message(text, is_user=True)
+
     def add_ai_message(self, text: str) -> str:
+        """Append a one-shot AI bubble (no streaming)."""
         return self._add_message(text, is_user=False)
 
-    def add_user_message(self, text: str) -> str:
-        return self._add_message(text, is_user=True)
+    def stream_ai_message(self, item_id: str, accumulated_text: str) -> str:
+        """Upsert the AI bubble for `item_id`.
+
+        First call for a given item_id creates a new bubble. Subsequent
+        calls update the same bubble in place so the text grows live
+        alongside the audio playback (no end-of-response lag).
+        """
+        if not accumulated_text:
+            return ""
+        existing = self._active_ai_msg_ids.get(item_id)
+        if existing is not None:
+            row = self._messages.get(existing)
+            if row is not None:
+                row.update_text(accumulated_text)
+                self._compact_speaker.text = 'AI'
+                self._compact_label.text = accumulated_text
+                # Keep latest line in view as it grows
+                Clock.schedule_once(
+                    lambda _dt: setattr(self._scroll, 'scroll_y', 0), 0.02
+                )
+                return existing
+        # First delta for this AI response — create a new bubble
+        msg_id = self._add_message(accumulated_text, is_user=False)
+        if msg_id:
+            self._active_ai_msg_ids[item_id] = msg_id
+        return msg_id
 
     def update_user_message(self, msg_id: str, corrected: str):
         row = self._messages.get(msg_id)
         if row is not None:
             row.update_text(corrected)
-        # Also refresh compact view if this is the message currently shown
-        if self._compact_label.text and self._compact_speaker.text == 'You':
+        if self._compact_speaker.text == 'You':
             self._compact_label.text = corrected
 
     def set_compact(self, compact: bool):
@@ -366,7 +434,7 @@ class TranscriptionOverlay(FloatLayout):
 
             # Scroll to bottom (full-mode list)
             Clock.schedule_once(
-                lambda _dt: setattr(self._scroll, 'scroll_y', 0), 0.15
+                lambda _dt: setattr(self._scroll, 'scroll_y', 0), 0.12
             )
 
             # Always make the overlay visible when new content arrives
@@ -393,17 +461,15 @@ class TranscriptionOverlay(FloatLayout):
         return False
 
     def on_touch_down(self, touch):
-        """Consume touches only where the visible chrome actually is, so the
-        underlying screen stays interactive elsewhere (especially in compact
-        mode where most of the screen should remain usable)."""
+        """Consume touches only over the visible chrome so the underlying
+        screen stays interactive everywhere else (especially in compact mode
+        where most of the screen should remain usable)."""
         if self.opacity < 0.05:
             return False
         if self._compact:
-            # Pass touches through everywhere except the bottom strip
             if self._compact_view.collide_point(*touch.pos):
                 super().on_touch_down(touch)
                 return True
             return False
-        # Full mode — consume everything (modal)
         super().on_touch_down(touch)
         return True

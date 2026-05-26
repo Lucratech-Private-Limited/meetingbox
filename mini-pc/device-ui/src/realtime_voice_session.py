@@ -268,6 +268,7 @@ class RealtimeVoiceSession:
         on_state_change=None,
         on_user_transcript=None,
         on_ai_transcript=None,
+        on_ai_transcript_delta=None,
     ):
         self._client_secret = (client_secret or "").strip()
         self._model = (model or "").strip()
@@ -281,6 +282,7 @@ class RealtimeVoiceSession:
         self._on_state_change_cb = on_state_change
         self._on_user_transcript_cb = on_user_transcript
         self._on_ai_transcript_cb = on_ai_transcript
+        self._on_ai_transcript_delta_cb = on_ai_transcript_delta
         self._output_voice = (
             (output_voice or "").strip().lower()
             or _REALTIME_OUTPUT_VOICE_FALLBACK
@@ -351,6 +353,10 @@ class RealtimeVoiceSession:
         # on the matching .done event, or on response.done as a fallback
         # when the API never emits .done at all.
         self._ai_transcript_buf: str = ""
+        # item_id (or response_id) of the AI response currently streaming.
+        # The UI uses this to decide whether to update the existing AI
+        # bubble or create a new one for a fresh response.
+        self._active_ai_transcript_item_id: str = ""
 
         # Tools we received from the server in session.created. Cached so
         # we can re-send them in session.update with end_session appended.
@@ -435,6 +441,18 @@ class RealtimeVoiceSession:
         cb = self._on_ai_transcript_cb
         if cb and text:
             Clock.schedule_once(lambda _dt: self._safe_call(cb, text), 0)
+
+    def _emit_ai_transcript_delta(self, item_id: str, accumulated: str) -> None:
+        """Stream the running AI transcript text to the UI as it arrives.
+
+        Lets the assistant bubble grow word-by-word in sync with the audio
+        playback rather than appearing in one chunk after the response ends.
+        """
+        cb = self._on_ai_transcript_delta_cb
+        if cb and accumulated:
+            Clock.schedule_once(
+                lambda _dt: self._safe_call(cb, item_id, accumulated), 0
+            )
 
     def _emit_device_navigation(self, tool_output_json: str) -> None:
         cb = self._on_device_navigate_cb
@@ -971,20 +989,46 @@ class RealtimeVoiceSession:
                     # Fall back to whatever we accumulated from delta events
                     if not ai_text:
                         ai_text = self._ai_transcript_buf.strip()
+                    item_id = (
+                        msg.get("item_id")
+                        or msg.get("response_id")
+                        or self._active_ai_transcript_item_id
+                        or "ai_active"
+                    )
                     self._ai_transcript_buf = ""
+                    self._active_ai_transcript_item_id = ""
                     if ai_text:
                         logger.info("AI said: %r", ai_text)
+                        # Final streaming update to make sure the bubble
+                        # text exactly matches the .done payload, then a
+                        # backward-compatible emit for non-streaming consumers.
+                        self._emit_ai_transcript_delta(str(item_id), ai_text)
                         self._emit_ai_transcript(ai_text)
 
-                # Accumulate streamed transcript chunks as a fallback in
-                # case .done never arrives (some API versions skip it).
+                # Stream the AI transcript live as deltas arrive so the
+                # bubble updates word-by-word alongside the audio playback.
+                # Also accumulated as a fallback if .done never fires.
                 elif t in (
                     "response.audio_transcript.delta",
                     "response.output_audio_transcript.delta",
                 ):
                     delta = msg.get("delta")
                     if isinstance(delta, str) and delta:
+                        item_id = (
+                            msg.get("item_id")
+                            or msg.get("response_id")
+                            or self._active_ai_transcript_item_id
+                            or "ai_active"
+                        )
+                        # If item_id changed, start a fresh buffer for the
+                        # new assistant response.
+                        if item_id != self._active_ai_transcript_item_id:
+                            self._active_ai_transcript_item_id = str(item_id)
+                            self._ai_transcript_buf = ""
                         self._ai_transcript_buf += delta
+                        self._emit_ai_transcript_delta(
+                            str(item_id), self._ai_transcript_buf
+                        )
 
                 # ---- Model response lifecycle -------------------------
                 elif t in ("response.created", "response.started"):
@@ -1025,6 +1069,7 @@ class RealtimeVoiceSession:
                     # accumulated deltas, flush them now.
                     leftover = self._ai_transcript_buf.strip()
                     self._ai_transcript_buf = ""
+                    self._active_ai_transcript_item_id = ""
                     if leftover:
                         logger.info("AI said (flushed from deltas): %r", leftover)
                         self._emit_ai_transcript(leftover)

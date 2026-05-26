@@ -2996,11 +2996,23 @@ class MeetingBoxApp(App):
             threading.Thread(target=_correct_and_update, daemon=True).start()
 
         def _on_ai_transcript(text: str) -> None:
+            # Final transcript at end-of-response. By now the streaming
+            # delta callback has already created and populated the AI
+            # bubble — there's nothing more to do unless streaming was
+            # somehow skipped (e.g. no delta events fired at all).
+            overlay = self._transcript_overlay
+            if overlay is None or not text:
+                return
+            # If no active streaming bubble for any item, fall back to a
+            # one-shot append so the message still shows up.
+            if not overlay._active_ai_msg_ids:
+                overlay.add_ai_message(text)
+
+        def _on_ai_transcript_delta(item_id: str, accumulated: str) -> None:
             overlay = self._transcript_overlay
             if overlay is None:
                 return
-            # add_ai_message automatically calls show() and appends to history
-            overlay.add_ai_message(text)
+            overlay.stream_ai_message(item_id, accumulated)
 
         try:
             self._realtime_connected_ok = False
@@ -3019,6 +3031,7 @@ class MeetingBoxApp(App):
                 on_state_change=_on_rt_state,
                 on_user_transcript=_on_user_transcript,
                 on_ai_transcript=_on_ai_transcript,
+                on_ai_transcript_delta=_on_ai_transcript_delta,
             )
             self._sync_voice_assistant_state()
             self._realtime_voice_session.start()
