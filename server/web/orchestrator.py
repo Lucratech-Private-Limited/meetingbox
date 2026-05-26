@@ -317,6 +317,14 @@ _MULTI_AGENT_INSTRUCTIONS = (
   "  data is already provided — e.g. \"Draft an email to john@x.com with the meeting\n"
   "  summary from prior results.\" Do NOT inline the data yourself; the executor will.\n"
   "- If you cannot map the request to any specialist, return {\"steps\": []}.\n"
+  "\n"
+  "COMMON TWO-STEP PATTERNS (use these as templates):\n"
+  "- 'Email everyone on the <event> meeting saying X' / 'Notify all attendees of <event> that X':\n"
+  "    Step 1: calendar_agent — \"List the upcoming '<event>' meeting and surface the attendees.\" (depends_on_prior_results=false)\n"
+  "    Step 2: communication_agent — \"Draft an email to the attendees from the previous step saying X.\" (depends_on_prior_results=true)\n"
+  "- 'Draft an email summarising my last meeting and send to john@x.com':\n"
+  "    Step 1: memory_agent — \"Pull the summary of the most recent meeting.\" (depends_on_prior_results=false)\n"
+  "    Step 2: communication_agent — \"Draft an email to john@x.com with the summary from prior results.\" (depends_on_prior_results=true)\n"
 )
 
 

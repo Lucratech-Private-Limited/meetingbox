@@ -26,9 +26,11 @@ from orchestrator import (
 from tools.base_tool import ToolError
 from services.calendar import default_calendar_tz_name
 from tools.calendar_tool import (
+  calendar_check_conflicts,
   calendar_create_from_payload,
   calendar_delete_from_payload,
   calendar_list_upcoming,
+  calendar_rsvp_from_payload,
   calendar_suggest_free_slots,
   calendar_update_from_payload,
 )
@@ -70,6 +72,16 @@ TOOL_CAL_CREATE = "calendar_create_event"
 TOOL_CAL_DELETE = "calendar_delete_event"
 TOOL_CAL_UPDATE = "calendar_update_event"
 TOOL_CAL_SLOTS = "calendar_suggest_free_slots"
+TOOL_CAL_RSVP = "calendar_rsvp_event"
+
+CALENDAR_TOOLS = frozenset({
+  TOOL_CAL_LIST,
+  TOOL_CAL_CREATE,
+  TOOL_CAL_DELETE,
+  TOOL_CAL_UPDATE,
+  TOOL_CAL_SLOTS,
+  TOOL_CAL_RSVP,
+})
 TOOL_COMMITMENT_LIST = "commitment_list"
 TOOL_COMMITMENT_UPSERT = "commitment_upsert"
 TOOL_GMAIL_LIST = "gmail_list_recent"
@@ -106,6 +118,7 @@ WRITE_TOOLS = frozenset({
   TOOL_CAL_CREATE,
   TOOL_CAL_DELETE,
   TOOL_CAL_UPDATE,
+  TOOL_CAL_RSVP,
   TOOL_GMAIL_SEND,
   TOOL_GMAIL_DRAFT,
   TOOL_GMAIL_DRAFT_UPDATE,
@@ -224,14 +237,51 @@ def _llm_calendar_plan(message: str) -> list[dict[str, Any]] | None:
     return None
 
   today_str = __import__("datetime").date.today().isoformat()
+  default_tz = default_calendar_tz_name()
   prompt = (
-    "You are a calendar planning assistant. Given a user message, return ONLY valid JSON:\n"
-    "{\"steps\": [ {\"tool\": \"<tool_name>\", \"args\": {}, \"is_write\": true|false} ]}\n\n"
-    "TOOL SELECTION RULES (apply in order):\n\n"
+    "You are the Calendar Operations Agent. Pick ONE best tool call for the user message and return it as JSON.\n\n"
+    "Return ONLY valid JSON (no markdown, no explanation):\n"
+    "{\"steps\": [ {\"tool\": \"<exact_tool_name>\", \"args\": {<required fields>}, \"is_write\": true|false} ]}\n\n"
+    "OR, when one of the required fields for calendar_create_event is missing (title, date, start_time, duration), "
+    "return EXACTLY this shape instead — a clarification step that asks ONE focused question:\n"
+    "{\"steps\": [ {\"tool\": \"clarify\", \"question\": \"<one short focused question>\", \"missing_field\": \"<title|date|start_time|duration|attendees>\"} ]}\n\n"
+    "CRITICAL RULES — read before anything else:\n"
+    "- 'create / schedule / book / set up / add / put on calendar / block time / focus block' -> calendar_create_event.\n"
+    "- 'move / reschedule / push back / shift / change time / change date / rename / add attendee / remove attendee / update meeting / drop X from the meeting' -> calendar_update_event.\n"
+    "- 'delete / remove / cancel / clear / drop the event' -> calendar_delete_event.\n"
+    "- 'rsvp / accept / decline / going / not going / mark me attending / not attending / mark me as going / mark me tentative' -> calendar_rsvp_event.\n"
+    "- 'when am I free / availability / open slot / find time for' -> calendar_suggest_free_slots.\n"
+    "- 'what's on / show my schedule / what do I have / upcoming / my meetings today / tomorrow' -> calendar_list_upcoming.\n"
+    "- 'remind me / note to self / follow up / todo / task / action item' -> commitment_upsert.\n"
+    "- 'show my reminders / show my todos / what are my tasks' -> commitment_list.\n\n"
+    "DO NOT chain reads before writes — the write tools accept a title + date hint and look the event up themselves:\n"
+    "- For calendar_update_event / calendar_delete_event / calendar_rsvp_event when the user names the event (e.g. 'the All Hands invite on Friday', 'the Catch Up meeting', 'my 3 PM today'), go DIRECTLY to that write tool with the event title (or hint) + date. DO NOT call calendar_list_upcoming first.\n"
+    "- Use calendar_list_upcoming ONLY when the user explicitly asks to see/list/show what's on the calendar.\n\n"
+    "REQUIRED-FIELDS GATE for calendar_create_event:\n"
+    "- MUST HAVE: title, date (YYYY-MM-DD, never relative), start_time (ISO 'YYYY-MM-DDTHH:MM:SS'), duration_minutes (int).\n"
+    "- If ANY of these four are missing OR the user gave only a vague hint (e.g. just a date with no clock time, or just a duration with no start), return a 'clarify' step asking ONE focused short question. NEVER invent a start time or pick a default of 09:00 or any specific hour. NEVER invent a duration when the user didn't state one — exception: if the request is clearly a 'quick / brief / short' block AND user gave a clock time, you may default to 30 min.\n"
+    "- 'Block 30 mins on my calendar tomorrow' has duration but NO start time → return clarify asking 'What time should I block?' missing_field='start_time'.\n"
+    "- 'Schedule a meeting with X tomorrow at 3 PM titled sync' has title/start/attendees but NO duration → return clarify asking 'How long should the meeting be?' missing_field='duration'.\n"
+    "- 'Put something on my calendar tomorrow at 4 PM for 30 minutes' has start/duration but NO real title → return clarify asking 'What should I call this event?' missing_field='title'.\n"
+    "- NEVER ask the user about timezone — always use the default below.\n"
+    "- For SOLO BLOCKS (request contains 'block', 'focus', 'myself', 'me-time', 'heads-down', 'focus block', 'focus time', 'block my calendar', 'block off'): set attendees=[] without asking. Set add_meet_link=false for solo blocks.\n"
+    "- For events WITH attendees: set add_meet_link=true unless the user explicitly says 'no link', 'no meet', or 'no video call'.\n"
+    "- For RECURRING ('every weekday for 2 weeks', 'daily for next month', 'Mondays for 4 weeks'): use ONE step with a proper recurrence RRULE (e.g. 'RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;COUNT=10').\n\n"
+    "REQUIRED-FIELDS GATE for calendar_rsvp_event:\n"
+    "- MUST HAVE: response_status ('accepted' / 'declined' / 'tentative') and (title + date) OR event_id.\n"
+    "- Map: yes/accept/going/attending -> 'accepted'; no/decline/not going/not attending/can't make it -> 'declined'; maybe/tentative/mark me tentative -> 'tentative'.\n"
+    "- Phrases like 'Accept the All Hands invite on Friday' -> calendar_rsvp_event with title='All Hands', date='<Friday's date>', response_status='accepted'. DO NOT call list first.\n\n"
+    "REQUIRED-FIELDS GATE for calendar_update_event / calendar_delete_event:\n"
+    "- MUST HAVE: title + date (when the user said which one) OR event_id.\n"
+    "- Move/reschedule: include new_start_time (full ISO) or new_date + optionally new_duration_minutes.\n"
+    "- Add/remove attendee: include attendees_add OR attendees_remove (list of emails).\n"
+    "- Phrases like 'Move my 3 PM today to 4 PM' -> calendar_update_event with title='3 PM' or a sensible hint, date=today, new_start_time=today T16:00:00. DO NOT call list first.\n"
+    "- Phrases like 'Drop alex@example.com from the Friday review meeting' -> calendar_update_event with title='review', date=<Friday's date>, attendees_remove=['alex@example.com']. DO NOT call list first.\n\n"
+    "FULL TOOL REFERENCE:\n\n"
     f"{rules_block}\n\n"
-    f"Default timezone for new events: {default_calendar_tz_name()}.\n"
-    f"Today is {today_str}.\n"
-    f"User message:\n{message.strip()[:4000]}\n"
+    f"Default timezone for new/updated events: {default_tz}.\n"
+    f"Today is {today_str}.\n\n"
+    f"User message: {message.strip()[:3000]}\n"
   )
   model = os.getenv("AI_MODEL", "claude-sonnet-4-20250514")
   try:
@@ -257,12 +307,26 @@ def _llm_calendar_plan(message: str) -> list[dict[str, Any]] | None:
     if not isinstance(step, dict):
       continue
     tool = str(step.get("tool") or "").strip()
+    # Clarification step: planner asks a focused question instead of acting
+    if tool == "clarify":
+      q = str(step.get("question") or "").strip()
+      if q:
+        normalized.append({
+          "tool": "clarify",
+          "args": {
+            "question": q,
+            "missing_field": str(step.get("missing_field") or "").strip(),
+          },
+          "is_write": False,
+        })
+      continue
     allowed = frozenset({
       TOOL_CAL_LIST,
       TOOL_CAL_CREATE,
       TOOL_CAL_DELETE,
       TOOL_CAL_UPDATE,
       TOOL_CAL_SLOTS,
+      TOOL_CAL_RSVP,
       TOOL_COMMITMENT_LIST,
       TOOL_COMMITMENT_UPSERT,
     })
@@ -270,7 +334,7 @@ def _llm_calendar_plan(message: str) -> list[dict[str, Any]] | None:
       continue
     args = step.get("args") if isinstance(step.get("args"), dict) else {}
     is_write = bool(step.get("is_write"))
-    if tool in (TOOL_CAL_CREATE, TOOL_CAL_DELETE, TOOL_CAL_UPDATE):
+    if tool in (TOOL_CAL_CREATE, TOOL_CAL_DELETE, TOOL_CAL_UPDATE, TOOL_CAL_RSVP):
       is_write = True
     if tool == TOOL_COMMITMENT_UPSERT:
       is_write = True
@@ -398,13 +462,6 @@ def _llm_communication_plan(message: str) -> list[dict[str, Any]] | None:
     return None
 
   prompt = (
-<<<<<<< Updated upstream
-    "Plan Gmail tools for the user message. Return **only** valid JSON:\n"
-    "{\"steps\": [ {\"tool\": \"<tool_name>\", \"args\": {}, \"is_write\": true|false } ] }\n\n"
-    "TOOL SELECTION RULES (apply in order):\n\n"
-    f"{rules_block}\n\n"
-    f"User message:\n{message.strip()[:4000]}\n"
-=======
     "You are the Email Operations Agent. Your ONLY job is to select the single best Gmail tool for the user message and return it as JSON.\n\n"
     "Return ONLY valid JSON — no explanation, no markdown:\n"
     "{\"steps\": [ {\"tool\": \"<exact_tool_name>\", \"args\": {<required fields>}, \"is_write\": true|false} ]}\n\n"
@@ -423,7 +480,6 @@ def _llm_communication_plan(message: str) -> list[dict[str, Any]] | None:
     "FULL TOOL REFERENCE:\n\n"
     f"{rules_block}\n\n"
     f"User message: {message.strip()[:3000]}\n"
->>>>>>> Stashed changes
   )
   model = os.getenv("AI_MODEL", "claude-sonnet-4-20250514")
   try:
@@ -734,10 +790,40 @@ def assistant_action_brief_label(tool_name: str, payload: Any) -> str:
     return f"Delete '{t}'" + (f" on {d[:10]}" if d else "")
   if tool_name == TOOL_CAL_UPDATE:
     t = (payload.get("title") or payload.get("title_hint") or "Calendar event").strip()
+    new_start = str(payload.get("new_start_time") or payload.get("new_start_iso") or "").strip()
+    new_date = str(payload.get("new_date") or "").strip()
+    new_dur = payload.get("new_duration_minutes")
+    new_loc = str(payload.get("new_location") or "").strip()
+    new_title = str(payload.get("new_title") or "").strip()
+    new_recur = str(payload.get("new_recurrence") or "").strip()
     adds = payload.get("attendees_add") or []
+    removes = payload.get("attendees_remove") or []
+    bits: list[str] = []
+    if new_title:
+      bits.append(f"rename to '{new_title}'")
+    if new_start:
+      bits.append(f"move to {new_start[:16]}")
+    elif new_date:
+      bits.append(f"move to {new_date[:10]}")
+    if new_dur:
+      bits.append(f"set duration {new_dur}m")
+    if new_loc:
+      bits.append(f"location → {new_loc[:40]}")
+    if new_recur:
+      bits.append("change recurrence")
     if adds:
-      return f"Add {', '.join(str(e) for e in adds[:3])} to '{t}'"
-    return f"Update '{t}'"
+      bits.append(f"add {', '.join(str(e) for e in adds[:3])}")
+    if removes:
+      bits.append(f"remove {', '.join(str(e) for e in removes[:3])}")
+    if not bits:
+      return f"Update '{t}'"
+    return f"Update '{t}' — " + "; ".join(bits)
+  if tool_name == TOOL_CAL_RSVP:
+    t = (payload.get("title") or payload.get("title_hint") or "Calendar event").strip()
+    rs = str(payload.get("response_status") or payload.get("status") or "accepted").strip().lower()
+    d = str(payload.get("date") or payload.get("date_hint") or "").strip()
+    label = {"accepted": "Accept", "declined": "Decline", "tentative": "Tentative"}.get(rs, rs.title())
+    return f"{label} '{t}'" + (f" on {d[:10]}" if d else "")
   if tool_name == TOOL_GMAIL_SEND:
     subj = str(payload.get("subject") or "Draft email").strip()[:72]
     to_addr = str(payload.get("to") or "").strip()[:48]
@@ -851,7 +937,11 @@ def list_assistant_queue_for_briefing(user_id: str, limit: int = 24) -> dict[str
 
 
 def _filter_steps_for_agent(agent_id: str, steps: list[dict[str, Any]]) -> list[dict[str, Any]]:
-  """Drop planned steps that reference a tool not in the agent JSON's tools list."""
+  """Drop planned steps that reference a tool not in the agent JSON's tools list.
+
+  Sentinel pseudo-tools (currently 'clarify') are passed through regardless — they are
+  not real tools and don't need to be declared in the agent JSON.
+  """
   allowed = _agent_allowed_tool_ids(agent_id)
   if not allowed:
     # No tool list = no filter (back-compat; agent_registry validation already requires one)
@@ -859,7 +949,7 @@ def _filter_steps_for_agent(agent_id: str, steps: list[dict[str, Any]]) -> list[
   out: list[dict[str, Any]] = []
   for s in steps:
     t = str(s.get("tool") or "").strip()
-    if t in allowed:
+    if t == "clarify" or t in allowed:
       out.append(s)
   return out
 
@@ -988,9 +1078,23 @@ def _dispatch_single_agent(
   audit_device_id: str | None = None
 
   if agent_id == "calendar_agent":
-    ctx = _augment_user_text_for_agent(agent_doc, user_id, text)
-    # Use raw text for planning — augmented ctx contains memory/commitment blocks that confuse the LLM planner
+    # Plan tool selection using original text only — memory blobs would bias the planner
+    # (e.g. past reminders would push it toward commitment_upsert for unrelated requests).
     steps = _filter_steps_for_agent(agent_id, plan_calendar_steps(text))
+
+    # Note: 'clarify' is a sentinel step from the planner asking ONE focused question
+    # instead of acting. Surface the question as assistant text and queue nothing.
+    clarify_step = next((s for s in steps if s.get("tool") == "clarify"), None)
+    if clarify_step:
+      q = str((clarify_step.get("args") or {}).get("question") or "").strip()
+      if q:
+        assistant_lines.append(q)
+      # If a clarify step was returned, drop any other steps for this turn — the user
+      # needs to answer before we proceed.
+      steps = []
+
+    conflict_blurbs: list[str] = []
+
     for step in steps:
       tool = step["tool"]
       args = dict(step.get("args") or {})
@@ -1012,6 +1116,22 @@ def _dispatch_single_agent(
         if not user_id:
           tool_results.append({"tool": tool, "error": "Sign in is required to draft calendar events."})
           continue
+        # Pre-queue conflict check: warn user about overlapping events but still queue
+        # so the user decides at approval time (per agent guideline conflict_check_rules).
+        try:
+          conflicts = calendar_check_conflicts(user_id, args)
+        except Exception:
+          logger.exception("conflict pre-check failed")
+          conflicts = []
+        if conflicts:
+          ev_bits = [
+            f"'{c.get('summary')}' from {c.get('start_local')} to {c.get('end_local')}"
+            for c in conflicts[:4]
+          ]
+          conflict_blurbs.append(
+            "Heads up — this slot overlaps with " + ", ".join(ev_bits) + "."
+            " I've queued the create anyway so you can decide at approval; tell me to pick a different time if you'd rather not double-book."
+          )
         pid = str(uuid.uuid4())
         pending_rows.append((pid, agent_id, tool, args))
         pending_meta.append({
@@ -1019,12 +1139,14 @@ def _dispatch_single_agent(
           "tool_name": tool,
           "status": "pending",
           "brief_label": assistant_action_brief_label(tool, args),
+          **({"conflicts": conflicts} if conflicts else {}),
         })
         tool_results.append({
           "tool": tool,
           "queued": True,
           "pending_id": pid,
           "note": "Awaiting approval before creating the event.",
+          **({"conflicts": conflicts} if conflicts else {}),
         })
       elif tool == TOOL_CAL_DELETE:
         if not user_id:
@@ -1048,6 +1170,31 @@ def _dispatch_single_agent(
         if not user_id:
           tool_results.append({"tool": tool, "error": "Sign in is required to update calendar events."})
           continue
+        # If the update reschedules to a new time, also surface conflicts at the new slot.
+        new_start = args.get("new_start_time") or args.get("new_start_iso")
+        new_dur = args.get("new_duration_minutes")
+        if new_start and new_dur:
+          try:
+            conflicts = calendar_check_conflicts(
+              user_id,
+              {
+                "start_time": new_start,
+                "duration_minutes": new_dur,
+                "timezone": args.get("timezone"),
+              },
+            )
+          except Exception:
+            logger.exception("update conflict pre-check failed")
+            conflicts = []
+          if conflicts:
+            ev_bits = [
+              f"'{c.get('summary')}' from {c.get('start_local')} to {c.get('end_local')}"
+              for c in conflicts[:4]
+            ]
+            conflict_blurbs.append(
+              "Heads up — the new slot overlaps with " + ", ".join(ev_bits) + "."
+              " I've queued the reschedule anyway so you can decide at approval."
+            )
         pid = str(uuid.uuid4())
         pending_rows.append((pid, agent_id, tool, args))
         pending_meta.append({
@@ -1061,6 +1208,24 @@ def _dispatch_single_agent(
           "queued": True,
           "pending_id": pid,
           "note": "Awaiting approval before updating the event.",
+        })
+      elif tool == TOOL_CAL_RSVP:
+        if not user_id:
+          tool_results.append({"tool": tool, "error": "Sign in is required to RSVP to calendar events."})
+          continue
+        pid = str(uuid.uuid4())
+        pending_rows.append((pid, agent_id, tool, args))
+        pending_meta.append({
+          "id": pid,
+          "tool_name": tool,
+          "status": "pending",
+          "brief_label": assistant_action_brief_label(tool, args),
+        })
+        tool_results.append({
+          "tool": tool,
+          "queued": True,
+          "pending_id": pid,
+          "note": "Awaiting approval before sending the RSVP.",
         })
       elif tool == TOOL_CAL_SLOTS:
         if not user_id:
@@ -1100,18 +1265,30 @@ def _dispatch_single_agent(
         tool_results.append({"tool": tool, "error": "Unknown calendar tool"})
 
     # assistant summary text
+    # Conflict warnings go FIRST so the user sees them before the queued-action confirmation.
+    for blurb in conflict_blurbs:
+      assistant_lines.append(blurb)
+
     if pending_meta:
-      if len(pending_meta) == 1:
+      # RSVP confirmations need to label the response (accepted / declined / tentative) per safety policy.
+      rsvp_pending = [m for m in pending_meta if m.get("tool_name") == TOOL_CAL_RSVP]
+      non_rsvp = [m for m in pending_meta if m.get("tool_name") != TOOL_CAL_RSVP]
+      for r in rsvp_pending:
         assistant_lines.append(
-          f"I queued a calendar change for you to okay first: {pending_meta[0].get('brief_label', 'event')}."
+          f"RSVP queued for approval — {r.get('brief_label', 'event')}. Approve to send your response to the organizer."
         )
-      else:
-        bits = [m.get("brief_label", "event") for m in pending_meta[:12]]
-        assistant_lines.append(
-          f"I've got {len(pending_meta)} calendar items waiting on your thumbs-up: "
-          + "; ".join(bits)
-          + ". Say yes when you're good with them, or tell me to tweak or drop one."
-        )
+      if non_rsvp:
+        if len(non_rsvp) == 1:
+          assistant_lines.append(
+            f"I queued a calendar change for you to okay first: {non_rsvp[0].get('brief_label', 'event')}."
+          )
+        else:
+          bits = [m.get("brief_label", "event") for m in non_rsvp[:12]]
+          assistant_lines.append(
+            f"I've got {len(non_rsvp)} calendar items waiting on your thumbs-up: "
+            + "; ".join(bits)
+            + ". Say yes when you're good with them, or tell me to tweak or drop one."
+          )
     listed = next((t for t in tool_results if t.get("tool") == TOOL_CAL_LIST and "result" in t), None)
     if listed and "result" in listed:
       n = listed["result"].get("count", 0)
@@ -1140,15 +1317,10 @@ def _dispatch_single_agent(
         maybe_ingest_calendar_snapshot(user_id, tr["result"])
 
   elif agent_id in ("gmail_agent", "communication_agent"):
-<<<<<<< Updated upstream
-    ctx = _augment_user_text_for_agent(agent_doc, user_id, text)
-    steps = _filter_steps_for_agent(agent_id, plan_communication_steps(ctx))
-=======
     # Plan tool selection using original text only — memory blobs must NOT bias which
     # Gmail tool to pick (e.g. past reply-all conversations would cause the planner to
     # plan gmail_reply_all for unrelated requests like "check my inbox").
     steps = _filter_steps_for_agent(agent_id, plan_communication_steps(text))
->>>>>>> Stashed changes
 
     # Direct-execute table for Gmail tools that don't go through the approval queue.
     # Keys are tool names; values are the *_from_payload adapters in tools/gmail_tool.py.
@@ -1776,6 +1948,7 @@ def update_pending_assistant_payload(
       TOOL_GMAIL_FORWARD,
       TOOL_CAL_CREATE,
       TOOL_CAL_UPDATE,
+      TOOL_CAL_RSVP,
     ):
       raise HTTPException(status_code=400, detail="Only email drafts or calendar events can be edited here")
     cur.execute(
@@ -1876,6 +2049,9 @@ def approve_pending_action(pending_id: str, user_id: str) -> dict[str, Any]:
     elif tool == TOOL_CAL_UPDATE:
       result = calendar_update_from_payload(user_id, payload)
       result_blob = {"calendar_update": result}
+    elif tool == TOOL_CAL_RSVP:
+      result = calendar_rsvp_from_payload(user_id, payload)
+      result_blob = {"calendar_rsvp": result}
     elif tool == TOOL_GMAIL_SEND:
       result = gmail_send_from_payload(user_id, payload)
       result_blob = {"gmail": result}

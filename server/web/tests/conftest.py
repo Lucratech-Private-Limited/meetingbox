@@ -121,10 +121,11 @@ if "mem0" not in sys.modules:
     _stub_module("mem0.client")
     _stub_module("mem0.client.utils")
 
-# --- googleapiclient (Gmail API) ---
+# --- googleapiclient (Gmail / Calendar API) ---
 if "googleapiclient" not in sys.modules:
-    _stub_module("googleapiclient")
+    gc = _stub_module("googleapiclient")
     gd = _stub_module("googleapiclient.discovery")
+    ge = _stub_module("googleapiclient.errors")
 
     def _fake_build(*a, **kw):
         class _Stub:
@@ -135,6 +136,17 @@ if "googleapiclient" not in sys.modules:
         return _Stub()
 
     gd.build = _fake_build  # type: ignore[attr-defined]
+
+    class _FakeHttpError(Exception):
+        def __init__(self, resp=None, content=b"", uri=""):
+            self.resp = resp
+            self.content = content
+            self.uri = uri
+            super().__init__(str(content))
+
+    ge.HttpError = _FakeHttpError  # type: ignore[attr-defined]
+    gc.errors = ge  # type: ignore[attr-defined]
+    gc.discovery = gd  # type: ignore[attr-defined]
 
 # --- google.oauth2.credentials ---
 if "google" not in sys.modules:
