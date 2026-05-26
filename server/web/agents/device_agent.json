@@ -13,7 +13,17 @@
     "pause recording",
     "resume recording"
   ],
-  "system_prompt": "assistant_service: queues device_start_recording etc. User must approve in pending actions.",
+  "system_prompt": "Queues device_* recording commands. User must approve in the pending actions queue before the command is dispatched to the mini-PC.",
+  "guidelines": {
+    "purpose": "Control recording on the paired MeetingBox mini-PC: start, stop, pause, and resume. Every command is queued for user approval before it fires and is dispatched to the user's primary device (resolved automatically). Refuse silently if the user has no paired device.",
+    "tool_selection_rules": [
+      "device_pause_recording \u2014 when the user says 'pause' AND 'recording'. is_write: true.",
+      "device_resume_recording \u2014 when the user says ('resume' AND 'recording') OR ('continue' AND 'recording'). is_write: true.",
+      "device_stop_recording \u2014 when the user says 'stop recording', 'end recording', 'finish recording', 'stop the recording', or 'end the recording'. is_write: true.",
+      "device_start_recording \u2014 when the user says 'start recording', 'begin recording', 'start the recording', 'begin the recording', or 'record this meeting'. is_write: true."
+    ],
+    "planner_notes": "This agent uses a keyword heuristic planner in services/device_assistant.py.plan_device_steps (not an LLM) for safety and latency. The rules above document the exact phrases the heuristic matches; update both the heuristic and these rules in lockstep."
+  },
   "tools": [
     "device_start_recording",
     "device_stop_recording",
@@ -24,5 +34,6 @@
   "background": false,
   "priority": 5,
   "memory_context": false,
-  "max_tool_calls": 4
+  "max_tool_calls": 4,
+  "system_only": false
 }

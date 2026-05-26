@@ -76,6 +76,60 @@ def _validate_entry(entry: dict[str, Any], source: str, stem: str) -> None:
   if not isinstance(max_tc, int) or max_tc < 0:
     raise ValueError(f"{source}: 'max_tool_calls' must be an integer >= 0")
 
+  # Optional 'system_only' flag (default false). When true, the agent is not
+  # exposed to the user-facing intent router; only system pipelines may trigger it.
+  if "system_only" in entry and not isinstance(entry["system_only"], bool):
+    raise ValueError(f"{source}: 'system_only' must be a boolean if present")
+
+  # Optional 'guidelines' block (Phase A: agent guidelines source of truth).
+  # Kept optional so existing JSON files without guidelines still validate.
+  if "guidelines" in entry:
+    g = entry["guidelines"]
+    if not isinstance(g, dict):
+      raise ValueError(f"{source}: 'guidelines' must be an object if present")
+    if "purpose" in g and not isinstance(g["purpose"], str):
+      raise ValueError(f"{source}: 'guidelines.purpose' must be a string")
+    for list_key in (
+      "tool_selection_rules",
+      "tool_selection_overrides",
+      "behavior_rules",
+      "priorities",
+      "supported_operations",
+      "search_rules",
+    ):
+      if list_key in g:
+        val = g[list_key]
+        if not isinstance(val, list) or not all(isinstance(r, str) for r in val):
+          raise ValueError(
+            f"{source}: 'guidelines.{list_key}' must be a list of strings"
+          )
+    for str_key in ("response_style", "planner_notes", "disambiguation"):
+      if str_key in g and not isinstance(g[str_key], str):
+        raise ValueError(f"{source}: 'guidelines.{str_key}' must be a string")
+
+  # Optional per-tool policy map (e.g. requires_approval, category labels).
+  # When omitted, tools inherit the agent-level requires_approval default.
+  if "tool_policies" in entry:
+    tp = entry["tool_policies"]
+    if not isinstance(tp, dict):
+      raise ValueError(f"{source}: 'tool_policies' must be an object if present")
+    for tool_name, policy in tp.items():
+      if not isinstance(tool_name, str) or not tool_name.strip():
+        raise ValueError(f"{source}: 'tool_policies' keys must be non-empty strings")
+      if not isinstance(policy, dict):
+        raise ValueError(
+          f"{source}: 'tool_policies[{tool_name}]' must be an object"
+        )
+      if "requires_approval" in policy and not isinstance(policy["requires_approval"], bool):
+        raise ValueError(
+          f"{source}: 'tool_policies[{tool_name}].requires_approval' must be a boolean"
+        )
+      for s_key in ("category", "safety"):
+        if s_key in policy and not isinstance(policy[s_key], str):
+          raise ValueError(
+            f"{source}: 'tool_policies[{tool_name}].{s_key}' must be a string"
+          )
+
 
 def load_agent_definitions() -> dict[str, dict[str, Any]]:
   """Load all *.json agent descriptors; raise ValueError on invalid data."""

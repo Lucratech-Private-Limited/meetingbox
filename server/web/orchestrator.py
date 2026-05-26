@@ -4,6 +4,11 @@ Route free-form user text to a specialist agent id (Phase 1 orchestrator).
 1) Keyword overlap in agent JSON (fast path).
 2) LLM classification: OpenAI (when OPENAI_API_KEY is set) with optional Mem0 context + agent
    descriptions; otherwise Anthropic (AI_MODEL). No hard-coded phrase routing.
+
+Phase 2 (opt-in, gated by env MEETINGBOX_MULTI_AGENT_PLANNER=1):
+   plan_multi_agent_intent(): returns an ordered list of specialist steps so a single
+   user turn can chain agents (e.g. memory_agent -> communication_agent). Falls back
+   to single-agent routing when the planner declines or is unavailable.
 """
 
 from __future__ import annotations
@@ -11,14 +16,20 @@ from __future__ import annotations
 import json
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from agent_registry import list_agents
 
 logger = logging.getLogger("meetingbox.orchestrator")
 
-SYSTEM_ONLY_AGENTS = frozenset({"meeting_agent"})
+MULTI_AGENT_MAX_STEPS = 4
+MULTI_AGENT_FLAG_ENV = "MEETINGBOX_MULTI_AGENT_PLANNER"
+
+
+def _is_system_only(agent: dict[str, Any]) -> bool:
+  """An agent is hidden from the user-facing router when system_only=true in its JSON."""
+  return bool(agent.get("system_only"))
 
 
 @dataclass
@@ -26,6 +37,26 @@ class RouteResult:
   agent_id: str | None
   method: str
   rationale: str = ""
+
+
+@dataclass
+class PlanStep:
+  agent_id: str
+  message: str
+  depends_on_prior_results: bool = False
+  rationale: str = ""
+
+
+@dataclass
+class MultiAgentPlan:
+  steps: list[PlanStep] = field(default_factory=list)
+  method: str = "none"
+  rationale: str = ""
+
+
+def multi_agent_enabled() -> bool:
+  """Feature flag for the multi-step planner. Default off — keeps legacy single-agent path."""
+  return (os.getenv(MULTI_AGENT_FLAG_ENV, "0") or "").strip() == "1"
 
 
 _anthropic_client = None
@@ -66,7 +97,7 @@ def _router_candidates() -> tuple[set[str], list[dict[str, Any]]]:
   valid_ids: set[str] = set()
   candidates: list[dict[str, Any]] = []
   for agent in list_agents():
-    if agent["id"] in SYSTEM_ONLY_AGENTS:
+    if _is_system_only(agent):
       continue
     valid_ids.add(agent["id"])
     candidates.append(
@@ -100,7 +131,7 @@ def route_with_triggers(message: str) -> RouteResult | None:
   ranked: list[tuple[str, int, int]] = []
   for agent in list_agents():
     aid = agent["id"]
-    if aid in SYSTEM_ONLY_AGENTS:
+    if _is_system_only(agent):
       continue
     triggers = agent.get("triggers") or []
     if not isinstance(triggers, list):
@@ -242,4 +273,195 @@ def route_intent(message: str, user_id: str | None = None) -> RouteResult:
     return llm_hit
 
   return RouteResult(agent_id=None, method="none", rationale="no_trigger_no_llm_match")
+
+
+# ----------------------------- Multi-agent planner -----------------------------
+#
+# Opt-in via MEETINGBOX_MULTI_AGENT_PLANNER=1. Returns an ordered plan that the
+# assistant_service executor runs step-by-step, threading prior tool_results into
+# the next step's message. Each step still routes through the existing per-agent
+# branch in assistant_service — no specialist behaviour changes.
+
+
+_MULTI_AGENT_INSTRUCTIONS = (
+  "You are a multi-agent planner. Given a user request, decide whether it needs\n"
+  "ONE specialist or a short ORDERED sequence of specialists. Each specialist runs\n"
+  "in isolation and can only use its own tools; the only way data flows from one\n"
+  "to the next is by you marking depends_on_prior_results=true on later steps,\n"
+  "which gives that step access to a compact JSON of prior tool results.\n"
+  "\n"
+  "Return ONLY valid JSON with this exact shape:\n"
+  "{\n"
+  "  \"steps\": [\n"
+  "    {\n"
+  "      \"agent_id\": \"<one of the candidate ids>\",\n"
+  "      \"message\": \"<a focused sub-task for this specialist, in the user's voice>\",\n"
+  "      \"depends_on_prior_results\": true|false,\n"
+  "      \"rationale\": \"<one short sentence>\"\n"
+  "    }\n"
+  "  ],\n"
+  "  \"rationale\": \"<one short sentence on the overall plan>\"\n"
+  "}\n"
+  "\n"
+  "PLANNING RULES:\n"
+  f"- At most {MULTI_AGENT_MAX_STEPS} steps. Prefer 1 step when one specialist suffices.\n"
+  "- Use multiple steps ONLY when the request genuinely needs data or actions from\n"
+  "  more than one domain (e.g. read a past meeting summary AND draft an email about it).\n"
+  "- The FIRST step must be a READ specialist (e.g. memory_agent, calendar_agent\n"
+  "  listing) when later steps need its data; set its depends_on_prior_results=false.\n"
+  "- Set depends_on_prior_results=true ONLY for steps that need the previous step's\n"
+  "  data to do their job (e.g. communication_agent drafting an email about a fetched summary).\n"
+  "- Rewrite each step's message as a clear standalone instruction for that specialist;\n"
+  "  do not assume the specialist sees the rest of the plan.\n"
+  "- For steps with depends_on_prior_results=true, write the message as if the prior\n"
+  "  data is already provided — e.g. \"Draft an email to john@x.com with the meeting\n"
+  "  summary from prior results.\" Do NOT inline the data yourself; the executor will.\n"
+  "- If you cannot map the request to any specialist, return {\"steps\": []}.\n"
+)
+
+
+def _safe_int(val: Any, default: int) -> int:
+  try:
+    return int(val)
+  except (TypeError, ValueError):
+    return default
+
+
+def _normalize_plan_steps(
+  data: dict[str, Any],
+  valid_ids: set[str],
+) -> list[PlanStep]:
+  raw_steps = data.get("steps") if isinstance(data, dict) else None
+  if not isinstance(raw_steps, list):
+    return []
+  out: list[PlanStep] = []
+  for idx, item in enumerate(raw_steps):
+    if not isinstance(item, dict):
+      continue
+    aid = str(item.get("agent_id") or "").strip()
+    if not aid or aid not in valid_ids:
+      logger.warning("multi-agent planner: dropping step %d with invalid agent_id=%r", idx, aid)
+      continue
+    msg = str(item.get("message") or "").strip()
+    if not msg:
+      continue
+    depends = bool(item.get("depends_on_prior_results"))
+    # First step never depends on prior results — there are none.
+    if not out:
+      depends = False
+    rationale = str(item.get("rationale") or "").strip()
+    out.append(PlanStep(
+      agent_id=aid,
+      message=msg[:4000],
+      depends_on_prior_results=depends,
+      rationale=rationale[:400],
+    ))
+    if len(out) >= MULTI_AGENT_MAX_STEPS:
+      break
+  return out
+
+
+def _call_openai_multi_planner(
+  message: str,
+  candidates: list[dict[str, Any]],
+  mem0_part: str,
+) -> dict[str, Any] | None:
+  oa_key = os.getenv("OPENAI_API_KEY", "").strip()
+  if not oa_key:
+    return None
+  try:
+    from openai import OpenAI
+
+    planner_model = (
+      os.getenv("OPENAI_MULTI_AGENT_PLANNER_MODEL")
+      or os.getenv("OPENAI_ROUTER_MODEL")
+      or "gpt-4o-mini"
+    ).strip()
+    client = OpenAI(api_key=oa_key)
+    user_payload = (
+      f"Candidates (specialists you may pick from):\n{json.dumps(candidates, indent=2)}\n"
+      f"{mem0_part}\nUser message:\n{message[:4000]}\n"
+    )
+    resp = client.chat.completions.create(
+      model=planner_model,
+      max_tokens=600,
+      response_format={"type": "json_object"},
+      messages=[
+        {"role": "system", "content": _MULTI_AGENT_INSTRUCTIONS},
+        {"role": "user", "content": user_payload},
+      ],
+    )
+    raw = (resp.choices[0].message.content or "").strip()
+    return json.loads(raw)
+  except Exception:
+    logger.exception("OpenAI multi-agent planner failed; will try Anthropic fallback")
+    return None
+
+
+def _call_anthropic_multi_planner(
+  message: str,
+  candidates: list[dict[str, Any]],
+  mem0_part: str,
+) -> dict[str, Any] | None:
+  client = _get_anthropic()
+  if not client:
+    return None
+  prompt = (
+    _MULTI_AGENT_INSTRUCTIONS
+    + "\nReturn ONLY the JSON object — no commentary.\n\n"
+    + f"Candidates:\n{json.dumps(candidates, indent=2)}\n"
+    + f"{mem0_part}\nUser message:\n{message[:4000]}\n"
+  )
+  model = os.getenv("AI_MODEL", "claude-sonnet-4-20250514")
+  try:
+    resp = client.messages.create(
+      model=model,
+      max_tokens=700,
+      messages=[{"role": "user", "content": prompt}],
+    )
+  except Exception:
+    logger.exception("Anthropic multi-agent planner failed")
+    return None
+  block = resp.content[0]
+  text = getattr(block, "text", "") or ""
+  try:
+    return _parse_classifier_json(text)
+  except (json.JSONDecodeError, IndexError, TypeError):
+    logger.warning("Anthropic multi-agent planner returned non-JSON: %s", text[:200])
+    return None
+
+
+def plan_multi_agent_intent(
+  message: str,
+  user_id: str | None = None,
+) -> MultiAgentPlan | None:
+  """
+  Return an ordered multi-step plan for the given user message, or None if the planner
+  declined / is unavailable. Caller is responsible for falling back to single-agent
+  routing when this returns None or an empty plan.
+  """
+  text = (message or "").strip()
+  if not text:
+    return None
+
+  valid_ids, candidates = _router_candidates()
+  if not valid_ids:
+    return None
+
+  mem0_part = _mem0_router_snippet(user_id, text)
+
+  data = _call_openai_multi_planner(text, candidates, mem0_part)
+  method = "openai"
+  if data is None:
+    data = _call_anthropic_multi_planner(text, candidates, mem0_part)
+    method = "anthropic"
+  if not isinstance(data, dict):
+    return None
+
+  steps = _normalize_plan_steps(data, valid_ids)
+  if not steps:
+    return None
+
+  rationale = str(data.get("rationale") or "").strip()[:400]
+  return MultiAgentPlan(steps=steps, method=method, rationale=rationale)
 

@@ -82,11 +82,24 @@
     "delete from calendar",
     "clear the event"
   ],
-  "system_prompt": "Used by assistant_service with calendar and commitment tools.",
+  "system_prompt": "Used by assistant_service with calendar and commitment tools. See guidelines.tool_selection_rules for the source-of-truth planner rules.",
+  "guidelines": {
+    "purpose": "Help the user manage their Google Calendar (read, create, update, delete events; find free time) and local commitments/reminders. Pick the right tool for the request, queue every write for user approval before it fires, and preserve existing attendees when updating events. Never write without an approval step.",
+    "tool_selection_rules": [
+      "calendar_create_event \u2014 use when the user wants to CREATE, ADD, SCHEDULE, BOOK, SET UP, or BLOCK a named event/slot on their calendar. This includes focus blocks, standups, meetings, time blocks, work sessions, recurring slots, etc. ANY intent to put something NEW on the calendar -> this tool. Args: title (str), start_time (ISO datetime, e.g. '2026-05-19T15:00:00'), duration_minutes (int), attendees (list of emails, empty [] if none), timezone (IANA, use the default provided in the planner context if not given), description (str, optional), recurrence (str RRULE for recurring events, e.g. 'RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;COUNT=10'). is_write: true. For RECURRING requests (e.g. 'every weekday for two weeks', 'daily for next month', 'Mondays for 4 weeks') use ONE step with a recurrence RRULE. 'All weekdays for two weeks' = RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;COUNT=10. 'Every day for 2 weeks' = RRULE:FREQ=DAILY;COUNT=14.",
+      "calendar_delete_event \u2014 use when the user wants to DELETE, REMOVE, CANCEL, or CLEAR an existing calendar event (e.g. 'delete focus time tomorrow', 'cancel my 3pm', 'remove the standup on Friday'). Args: title (str) \u2014 ONLY the event name/title, nothing else. Extract JUST the name. Examples: 'Focus Time', 'Standup', 'Team meeting'. NEVER put a full sentence here. date (str) \u2014 ISO date hint, e.g. '2026-05-20'. Resolve 'tomorrow'/'today' to an actual date. event_id (str) \u2014 only if you have the exact Google Calendar event ID. is_write: true.",
+      "calendar_update_event \u2014 use when the user wants to ADD ATTENDEES/GUESTS/PEOPLE to an existing event, or modify an existing event's title or description (e.g. 'add john@example.com to the catch-up invite', 'add my friend to the meeting', 'update the event to include sarah@example.com'). Args: title (str) \u2014 name of the existing event to update (e.g. 'Catch Up', 'Team Meeting'). date (str) \u2014 ISO date hint if known, e.g. '2026-05-20'. event_id (str) \u2014 only if you have the exact Google Calendar event ID. attendees_add (list of email strings) \u2014 NEW email addresses to add (existing attendees are preserved). new_title (str) \u2014 optional, rename the event. is_write: true.",
+      "calendar_list_upcoming \u2014 use ONLY when user wants to VIEW/SEE/CHECK what's on their calendar (e.g. 'what do I have today', 'show my schedule', 'any meetings tomorrow'). Args: max_results (int, default 10). is_write: false.",
+      "calendar_suggest_free_slots \u2014 use ONLY when user asks about FREE TIME, AVAILABILITY, open slots (e.g. 'when am I free', 'find time for a meeting'). Args: days_ahead (1\u201321), duration_minutes, work_start_hhmm, work_end_hhmm, timezone. is_write: false.",
+      "commitment_upsert \u2014 use ONLY for vague REMINDERS or TASKS that are NOT calendar events (e.g. 'remind me to call John', 'note to self: buy milk', 'follow up with Sarah next week'). Args: title, detail, tags (array), source (voice|chat), remind_at, due_at. is_write: true.",
+      "commitment_list \u2014 use ONLY when user wants to SEE their existing reminders/todos/tasks (e.g. 'what are my reminders', 'show my todos'). NEVER use this for CREATE or DELETE requests. is_write: false."
+    ]
+  },
   "tools": [
     "calendar_list_upcoming",
     "calendar_create_event",
     "calendar_delete_event",
+    "calendar_update_event",
     "calendar_suggest_free_slots",
     "commitment_list",
     "commitment_upsert"
@@ -95,5 +108,6 @@
   "background": false,
   "priority": 5,
   "memory_context": true,
-  "max_tool_calls": 8
+  "max_tool_calls": 8,
+  "system_only": false
 }

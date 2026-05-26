@@ -9,6 +9,7 @@ import re
 from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from email.utils import getaddresses
 
 from googleapiclient.discovery import build
 
@@ -552,9 +553,9 @@ def send_email(
 
 def create_draft(
     credentials,
-    to: str,
-    subject: str,
-    body: str,
+    to: str = "",
+    subject: str = "",
+    body: str = "",
     cc: str | None = None,
 ) -> dict:
     """
@@ -666,3 +667,451 @@ def get_user_email(credentials) -> str:
     service = build("gmail", "v1", credentials=credentials, cache_discovery=False)
     profile = service.users().getProfile(userId="me").execute()
     return profile.get("emailAddress", "")
+
+
+# --------------------------------------------------------------------------
+# Email Operations Agent helpers
+# --------------------------------------------------------------------------
+# Used by reply / reply_all / forward / draft-edit operations. All assume the
+# OAuth credentials already grant the required scopes (gmail.compose for
+# drafts, gmail.send for sending, gmail.readonly for thread/message reads,
+# gmail.modify for trash).
+
+
+def _parse_gmail_message_envelope(msg: dict) -> dict:
+    """Extract subject/to/cc/bcc/from headers from a Gmail message dict (any format)."""
+    headers: dict[str, str] = {}
+    for h in msg.get("payload", {}).get("headers", []):
+        name = (h.get("name") or "").lower()
+        if name:
+            headers[name] = h.get("value") or ""
+    return {
+        "subject": headers.get("subject", ""),
+        "to": headers.get("to", ""),
+        "cc": headers.get("cc", ""),
+        "bcc": headers.get("bcc", ""),
+        "from": headers.get("from", ""),
+        "message_id": headers.get("message-id", ""),
+        "in_reply_to": headers.get("in-reply-to", ""),
+        "references": headers.get("references", ""),
+    }
+
+
+def _format_address_pairs(pairs: list[tuple[str, str]]) -> str:
+    """Format [(name, email), ...] back into a comma-separated address string."""
+    parts: list[str] = []
+    for name, email in pairs:
+        e = (email or "").strip()
+        if not e:
+            continue
+        n = (name or "").strip()
+        parts.append(f"{n} <{e}>" if n else e)
+    return ", ".join(parts)
+
+
+def _addr_pairs(addr_str: str) -> list[tuple[str, str]]:
+    """Parse 'Name <email>, Name2 <email2>' into [(name, email), ...]; empties filtered."""
+    if not addr_str:
+        return []
+    return [(n, e) for (n, e) in getaddresses([addr_str]) if e]
+
+
+def _to_list_or_str(value) -> str:
+    """Coerce a recipient field (str or list) into a comma-separated string."""
+    if value is None:
+        return ""
+    if isinstance(value, list):
+        return ", ".join(str(x).strip() for x in value if str(x).strip())
+    return str(value).strip()
+
+
+def _build_mime(body: str, html_body: str | None) -> MIMEText | MIMEMultipart:
+    if html_body:
+        m = MIMEMultipart("alternative")
+        m.attach(MIMEText(body, "plain"))
+        m.attach(MIMEText(html_body, "html"))
+        return m
+    return MIMEText(body, "plain")
+
+
+def update_draft(
+    credentials,
+    draft_id: str,
+    to: str | None = None,
+    subject: str | None = None,
+    body: str | None = None,
+    cc: str | None = None,
+    bcc: str | None = None,
+    html_body: str | None = None,
+) -> dict:
+    """
+    Replace fields on an existing Gmail draft. Any argument left as None preserves
+    the draft's current value for that field. Returns the updated draft's id +
+    final field values.
+    """
+    service = build("gmail", "v1", credentials=credentials, cache_discovery=False)
+    draft = service.users().drafts().get(userId="me", id=draft_id, format="full").execute()
+    msg = draft.get("message", {})
+    env = _parse_gmail_message_envelope(msg)
+
+    new_subject = subject if subject is not None else env["subject"]
+    new_to = to if to is not None else env["to"]
+    new_cc = cc if cc is not None else env["cc"]
+    new_bcc = bcc if bcc is not None else env["bcc"]
+
+    existing_body = _extract_body(msg.get("payload", {})) or ""
+    new_body = body if body is not None else existing_body
+
+    mime = _build_mime(new_body, html_body)
+    mime["to"] = new_to or ""
+    mime["subject"] = new_subject or ""
+    if new_cc:
+        mime["cc"] = new_cc
+    if new_bcc:
+        mime["bcc"] = new_bcc
+
+    raw = base64.urlsafe_b64encode(mime.as_bytes()).decode("utf-8")
+    result = service.users().drafts().update(
+        userId="me",
+        id=draft_id,
+        body={"message": {"raw": raw}},
+    ).execute()
+
+    logger.info("Gmail draft updated: id=%s subject=%s", result.get("id"), new_subject)
+    return {
+        "draft_id": result.get("id"),
+        "subject": new_subject,
+        "to": new_to,
+        "cc": new_cc,
+        "bcc": new_bcc,
+    }
+
+
+def add_recipients_to_draft(
+    credentials,
+    draft_id: str,
+    to_add: list[str] | None = None,
+    cc_add: list[str] | None = None,
+    bcc_add: list[str] | None = None,
+) -> dict:
+    """Append recipients to an existing draft (deduplicated). Preserves existing entries."""
+    service = build("gmail", "v1", credentials=credentials, cache_discovery=False)
+    draft = service.users().drafts().get(userId="me", id=draft_id, format="full").execute()
+    msg = draft.get("message", {})
+    env = _parse_gmail_message_envelope(msg)
+    body_text = _extract_body(msg.get("payload", {})) or ""
+
+    existing_to = _addr_pairs(env["to"])
+    existing_cc = _addr_pairs(env["cc"])
+    existing_bcc = _addr_pairs(env["bcc"])
+
+    seen = {e.lower() for _, e in (existing_to + existing_cc + existing_bcc)}
+
+    def _append(pairs: list[tuple[str, str]], additions: list[str] | None) -> list[tuple[str, str]]:
+        if not additions:
+            return pairs
+        out = list(pairs)
+        for addr in additions:
+            a = str(addr or "").strip()
+            if not a:
+                continue
+            if a.lower() in seen:
+                continue
+            out.append(("", a))
+            seen.add(a.lower())
+        return out
+
+    new_to = _append(existing_to, to_add)
+    new_cc = _append(existing_cc, cc_add)
+    new_bcc = _append(existing_bcc, bcc_add)
+
+    mime = MIMEText(body_text, "plain")
+    mime["to"] = _format_address_pairs(new_to)
+    mime["subject"] = env["subject"]
+    if new_cc:
+        mime["cc"] = _format_address_pairs(new_cc)
+    if new_bcc:
+        mime["bcc"] = _format_address_pairs(new_bcc)
+
+    raw = base64.urlsafe_b64encode(mime.as_bytes()).decode("utf-8")
+    result = service.users().drafts().update(
+        userId="me",
+        id=draft_id,
+        body={"message": {"raw": raw}},
+    ).execute()
+
+    return {
+        "draft_id": result.get("id"),
+        "to": _format_address_pairs(new_to),
+        "cc": _format_address_pairs(new_cc),
+        "bcc": _format_address_pairs(new_bcc),
+        "subject": env["subject"],
+        "added": {
+            "to": list(to_add or []),
+            "cc": list(cc_add or []),
+            "bcc": list(bcc_add or []),
+        },
+    }
+
+
+def remove_recipients_from_draft(
+    credentials,
+    draft_id: str,
+    to_remove: list[str] | None = None,
+    cc_remove: list[str] | None = None,
+    bcc_remove: list[str] | None = None,
+) -> dict:
+    """Remove specific email addresses from a draft's recipient fields (case-insensitive)."""
+    service = build("gmail", "v1", credentials=credentials, cache_discovery=False)
+    draft = service.users().drafts().get(userId="me", id=draft_id, format="full").execute()
+    msg = draft.get("message", {})
+    env = _parse_gmail_message_envelope(msg)
+    body_text = _extract_body(msg.get("payload", {})) or ""
+
+    existing_to = _addr_pairs(env["to"])
+    existing_cc = _addr_pairs(env["cc"])
+    existing_bcc = _addr_pairs(env["bcc"])
+
+    def _filter(pairs: list[tuple[str, str]], removals: list[str] | None) -> list[tuple[str, str]]:
+        if not removals:
+            return pairs
+        rm = {str(r).strip().lower() for r in removals if str(r).strip()}
+        return [(n, e) for (n, e) in pairs if e.lower() not in rm]
+
+    new_to = _filter(existing_to, to_remove)
+    new_cc = _filter(existing_cc, cc_remove)
+    new_bcc = _filter(existing_bcc, bcc_remove)
+
+    mime = MIMEText(body_text, "plain")
+    mime["to"] = _format_address_pairs(new_to)
+    mime["subject"] = env["subject"]
+    if new_cc:
+        mime["cc"] = _format_address_pairs(new_cc)
+    if new_bcc:
+        mime["bcc"] = _format_address_pairs(new_bcc)
+
+    raw = base64.urlsafe_b64encode(mime.as_bytes()).decode("utf-8")
+    result = service.users().drafts().update(
+        userId="me",
+        id=draft_id,
+        body={"message": {"raw": raw}},
+    ).execute()
+
+    return {
+        "draft_id": result.get("id"),
+        "to": _format_address_pairs(new_to),
+        "cc": _format_address_pairs(new_cc),
+        "bcc": _format_address_pairs(new_bcc),
+        "subject": env["subject"],
+        "removed": {
+            "to": list(to_remove or []),
+            "cc": list(cc_remove or []),
+            "bcc": list(bcc_remove or []),
+        },
+    }
+
+
+def reply_to_thread(
+    credentials,
+    thread_id: str,
+    body: str,
+    html_body: str | None = None,
+    cc: list[str] | str | None = None,
+) -> dict:
+    """
+    Reply to the most recent message in a thread. Recipient defaults to the
+    original sender; subject is preserved (with 'Re: ' prefix if missing).
+    """
+    service = build("gmail", "v1", credentials=credentials, cache_discovery=False)
+    thread = service.users().threads().get(
+        userId="me",
+        id=thread_id,
+        format="metadata",
+        metadataHeaders=["From", "To", "Cc", "Subject", "Message-ID", "References"],
+    ).execute()
+    messages = thread.get("messages", [])
+    if not messages:
+        raise ValueError(f"Thread {thread_id} has no messages")
+
+    last = messages[-1]
+    env = _parse_gmail_message_envelope(last)
+    reply_to = env["from"]
+    subject = env["subject"]
+    if subject and not subject.lower().startswith("re:"):
+        subject = "Re: " + subject
+
+    mime = _build_mime(body, html_body)
+    mime["to"] = reply_to
+    mime["subject"] = subject
+    cc_str = _to_list_or_str(cc)
+    if cc_str:
+        mime["cc"] = cc_str
+
+    raw = base64.urlsafe_b64encode(mime.as_bytes()).decode("utf-8")
+    result = service.users().messages().send(
+        userId="me",
+        body={"raw": raw, "threadId": thread_id},
+    ).execute()
+
+    logger.info("Gmail reply sent: id=%s thread=%s to=%s", result.get("id"), thread_id, reply_to)
+    return {
+        "id": result.get("id"),
+        "thread_id": thread_id,
+        "to": reply_to,
+        "subject": subject,
+    }
+
+
+def reply_all_in_thread(
+    credentials,
+    thread_id: str,
+    body: str,
+    html_body: str | None = None,
+) -> dict:
+    """
+    Reply to every participant on a thread (To + Cc + From across all messages),
+    excluding the authenticated user. The original sender becomes the primary To;
+    everyone else becomes Cc.
+    """
+    service = build("gmail", "v1", credentials=credentials, cache_discovery=False)
+
+    profile = service.users().getProfile(userId="me").execute()
+    my_email = (profile.get("emailAddress") or "").lower().strip()
+
+    thread = service.users().threads().get(
+        userId="me",
+        id=thread_id,
+        format="metadata",
+        metadataHeaders=["From", "To", "Cc", "Subject"],
+    ).execute()
+    messages = thread.get("messages", [])
+    if not messages:
+        raise ValueError(f"Thread {thread_id} has no messages")
+
+    # Collect every distinct participant, preserving the formatted "Name <email>" form.
+    participants: dict[str, str] = {}
+    for msg in messages:
+        env = _parse_gmail_message_envelope(msg)
+        for field in ("from", "to", "cc"):
+            for name, email in _addr_pairs(env.get(field, "")):
+                e_lc = email.lower()
+                if not e_lc or e_lc == my_email:
+                    continue
+                if e_lc not in participants:
+                    participants[e_lc] = f"{name} <{email}>" if name else email
+
+    # Primary To = the From of the last inbound message (excluding self).
+    last_env = _parse_gmail_message_envelope(messages[-1])
+    primary_to = ""
+    primary_lc = ""
+    for name, email in _addr_pairs(last_env.get("from", "")):
+        if email.lower() != my_email:
+            primary_to = f"{name} <{email}>" if name else email
+            primary_lc = email.lower()
+            break
+
+    if not primary_to and participants:
+        # Fallback: first remaining participant.
+        primary_lc, primary_to = next(iter(participants.items()))
+
+    cc_list = [v for k, v in participants.items() if k != primary_lc]
+
+    subject = last_env.get("subject", "")
+    if subject and not subject.lower().startswith("re:"):
+        subject = "Re: " + subject
+
+    mime = _build_mime(body, html_body)
+    mime["to"] = primary_to
+    mime["subject"] = subject
+    if cc_list:
+        mime["cc"] = ", ".join(cc_list)
+
+    raw = base64.urlsafe_b64encode(mime.as_bytes()).decode("utf-8")
+    result = service.users().messages().send(
+        userId="me",
+        body={"raw": raw, "threadId": thread_id},
+    ).execute()
+
+    logger.info(
+        "Gmail reply-all sent: id=%s thread=%s to=%s cc_count=%s",
+        result.get("id"),
+        thread_id,
+        primary_to,
+        len(cc_list),
+    )
+    return {
+        "id": result.get("id"),
+        "thread_id": thread_id,
+        "to": primary_to,
+        "cc": ", ".join(cc_list) if cc_list else "",
+        "subject": subject,
+        "recipient_count": (1 if primary_to else 0) + len(cc_list),
+        "all_recipients": ([primary_to] if primary_to else []) + cc_list,
+    }
+
+
+def forward_message(
+    credentials,
+    message_id: str,
+    to,
+    body: str | None = None,
+    html_body: str | None = None,
+) -> dict:
+    """
+    Forward an existing inbox message to new recipients. Builds the standard
+    'Forwarded message' envelope inline; attachments are NOT carried (text only
+    for now).
+    """
+    original = get_message_full(credentials, message_id)
+    orig_subject = original.get("subject") or ""
+    new_subject = orig_subject if orig_subject.lower().startswith("fwd:") else (
+        f"Fwd: {orig_subject}" if orig_subject else "Fwd:"
+    )
+
+    orig_body = original.get("body") or original.get("snippet") or ""
+    user_prefix = (body or "").strip()
+    forwarded = (
+        (f"{user_prefix}\n\n" if user_prefix else "")
+        + "---------- Forwarded message ----------\n"
+        + f"From: {original.get('from', '')}\n"
+        + f"Date: {original.get('date', '')}\n"
+        + f"Subject: {orig_subject}\n"
+        + f"To: {original.get('to', '')}\n\n"
+        + f"{orig_body}\n"
+    )
+
+    to_str = _to_list_or_str(to)
+    if not to_str:
+        raise ValueError("Forward requires at least one recipient.")
+
+    service = build("gmail", "v1", credentials=credentials, cache_discovery=False)
+    mime = _build_mime(forwarded, html_body)
+    mime["to"] = to_str
+    mime["subject"] = new_subject
+
+    raw = base64.urlsafe_b64encode(mime.as_bytes()).decode("utf-8")
+    result = service.users().messages().send(
+        userId="me",
+        body={"raw": raw},
+    ).execute()
+
+    logger.info(
+        "Gmail forward sent: id=%s forwarded_message_id=%s to=%s",
+        result.get("id"),
+        message_id,
+        to_str,
+    )
+    return {
+        "id": result.get("id"),
+        "to": to_str,
+        "subject": new_subject,
+        "forwarded_message_id": message_id,
+    }
+
+
+def trash_message(credentials, message_id: str) -> dict:
+    """Move a message to Gmail Trash (recoverable for 30 days)."""
+    service = build("gmail", "v1", credentials=credentials, cache_discovery=False)
+    result = service.users().messages().trash(userId="me", id=message_id).execute()
+    logger.info("Gmail message trashed: id=%s", message_id)
+    return {"id": message_id, "status": "trashed", "label_ids": result.get("labelIds", [])}

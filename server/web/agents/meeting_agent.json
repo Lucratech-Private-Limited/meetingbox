@@ -3,11 +3,21 @@
   "name": "Meeting Agent",
   "description": "Runs after a meeting ends: transcribe audio, generate meeting report, persist to SQLite, emit device events. Triggered only by the system (upload-audio / MEETING_ENDED pipeline), not by voice.",
   "triggers": [],
-  "system_prompt": "Not used directly — pipeline is implemented in meeting_agent.py and routes/meetings.py (Whisper + Claude report).",
+  "system_prompt": "System-only post-meeting pipeline. Not callable from the user intent router; orchestrated by meeting_agent.py and routes/meetings.py.",
+  "guidelines": {
+    "purpose": "Post-meeting pipeline triggered by the audio upload / MEETING_ENDED event. Transcribes recorded audio, generates a structured meeting report (summary, decisions, action items, participants), and persists everything to SQLite. System-triggered only \u2014 never invoked by user voice or chat.",
+    "tool_selection_rules": [
+      "meeting_transcribe \u2014 pipeline stage: convert recorded audio into a Whisper transcript with speaker labels. is_write: true.",
+      "meeting_report \u2014 pipeline stage: synthesize the transcript into a structured report (title, summary, decisions, action items) via Claude. is_write: true.",
+      "meeting_persist \u2014 pipeline stage: write the transcript + report into SQLite and emit completion events. is_write: true."
+    ],
+    "planner_notes": "Not callable via the assistant tool planner (max_tool_calls=0, system_only=true). The pipeline runs sequentially inside meeting_agent.py and routes/meetings.py; the tool names above are conceptual stage labels for documentation and audit purposes."
+  },
   "tools": ["meeting_transcribe", "meeting_report", "meeting_persist"],
   "requires_approval": false,
   "background": false,
   "priority": 10,
   "memory_context": false,
-  "max_tool_calls": 0
+  "max_tool_calls": 0,
+  "system_only": true
 }
