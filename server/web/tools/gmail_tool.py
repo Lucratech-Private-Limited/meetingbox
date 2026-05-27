@@ -66,6 +66,38 @@ def _addr_field_list(value: Any) -> list[str]:
 # ----------------- existing tools (unchanged surface) -----------------
 
 
+def _build_message_to_draft_id_map(creds, max_results: int) -> dict[str, str]:
+  """When the caller queries drafts, Gmail's messages.list returns message IDs which
+  are NOT valid draft IDs (drafts.update/send require the draft ID). Join via
+  drafts.list to build a message_id -> draft_id map so callers can resolve correctly."""
+  try:
+    from googleapiclient.discovery import build
+
+    service = build("gmail", "v1", credentials=creds, cache_discovery=False)
+    fetch = max(max_results * 3, 30)
+    fetch = min(fetch, 100)
+    resp = (
+      service.users()
+      .drafts()
+      .list(userId="me", maxResults=fetch)
+      .execute()
+    )
+    out: dict[str, str] = {}
+    for d in resp.get("drafts", []) or []:
+      did = d.get("id")
+      mid = (d.get("message") or {}).get("id")
+      if did and mid:
+        out[mid] = did
+    return out
+  except Exception:
+    return {}
+
+
+def _query_targets_drafts(q: str) -> bool:
+  ql = (q or "").lower()
+  return ("in:drafts" in ql) or ("is:draft" in ql) or ("label:draft" in ql)
+
+
 def gmail_list_recent(
   user_id: str,
   max_results: int = 10,
@@ -74,6 +106,12 @@ def gmail_list_recent(
   creds = _require_creds(user_id)
   max_results = max(1, min(int(max_results), 30))
   messages = list_recent_messages(creds, max_results=max_results, q=q or "")
+  if _query_targets_drafts(q):
+    mid_to_did = _build_message_to_draft_id_map(creds, max_results)
+    for m in messages:
+      did = mid_to_did.get(m.get("id"))
+      if did:
+        m["draft_id"] = did
   return {"messages": messages, "count": len(messages)}
 
 

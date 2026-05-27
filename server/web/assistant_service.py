@@ -492,31 +492,50 @@ def _llm_communication_plan(message: str) -> list[dict[str, Any]] | None:
     return None
 
   prompt = (
-    "You are the Email Operations Agent. Your ONLY job is to select the single best Gmail tool for the user message and return it as JSON.\n\n"
+    "You are the Email Operations Agent. Pick the minimum sequence of Gmail tools to fulfil the user's request and return JSON.\n\n"
     "Return ONLY valid JSON — no explanation, no markdown:\n"
-    "{\"steps\": [ {\"tool\": \"<exact_tool_name>\", \"args\": {<required fields>}, \"is_write\": true|false} ]}\n\n"
-    "CRITICAL RULES — read every rule carefully before selecting a tool:\n\n"
-    "RULE 1 — MODIFYING AN EXISTING DRAFT:\n"
-    "If the user is changing, editing, or updating something about an existing draft (e.g. 'add a question mark to the subject', 'change the body', 'update the draft') → ALWAYS use gmail_update_draft with the draft_id from conversation context. NEVER use gmail_create_draft for modifications to an existing draft.\n\n"
-    "RULE 2 — SENDING AN EXISTING DRAFT:\n"
-    "If the user says 'send the draft', 'send it', 'go ahead and send', 'send the email I saved' → use gmail_send_draft with the draft_id from context. Do NOT use gmail_send_email for sending a saved draft.\n\n"
-    "RULE 3 — CREATING A BRAND NEW DRAFT:\n"
-    "Only use gmail_create_draft when the user explicitly wants to compose a NEW email and save it for later (e.g. 'draft an email', 'save as draft', 'prepare an email for me to review'). Not when they are modifying an existing draft.\n\n"
-    "RULE 4 — SENDING A FRESH EMAIL:\n"
-    "Only use gmail_send_email when composing and sending a completely new email that has NOT been saved as a draft before.\n\n"
-    "RULE 5 — REPLY-ALL:\n"
-    "If the user says 'reply all', 'reply to everyone', 'respond to all participants', 'reply all and add/remove someone' → use gmail_reply_all. The tool automatically collects all thread participants — you do NOT need to fetch recipients manually.\n\n"
-    "RULE 6 — FORWARD / ARCHIVE / DELETE:\n"
-    "For forward/archive/delete, you MUST have a message_id. If the message_id is not already in context, first call gmail_list_recent to find the email, then include the correct message_id. Never call forward/archive/delete with an empty message_id.\n\n"
-    "RULE 7 — LISTING:\n"
-    "NEVER default to gmail_list_recent unless the user explicitly asks to check, list, search, or read emails.\n\n"
+    "{\"steps\": [ {\"tool\": \"<exact_tool_name>\", \"args\": {<fields>}, \"is_write\": true|false}, ... ]}\n\n"
+    "MULTI-STEP PLANS (CRITICAL — read this first):\n"
+    "Action tools like gmail_forward_email, gmail_archive_email, gmail_delete_email, gmail_update_draft, gmail_send_draft, gmail_reply_to_thread, gmail_reply_all need an id (message_id / thread_id / draft_id). If you do NOT already have that id, emit a TWO-STEP plan:\n"
+    "  Step 1: gmail_list_recent with a precise q (e.g. q='from:Trilok subject:Lunch' or q='in:drafts subject:World War' or q='subject:Catchup enquiry')\n"
+    "  Step 2: the action tool with the placeholder \"$PREV\" wherever the id is needed.\n"
+    "The system will substitute $PREV with the first matching message_id / threadId / draft_id from Step 1 at execution time.\n\n"
+    "Example — 'Forward Trilok's lunch email to shiva@x.com':\n"
+    "  {\"steps\":[\n"
+    "    {\"tool\":\"gmail_list_recent\",\"args\":{\"q\":\"from:Trilok subject:Lunch\",\"max_results\":3},\"is_write\":false},\n"
+    "    {\"tool\":\"gmail_forward_email\",\"args\":{\"message_id\":\"$PREV\",\"to\":\"shiva@x.com\"},\"is_write\":true}\n"
+    "  ]}\n\n"
+    "Example — 'Update the existing draft about World War II':\n"
+    "  {\"steps\":[\n"
+    "    {\"tool\":\"gmail_list_recent\",\"args\":{\"q\":\"in:drafts subject:World War\",\"max_results\":3},\"is_write\":false},\n"
+    "    {\"tool\":\"gmail_update_draft\",\"args\":{\"draft_id\":\"$PREV\",\"body\":\"...\"},\"is_write\":true}\n"
+    "  ]}\n\n"
+    "Example — 'Reply on the Catchup enquiry thread; remove Naveen, add vivek':\n"
+    "  {\"steps\":[\n"
+    "    {\"tool\":\"gmail_list_recent\",\"args\":{\"q\":\"subject:Catchup enquiry\",\"max_results\":3},\"is_write\":false},\n"
+    "    {\"tool\":\"gmail_reply_to_thread\",\"args\":{\"thread_id\":\"$PREV\",\"body\":\"...\",\"cc\":[\"vivekreddy1111@gmail.com\"]},\"is_write\":true}\n"
+    "  ]}\n\n"
+    "Example — 'Archive the email from Trilok about lunch':\n"
+    "  {\"steps\":[\n"
+    "    {\"tool\":\"gmail_list_recent\",\"args\":{\"q\":\"from:Trilok subject:Lunch\",\"max_results\":3},\"is_write\":false},\n"
+    "    {\"tool\":\"gmail_archive_email\",\"args\":{\"message_id\":\"$PREV\"},\"is_write\":true}\n"
+    "  ]}\n\n"
+    "RULES:\n"
+    "1. MODIFYING AN EXISTING DRAFT: emit list_recent (q='in:drafts ...') + gmail_update_draft with $PREV. NEVER use gmail_create_draft for modifications.\n"
+    "2. SENDING AN EXISTING DRAFT: emit list_recent (q='in:drafts ...') + gmail_send_draft with $PREV. NEVER use gmail_send_email for a saved draft.\n"
+    "3. CREATING A NEW DRAFT: gmail_create_draft (single step, no lookup). Use only when composing a brand-new email.\n"
+    "4. SENDING A FRESH EMAIL: gmail_send_email (single step, no lookup). Only for emails that were never drafted before.\n"
+    "5. REPLY-ALL: emit list_recent (q='subject:...') + gmail_reply_all with thread_id=$PREV. The reply_all tool collects all participants automatically — do NOT fetch recipients manually.\n"
+    "6. FORWARD / ARCHIVE / DELETE: always need a message_id. If absent, emit list_recent + action with $PREV. Never call these with empty/literal-subject message_id.\n"
+    "7. REPLY ON EXISTING THREAD (with or without recipient changes): emit list_recent (q='subject:...' or 'from:...') + gmail_reply_to_thread / gmail_reply_all with thread_id=$PREV. NEVER pass the subject string as thread_id — only the real Gmail thread id.\n"
+    "8. SIMPLE LISTING: gmail_list_recent only. Never default to listing unless the user explicitly asks to check / list / search / read emails.\n\n"
     "OTHER TOOL SELECTION:\n"
-    "- 'reply' or 'respond' (not reply all) → gmail_reply_to_thread\n"
+    "- 'reply' / 'respond' (not reply all) → gmail_reply_to_thread\n"
     "- 'forward' → gmail_forward_email\n"
     "- 'archive' → gmail_archive_email\n"
-    "- 'delete', 'trash', 'remove' (an email) → gmail_delete_email\n"
-    "- 'add ... to the draft/email' (a person) → gmail_add_recipients\n"
-    "- 'remove ... from the draft/email' (a person) → gmail_remove_recipients\n\n"
+    "- 'delete' / 'trash' (an email) → gmail_delete_email\n"
+    "- 'add ... to the draft' (a person) → gmail_add_recipients (with $PREV draft_id if needed)\n"
+    "- 'remove ... from the draft' (a person) → gmail_remove_recipients\n\n"
     "FULL TOOL REFERENCE:\n\n"
     f"{rules_block}\n\n"
     f"User message: {message.strip()[:3000]}\n"
@@ -1471,10 +1490,43 @@ def _dispatch_single_agent(
       assistant_lines.append(f"You've got {n} events coming up; the rundown is right here in results.")
     slotted = next((t for t in tool_results if t.get("tool") == TOOL_CAL_SLOTS and "result" in t), None)
     if slotted and isinstance(slotted.get("result"), dict):
-      sc = int(slotted["result"].get("count") or 0)
-      assistant_lines.append(
-        f"I spotted {sc} time windows that could work—the raw slots are in the results."
-      )
+      slot_res = slotted["result"]
+      sc = int(slot_res.get("count") or 0)
+      slots_list = slot_res.get("slots") or []
+      if sc == 0:
+        assistant_lines.append(
+          "I couldn't find a free slot in the search window. Want me to expand the window or look at a different time of day?"
+        )
+      else:
+        # Voice-friendly: read up to 3 distinct options and ALWAYS ask if more are wanted.
+        # The voice agent must relay this verbatim — do not summarise to a single "best option".
+        def _fmt_slot(s: dict) -> str:
+          try:
+            start_iso = str(s.get("start_local") or "")
+            end_iso = str(s.get("end_local") or "")
+            start_dt = datetime.fromisoformat(start_iso) if start_iso else None
+            end_dt = datetime.fromisoformat(end_iso) if end_iso else None
+            if start_dt and end_dt:
+              date_part = start_dt.strftime("%A %b %d")
+              start_part = start_dt.strftime("%I:%M %p").lstrip("0")
+              end_part = end_dt.strftime("%I:%M %p").lstrip("0")
+              return f"{date_part}, {start_part} to {end_part}"
+            return start_iso or "(unknown)"
+          except Exception:
+            return str(s)
+
+        top = [_fmt_slot(s) for s in slots_list[:3]]
+        slot_lines = "; ".join(f"({i + 1}) {t}" for i, t in enumerate(top))
+        more_clause = (
+          f" There are {sc - 3} more options I haven't read yet — "
+          "want me to list more, or do one of these work?"
+          if sc > 3 else
+          " Do any of these work, or would you like me to look further out?"
+        )
+        assistant_lines.append(
+          f"Here are {len(top)} open windows that completely clear of any meeting: "
+          f"{slot_lines}." + more_clause
+        )
     com_up = next((t for t in tool_results if t.get("tool") == TOOL_COMMITMENT_UPSERT and "result" in t), None)
     if com_up and isinstance(com_up.get("result"), dict) and com_up["result"].get("saved"):
       assistant_lines.append("Saved—that reminder's on your list now (memory picks it up too when enabled).")
@@ -1506,6 +1558,63 @@ def _dispatch_single_agent(
       TOOL_GMAIL_ADD_RECIPIENTS: gmail_add_recipients_from_payload,
       TOOL_GMAIL_REMOVE_RECIPIENTS: gmail_remove_recipients_from_payload,
     }
+
+    # Resolves "$PREV" placeholders in step args using the most recent
+    # gmail_list_recent result. Picks the right id (message_id / thread_id /
+    # draft_id) per the action tool so the LLM only needs one placeholder.
+    def _resolve_prev_refs(action_tool: str, raw_args: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
+      """Returns (resolved_args, error_str). error_str is set if $PREV used but no list result available."""
+      out = dict(raw_args)
+      needs_resolve = any(
+        isinstance(v, str) and v.strip().upper() == "$PREV"
+        for v in out.values()
+      )
+      if not needs_resolve:
+        return out, None
+
+      # Find the most recent successful list_recent result in tool_results.
+      list_res: dict[str, Any] | None = None
+      for tr in reversed(tool_results):
+        if tr.get("tool") == TOOL_GMAIL_LIST and isinstance(tr.get("result"), dict) and not tr.get("error"):
+          list_res = tr["result"]
+          break
+      if not list_res:
+        return out, "Cannot resolve $PREV: no preceding gmail_list_recent succeeded."
+      messages = list_res.get("messages") or []
+      if not messages:
+        return out, "Cannot resolve $PREV: lookup returned no matching emails."
+      first = messages[0]
+      # draft tools need draft_id (Gmail draft messages have a draft id in 'id' when listed via in:drafts).
+      # message-level tools need 'id'; thread-level tools need 'threadId'.
+      THREAD_TOOLS = {TOOL_GMAIL_REPLY, TOOL_GMAIL_REPLY_ALL}
+      DRAFT_TOOLS_NEED_DRAFT_ID = {
+        TOOL_GMAIL_DRAFT_UPDATE,
+        TOOL_GMAIL_SEND_DRAFT,
+        TOOL_GMAIL_ADD_RECIPIENTS,
+        TOOL_GMAIL_REMOVE_RECIPIENTS,
+      }
+      # Gmail message_id and draft_id live in different ID spaces — the messages.list
+      # endpoint never returns draft IDs. The list wrapper enriches drafts-query results
+      # with a 'draft_id' field; prefer that when the action requires a draft.
+      resolved_msg_id = first.get("id") or ""
+      resolved_draft_id = first.get("draft_id") or ""
+      resolved_thread = first.get("threadId") or first.get("thread_id") or resolved_msg_id
+      for k, v in list(out.items()):
+        if not (isinstance(v, str) and v.strip().upper() == "$PREV"):
+          continue
+        if k in ("thread_id", "threadId") or action_tool in THREAD_TOOLS:
+          out[k] = resolved_thread
+        elif k == "draft_id" or action_tool in DRAFT_TOOLS_NEED_DRAFT_ID:
+          if not resolved_draft_id:
+            return out, (
+              "Cannot resolve draft_id from lookup — re-run gmail_list_recent with "
+              "q='in:drafts ...' to surface the draft (the inbox listing returns "
+              "message IDs which are not valid for drafts.update/send)."
+            )
+          out[k] = resolved_draft_id
+        else:
+          out[k] = resolved_msg_id
+      return out, None
 
     for step in steps:
       tool = step["tool"]
@@ -1539,6 +1648,12 @@ def _dispatch_single_agent(
           "tool": tool,
           "error": "Sign in is required for this email operation.",
         })
+        continue
+
+      # Resolve any $PREV placeholders against the most recent list_recent result.
+      args, prev_err = _resolve_prev_refs(tool, args)
+      if prev_err:
+        tool_results.append({"tool": tool, "error": prev_err})
         continue
 
       if _tool_requires_approval(agent_doc, tool):
