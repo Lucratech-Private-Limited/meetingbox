@@ -48,14 +48,25 @@ def _wrap_google_error(exc: HttpError) -> ToolError:
     return ToolError("Google Calendar error: " + detail[:200])
 
 
-def calendar_list_upcoming(user_id: str, max_results: int = 10) -> dict[str, Any]:
+def calendar_list_upcoming(
+  user_id: str,
+  max_results: int = 10,
+  date: str | None = None,
+  days_ahead: int | None = None,
+) -> dict[str, Any]:
   if not user_id:
     raise ToolError("Sign in is required to access your calendar.")
   creds = get_credentials_for_provider(user_id, "calendar")
   if not creds:
     raise ToolError("Google Calendar is not connected. Connect it in Settings.")
   try:
-    raw = list_upcoming_events(creds, max_results=max(1, min(int(max_results), 50)))
+    raw = list_upcoming_events(
+      creds,
+      max_results=max(1, min(int(max_results), 50)),
+      date_filter=(str(date).strip() if date else None) or None,
+      days_ahead=int(days_ahead) if days_ahead else None,
+      timezone=default_calendar_tz_name(),
+    )
   except HttpError as e:
     raise _wrap_google_error(e) from e
   slim = []

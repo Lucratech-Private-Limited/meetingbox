@@ -520,22 +520,57 @@ def update_event(
     return result
 
 
-def list_upcoming_events(credentials, max_results: int = 10) -> list[dict]:
-    """Return upcoming calendar events (for context in action execution)."""
-    service = build("calendar", "v3", credentials=credentials, cache_discovery=False)
+def list_upcoming_events(
+    credentials,
+    max_results: int = 10,
+    date_filter: str | None = None,
+    days_ahead: int | None = None,
+    timezone: str | None = None,
+) -> list[dict]:
+    """Return upcoming calendar events (for context in action execution).
 
-    now = datetime.utcnow().isoformat() + "Z"
-    result = (
-        service.events()
-        .list(
-            calendarId="primary",
-            timeMin=now,
-            maxResults=max_results,
-            singleEvents=True,
-            orderBy="startTime",
-        )
-        .execute()
-    )
+    date_filter: ISO date string 'YYYY-MM-DD'. When provided, returns events that
+      START on or after midnight of that day (local timezone) and before midnight of
+      date_filter + days_ahead (default 1 day window so "next Tuesday" returns just
+      Tuesday's events).
+    days_ahead: number of days to include from date_filter (default 1). Only used
+      when date_filter is set.
+    """
+    service = build("calendar", "v3", credentials=credentials, cache_discovery=False)
+    utc = ZoneInfo("UTC")
+
+    if date_filter:
+        tz_name = (timezone or _default_tz_name()).strip() or _default_tz_name()
+        zone = _safe_zone(tz_name)
+        try:
+            from datetime import date as _date
+            target_date = _date.fromisoformat(date_filter)
+        except (ValueError, TypeError):
+            target_date = datetime.now(zone).date()
+        span = max(1, int(days_ahead or 1))
+        time_min_dt = datetime.combine(target_date, time(0, 0), tzinfo=zone)
+        time_max_dt = time_min_dt + timedelta(days=span)
+        time_min = time_min_dt.astimezone(utc).isoformat().replace("+00:00", "Z")
+        time_max = time_max_dt.astimezone(utc).isoformat().replace("+00:00", "Z")
+        kwargs: dict = {
+            "calendarId": "primary",
+            "timeMin": time_min,
+            "timeMax": time_max,
+            "maxResults": max_results,
+            "singleEvents": True,
+            "orderBy": "startTime",
+        }
+    else:
+        now = datetime.utcnow().isoformat() + "Z"
+        kwargs = {
+            "calendarId": "primary",
+            "timeMin": now,
+            "maxResults": max_results,
+            "singleEvents": True,
+            "orderBy": "startTime",
+        }
+
+    result = service.events().list(**kwargs).execute()
     return result.get("items", [])
 
 

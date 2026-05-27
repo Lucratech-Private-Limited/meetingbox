@@ -281,7 +281,9 @@ def _llm_calendar_plan(message: str) -> list[dict[str, Any]] | None:
     "- 'delete / remove / cancel / clear / drop the event' -> calendar_delete_event.\n"
     "- 'rsvp / accept / decline / going / not going / mark me attending / not attending / mark me as going / mark me tentative' -> calendar_rsvp_event.\n"
     "- 'when am I free / availability / open slot / find time for' -> calendar_suggest_free_slots.\n"
-    "- 'what's on / show my schedule / what do I have / upcoming / my meetings today / tomorrow' -> calendar_list_upcoming.\n"
+    "- 'what's on / show my schedule / what do I have / upcoming / my meetings today / tomorrow / next Tuesday / this Friday / next week' -> calendar_list_upcoming.\n"
+    "  calendar_list_upcoming args: max_results (int, default 15), date (YYYY-MM-DD — REQUIRED when user names a specific day or range; omit only for 'upcoming/today' queries), days_ahead (int, default 1 — use 7 when user says 'next week' or a full week range).\n"
+    "  ALWAYS resolve relative days to absolute YYYY-MM-DD using today=" + today_str + ". Examples: 'next Tuesday' -> next Tuesday's date, 'this Friday' -> this Friday's date, 'tomorrow' -> today+1, 'next week' -> next Monday's date with days_ahead=7.\n"
     "- 'remind me / note to self / follow up / todo / task / action item' -> commitment_upsert.\n"
     "- 'show my reminders / show my todos / what are my tasks' -> commitment_list.\n\n"
     "DO NOT chain reads before writes — the write tools accept a title + date hint and look the event up themselves:\n"
@@ -1303,7 +1305,12 @@ def _dispatch_single_agent(
           })
           continue
         try:
-          res = calendar_list_upcoming(user_id, max_results=int(args.get("max_results", 10)))
+          res = calendar_list_upcoming(
+            user_id,
+            max_results=int(args.get("max_results", 10)),
+            date=args.get("date") or None,
+            days_ahead=args.get("days_ahead") or None,
+          )
           tool_results.append({"tool": tool, "result": res})
         except ToolError as e:
           tool_results.append({"tool": tool, "error": str(e)})
