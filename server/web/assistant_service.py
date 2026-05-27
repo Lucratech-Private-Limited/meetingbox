@@ -45,6 +45,7 @@ from tools.gmail_tool import (
   gmail_remove_recipients_from_payload,
   gmail_reply_all_from_payload,
   gmail_reply_from_payload,
+  gmail_send_draft_from_payload,
   gmail_send_from_payload,
   gmail_update_draft_from_payload,
 )
@@ -97,6 +98,7 @@ TOOL_GMAIL_LIST = "gmail_list_recent"
 TOOL_GMAIL_SEND = "gmail_send_email"
 TOOL_GMAIL_DRAFT = "gmail_create_draft"
 TOOL_GMAIL_DRAFT_UPDATE = "gmail_update_draft"
+TOOL_GMAIL_SEND_DRAFT = "gmail_send_draft"
 TOOL_GMAIL_ADD_RECIPIENTS = "gmail_add_recipients"
 TOOL_GMAIL_REMOVE_RECIPIENTS = "gmail_remove_recipients"
 TOOL_GMAIL_REPLY = "gmail_reply_to_thread"
@@ -129,6 +131,7 @@ GMAIL_TOOLS = frozenset({
   TOOL_GMAIL_SEND,
   TOOL_GMAIL_DRAFT,
   TOOL_GMAIL_DRAFT_UPDATE,
+  TOOL_GMAIL_SEND_DRAFT,
   TOOL_GMAIL_ADD_RECIPIENTS,
   TOOL_GMAIL_REMOVE_RECIPIENTS,
   TOOL_GMAIL_REPLY,
@@ -148,6 +151,7 @@ WRITE_TOOLS = frozenset({
   TOOL_GMAIL_SEND,
   TOOL_GMAIL_DRAFT,
   TOOL_GMAIL_DRAFT_UPDATE,
+  TOOL_GMAIL_SEND_DRAFT,
   TOOL_GMAIL_ADD_RECIPIENTS,
   TOOL_GMAIL_REMOVE_RECIPIENTS,
   TOOL_GMAIL_REPLY,
@@ -491,18 +495,28 @@ def _llm_communication_plan(message: str) -> list[dict[str, Any]] | None:
     "You are the Email Operations Agent. Your ONLY job is to select the single best Gmail tool for the user message and return it as JSON.\n\n"
     "Return ONLY valid JSON — no explanation, no markdown:\n"
     "{\"steps\": [ {\"tool\": \"<exact_tool_name>\", \"args\": {<required fields>}, \"is_write\": true|false} ]}\n\n"
-    "CRITICAL RULES — read before anything else:\n"
-    "- NEVER default to gmail_list_recent unless the user explicitly asks to check, list, search, or read emails.\n"
-    "- If the user says 'draft', 'write', 'compose', or 'prepare' an email → use gmail_create_draft.\n"
-    "- If the user says 'send', 'email to', 'shoot a message' → use gmail_send_email.\n"
-    "- If the user says 'reply all' or 'reply to everyone' → use gmail_reply_all.\n"
-    "- If the user says 'reply' or 'respond' (not reply all) → use gmail_reply_to_thread.\n"
-    "- If the user says 'forward' → use gmail_forward_email.\n"
-    "- If the user says 'archive' → use gmail_archive_email.\n"
-    "- If the user says 'delete', 'trash', 'remove' (an email) → use gmail_delete_email.\n"
-    "- If the user says 'update the draft', 'change the draft' → use gmail_update_draft.\n"
-    "- If the user says 'add ... to the draft/email' (a person) → use gmail_add_recipients.\n"
-    "- If the user says 'remove ... from the draft/email' (a person) → use gmail_remove_recipients.\n\n"
+    "CRITICAL RULES — read every rule carefully before selecting a tool:\n\n"
+    "RULE 1 — MODIFYING AN EXISTING DRAFT:\n"
+    "If the user is changing, editing, or updating something about an existing draft (e.g. 'add a question mark to the subject', 'change the body', 'update the draft') → ALWAYS use gmail_update_draft with the draft_id from conversation context. NEVER use gmail_create_draft for modifications to an existing draft.\n\n"
+    "RULE 2 — SENDING AN EXISTING DRAFT:\n"
+    "If the user says 'send the draft', 'send it', 'go ahead and send', 'send the email I saved' → use gmail_send_draft with the draft_id from context. Do NOT use gmail_send_email for sending a saved draft.\n\n"
+    "RULE 3 — CREATING A BRAND NEW DRAFT:\n"
+    "Only use gmail_create_draft when the user explicitly wants to compose a NEW email and save it for later (e.g. 'draft an email', 'save as draft', 'prepare an email for me to review'). Not when they are modifying an existing draft.\n\n"
+    "RULE 4 — SENDING A FRESH EMAIL:\n"
+    "Only use gmail_send_email when composing and sending a completely new email that has NOT been saved as a draft before.\n\n"
+    "RULE 5 — REPLY-ALL:\n"
+    "If the user says 'reply all', 'reply to everyone', 'respond to all participants', 'reply all and add/remove someone' → use gmail_reply_all. The tool automatically collects all thread participants — you do NOT need to fetch recipients manually.\n\n"
+    "RULE 6 — FORWARD / ARCHIVE / DELETE:\n"
+    "For forward/archive/delete, you MUST have a message_id. If the message_id is not already in context, first call gmail_list_recent to find the email, then include the correct message_id. Never call forward/archive/delete with an empty message_id.\n\n"
+    "RULE 7 — LISTING:\n"
+    "NEVER default to gmail_list_recent unless the user explicitly asks to check, list, search, or read emails.\n\n"
+    "OTHER TOOL SELECTION:\n"
+    "- 'reply' or 'respond' (not reply all) → gmail_reply_to_thread\n"
+    "- 'forward' → gmail_forward_email\n"
+    "- 'archive' → gmail_archive_email\n"
+    "- 'delete', 'trash', 'remove' (an email) → gmail_delete_email\n"
+    "- 'add ... to the draft/email' (a person) → gmail_add_recipients\n"
+    "- 'remove ... from the draft/email' (a person) → gmail_remove_recipients\n\n"
     "FULL TOOL REFERENCE:\n\n"
     f"{rules_block}\n\n"
     f"User message: {message.strip()[:3000]}\n"
@@ -565,8 +579,26 @@ def _heuristic_communication_plan(message: str) -> list[dict[str, Any]]:
     q = "is:unread" if "unread" in m else ""
     return [{"tool": TOOL_GMAIL_LIST, "args": {"max_results": 15, "q": q}, "is_write": False}]
 
+  # Explicit send-draft markers — user wants to send a previously saved draft.
+  send_draft_markers = (
+    "send the draft", "send that draft", "send it", "go ahead and send",
+    "send the email i saved", "send from drafts", "send draft",
+  )
+  if any(x in m for x in send_draft_markers):
+    return [{"tool": TOOL_GMAIL_SEND_DRAFT, "args": {}, "is_write": True}]
+
+  # Archive/delete/forward markers — route to correct tool; message_id must come from context.
+  if any(x in m for x in ("archive this", "archive the email", "archive it")):
+    return [{"tool": TOOL_GMAIL_ARCHIVE, "args": {}, "is_write": True}]
+  if any(x in m for x in ("delete this", "delete the email", "trash this", "trash the email", "delete it")):
+    return [{"tool": TOOL_GMAIL_DELETE, "args": {}, "is_write": True}]
+  if "forward" in m:
+    emails = _extract_emails_from_text(message)
+    return [{"tool": TOOL_GMAIL_FORWARD, "args": {"to": emails[0] if emails else ""}, "is_write": True}]
+
+  # New draft (save for later, not send now).
   draft_markers = (
-    "draft", "save as draft", "draft for later", "save it", "don't send",
+    "save as draft", "draft for later", "save it", "don't send",
     "do not send", "send it later", "i'll send", "i will send",
   )
   emails = _extract_emails_from_text(message)
@@ -976,6 +1008,10 @@ def assistant_action_brief_label(tool_name: str, payload: Any) -> str:
     did = str(payload.get("draft_id") or "")[:16]
     subj = str(payload.get("subject") or "draft").strip()[:48]
     return f"Update draft {did}: {subj}" if did else f"Update draft: {subj}"
+  if tool_name == TOOL_GMAIL_SEND_DRAFT:
+    did = str(payload.get("draft_id") or "")[:16]
+    subj = str(payload.get("subject") or "").strip()[:60]
+    return f"Send draft: {subj}" if subj else (f"Send draft {did}" if did else "Send draft")
   if tool_name == TOOL_GMAIL_ADD_RECIPIENTS:
     did = str(payload.get("draft_id") or "")[:16]
     adds = [
@@ -1547,13 +1583,16 @@ def _dispatch_single_agent(
         assistant_lines.append(f"Pulled {n} recent messages; the thread list is in results.")
       elif t == TOOL_GMAIL_DRAFT and isinstance(tr.get("result"), dict):
         r = tr["result"]
+        did = r.get("draft_id") or ""
         assistant_lines.append(
-          f"Saved a draft in Gmail Drafts (subject: {r.get('subject', '(no subject)')}, to: {r.get('to') or 'TBD'})."
+          f"Draft saved in Gmail Drafts — draft_id={did}, subject: {r.get('subject', '(no subject)')}, to: {r.get('to') or 'TBD'}."
+          " To update this draft later, use draft_id=" + did + "."
         )
       elif t == TOOL_GMAIL_DRAFT_UPDATE and isinstance(tr.get("result"), dict):
         r = tr["result"]
+        did = r.get("draft_id") or r.get("id") or ""
         assistant_lines.append(
-          f"Updated the draft (subject: {r.get('subject', '(no subject)')}, to: {r.get('to') or 'TBD'})."
+          f"Draft updated — draft_id={did}, subject: {r.get('subject', '(no subject)')}, to: {r.get('to') or 'TBD'}."
         )
       elif t == TOOL_GMAIL_ADD_RECIPIENTS and isinstance(tr.get("result"), dict):
         r = tr["result"]
@@ -1605,6 +1644,11 @@ def _dispatch_single_agent(
         assistant_lines.append("Forward drafted and queued for approval — review recipients and the message before approving.")
       elif tname == TOOL_GMAIL_SEND:
         assistant_lines.append("Email drafted and queued for approval — give it a look (recipients, subject, body) and approve when it feels right.")
+      elif tname == TOOL_GMAIL_SEND_DRAFT:
+        assistant_lines.append(
+          "I've queued the draft for sending. The email contents are shown on the transcription screen — "
+          "have a look and let me know if you'd like me to read it out. Approve whenever you're ready to send."
+        )
       elif tname == TOOL_GMAIL_ARCHIVE:
         assistant_lines.append("Archive queued for approval — approve to remove from your inbox (you can still find it via search).")
       elif tname == TOOL_GMAIL_DELETE:
@@ -2213,6 +2257,7 @@ def update_pending_assistant_payload(
     if row["tool_name"] not in (
       TOOL_GMAIL_SEND,
       TOOL_GMAIL_DRAFT,
+      TOOL_GMAIL_SEND_DRAFT,
       TOOL_GMAIL_REPLY,
       TOOL_GMAIL_REPLY_ALL,
       TOOL_GMAIL_FORWARD,
@@ -2325,6 +2370,9 @@ def approve_pending_action(pending_id: str, user_id: str) -> dict[str, Any]:
     elif tool == TOOL_GMAIL_SEND:
       result = gmail_send_from_payload(user_id, payload)
       result_blob = {"gmail": result}
+    elif tool == TOOL_GMAIL_SEND_DRAFT:
+      result = gmail_send_draft_from_payload(user_id, payload)
+      result_blob = {"gmail_send_draft": result}
     elif tool == TOOL_GMAIL_DRAFT:
       result = gmail_draft_from_payload(user_id, payload)
       result_blob = {"gmail_draft": result}

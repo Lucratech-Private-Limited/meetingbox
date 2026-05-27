@@ -14,6 +14,7 @@ from services.gmail import (
   remove_recipients_from_draft,
   reply_all_in_thread,
   reply_to_thread,
+  send_draft,
   send_email,
   trash_message,
   update_draft,
@@ -275,3 +276,16 @@ def gmail_delete_from_payload(user_id: str, payload: dict[str, Any]) -> dict[str
   if not message_id:
     raise ToolError("message_id is required to delete an email.")
   return trash_message(creds, message_id)
+
+
+def gmail_send_draft_from_payload(user_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+  """
+  Send an existing Gmail draft by draft_id.
+  Uses Gmail's drafts.send API — the draft is automatically moved to Sent
+  and removed from Drafts. No body needed; content is taken from the stored draft.
+  """
+  creds = _require_creds(user_id)
+  draft_id = str(payload.get("draft_id") or "").strip()
+  if not draft_id:
+    raise ToolError("draft_id is required to send a draft. Use gmail_list_recent with q='in:drafts' to find it.")
+  return send_draft(credentials=creds, draft_id=draft_id)

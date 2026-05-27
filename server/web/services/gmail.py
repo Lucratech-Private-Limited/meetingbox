@@ -579,6 +579,32 @@ def create_draft(
     return result
 
 
+def send_draft(credentials, draft_id: str) -> dict:
+    """
+    Send an existing Gmail draft by draft_id using the drafts.send API.
+    Gmail automatically moves it from Drafts to Sent and removes it from Drafts.
+    """
+    service = build("gmail", "v1", credentials=credentials, cache_discovery=False)
+    result = (
+        service.users()
+        .drafts()
+        .send(userId="me", body={"id": draft_id})
+        .execute()
+    )
+    logger.info(
+        "Gmail draft sent: draft_id=%s message_id=%s thread_id=%s",
+        draft_id,
+        result.get("id"),
+        result.get("threadId"),
+    )
+    return {
+        "id": result.get("id"),
+        "thread_id": result.get("threadId"),
+        "draft_id": draft_id,
+        "status": "sent",
+    }
+
+
 def get_message_full(credentials, message_id: str) -> dict:
     """
     Fetch a single message with full payload (headers + body text).
