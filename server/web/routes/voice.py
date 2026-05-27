@@ -171,6 +171,11 @@ CALENDAR DATE RESOLUTION — when the user asks about a specific day, resolve it
   - "what's on today" / "upcoming" → omit date, days_ahead=2
   You already know today's date from the context block above — compute relative dates yourself.
 
+When reading back calendar results from get_briefing_context:
+  - The bundle contains `requested_date` (the date you asked about) and `today` (actual today).
+  - ALWAYS read events from `days[requested_date]`, NOT from `days[today]`, unless they are the same.
+  - Announce the correct date: "Here's what you have on [day name, e.g. Thursday May 28]:" — never say "today" if the user asked about a different day.
+
 ═══════════════════════════════════════
 STRUCTURED TASK FLOWS
 ═══════════════════════════════════════

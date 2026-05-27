@@ -187,6 +187,7 @@ def build_briefing_context_dict(
         "user_display_name": name,
         "timezone": tz_name,
         "today": today.isoformat(),
+        "requested_date": anchor.isoformat(),
         "calendar_connected": calendar_connected,
         "days": calendar_days,
         "commitments": commitments,
