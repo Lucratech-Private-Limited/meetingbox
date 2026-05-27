@@ -27,7 +27,6 @@ from services.mem0_service import (
     mem0_runtime_ready,
     search_context_for_prompt,
 )
-
 logger = logging.getLogger(__name__)
 
 _MAX_ASSISTANT_INTENT_JSON = 24000
@@ -114,7 +113,87 @@ def _fetch_weather_sync() -> dict:
 # ---------------------------------------------------------------------------
 # Web search helper (sync — called from run_in_executor)
 # Primary: Brave Search API (BRAVE_SEARCH_API_KEY env var, free tier 2000/mo)
-# Fallback: DuckDuckGo Instant Answer API (no key, limited to factual answers)
+# ---------------------------------------------------------------------------
+# Google News RSS scraper (free, no key, returns real headlines)
+# ---------------------------------------------------------------------------
+
+def _fetch_google_news_rss_sync(query: str, num_results: int = 6) -> dict | None:
+    """Fetch news results from Google News RSS. Returns None on failure."""
+    try:
+        encoded = query.replace(" ", "+")
+        url = f"https://news.google.com/rss/search?q={encoded}&hl=en&gl=US&ceid=US:en"
+        with httpx.Client(timeout=8.0, follow_redirects=True) as client:
+            resp = client.get(url, headers={"User-Agent": "Mozilla/5.0"})
+            resp.raise_for_status()
+        root = ET.fromstring(resp.text)
+        channel = root.find("channel")
+        if channel is None:
+            return None
+        items = channel.findall("item")
+        results = []
+        for item in items[:num_results]:
+            title = (item.findtext("title") or "").strip()
+            link = (item.findtext("link") or "").strip()
+            source_el = item.find("{https://news.google.com}source") or item.find("source")
+            source_name = source_el.text.strip() if source_el is not None and source_el.text else ""
+            pub_date = (item.findtext("pubDate") or "").strip()
+            if title:
+                snippet = title
+                if source_name:
+                    snippet += f" ({source_name})"
+                if pub_date:
+                    snippet += f" — {pub_date[:22]}"
+                results.append({"title": title, "url": link, "snippet": snippet})
+        if not results:
+            return None
+        return {
+            "source": "google_news_rss",
+            "query": query,
+            "results": results,
+        }
+    except Exception as exc:
+        logger.warning("Google News RSS failed: %s", exc)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# DuckDuckGo HTML scraper (free, no key, general web results)
+# ---------------------------------------------------------------------------
+
+def _fetch_ddg_html_sync(query: str, num_results: int = 5) -> dict | None:
+    """Scrape DuckDuckGo HTML search for snippet-level results. Returns None on failure."""
+    import re
+    try:
+        with httpx.Client(timeout=8.0, follow_redirects=True) as client:
+            resp = client.get(
+                "https://html.duckduckgo.com/html/",
+                params={"q": query},
+                headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"},
+            )
+            resp.raise_for_status()
+        html = resp.text
+        # Extract result snippets using regex on DDG HTML structure
+        snippets = re.findall(r'class="result__snippet"[^>]*>(.*?)</a>', html, re.DOTALL)
+        titles = re.findall(r'class="result__a"[^>]*>(.*?)</a>', html, re.DOTALL)
+        # Strip HTML tags from snippets
+        def strip_tags(s: str) -> str:
+            return re.sub(r"<[^>]+>", "", s).strip()
+        results = []
+        for i, snip in enumerate(snippets[:num_results]):
+            title = strip_tags(titles[i]) if i < len(titles) else ""
+            snippet = strip_tags(snip)
+            if snippet:
+                results.append({"title": title, "snippet": snippet})
+        if not results:
+            return None
+        return {"source": "duckduckgo_html", "query": query, "results": results}
+    except Exception as exc:
+        logger.warning("DDG HTML scrape failed: %s", exc)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Web search — Brave (paid) → Google News RSS → DDG HTML → DDG JSON instant
 # ---------------------------------------------------------------------------
 
 def _fetch_web_search_sync(query: str, num_results: int = 5) -> dict:
@@ -162,9 +241,25 @@ def _fetch_web_search_sync(query: str, num_results: int = 5) -> dict:
         except Exception as exc:
             logger.warning("Brave search failed, falling back to DDG: %s", exc)
 
-    # Fallback: DuckDuckGo Instant Answer API (facts/definitions only, no full web results)
+    # Fallback 1: Google News RSS — best for any news/current-events query
+    news_kw = any(w in query.lower() for w in (
+        "news", "latest", "today", "recent", "update", "headline", "breaking",
+        "ipl", "cricket", "football", "match", "score", "politics", "election",
+        "market", "stock", "economy", "trump", "modi", "government",
+    ))
+    if news_kw:
+        gnews = _fetch_google_news_rss_sync(query, num_results)
+        if gnews:
+            return gnews
+
+    # Fallback 2: DuckDuckGo HTML scraper — general web results
+    ddg_html = _fetch_ddg_html_sync(query, num_results)
+    if ddg_html:
+        return ddg_html
+
+    # Fallback 3: DuckDuckGo Instant Answer JSON (factual lookups only)
     try:
-        with httpx.Client(timeout=8.0, follow_redirects=True) as client:
+        with httpx.Client(timeout=6.0, follow_redirects=True) as client:
             resp = client.get(
                 "https://api.duckduckgo.com/",
                 params={"q": query, "format": "json", "no_redirect": 1, "no_html": 1, "skip_disambig": 1},
@@ -184,23 +279,27 @@ def _fetch_web_search_sync(query: str, num_results: int = 5) -> dict:
             if text:
                 related.append({"snippet": text[:200]})
 
-        if not quick and not related:
+        if quick or related:
             return {
                 "source": "duckduckgo",
                 "query": query,
-                "note": "No instant answer found. Set BRAVE_SEARCH_API_KEY for full web search.",
-                "results": [],
+                "quick_answer": quick,
+                "results": related,
             }
-
-        return {
-            "source": "duckduckgo",
-            "query": query,
-            "quick_answer": quick,
-            "results": related,
-        }
     except Exception as exc:
-        logger.warning("DDG fallback also failed: %s", exc)
-        return {"error": "search_unavailable", "detail": str(exc)}
+        logger.warning("DDG JSON fallback failed: %s", exc)
+
+    # Try Google News RSS for any query as last resort
+    gnews_any = _fetch_google_news_rss_sync(query, num_results)
+    if gnews_any:
+        return gnews_any
+
+    return {
+        "source": "unavailable",
+        "query": query,
+        "note": "All search backends failed. Add BRAVE_SEARCH_API_KEY for reliable results.",
+        "results": [],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -377,7 +476,9 @@ REALTIME_VOICE_TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "mem0_snippet = long-term memory; pending_assistant = queued actions. "
             "Call this (and memory_search if needed) before answering schedule/email/task questions. "
             "Explain results to the user in natural conversational speech—not as raw field names—unless they ask for exact details. "
-            "Use days_ahead>=2 if the user said tomorrow or the next day."
+            "Use days_ahead>=2 if the user said tomorrow or the next day. "
+            "When the user asks about a specific future date (e.g. 'next Tuesday', 'this Friday', 'next week'), "
+            "resolve it to YYYY-MM-DD and pass it as 'date' — do NOT omit it and rely on days_ahead alone."
         ),
         "parameters": {
             "type": "object",
@@ -385,8 +486,17 @@ REALTIME_VOICE_TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "days_ahead": {
                     "type": "integer",
                     "description": (
-                        "Inclusive day count starting today in the user's timezone: 1=today only, "
-                        "2=today+tomorrow, up to 14. Omit to default to today+tomorrow for voice."
+                        "Inclusive day count starting from 'date' (or today if date omitted): "
+                        "1=single day, 2=two days, up to 14. Use 7 for 'next week'. Defaults to 2."
+                    ),
+                },
+                "date": {
+                    "type": "string",
+                    "description": (
+                        "Start date in YYYY-MM-DD format. REQUIRED when the user asks about a specific "
+                        "day other than today (e.g. 'next Tuesday' -> that Tuesday's date, "
+                        "'this Friday' -> this Friday's date, 'next week' -> next Monday's date). "
+                        "Omit only for 'today' or 'upcoming' queries."
                     ),
                 },
             },
@@ -483,6 +593,15 @@ REALTIME_VOICE_TOOL_DEFINITIONS: list[dict[str, Any]] = [
                     "type": "string",
                     "enum": sorted(REALTIME_DEVICE_NAV_SCREENS),
                     "description": "Registered device screen id (matches device-ui Screen.name).",
+                },
+                "target_date": {
+                    "type": "string",
+                    "description": (
+                        "ISO 8601 date (YYYY-MM-DD) to open the calendar on. "
+                        "Only used when screen=calendar. "
+                        "Always resolve relative expressions such as 'next Tuesday', 'this Friday', "
+                        "'31st of May', or 'tomorrow' to an actual YYYY-MM-DD date before passing here."
+                    ),
                 },
             },
             "required": ["screen"],
@@ -661,10 +780,12 @@ def execute_realtime_voice_tool(
                     da = int(raw_da)
                 except (TypeError, ValueError):
                     da = 2
+            raw_date = (args.get("date") or "").strip() or None
             bundle = build_briefing_context_dict(
                 actor=actor,
                 user_id=user_id,
                 days_ahead=da,
+                date=raw_date,
                 mem0_cap=2800,
                 gmail_preview_max=15,
             )
@@ -793,7 +914,12 @@ def execute_realtime_voice_tool(
                         "allowed": sorted(REALTIME_DEVICE_NAV_SCREENS),
                     }
                 )
-            return json.dumps({"ok": True, "device_navigate": raw})
+            payload: dict = {"ok": True, "device_navigate": raw}
+            if raw == "calendar":
+                td = str(args.get("target_date") or "").strip()
+                if td:
+                    payload["target_date"] = td
+            return json.dumps(payload)
 
         if name == "web_search":
             query = str(args.get("query") or "").strip()

@@ -75,6 +75,7 @@ def build_briefing_context_dict(
     actor: dict,
     user_id: str,
     days_ahead: int = 1,
+    date: str | None = None,
     mem0_cap: int = 1200,
     gmail_preview_max: int = 1,
     mem0_briefing_query: str | None = None,
@@ -84,21 +85,32 @@ def build_briefing_context_dict(
 
     gmail_preview_max: Gmail rows to attach (Realtime voice uses >1; SPA default stays 1).
     mem0_briefing_query: override Mem0 briefing search string (None = sensible default).
+    date: ISO date string 'YYYY-MM-DD'. When provided, the calendar window starts on that
+      date instead of today, so "next Tuesday" or "this Friday" return the correct day's events.
     """
-    # da=1 → today only. da=2 → today through tomorrow (included). Voice questions often mean
-    # "tomorrow" while the tool omitted days_ahead; Realtime tooling defaults da=2 in realtime_voice_tools.
     da = max(1, min(int(days_ahead), 14))
     cap = max(0, min(int(mem0_cap), 8000))
 
     tz_name = default_calendar_tz_name()
     zone = ZoneInfo(tz_name)
     today = datetime.now(zone).date()
-    end_day = today + timedelta(days=da - 1)
 
-    time_min = datetime.combine(today, time.min, tzinfo=zone).isoformat()
+    # When a specific date is requested, anchor the window there instead of today.
+    if date:
+        try:
+            from datetime import date as _date
+            anchor = _date.fromisoformat(str(date).strip())
+        except (ValueError, TypeError):
+            anchor = today
+    else:
+        anchor = today
+
+    end_day = anchor + timedelta(days=da - 1)
+
+    time_min = datetime.combine(anchor, time.min, tzinfo=zone).isoformat()
     time_max = datetime.combine(end_day, time(23, 59, 59), tzinfo=zone).isoformat()
 
-    d0, d1 = today, end_day
+    d0, d1 = anchor, end_day
     calendar_days = build_days_map_for_range(d0, d1, [], tz_name)
     calendar_connected = False
     creds_cal = get_credentials_for_provider(user_id, "calendar")
