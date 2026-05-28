@@ -559,6 +559,12 @@ class HomeScreen(BaseScreen):
         self._summary_poll_event: object | None = None
         self._home_cache_subscribed: bool = False
 
+        # Status strip widget refs (Icon instances from components/icons.py)
+        self._sts_battery: object | None = None   # battery Icon
+        self._sts_bat_lbl: Label | None  = None   # "87%" label next to battery icon
+        self._sts_wifi:    object | None = None   # wifi Icon
+        self._sts_bt:      object | None = None   # bluetooth Icon
+
         # Voice interaction widgets and state
         self._listening_pill:    object | None = None  # the pill _Card
         self._soundwave_wf:      _FigmaWaveform | None = None
@@ -630,6 +636,87 @@ class HomeScreen(BaseScreen):
             ))
             sg_btn.bind(on_release=lambda *_: self.goto("settings"))
             root.add_widget(sg_btn)
+
+        # Status strip (battery / WiFi / BT) — anchored to absolute top-right,
+        # above all other Figma elements.  Updates every 30 s.
+        self._build_status_strip(root)
+
+    def _build_status_strip(self, root: FloatLayout) -> None:
+        """Compact canvas-drawn status indicators at absolute top-right.
+
+        Three icons drawn via components/icons.py (no font dependency):
+          [battery rect + fill]  [87%]   [wifi arcs]  [bt symbol]
+        """
+        from kivy.uix.boxlayout import BoxLayout as _BL
+        from components.icons import Icon as _Icon
+
+        _strip_h = max(18, int(DISPLAY_HEIGHT * 0.032))
+        _icon_h  = max(10, int(_strip_h * 0.65))
+        _strip_w = int(DISPLAY_WIDTH * 0.22)
+        _fs      = max(7, int(_strip_h * 0.62))
+        _muted   = (0.55, 0.55, 0.60, 0.80)
+        _on_col  = (0.22, 0.53, 0.98, 0.92)
+        _spacing = max(4, int(_strip_w * 0.04))
+
+        strip = _BL(
+            orientation="horizontal",
+            size_hint=(None, None),
+            width=_strip_w,
+            height=_strip_h,
+            padding=[0, 1, 8, 1],
+            spacing=_spacing,
+            pos_hint={"right": 1.0, "top": 1.0},
+        )
+
+        # Battery icon — rectangle with fill level
+        bat_icon_w = max(20, int(_icon_h * 2.0))
+        self._sts_battery = _Icon(
+            "battery",
+            color=_muted,
+            level=1.0,
+            size_hint=(None, None),
+            size=(bat_icon_w, _icon_h),
+            pos_hint={"center_y": 0.5},
+        )
+        strip.add_widget(self._sts_battery)
+
+        # Percent label next to battery
+        self._sts_bat_lbl = Label(
+            text="--%",
+            font_size=_fs,
+            color=_muted,
+            halign="left",
+            valign="middle",
+            size_hint=(None, 1),
+            width=max(22, int(_strip_w * 0.22)),
+        )
+        self._sts_bat_lbl.bind(size=self._sts_bat_lbl.setter("text_size"))
+        strip.add_widget(self._sts_bat_lbl)
+
+        # WiFi icon
+        wifi_icon_w = max(14, int(_icon_h * 1.1))
+        self._sts_wifi = _Icon(
+            "wifi",
+            color=_muted,
+            size_hint=(None, None),
+            size=(wifi_icon_w, _icon_h),
+            pos_hint={"center_y": 0.5},
+        )
+        strip.add_widget(self._sts_wifi)
+
+        # Bluetooth icon
+        bt_icon_w = max(10, int(_icon_h * 0.75))
+        self._sts_bt = _Icon(
+            "bluetooth",
+            color=_muted,
+            size_hint=(None, None),
+            size=(bt_icon_w, _icon_h),
+            pos_hint={"center_y": 0.5},
+        )
+        strip.add_widget(self._sts_bt)
+
+        root.add_widget(strip)
+        self._status_strip_event: object | None = None
 
     def _build_listening_pill(self, root: FloatLayout) -> None:
         """Voice-state pill  (805.16, 21.19)  302.29 × 76.28.
@@ -1361,6 +1448,14 @@ class HomeScreen(BaseScreen):
                 fit_mode="contain",
             ))
 
+        def _tasks_touch(w, t):
+            lx, ly = w.to_widget(t.x, t.y)
+            if w.collide_point(lx, ly):
+                self.goto("tasks", transition="slide_left")
+                return True
+            return False
+        card.bind(on_touch_up=_tasks_touch)
+
         root.add_widget(card)
         self.tasks_card = _CardData(val_lbl, txt_lbl)
 
@@ -1493,6 +1588,17 @@ class HomeScreen(BaseScreen):
             self._summary_poll_event.cancel()
             self._summary_poll_event = None
 
+        # Status strip — initial load + 30-second refresh
+        if getattr(self, "_status_strip_event", None):
+            self._status_strip_event.cancel()
+        Clock.schedule_once(lambda _dt: self._refresh_status_strip(), 1.5)
+        self._status_strip_event = Clock.schedule_interval(
+            lambda _dt: self._refresh_status_strip(), 30.0
+        )
+
+        # Tasks count badge — fetched from /api/commitments every visit
+        Clock.schedule_once(lambda _dt: self._load_tasks_count(), 2.0)
+
     def on_leave(self):
         # Clean up listening state immediately when leaving home
         self._listening_active = False
@@ -1521,6 +1627,9 @@ class HomeScreen(BaseScreen):
         if self._summary_poll_event:
             self._summary_poll_event.cancel()
             self._summary_poll_event = None
+        if getattr(self, "_status_strip_event", None):
+            self._status_strip_event.cancel()
+            self._status_strip_event = None
         if self._home_cache_subscribed:
             self.app.ui_cache_unsubscribe("home_summary_bundle", self._on_cached_home_summary)
             self._home_cache_subscribed = False
@@ -1831,6 +1940,59 @@ class HomeScreen(BaseScreen):
             self._current_amplitude = amp
 
     # -----------------------------------------------------------------------
+    # Status strip (battery / WiFi / BT icons at absolute top-right)
+    # -----------------------------------------------------------------------
+
+    def _refresh_status_strip(self):
+        """Fetch hardware status in a background thread and update the strip labels."""
+        import threading as _t
+        _t.Thread(target=self._fetch_status_strip, daemon=True).start()
+
+    def _fetch_status_strip(self):
+        try:
+            import hardware as _hw
+            import wifi_nmcli_local as _wifi
+            import bluetooth_local as _bt
+
+            batt    = _hw.get_battery_info()
+            wifi_on = _wifi.get_wifi_radio_enabled()
+            bt_on   = _bt.get_power_state()
+        except Exception:
+            return
+
+        def _apply(_dt):
+            if self._sts_battery is None:
+                return
+
+            pct      = batt.get("percent")
+            charging = batt.get("charging")
+            on_col   = (0.22, 0.53, 0.98, 0.92)   # blue — active
+            off_col  = (0.44, 0.44, 0.46, 0.65)   # gray — inactive
+
+            if pct is not None:
+                level = pct / 100.0
+                bat_col = (
+                    (0.22, 0.80, 0.35, 0.88) if level > 0.50 else
+                    (0.95, 0.65, 0.10, 0.88) if level > 0.20 else
+                    (0.95, 0.25, 0.20, 0.88)
+                )
+                self._sts_battery.set_color(bat_col)
+                self._sts_battery.set_level(level)
+                chg_sfx = "+" if charging else ""
+                self._sts_bat_lbl.text = f"{pct}%{chg_sfx}"
+                self._sts_bat_lbl.color = bat_col
+            else:
+                self._sts_battery.set_level(1.0)
+                self._sts_battery.set_color(off_col)
+                self._sts_bat_lbl.text = "AC"
+                self._sts_bat_lbl.color = off_col
+
+            self._sts_wifi.set_color(on_col if wifi_on else off_col)
+            self._sts_bt.set_color(on_col if bt_on else off_col)
+
+        Clock.schedule_once(_apply, 0)
+
+    # -----------------------------------------------------------------------
     # Clock labels
     # -----------------------------------------------------------------------
 
@@ -1891,6 +2053,30 @@ class HomeScreen(BaseScreen):
                     # navigate away and back.
                     Clock.schedule_once(lambda _dt2: self._load_system_status(), 30.0)
                 Clock.schedule_once(_backend_offline, 0)
+
+        run_async(_fetch())
+
+    # -----------------------------------------------------------------------
+    # Tasks count badge (independent fetch from /api/commitments)
+    # -----------------------------------------------------------------------
+
+    def _load_tasks_count(self) -> None:
+        """Fetch the real open-task count and update the Tasks chip on the home screen."""
+        async def _fetch():
+            try:
+                result = await self.backend.get_commitments(status="", limit=200)
+                rows: list = result.get("commitments") or []
+                count = sum(
+                    1 for r in rows
+                    if (r.get("status") or "").lower() not in ("completed", "cancelled", "canceled")
+                )
+            except Exception:
+                return
+
+            def _apply(_dt):
+                if self.tasks_card is not None:
+                    self.tasks_card.value_label.text = str(count) if count else "0"
+            Clock.schedule_once(_apply, 0)
 
         run_async(_fetch())
 
