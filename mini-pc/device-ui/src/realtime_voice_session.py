@@ -71,10 +71,14 @@ REALTIME_VOICE_IMPLEMENTED = True
 _REALTIME_WS_HOST = "api.openai.com"
 _REALTIME_RATE = 24000
 
-# Mic chunk duration. Smaller chunks let the server VAD see speech edges
-# sooner, which directly reduces the latency between user-stops and
-# response-starts. 5 ms = 240 bytes per chunk at 24 kHz mono PCM16.
-_APPEND_CHUNK_MS = 5
+# Mic chunk duration. Smaller chunks help the server VAD see speech edges
+# sooner, but 5 ms (200 callbacks/s at 48 kHz capture) overwhelms the
+# asyncio executor on this hardware and produces persistent PortAudio
+# `input overflow` warnings — dropped samples in the middle of a word
+# corrupt both STT and the speech-to-speech model's input. 20 ms is the
+# sweet spot: 50 callbacks/s sustains cleanly, while only adding ~15 ms
+# to the user-stop → response-start latency vs 5 ms.
+_APPEND_CHUNK_MS = 20
 
 # How often the mic pump polls the audio queue. Kept tight so the
 # event loop never sleeps long enough to delay a flush.
@@ -95,19 +99,33 @@ _SESSION_IDLE_CLOSE_S = 40.0
 
 _REALTIME_OUTPUT_VOICE_FALLBACK = "marin"
 
-# STT model for the user-speech transcript stream (used by the UI
-# overlay, farewell detection, and grammar correction). The full
-# gpt-4o-transcribe is significantly more accurate than the mini
-# variant on short conversational phrases that were being misheard
-# (e.g. "alright thanks" -> "Aller"), at the cost of a small extra
-# latency that we hide behind the speech-stopped placeholder.
-_DEFAULT_INPUT_TRANSCRIPTION_MODEL = "gpt-4o-transcribe"
-_INPUT_TRANSCRIPTION_PROMPT = (
-    "Conversational English with a MeetingBox voice assistant. Common "
-    "phrases include: alright thanks, okay bye, thank you, goodbye, "
-    "see you later, that's all, yes please, no thanks, what's on my "
-    "calendar, show me my emails, schedule a meeting, set a reminder."
+# When True, the device sends a small response.create right after the
+# session is configured so the model greets the user (e.g. "Hey, how can I
+# help you?"). This gives a consistent verbal "I'm listening" cue after the
+# wake word triggers, instead of silence until the user speaks again.
+# The greeting is interruptible (interrupt_response stays true), so if the
+# user is already mid-sentence after the wake word it gets pre-empted
+# naturally without dead air.
+_REALTIME_WAKE_GREETING_ENABLED = os.environ.get(
+    "REALTIME_WAKE_GREETING_ENABLED", "1"
+).strip().lower() not in ("", "0", "false", "no", "off")
+
+_REALTIME_WAKE_GREETING_INSTRUCTIONS = (
+    "Open with exactly one short greeting sentence to confirm you are "
+    "listening, max six words. Vary it naturally between phrasings like "
+    "'Hey, how can I help you?', 'Yes, I'm listening', 'Hi, what do you "
+    "need?', 'Go ahead.', 'I'm here.'. Then immediately stop and wait for "
+    "the user's request. Do NOT introduce yourself, list capabilities, "
+    "mention tools, or read out today's date / weather / schedule unless "
+    "the user explicitly asks."
 )
+
+# STT model for the user-speech transcript stream (used by the UI
+# overlay, farewell detection, and grammar correction). Keep this on
+# Whisper so realtime voice follows the same STT model family as meetings.
+_DEFAULT_INPUT_TRANSCRIPTION_MODEL = "whisper-1"
+# Deliberately neutral — see server/web/routes/voice.py for the rationale.
+_INPUT_TRANSCRIPTION_PROMPT = "Conversational English."
 
 
 # ---------------------------------------------------------------------------
@@ -281,6 +299,8 @@ class RealtimeVoiceSession:
         on_ai_transcript=None,
         on_ai_transcript_delta=None,
         on_user_speech_stopped=None,
+        on_email_draft=None,
+        on_recipient_picker=None,
     ):
         self._client_secret = (client_secret or "").strip()
         self._model = (model or "").strip()
@@ -296,6 +316,8 @@ class RealtimeVoiceSession:
         self._on_ai_transcript_cb = on_ai_transcript
         self._on_ai_transcript_delta_cb = on_ai_transcript_delta
         self._on_user_speech_stopped_cb = on_user_speech_stopped
+        self._on_email_draft_cb = on_email_draft
+        self._on_recipient_picker_cb = on_recipient_picker
         self._output_voice = (
             (output_voice or "").strip().lower()
             or _REALTIME_OUTPUT_VOICE_FALLBACK
@@ -374,6 +396,10 @@ class RealtimeVoiceSession:
         # Tools we received from the server in session.created. Cached so
         # we can re-send them in session.update with end_session appended.
         self._server_tools: list[dict] = []
+
+        # Set once the wake-word greeting response.create has been emitted
+        # for this session, so we never send it twice.
+        self._wake_greeting_sent: bool = False
 
         # State exposed to the UI / idle watchdog
         self._state = "idle"            # idle | listening | thinking | speaking
@@ -491,7 +517,85 @@ class RealtimeVoiceSession:
         screen = data.get("device_navigate")
         if not isinstance(screen, str) or not screen.strip():
             return
-        Clock.schedule_once(lambda _dt: self._safe_call(cb, screen.strip()), 0)
+        target_date = None
+        target_date_str = data.get("target_date")
+        if target_date_str:
+            try:
+                from datetime import date as _date
+                target_date = _date.fromisoformat(str(target_date_str).strip())
+            except (ValueError, TypeError):
+                pass
+        Clock.schedule_once(lambda _dt: self._safe_call(cb, screen.strip(), target_date), 0)
+
+    def _emit_email_draft(self, tool_output_json: str) -> None:
+        """Forward a show_email_draft directive payload to the UI."""
+        cb = self._on_email_draft_cb
+        if not cb:
+            return
+        try:
+            data = json.loads(tool_output_json)
+        except (json.JSONDecodeError, TypeError):
+            return
+        if not isinstance(data, dict) or not data.get("ok"):
+            return
+        draft = data.get("device_email_draft")
+        if not isinstance(draft, dict):
+            return
+        Clock.schedule_once(lambda _dt: self._safe_call(cb, draft), 0)
+
+    def _emit_recipient_picker(self, tool_output_json: str) -> None:
+        """Forward a show_recipient_picker directive payload to the UI."""
+        cb = self._on_recipient_picker_cb
+        if not cb:
+            return
+        try:
+            data = json.loads(tool_output_json)
+        except (json.JSONDecodeError, TypeError):
+            return
+        if not isinstance(data, dict) or not data.get("ok"):
+            return
+        picker = data.get("device_recipient_picker")
+        if not isinstance(picker, dict):
+            return
+        query = str(picker.get("query") or "")
+        candidates = picker.get("candidates")
+        if not isinstance(candidates, list):
+            candidates = []
+        Clock.schedule_once(
+            lambda _dt: self._safe_call(cb, query, candidates), 0
+        )
+
+    def send_user_text(self, text: str) -> None:
+        """Inject a user turn into the live session (e.g. from a screen tap).
+
+        Creates a conversation item with the given text and asks the model to
+        respond, so a touch interaction is treated exactly like the user having
+        said it aloud — keeping the assistant in control of the email workflow.
+        Safe to call from the Kivy main thread.
+        """
+        msg = (text or "").strip()
+        loop, ws = self._loop, self._ws
+        if not msg or loop is None or ws is None or loop.is_closed():
+            return
+
+        async def _send():
+            try:
+                await ws.send(json.dumps({
+                    "type": "conversation.item.create",
+                    "item": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": msg}],
+                    },
+                }))
+                await ws.send(json.dumps({"type": "response.create"}))
+            except Exception:
+                logger.warning("Realtime send_user_text failed", exc_info=True)
+
+        try:
+            asyncio.run_coroutine_threadsafe(_send(), loop)
+        except Exception:
+            logger.debug("send_user_text schedule failed", exc_info=True)
 
     @staticmethod
     def _safe_call(cb, *args) -> None:
@@ -950,6 +1054,28 @@ class RealtimeVoiceSession:
 
                 elif t == "session.updated":
                     self._log_session_summary(msg, label="session.updated")
+                    # Fire the wake-word greeting once per session, right
+                    # after our session.update is acknowledged so the model
+                    # has its full tool list + voice config. Interruptible,
+                    # so a user already mid-sentence pre-empts it cleanly.
+                    if (
+                        _REALTIME_WAKE_GREETING_ENABLED
+                        and not self._wake_greeting_sent
+                    ):
+                        self._wake_greeting_sent = True
+                        try:
+                            await ws.send(json.dumps({
+                                "type": "response.create",
+                                "response": {
+                                    "instructions": _REALTIME_WAKE_GREETING_INSTRUCTIONS,
+                                },
+                            }))
+                            logger.info("Realtime: wake-word greeting sent")
+                        except Exception:
+                            logger.warning(
+                                "Realtime: wake-word greeting send failed",
+                                exc_info=True,
+                            )
 
                 # ---- User speech --------------------------------------
                 elif t == "input_audio_buffer.speech_started":
@@ -961,11 +1087,21 @@ class RealtimeVoiceSession:
                     self._suppress_audio_until = (
                         time.monotonic() + _BARGE_IN_SUPPRESS_AUDIO_S
                     )
-                    # Drop the queued AEC far-end reference: the audio it
-                    # represents is no longer going to the speaker.
+                    # Trim — do NOT fully clear — the AEC far-end reference.
+                    # aplay still has ~70 ms buffered and the room contributes
+                    # ~50–150 ms of reflections, so the assistant's tail audio
+                    # keeps reaching the mic for a short while after we kill
+                    # playback. Fully clearing the reference leaves AEC with
+                    # nothing to subtract, and the user's barge-in mic frames
+                    # arrive contaminated with the assistant's own voice —
+                    # which then mistranscribes and biases the realtime model.
+                    # Retain ~300 ms of far-end so AEC keeps suppressing the
+                    # tail; older samples are discarded.
                     if self._aec is not None:
+                        retain_bytes = int(_REALTIME_RATE * 0.3) * 2  # 300 ms PCM16
                         with self._aec_buf_lock:
-                            self._aec_far_buf.clear()
+                            if len(self._aec_far_buf) > retain_bytes:
+                                del self._aec_far_buf[: len(self._aec_far_buf) - retain_bytes]
                     self._emit_state("listening")
 
                 elif t == "input_audio_buffer.speech_stopped":
@@ -1259,6 +1395,10 @@ class RealtimeVoiceSession:
 
             if name == "navigate_device_ui":
                 self._emit_device_navigation(out)
+            elif name == "show_email_draft":
+                self._emit_email_draft(out)
+            elif name == "show_recipient_picker":
+                self._emit_recipient_picker(out)
 
             pending.append({
                 "type": "conversation.item.create",

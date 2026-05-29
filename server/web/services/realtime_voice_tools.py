@@ -657,6 +657,391 @@ REALTIME_VOICE_TOOL_DEFINITIONS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "name": "convert_currency",
+        "description": (
+            "Convert an amount between two currencies at live daily rates (open.er-api.com). "
+            "Call instantly whenever the user asks 'how much is X in Y', 'convert 100 USD to INR', "
+            "'rupee to dollar', 'price in euros', etc. Accepts common names (dollar, rupee, euro, "
+            "pound, yen) or ISO codes (USD, INR, EUR, GBP, JPY)."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "amount": {
+                    "type": "number",
+                    "description": "Numeric amount to convert. Defaults to 1 if the user just asks for a rate.",
+                },
+                "from": {
+                    "type": "string",
+                    "description": "Source currency (e.g. 'USD', 'rupee', '$').",
+                },
+                "to": {
+                    "type": "string",
+                    "description": "Target currency (e.g. 'INR', 'euro', '£').",
+                },
+            },
+            "required": ["from", "to"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "get_stock_price",
+        "description": (
+            "Get a live stock / index quote from Yahoo Finance. Works for US tickers "
+            "(AAPL, TSLA, MSFT), Indian NSE/BSE tickers (RELIANCE.NS, TATASTEEL.NS, INFY.BO), and "
+            "indices (^NSEI for Nifty, ^BSESN for Sensex, ^GSPC for S&P 500). The agent should "
+            "accept either the ticker symbol OR the plain company name — common Indian names like "
+            "'Tata Steel', 'Reliance', 'TCS', 'Infosys', 'Nifty', 'Sensex' resolve automatically. "
+            "Returns the current price, % change vs previous close, currency, and exchange. "
+            "Use this tool — DO NOT fall back to web_search — for any price / quote / 'how much is X "
+            "trading at' / 'XYZ share price' query."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "ticker": {
+                    "type": "string",
+                    "description": "Ticker symbol or recognizable company / index name (e.g. 'AAPL', 'TATASTEEL.NS', 'Tata Steel', 'Nifty', 'Sensex').",
+                },
+            },
+            "required": ["ticker"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "get_sports_score",
+        "description": (
+            "Get the latest score / result for a sports match (cricket, football, basketball, etc.). "
+            "Call whenever the user asks about a match, game, score, result, or league standing — "
+            "'India vs Australia score', 'Man United latest match', 'IPL today', 'world cup standings'. "
+            "Pass the user's exact phrasing as the query — the tool augments it for relevance."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Free-form match / team / league query (e.g. 'India vs Australia ODI today', 'Premier League standings').",
+                },
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "find_research_paper",
+        "description": (
+            "Search Semantic Scholar for academic / research papers by free-text query. "
+            "Use this — NOT web_search — whenever the user asks about a research paper, citation, "
+            "academic work, peer-reviewed study, conference paper (ICCV / NeurIPS / CVPR etc.), or "
+            "wants citations / references on a topic. Returns title, authors, year, venue, "
+            "citation count, abstract, DOI, and PDF link when available."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Paper title, topic, or author name (e.g. 'Placeit3D language guided object placement', 'attention is all you need').",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "How many results to fetch (default 5, max 10).",
+                },
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "deep_research",
+        "description": (
+            "Multi-source web research with cited synthesis. Plans 3 focused sub-queries by default "
+            "(shallow depth — fast and cheap), fetches results from each, and asks Claude to "
+            "synthesize a single answer with [1] [2] citation markers and a source list. "
+            "Use ONLY when the user explicitly asks to 'research X', 'deep dive on X', 'investigate X', "
+            "'compare X and Y', or asks a question broad enough that one web_search won't cover it. "
+            "Default to shallow depth. Upgrade only when the user says 'deep dive', 'comprehensive', "
+            "'thorough', 'in-depth', or 'exhaustive'."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "topic": {
+                    "type": "string",
+                    "description": "The research topic in the user's words.",
+                },
+                "depth": {
+                    "type": "string",
+                    "enum": ["shallow", "medium", "deep"],
+                    "description": "How thorough to go. Default 'shallow' (3 sub-queries, ~200 words). Only upgrade on explicit user cues.",
+                },
+            },
+            "required": ["topic"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "create_task",
+        "description": (
+            "Add a single task / to-do / reminder to the user's task list. Use this for any phrasing like "
+            "'add a task', 'remind me to', 'note that', 'add to my list', 'save as task', 'follow up on'. "
+            "FAITHFULNESS RULES (strict): "
+            "(1) title must be a ≤8-word paraphrase of what the user said — keep the verb and the object, "
+            "drop filler. Never invent. "
+            "(2) due_date only when the user explicitly mentions a date ('tomorrow', 'by Friday', "
+            "'on the 15th'). Resolve to YYYY-MM-DD before passing. If no date, OMIT due_date — the task "
+            "lands in the Unplanned bucket. "
+            "(3) description is empty unless the user spoke a clear description. Never invent details. "
+            "DUPLICATE CHECK: this tool checks for similar active tasks first. If one exists, it returns "
+            "{warning: 'similar_task_exists', ...} WITHOUT creating. The agent must read out the existing "
+            "task to the user and ask 'add anyway, or update the existing one?' before calling again "
+            "with confirm_duplicate=true."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "title": {
+                    "type": "string",
+                    "description": "Task header — ≤8-word paraphrase of the user's request (e.g. 'Call John about proposal').",
+                },
+                "due_date": {
+                    "type": "string",
+                    "description": "Optional ISO date YYYY-MM-DD. Set ONLY when the user explicitly mentioned a date. Resolve 'tomorrow', 'Friday', 'next Monday' to a real date.",
+                },
+                "description": {
+                    "type": "string",
+                    "description": "Optional detail. Only set if the user spoke an explicit description. Never invent.",
+                },
+                "confirm_duplicate": {
+                    "type": "boolean",
+                    "description": "Set true only after the user has verbally confirmed 'add anyway' despite a similar task existing.",
+                },
+            },
+            "required": ["title"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "list_tasks",
+        "description": (
+            "Read the user's tasks. Use when they ask 'show my tasks', 'what's on my list', "
+            "'any tasks today', 'unplanned tasks', 'pending tasks', etc. Returns title, id, due_at, "
+            "status, detail, source for each task. Filter by status when relevant."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "status": {
+                    "type": "string",
+                    "enum": ["active", "snoozed", "completed", "cancelled", "all"],
+                    "description": "Status filter. Default: open (active + snoozed). Use 'all' for full history.",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max tasks to return (1-100). Default 30.",
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "name": "update_task",
+        "description": (
+            "Update an existing task: mark completed, cancel/delete, snooze, or set/change a due date. "
+            "Use when the user says 'mark X done', 'cancel that task', 'snooze X for tomorrow', "
+            "'set X to Friday', or 'I finished X'. You must identify the task either by task_id "
+            "(preferred — get it from list_tasks first) or by title_match (a few words from the title). "
+            "Title-match resolves to the closest active task; if multiple match, returns the candidates "
+            "and asks the agent to disambiguate."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "task_id": {
+                    "type": "string",
+                    "description": "Exact task id from list_tasks (preferred way to identify).",
+                },
+                "title_match": {
+                    "type": "string",
+                    "description": "Fallback: a few words from the task title to match fuzzily (e.g. 'call John').",
+                },
+                "status": {
+                    "type": "string",
+                    "enum": ["completed", "cancelled", "snoozed", "active"],
+                    "description": "New status. 'completed' for done, 'cancelled' for delete, 'snoozed' to defer, 'active' to un-snooze.",
+                },
+                "due_date": {
+                    "type": "string",
+                    "description": "Optional ISO date YYYY-MM-DD to set as the new due_at (use this for 'set X to Friday' or 'change deadline').",
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "name": "extract_tasks_from_emails",
+        "description": (
+            "Scan the user's recent emails for action items where the user is the named actionee, and "
+            "return them as PROPOSED tasks (not saved). The agent must read each proposal aloud and "
+            "wait for verbal confirmation before calling create_task for each accepted one. "
+            "Use ONLY when the user explicitly says 'any tasks in my inbox?', 'turn that email into "
+            "a task', 'extract tasks from emails', or similar."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Optional Gmail search query to narrow the scan (e.g. 'from:boss', 'subject:project'). Empty = recent inbox.",
+                },
+                "max_emails": {
+                    "type": "integer",
+                    "description": "How many recent emails to scan (1-15). Default 5.",
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "name": "lookup_email_contacts",
+        "description": (
+            "Look up known email addresses for a person by name or partial email. "
+            "Call this BEFORE drafting or sending any email when the user gives only a name "
+            "(e.g. 'email vivek', 'draft mail to priya'). Returns up to 5 matching contacts "
+            "sorted by how often the user has interacted with them. "
+            "If matches are found, read them out and ask: "
+            "'I have these addresses for [name] — (1) email1 (2) email2. Is it one of these, or a different address?' "
+            "If no matches are found, ask the user to spell out the address."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "The person's name or partial email to search (e.g. 'vivek', 'priya', 'gmail.com').",
+                },
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "show_recipient_picker",
+        "description": (
+            "RESOLVE AND CONFIRM an email recipient the user referred to by NAME. This is the "
+            "REQUIRED first step whenever the user wants to email / draft / reply / forward to a "
+            "person without spelling the full address (e.g. 'email Rahul', 'draft a mail to Neha'). "
+            "The server searches ALL known contact sources (sent mail, received mail, draft "
+            "recipients, calendar attendees) ranked by interaction frequency, and displays the "
+            "matching contacts as tappable cards on the device screen so the user can confirm by "
+            "voice OR touch. "
+            "CRITICAL: you MUST call this and wait for the user to confirm BEFORE drafting — never "
+            "assume a recipient, even when only one match exists. "
+            "Behavior based on the returned 'count': "
+            "1 match -> say e.g. 'I found [Name] at [email] — is that the right person?' and wait for "
+            "a yes / tap. "
+            ">1 match -> say e.g. 'I found a few: (1) [Name] [email], (2) [Name] [email]. Which one?' "
+            "and wait for a spoken choice ('the first one' / a name) or a tap. "
+            "0 matches -> say EXACTLY 'Sorry, I couldn't find anyone by that name. Could you tell me "
+            "their email address?', take the dictated address, then call remember_contact. "
+            "For 'email Rahul and Neha', call show_recipient_picker once per person and confirm each "
+            "before continuing."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "The person's name (or partial name/email) the user said, e.g. 'Rahul', 'Neha Sharma'.",
+                },
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "remember_contact",
+        "description": (
+            "Validate and save a NEW email contact for future use. Call this after the user dictates "
+            "an email address for a person you could not find with show_recipient_picker, so the "
+            "address is remembered next time. The server validates the address format and stores it "
+            "in the user's known contacts. If the address is invalid it returns an error — re-ask the "
+            "user to repeat it. Always read the address back letter-by-letter for confirmation before "
+            "using it in a draft."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "The person's display name as the user referred to them (e.g. 'Rahul', 'Neha Sharma').",
+                },
+                "email": {
+                    "type": "string",
+                    "description": "The full email address the user dictated (e.g. 'rahul@company.com').",
+                },
+            },
+            "required": ["email"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "show_email_draft",
+        "description": (
+            "Display or update the email draft popup on the device screen. This popup is the PRIMARY "
+            "review surface for emails — the user reads the draft here, you do NOT read the full body "
+            "aloud. Call it as you compose so fields appear progressively (recipient first, then "
+            "subject, then body) and again after any edit so the screen always matches the live draft. "
+            "Keep your spoken reply SHORT (e.g. 'I've drafted the email.', 'The draft is ready for "
+            "review.', 'Updated.'). "
+            "Pass only confirmed recipients. Leave cc / bcc empty unless the user asked for them — "
+            "empty cc/bcc rows are hidden and their space is given to the body. "
+            "Set 'state' to reflect the lifecycle: 'drafting' while composing/editing, 'ready' once "
+            "the draft is complete and awaiting the user's decision, 'sent' after an approved send, "
+            "'saved' after saving to Gmail drafts, 'discarded' if the user discards it. "
+            "Never use this tool to send — sending still requires the normal approval flow."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "state": {
+                    "type": "string",
+                    "enum": ["drafting", "ready", "sending", "sent", "saved", "discarded"],
+                    "description": "Lifecycle state of the draft. Default 'drafting'.",
+                },
+                "to": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Confirmed To recipients (email addresses, optionally 'Name <email>').",
+                },
+                "cc": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Cc recipients. Omit or leave empty unless the user asked for cc.",
+                },
+                "bcc": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Bcc recipients. Omit or leave empty unless the user asked for bcc.",
+                },
+                "subject": {
+                    "type": "string",
+                    "description": "The email subject line.",
+                },
+                "body": {
+                    "type": "string",
+                    "description": "The full email body text as composed so far.",
+                },
+                "draft_id": {
+                    "type": "string",
+                    "description": "Optional Gmail draft id once a draft has been created/updated.",
+                },
+            },
+        },
+    },
 ]
 
 
@@ -723,6 +1108,63 @@ def _needs_task_clarification(message: str) -> str | None:
         if not any(k in m for k in ("at ", "tomorrow", "today", "next ", "on ", "in ")):
             return "Got it. What should I remind you about, and when should I remind you?"
     return None
+
+
+import email.utils as _email_utils
+import re as _re
+
+_EMAIL_RE = _re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def _parse_email_address(raw: str) -> tuple[str, str]:
+    """Parse 'Name <addr>' or a bare address. Returns (name, lowercased_email) or ('', '')."""
+    try:
+        name, addr = _email_utils.parseaddr(raw or "")
+        addr = (addr or "").strip().lower()
+        if addr and _EMAIL_RE.match(addr):
+            return name.strip(), addr
+    except Exception:
+        pass
+    return "", ""
+
+
+def _normalize_recipient_list(value: Any) -> list[dict[str, str]]:
+    """Normalize a To/Cc/Bcc value into a list of {name, email} dicts.
+
+    Accepts a list of strings ('addr' or 'Name <addr>'), a comma-separated
+    string, or a list of {name,email} dicts. Invalid entries are dropped.
+    """
+    items: list[Any] = []
+    if value is None:
+        return []
+    if isinstance(value, str):
+        items = [p for p in value.split(",")]
+    elif isinstance(value, (list, tuple)):
+        items = list(value)
+    else:
+        items = [value]
+
+    out: list[dict[str, str]] = []
+    for item in items:
+        if isinstance(item, dict):
+            addr = str(item.get("email") or "").strip()
+            disp = str(item.get("name") or "").strip()
+            pname, paddr = _parse_email_address(addr)
+            if paddr:
+                out.append({"name": disp or pname, "email": paddr})
+            elif addr:
+                # Keep an as-yet-unvalidated address so the UI can still show it.
+                out.append({"name": disp, "email": addr.strip().lower()})
+        else:
+            raw = str(item or "").strip()
+            if not raw:
+                continue
+            pname, paddr = _parse_email_address(raw)
+            if paddr:
+                out.append({"name": pname, "email": paddr})
+            else:
+                out.append({"name": "", "email": raw.lower()})
+    return out
 
 
 def execute_realtime_voice_tool(
@@ -938,6 +1380,357 @@ def execute_realtime_voice_tool(
                 category = "top"
             result = _fetch_news_sync(category=category)
             return json.dumps(result)
+
+        if name == "convert_currency":
+            from services.research import fetch_currency_convert_sync
+            try:
+                amount = float(args.get("amount") if args.get("amount") not in (None, "") else 1.0)
+            except (TypeError, ValueError):
+                amount = 1.0
+            frm = str(args.get("from") or args.get("from_currency") or "").strip()
+            to = str(args.get("to") or args.get("to_currency") or "").strip()
+            if not frm or not to:
+                return json.dumps({"error": "missing_currency", "detail": "Both 'from' and 'to' are required."})
+            try:
+                result = fetch_currency_convert_sync(amount=amount, from_ccy=frm, to_ccy=to)
+            except Exception as exc:
+                logger.warning("convert_currency failed: %s", exc)
+                return json.dumps({"error": "currency_unavailable", "detail": str(exc)})
+            return json.dumps(result, default=str)
+
+        if name == "get_stock_price":
+            from services.research import fetch_stock_price_sync
+            ticker = str(args.get("ticker") or args.get("symbol") or "").strip()
+            if not ticker:
+                return json.dumps({"error": "ticker_required"})
+            try:
+                result = fetch_stock_price_sync(ticker)
+            except Exception as exc:
+                logger.warning("get_stock_price failed: %s", exc)
+                return json.dumps({"error": "stock_unavailable", "ticker": ticker, "detail": str(exc)})
+            return json.dumps(result, default=str)
+
+        if name == "get_sports_score":
+            from services.research import fetch_sports_score_sync
+            q = str(args.get("query") or args.get("match") or "").strip()
+            if not q:
+                return json.dumps({"error": "query_required"})
+            try:
+                result = fetch_sports_score_sync(q)
+            except Exception as exc:
+                logger.warning("get_sports_score failed: %s", exc)
+                return json.dumps({"error": "sports_unavailable", "query": q, "detail": str(exc)})
+            return json.dumps(result, default=str)
+
+        if name == "find_research_paper":
+            from services.research import fetch_research_paper_sync
+            q = str(args.get("query") or args.get("topic") or "").strip()
+            if not q:
+                return json.dumps({"error": "query_required"})
+            try:
+                limit = int(args.get("limit") or 5)
+            except (TypeError, ValueError):
+                limit = 5
+            try:
+                result = fetch_research_paper_sync(query=q, limit=limit)
+            except Exception as exc:
+                logger.warning("find_research_paper failed: %s", exc)
+                return json.dumps({"error": "paper_search_unavailable", "query": q, "detail": str(exc)})
+            return json.dumps(result, default=str)
+
+        if name == "deep_research":
+            from services.research import fetch_deep_research_sync
+            topic = str(args.get("topic") or args.get("query") or "").strip()
+            if not topic:
+                return json.dumps({"error": "topic_required"})
+            depth = str(args.get("depth") or "shallow").strip().lower()
+            if depth not in ("shallow", "medium", "deep"):
+                depth = "shallow"
+            try:
+                result = fetch_deep_research_sync(topic=topic, depth=depth, original_message=topic)
+            except Exception as exc:
+                logger.warning("deep_research failed: %s", exc)
+                return json.dumps({"error": "deep_research_unavailable", "topic": topic, "detail": str(exc)})
+            return json.dumps(result, default=str)
+
+        if name == "create_task":
+            from services.tasks_service import (
+                voice_create_task,
+                TaskFidelityError,
+                SimilarTaskExistsError,
+            )
+            title = str(args.get("title") or "").strip()
+            if not title:
+                return json.dumps({"error": "title_required"})
+            due_raw = str(args.get("due_date") or args.get("due_at") or "").strip()
+            desc_raw = str(args.get("description") or args.get("detail") or "").strip()
+            confirm_dupe = bool(args.get("confirm_duplicate"))
+            try:
+                row = voice_create_task(
+                    user_id=user_id,
+                    title=title,
+                    due_date=due_raw or None,
+                    description=desc_raw or None,
+                    confirm_duplicate=confirm_dupe,
+                    source="voice",
+                )
+            except SimilarTaskExistsError as exc:
+                return json.dumps(
+                    {
+                        "warning": "similar_task_exists",
+                        "similar_task": exc.similar,
+                        "message": (
+                            "A similar task already exists. Read the existing task's title back to "
+                            "the user and ask whether to add this as a new task or update the "
+                            "existing one. Call create_task again with confirm_duplicate=true if "
+                            "the user wants a new task; or call update_task with the existing "
+                            "task_id if they want to update it."
+                        ),
+                        "truth_status": {"writes_committed": False, "note": "No task created."},
+                    },
+                    default=str,
+                )
+            except TaskFidelityError as exc:
+                return json.dumps({"error": "task_fidelity", "detail": str(exc)})
+            except Exception as exc:
+                logger.warning("create_task failed: %s", exc)
+                return json.dumps({"error": "task_create_failed", "detail": str(exc)})
+            return json.dumps(
+                {
+                    "task": {
+                        "id": row.get("id"),
+                        "title": row.get("title"),
+                        "due_at": row.get("due_at"),
+                        "status": row.get("status"),
+                        "detail": row.get("detail"),
+                    },
+                    "truth_status": {
+                        "writes_committed": True,
+                        "note": "Task saved to user_commitments.",
+                    },
+                },
+                default=str,
+            )
+
+        if name == "list_tasks":
+            from tools.commitments_tool import commitment_list_for_user
+            from tools.base_tool import ToolError as _ToolErrLocal
+            status_raw = str(args.get("status") or "").strip().lower()
+            try:
+                lim = int(args.get("limit") or 30)
+            except (TypeError, ValueError):
+                lim = 30
+            try:
+                res = commitment_list_for_user(
+                    user_id, max_results=lim, status=status_raw
+                )
+            except _ToolErrLocal as exc:
+                return json.dumps({"error": "list_tasks_failed", "detail": str(exc)})
+            tasks = [
+                {
+                    "id": r.get("id"),
+                    "title": r.get("title"),
+                    "due_at": r.get("due_at"),
+                    "status": r.get("status"),
+                    "detail": (r.get("detail") or "")[:200],
+                    "source": r.get("source"),
+                }
+                for r in (res.get("commitments") or [])
+            ]
+            return json.dumps(
+                {"tasks": tasks, "count": len(tasks)},
+                default=str,
+            )
+
+        if name == "update_task":
+            from services.tasks_service import (
+                voice_update_task,
+                TaskNotFoundError,
+                AmbiguousTaskMatchError,
+                TaskFidelityError,
+            )
+            task_id = str(args.get("task_id") or "").strip() or None
+            title_match = str(args.get("title_match") or "").strip() or None
+            status_new = str(args.get("status") or "").strip().lower() or None
+            due_new = str(args.get("due_date") or args.get("due_at") or "").strip() or None
+            if not task_id and not title_match:
+                return json.dumps(
+                    {"error": "id_or_title_match_required", "detail": "Pass task_id or title_match."}
+                )
+            if not status_new and not due_new:
+                return json.dumps(
+                    {"error": "nothing_to_update", "detail": "Pass status and/or due_date."}
+                )
+            try:
+                row = voice_update_task(
+                    user_id=user_id,
+                    task_id=task_id,
+                    title_match=title_match,
+                    status=status_new,
+                    due_date=due_new,
+                )
+            except TaskNotFoundError:
+                return json.dumps(
+                    {
+                        "error": "task_not_found",
+                        "detail": "No matching task found. Try list_tasks first to find the right one.",
+                    }
+                )
+            except AmbiguousTaskMatchError as exc:
+                return json.dumps(
+                    {
+                        "warning": "ambiguous_match",
+                        "candidates": exc.candidates,
+                        "message": (
+                            "Multiple tasks match — read the candidate titles to the user and ask "
+                            "which one they meant, then call update_task with task_id."
+                        ),
+                    },
+                    default=str,
+                )
+            except TaskFidelityError as exc:
+                return json.dumps({"error": "task_fidelity", "detail": str(exc)})
+            except Exception as exc:
+                logger.warning("update_task failed: %s", exc)
+                return json.dumps({"error": "task_update_failed", "detail": str(exc)})
+            return json.dumps(
+                {
+                    "task": {
+                        "id": row.get("id"),
+                        "title": row.get("title"),
+                        "due_at": row.get("due_at"),
+                        "status": row.get("status"),
+                    },
+                    "truth_status": {"writes_committed": True, "note": "Task updated."},
+                },
+                default=str,
+            )
+
+        if name == "extract_tasks_from_emails":
+            from services.tasks_service import extract_tasks_from_emails_sync
+            q = str(args.get("query") or "").strip() or None
+            try:
+                max_emails = int(args.get("max_emails") or 5)
+            except (TypeError, ValueError):
+                max_emails = 5
+            try:
+                result = extract_tasks_from_emails_sync(
+                    user_id=user_id,
+                    query=q,
+                    max_emails=max(1, min(max_emails, 15)),
+                )
+            except Exception as exc:
+                logger.warning("extract_tasks_from_emails failed: %s", exc)
+                return json.dumps(
+                    {"error": "extraction_failed", "detail": str(exc)}
+                )
+            return json.dumps(result, default=str)
+
+        if name == "lookup_email_contacts":
+            from services.contacts_service import lookup_contacts
+            query = str(args.get("query") or "").strip()
+            if not query:
+                return json.dumps({"error": "query_required"})
+            try:
+                matches = lookup_contacts(user_id, query, limit=5)
+            except Exception as exc:
+                logger.warning("lookup_email_contacts failed: %s", exc)
+                return json.dumps({"error": "lookup_failed", "detail": str(exc)})
+            if not matches:
+                return json.dumps({
+                    "contacts": [],
+                    "count": 0,
+                    "note": f"No known contacts found for '{query}'. Ask the user to spell out the full email address.",
+                })
+            return json.dumps({
+                "contacts": matches,
+                "count": len(matches),
+                "note": "Read these options to the user and ask which one applies, or if it's a new address.",
+            })
+
+        if name == "show_recipient_picker":
+            from services.contacts_service import lookup_contacts
+            query = str(args.get("query") or "").strip()
+            if not query:
+                return json.dumps({"error": "query_required"})
+            try:
+                matches = lookup_contacts(user_id, query, limit=8)
+            except Exception as exc:
+                logger.warning("show_recipient_picker lookup failed: %s", exc)
+                matches = []
+            candidates = [
+                {"name": m.get("name") or "", "email": m.get("email") or ""}
+                for m in matches
+                if m.get("email")
+            ]
+            payload = {
+                "ok": True,
+                "device_recipient_picker": {"query": query, "candidates": candidates},
+                "contacts": candidates,
+                "count": len(candidates),
+            }
+            if not candidates:
+                payload["note"] = (
+                    f"No known contacts match '{query}'. Say EXACTLY: 'Sorry, I couldn't find "
+                    "anyone by that name. Could you tell me their email address?' Then take the "
+                    "dictated address and call remember_contact. NEVER guess an address."
+                )
+            elif len(candidates) == 1:
+                payload["note"] = (
+                    "One match — the card is shown on screen. Confirm with the user "
+                    "(voice or tap) BEFORE drafting. Never assume it is correct."
+                )
+            else:
+                payload["note"] = (
+                    "Multiple matches — all cards are shown on screen. Read them out and ask "
+                    "which one (the user may say 'the first one' / a name, or tap a card). "
+                    "Confirm before drafting."
+                )
+            return json.dumps(payload, default=str)
+
+        if name == "remember_contact":
+            from services.contacts_service import store_contacts
+            email_addr = str(args.get("email") or "").strip()
+            person = str(args.get("name") or "").strip()
+            parsed_name, parsed_addr = _parse_email_address(email_addr)
+            if not parsed_addr:
+                return json.dumps({
+                    "error": "invalid_email",
+                    "detail": (
+                        f"'{email_addr}' is not a valid email address. Ask the user to repeat it."
+                    ),
+                })
+            try:
+                store_contacts(user_id, [{"email": parsed_addr, "name": person or parsed_name}])
+            except Exception as exc:
+                logger.warning("remember_contact store failed: %s", exc)
+                return json.dumps({"error": "store_failed", "detail": str(exc)})
+            return json.dumps({
+                "ok": True,
+                "contact": {"name": person or parsed_name, "email": parsed_addr},
+                "note": "Address validated and saved for future use. Read it back to confirm, then continue.",
+            })
+
+        if name == "show_email_draft":
+            draft = {
+                "state": str(args.get("state") or "drafting").strip().lower() or "drafting",
+                "to": _normalize_recipient_list(args.get("to")),
+                "cc": _normalize_recipient_list(args.get("cc")),
+                "bcc": _normalize_recipient_list(args.get("bcc")),
+                "subject": str(args.get("subject") or ""),
+                "body": str(args.get("body") or ""),
+            }
+            draft_id = str(args.get("draft_id") or "").strip()
+            if draft_id:
+                draft["draft_id"] = draft_id
+            return json.dumps({
+                "ok": True,
+                "device_email_draft": draft,
+                "note": (
+                    "Draft popup updated on screen. Keep your spoken reply short and do NOT read "
+                    "the body aloud unless the user asks."
+                ),
+            }, default=str)
 
         return json.dumps({"error": "unknown_tool", "name": name})
     except Exception:

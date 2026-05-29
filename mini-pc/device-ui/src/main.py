@@ -19,6 +19,7 @@ import traceback
 from datetime import datetime, timedelta
 from pathlib import Path
 from collections import defaultdict
+from typing import Optional
 
 import httpx
 
@@ -53,6 +54,7 @@ from kivy.uix.screenmanager import (
 from kivy.clock import Clock
 from kivy.config import Config
 from kivy.uix.floatlayout import FloatLayout
+from kivy.uix.widget import Widget
 
 # All graphics Config.set() calls must happen BEFORE 'from kivy.core.window import Window'
 # because Window is instantiated at import time in Kivy.
@@ -218,9 +220,6 @@ from config import (
     SHOW_MOUSE_CURSOR,
     TRANSITION_DURATION,
     DEFAULT_PRIVACY_MODE,
-    LOCAL_REDIS_HOST,
-    LOCAL_REDIS_PORT,
-    LOCAL_REDIS_ENABLED,
     display_now,
     resolve_device_config_dir,
     setup_complete_marker_paths_for_read,
@@ -305,6 +304,8 @@ from screens.system import SystemScreen
 from screens.calendar import CalendarScreen
 from screens.morning_brief import MorningBriefScreen
 from screens.emails import EmailsScreen
+from screens.tasks import TasksScreen
+from components.quick_panel import QuickPanel
 
 # ------------------------------------------------------------------
 # Logging
@@ -608,6 +609,14 @@ class MeetingBoxApp(App):
             self.backend = BackendClient()
             logger.info("Using REAL backend")
 
+        # Multi-device scoping: this device's id, resolved from
+        # /api/device/pairing-status after we know we're paired (see
+        # ``_refresh_device_identity``). When set, WS-relayed events
+        # carrying a ``device_id`` field for a different device are
+        # ignored so two paired mini-PCs sharing a Redis don't see
+        # each other's recording lifecycle.
+        self.device_id: Optional[str] = None
+
         # Application state
         self.current_session_id = None
         self.recording_state = {
@@ -671,15 +680,15 @@ class MeetingBoxApp(App):
         self._pairing_poll = None
 
         # Local Redis subscriber (audio_level / mic_test_level from audio process)
-        self._local_redis_thread = None
-        self._local_redis_stop = threading.Event()
-
         # Optional in-process audio capture child (MEETINGBOX_SPAWN_AUDIO=1, the
         # default inside the merged docker image). Replaces the separate audio
         # container / systemd unit. Never enable simultaneously with another
-        # audio_capture instance — they would race for the mic and Redis topics.
+        # audio_capture instance — they would race for the mic.
+        # Events flow back via stdout sentinel lines (``MEETINGBOX_EVT|...``)
+        # parsed by the supervisor and dispatched to the same handlers the
+        # old local Redis listener used.
         from audio_supervisor import maybe_create_from_env as _maybe_audio
-        self._audio_supervisor = _maybe_audio()
+        self._audio_supervisor = _maybe_audio(on_event=self._on_audio_supervisor_event)
 
         # Idle screen timeout (seconds; 0 = never).
         # Replaces the older display-off timer: instead of cutting the
@@ -1073,6 +1082,7 @@ class MeetingBoxApp(App):
         self.screen_manager.add_widget(CalendarScreen(name='calendar'))
         self.screen_manager.add_widget(MorningBriefScreen(name='morning_brief'))
         self.screen_manager.add_widget(EmailsScreen(name='emails'))
+        self.screen_manager.add_widget(TasksScreen(name='tasks'))
 
         # BOOT: always start with splash
         self.screen_manager.current = 'splash'
@@ -1080,16 +1090,42 @@ class MeetingBoxApp(App):
         # Start WebSocket listener
         self.start_websocket_listener()
 
-        # Optional: Redis pub/sub for audio levels when appliance runs with local Redis.
-        # Disable with LOCAL_REDIS_ENABLED=0 when using a remote API only (no local Redis).
-        if LOCAL_REDIS_ENABLED:
-            self._start_local_redis_listener()
+        # Audio_level / lifecycle events from the audio_capture child are
+        # delivered via audio_supervisor stdout (see
+        # ``_on_audio_supervisor_event``). Nothing to start here.
         # Voice assistant logic (wake phrase, intents) stays active; the floating
         # "Tony" overlay is intentionally not mounted. ``self.voice_indicator``
         # remains None (set in __init__) so existing _refresh/_set helpers no-op
         # via their ``if not self.voice_indicator`` guards.
         self._sync_voice_assistant_state()
         self._refresh_voice_indicator()
+
+        # Email draft popup + recipient confirmation overlay (voice-first email
+        # workflow). Added BEFORE the transcript overlay so the transcript bar
+        # renders on top and stays visible while drafting. Both start hidden.
+        try:
+            from components.email_draft_popup import EmailDraftPopup
+            self._email_draft_popup = EmailDraftPopup(
+                on_send=self._on_email_draft_send_tapped,
+                on_save_draft=self._on_email_draft_save_tapped,
+                on_discard=self._on_email_draft_discard_tapped,
+                on_close=self._on_email_draft_close_tapped,
+            )
+            self.root_layout.add_widget(self._email_draft_popup)
+        except Exception:
+            logger.exception("EmailDraftPopup failed to load")
+            self._email_draft_popup = None
+
+        try:
+            from components.recipient_confirm_overlay import RecipientConfirmOverlay
+            self._recipient_overlay = RecipientConfirmOverlay(
+                on_select=self._on_recipient_selected,
+                on_dismiss=self._on_recipient_dismissed,
+            )
+            self.root_layout.add_widget(self._recipient_overlay)
+        except Exception:
+            logger.exception("RecipientConfirmOverlay failed to load")
+            self._recipient_overlay = None
 
         # Transcript overlay — floats above everything, starts hidden.
         try:
@@ -1103,6 +1139,24 @@ class MeetingBoxApp(App):
             )
         except Exception:
             logger.exception("TranscriptionOverlay failed to load")
+
+        # Quick pull-down panel — floats above everything, hidden by default.
+        try:
+            self.quick_panel = QuickPanel()
+            self.quick_panel.app = self
+            self.root_layout.add_widget(self.quick_panel)
+        except Exception:
+            logger.exception("QuickPanel failed to load")
+            self.quick_panel = None
+
+        # Swipe handle — thin bar at the very top of the screen.
+        # Added LAST so it is drawn and hit-tested before other widgets.
+        # Uses touch.grab() so it is coordinate-system-independent.
+        try:
+            _handle = _SwipeHandle(app=self)
+            self.root_layout.add_widget(_handle)
+        except Exception:
+            logger.exception("SwipeHandle failed to load")
 
         if SHOW_FPS:
             Clock.schedule_interval(self._log_fps, 1.0)
@@ -1189,7 +1243,17 @@ class MeetingBoxApp(App):
 
     async def _pairing_watchdog_async(self):
         try:
-            await self.backend.get_pairing_status()
+            status = await self.backend.get_pairing_status()
+            # Cache our device id from the same response so multi-device
+            # event filtering knows our identity without an extra round
+            # trip. Best-effort: bad/empty values just leave it unset.
+            try:
+                did = (status or {}).get("device_id") if isinstance(status, dict) else None
+                if isinstance(did, str) and did and did != self.device_id:
+                    self.device_id = did
+                    logger.info("Resolved device_id=%s", did)
+            except Exception:
+                logger.debug("device_id cache update failed", exc_info=True)
         except httpx.HTTPStatusError as e:
             if e.response is not None and e.response.status_code == 401:
                 detail = None
@@ -1342,7 +1406,6 @@ class MeetingBoxApp(App):
                 self._audio_supervisor.stop()
             except Exception:
                 logger.exception("Audio supervisor stop failed")
-        self._local_redis_stop.set()
         if getattr(self, '_setup_poll', None):
             self._setup_poll.cancel()
         if getattr(self, '_pairing_poll', None):
@@ -1509,12 +1572,37 @@ class MeetingBoxApp(App):
                 self._websocket_listener(), loop)
             self.ws_task = future
 
+    def _event_belongs_to_this_device(self, event: dict, data: dict) -> bool:
+        """Multi-device scoping filter.
+
+        When this device knows its identity AND the incoming event
+        carries an explicit ``device_id`` for a *different* device,
+        drop it. Events without a ``device_id`` (legacy publishers,
+        backend system events) are always accepted so we stay
+        backward compatible.
+        """
+        my_id = self.device_id
+        if not my_id:
+            return True
+        for src in (data, event):
+            try:
+                ev_id = (src or {}).get("device_id") if isinstance(src, dict) else None
+            except Exception:
+                ev_id = None
+            if isinstance(ev_id, str) and ev_id:
+                return ev_id == my_id
+        return True
+
     async def _websocket_listener(self):
         try:
             async for event in self.backend.subscribe_events():
                 etype = event.get('type')
                 data = event.get('data') or event
                 logger.debug(f"WS event: {etype}")
+
+                if not self._event_belongs_to_this_device(event, data):
+                    logger.debug("Dropping cross-device WS event %s", etype)
+                    continue
 
                 dispatch = {
                     'recording_started': self.on_recording_started,
@@ -1550,75 +1638,45 @@ class MeetingBoxApp(App):
             Clock.schedule_once(lambda _: self.start_websocket_listener(), 0)
 
     # ==================================================================
-    # LOCAL REDIS LISTENER (audio_level / mic_test_level from audio container)
+    # AUDIO SUPERVISOR STDOUT EVENT DISPATCH
     # ==================================================================
+    # Replaces the previous appliance-side Redis ``events`` listener.
+    # ``audio_capture.py`` now writes ``MEETINGBOX_EVT|<json>`` lines to
+    # stdout; ``audio_supervisor`` parses them and calls
+    # ``_on_audio_supervisor_event`` on its reader thread for each one.
 
-    _LOCAL_REDIS_EVENT_TYPES = frozenset({
+    _SUPERVISOR_EVENT_TYPES = frozenset({
         'audio_level', 'mic_test_level',
         'recording_started', 'recording_stopped',
         'recording_paused', 'recording_resumed',
+        'error',
     })
 
-    def _start_local_redis_listener(self):
-        if self._local_redis_thread and self._local_redis_thread.is_alive():
+    def _on_audio_supervisor_event(self, event: dict) -> None:
+        if not isinstance(event, dict):
             return
-        self._local_redis_stop.clear()
-        t = threading.Thread(
-            target=self._local_redis_subscriber_loop, daemon=True,
-            name="local-redis-events",
-        )
-        t.start()
-        self._local_redis_thread = t
-
-    def _local_redis_subscriber_loop(self):
+        etype = event.get('type')
+        if etype not in self._SUPERVISOR_EVENT_TYPES:
+            return
+        data = event.get('data') or event
+        if not self._event_belongs_to_this_device(event, data):
+            logger.debug("Dropping cross-device supervisor event %s", etype)
+            return
+        handler = {
+            'audio_level': self.on_audio_level,
+            'mic_test_level': self.on_mic_test_level,
+            'recording_started': self.on_recording_started,
+            'recording_stopped': self.on_recording_stopped,
+            'recording_paused': self.on_recording_paused,
+            'recording_resumed': self.on_recording_resumed,
+            'error': self.on_error_event,
+        }.get(etype)
+        if handler is None:
+            return
         try:
-            import redis as _redis_mod
-        except ImportError:
-            logger.warning("redis package not installed — local audio levels unavailable")
-            return
-
-        backoff = 1
-        while not self._local_redis_stop.is_set():
-            try:
-                rc = _redis_mod.Redis(
-                    host=LOCAL_REDIS_HOST, port=LOCAL_REDIS_PORT,
-                    decode_responses=True, socket_connect_timeout=5,
-                )
-                rc.ping()
-                logger.info("Local Redis connected (%s:%s) — subscribing to 'events'",
-                            LOCAL_REDIS_HOST, LOCAL_REDIS_PORT)
-                backoff = 1
-                pubsub = rc.pubsub()
-                pubsub.subscribe("events")
-                for msg in pubsub.listen():
-                    if self._local_redis_stop.is_set():
-                        break
-                    if msg["type"] != "message":
-                        continue
-                    try:
-                        event = json.loads(msg["data"])
-                    except (json.JSONDecodeError, TypeError):
-                        continue
-                    etype = event.get("type")
-                    if etype not in self._LOCAL_REDIS_EVENT_TYPES:
-                        continue
-                    data = event.get("data") or event
-                    handler = {
-                        'audio_level': self.on_audio_level,
-                        'mic_test_level': self.on_mic_test_level,
-                        'recording_started': self.on_recording_started,
-                        'recording_stopped': self.on_recording_stopped,
-                        'recording_paused': self.on_recording_paused,
-                        'recording_resumed': self.on_recording_resumed,
-                    }.get(etype)
-                    if handler:
-                        handler(data)
-            except Exception as e:
-                if not self._local_redis_stop.is_set():
-                    logger.warning("Local Redis error (%s:%s): %s — retrying in %ss",
-                                   LOCAL_REDIS_HOST, LOCAL_REDIS_PORT, e, backoff)
-                    self._local_redis_stop.wait(backoff)
-                    backoff = min(backoff * 2, 30)
+            handler(data)
+        except Exception:
+            logger.exception("supervisor event handler failed for %s", etype)
 
     # ==================================================================
     # EVENT HANDLERS
@@ -1673,6 +1731,21 @@ class MeetingBoxApp(App):
         Clock.schedule_once(lambda _dt, mid=sid: self._start_transcript_cta_poll(mid), 0)
         Clock.schedule_once(lambda _dt, mid=sid: self._start_summary_poll(mid), 0)
 
+    def _prime_processing_screen(self, sid: str | None, duration_seconds: int | None = None):
+        """Seed processing header metadata before backend progress events arrive."""
+        if not sid:
+            return
+        try:
+            screen = self.screen_manager.get_screen('processing')
+        except Exception as e:
+            logger.debug("Processing screen unavailable for metadata prime: %s", e)
+            return
+        if hasattr(screen, 'on_processing_started'):
+            screen.on_processing_started({
+                'title': f'Meeting {sid}',
+                'duration': max(0, int(duration_seconds or 0)),
+            })
+
     def on_recording_stopped(self, data):
         self.recording_state['active'] = False
         try:
@@ -1680,6 +1753,8 @@ class MeetingBoxApp(App):
         except Exception:
             pass
         sid = data.get('session_id') or self.current_session_id
+        duration_seconds = data.get('duration') or self._current_recording_elapsed_seconds()
+        self._prime_processing_screen(sid, duration_seconds)
         self._kick_post_stop_meeting_polls(sid)
         self._voice_start_in_flight = False
         self._clear_recording_elapsed_clock()
@@ -1739,10 +1814,11 @@ class MeetingBoxApp(App):
         progress = data.get('progress', 0)
         status = data.get('status', '')
         eta = data.get('eta', 0)
+        stage = data.get('stage') or ''
         screen = self.screen_manager.get_screen('processing')
         if hasattr(screen, 'on_backend_progress'):
             Clock.schedule_once(
-                lambda _: screen.on_backend_progress(progress, status, eta), 0)
+                lambda _: screen.on_backend_progress(progress, status, eta, stage), 0)
 
     def on_transcription_complete(self, data):
         meeting_id = data.get('meeting_id') or data.get('session_id')
@@ -1833,13 +1909,15 @@ class MeetingBoxApp(App):
 
     def _show_processing_summary_ready(self, meeting_id: str, summary: dict):
         """Keep user on processing screen and enable CTA once summary is ready."""
-        try:
-            self._processing_summary_cache[meeting_id] = {'ok': True, 'summary': summary or {}}
-        except Exception:
-            pass
+        ready_for_review = self._summary_payload_ready_for_review(summary or {})
+        if ready_for_review:
+            try:
+                self._processing_summary_cache[meeting_id] = {'ok': True, 'summary': summary or {}}
+            except Exception:
+                pass
         # Any path reaching here is the authoritative "summary ready" signal —
         # silence the fallback poll so we don't duplicate work.
-        if self._summary_poll_meeting_id == meeting_id:
+        if ready_for_review and self._summary_poll_meeting_id == meeting_id:
             self._summary_poll_done = True
         try:
             processing = self.screen_manager.get_screen('processing')
@@ -1881,6 +1959,32 @@ class MeetingBoxApp(App):
         self._summary_poll_done = False
         run_async(self._poll_summary_until_ready(meeting_id))
 
+    @staticmethod
+    def _summary_payload_has_text(summary: dict) -> bool:
+        """True once the API has a saved summary body that the review screen can render."""
+        if not isinstance(summary, dict):
+            return False
+        raw_summary = summary.get('summary')
+        if isinstance(raw_summary, dict):
+            raw_summary = raw_summary.get('summary')
+        text = (
+            raw_summary
+            or summary.get('summary_text')
+            or summary.get('text')
+            or ''
+        )
+        return bool(str(text).strip())
+
+    @classmethod
+    def _summary_payload_ready_for_review(cls, summary: dict) -> bool:
+        """Match web readiness: summary review is available once summary text exists.
+
+        Topics, decisions, and action items can legitimately be empty for a
+        meeting, and the web frontend still renders the completed report in
+        that case. The device CTA should follow the same rule.
+        """
+        return cls._summary_payload_has_text(summary)
+
     async def _poll_summary_until_ready(self, meeting_id: str):
         """Poll GET /api/meetings/{id} every 5s for up to ~5 minutes. If a
         summary appears, deliver it via _show_processing_summary_ready."""
@@ -1900,7 +2004,7 @@ class MeetingBoxApp(App):
                 )
                 continue
             summary = (detail or {}).get('summary') or {}
-            if summary:
+            if self._summary_payload_ready_for_review(summary):
                 logger.info(
                     "Summary poll found summary for %s after %d attempt(s)",
                     meeting_id, attempt + 1,
@@ -1983,7 +2087,7 @@ class MeetingBoxApp(App):
             segments = (detail or {}).get('segments') or []
             summary_blob = (detail or {}).get('summary') or {}
             has_segments = len(segments) > 0
-            has_summary = isinstance(summary_blob, dict) and bool(summary_blob)
+            has_summary = self._summary_payload_ready_for_review(summary_blob)
             if has_segments or has_summary:
                 logger.info(
                     "Transcript CTA poll: content ready for %s (segments=%d summary=%s)",
@@ -1995,6 +2099,12 @@ class MeetingBoxApp(App):
                     lambda _dt, _mid=meeting_id: self._deliver_transcript_cta_from_poll(_mid),
                     0,
                 )
+                if has_summary:
+                    Clock.schedule_once(
+                        lambda _dt, _mid=meeting_id, _s=summary_blob:
+                            self._show_processing_summary_ready(_mid, _s),
+                        0,
+                    )
                 return
         logger.warning(
             "Transcript CTA poll gave up for meeting %s (no segments within ~6 min)",
@@ -2130,6 +2240,7 @@ class MeetingBoxApp(App):
         async def _stop():
             try:
                 sid = self.current_session_id
+                duration_seconds = self._current_recording_elapsed_seconds()
                 await self.backend.stop_recording(sid)
                 self.recording_state['active'] = False
                 self._voice_start_in_flight = False
@@ -2137,6 +2248,11 @@ class MeetingBoxApp(App):
                 Clock.schedule_once(lambda _: self._resume_voice_assistant_after_recording(), 0)
                 logger.info("Recording stopped successfully")
                 # Device-initiated stop never goes through on_recording_stopped (Redis/WS).
+                Clock.schedule_once(
+                    lambda _dt, _sid=sid, _dur=duration_seconds:
+                        self._prime_processing_screen(_sid, _dur),
+                    0,
+                )
                 self._kick_post_stop_meeting_polls(sid)
                 Clock.schedule_once(
                     lambda _: self.goto_screen('processing', 'fade'), 0)
@@ -2254,6 +2370,9 @@ class MeetingBoxApp(App):
         self._idle_timeout_seconds = n
         self._persist_local_idle_timeout(value)
         self._reset_idle_timer()
+
+    # _panel_touch_down / _panel_touch_move removed — gesture is now handled
+    # by the _SwipeHandle widget added to root_layout (see class below).
 
     def _reset_idle_timer(self, *_args):
         """Reset the idle countdown. Called on every touch.
@@ -2677,7 +2796,7 @@ class MeetingBoxApp(App):
             except Exception:
                 pass
 
-    def _realtime_voice_navigate(self, screen: str) -> None:
+    def _realtime_voice_navigate(self, screen: str, target_date=None) -> None:
         """Open a main UI screen when the cloud Realtime model calls navigate_device_ui."""
         s = (screen or "").strip()
         routes = {
@@ -2693,17 +2812,94 @@ class MeetingBoxApp(App):
         if not pair:
             return
         name, tr = pair
+        if target_date and name == "calendar":
+            try:
+                cal = self.screen_manager.get_screen("calendar")
+                cal.set_target_date(target_date)
+            except Exception:
+                logger.exception("Failed to set calendar target_date")
         try:
             self.goto_screen(name, tr)
         except Exception:
             logger.exception("Realtime navigate to %s failed", name)
 
-    def _sync_transcript_overlay_mode(self, screen_name: str | None = None) -> None:
-        """Toggle the overlay between full-screen and compact bottom-strip.
+    # ── Voice-first email workflow: directives + touch feedback ───────────
+    def _send_voice_user_text(self, text: str) -> None:
+        """Inject a spoken-equivalent user turn into the live Realtime session.
 
-        Full mode is used only on the home screen so the user gets the whole
-        WhatsApp-style conversation history. On every other screen we shrink
-        to a small bar at the bottom so the screen content stays readable.
+        Used so a screen tap (recipient card, Send / Save / Discard) is handled
+        by the assistant exactly as if the user had said it, preserving the
+        recipient-confirmation and send-approval workflow.
+        """
+        sess = getattr(self, "_realtime_voice_session", None)
+        if sess is None:
+            logger.debug("No active voice session for injected text: %r", text)
+            return
+        try:
+            sess.send_user_text(text)
+        except Exception:
+            logger.debug("send_user_text failed", exc_info=True)
+
+    def _on_email_draft_directive(self, draft: dict) -> None:
+        """Open/update the draft popup from a show_email_draft directive."""
+        popup = getattr(self, "_email_draft_popup", None)
+        if popup is None or not isinstance(draft, dict):
+            return
+        try:
+            if popup.visible:
+                popup.update_draft(draft)
+            else:
+                popup.open_draft(draft)
+        except Exception:
+            logger.exception("Failed to render email draft directive")
+
+    def _on_recipient_picker_directive(self, query: str, candidates: list) -> None:
+        """Show the recipient confirmation overlay from a show_recipient_picker directive."""
+        overlay = getattr(self, "_recipient_overlay", None)
+        if overlay is None:
+            return
+        try:
+            overlay.show_candidates(query, candidates or [])
+        except Exception:
+            logger.exception("Failed to render recipient picker directive")
+
+    def _on_recipient_selected(self, index: int, contact: dict) -> None:
+        overlay = getattr(self, "_recipient_overlay", None)
+        if overlay is not None:
+            overlay.close()
+        email = (contact or {}).get("email", "")
+        name = (contact or {}).get("name", "") or email
+        if email:
+            self._send_voice_user_text(f"Use {email} for {name}.")
+
+    def _on_recipient_dismissed(self) -> None:
+        overlay = getattr(self, "_recipient_overlay", None)
+        if overlay is not None:
+            overlay.close()
+
+    def _on_email_draft_send_tapped(self) -> None:
+        self._send_voice_user_text("Yes, send it.")
+
+    def _on_email_draft_save_tapped(self) -> None:
+        self._send_voice_user_text("Save it as a draft.")
+
+    def _on_email_draft_discard_tapped(self) -> None:
+        popup = getattr(self, "_email_draft_popup", None)
+        if popup is not None:
+            popup.close()
+        self._send_voice_user_text("Discard the email.")
+
+    def _on_email_draft_close_tapped(self) -> None:
+        popup = getattr(self, "_email_draft_popup", None)
+        if popup is not None:
+            popup.close()
+
+    def _sync_transcript_overlay_mode(self, screen_name: str | None = None) -> None:
+        """Sync the transcript overlay mode for the current screen.
+
+        On the home screen the say-bar handles transcription display, so the
+        overlay is suppressed and hidden. On all other screens the overlay
+        shows as a compact bottom strip.
         """
         overlay = self._transcript_overlay
         if overlay is None:
@@ -2711,7 +2907,24 @@ class MeetingBoxApp(App):
         name = screen_name or (
             self.screen_manager.current if self.screen_manager else None
         )
-        overlay.set_compact(name != 'home')
+        # Always compact — the full-screen overlay mode is no longer used.
+        overlay.set_compact(True)
+        if name == 'home':
+            # Home screen uses the say bar for transcription — keep overlay hidden.
+            overlay.suppress_auto_show = True
+            overlay.hide()
+        else:
+            overlay.suppress_auto_show = False
+
+    def _clear_home_say_bar(self) -> None:
+        """Clear the say-bar transcription on the home screen (if visible)."""
+        if self.screen_manager is None:
+            return
+        try:
+            home = self.screen_manager.get_screen('home')
+            home.clear_say_bar_transcription()
+        except Exception:
+            pass
 
     def _end_realtime_voice_session(self) -> None:
         self._realtime_mic_acquired = False
@@ -2719,6 +2932,14 @@ class MeetingBoxApp(App):
         self._set_voice_runtime_state("idle")
         if self._transcript_overlay is not None:
             self._transcript_overlay.hide()
+        # Tear down the email workflow overlays when the voice session ends.
+        popup = getattr(self, "_email_draft_popup", None)
+        if popup is not None and popup.visible:
+            popup.close()
+        recip = getattr(self, "_recipient_overlay", None)
+        if recip is not None and recip.visible:
+            recip.close()
+        Clock.schedule_once(lambda _dt: self._clear_home_say_bar(), 0)
         sess = self._realtime_voice_session
         started = getattr(self, "_realtime_session_start_monotonic", None)
         connected = getattr(self, "_realtime_connected_ok", False)
@@ -2959,7 +3180,13 @@ class MeetingBoxApp(App):
                 if self._transcript_overlay is not None:
                     self._transcript_overlay.clear_session()
                     self._sync_transcript_overlay_mode()
-                    self._transcript_overlay.show()
+                    # On home screen the say bar handles transcription; on
+                    # other screens show the compact overlay strip.
+                    if not (self.screen_manager
+                            and self.screen_manager.current == 'home'):
+                        self._transcript_overlay.show()
+                # Reset home say bar for the new session
+                self._clear_home_say_bar()
 
             Clock.schedule_once(_ui, 0)
 
@@ -2985,24 +3212,61 @@ class MeetingBoxApp(App):
             overlay = self._transcript_overlay
             if overlay is None:
                 return
-            # Re-use existing placeholder if we're mid-utterance (defensive)
+            # New utterance starts — reset the current bubble tracker so the
+            # next transcript event creates a fresh bubble (or updates the new
+            # placeholder), never the bubble from the previous utterance.
+            self._current_user_msg_id = None
             if not getattr(self, "_pending_user_msg_id", None):
                 self._pending_user_msg_id = overlay.add_user_message("…")
+            # Update home say bar with a placeholder immediately
+            def _say_bar_placeholder(_dt):
+                if (self.screen_manager is not None
+                        and self.screen_manager.current == 'home'):
+                    try:
+                        self.screen_manager.get_screen('home').update_say_bar_transcription("You", "…")
+                    except Exception:
+                        pass
+            Clock.schedule_once(_say_bar_placeholder, 0)
 
         def _on_user_transcript(text: str) -> None:
             overlay = self._transcript_overlay
             if overlay is None:
                 return
             pending = getattr(self, "_pending_user_msg_id", None)
+            current = getattr(self, "_current_user_msg_id", None)
             if pending:
-                # Replace the "…" placeholder in place
+                # First transcript event for this utterance: replace the "…"
+                # placeholder and remember the bubble id for subsequent deltas.
                 overlay.update_user_message(pending, text)
                 msg_id = pending
+                self._pending_user_msg_id = None
+                self._current_user_msg_id = msg_id
+            elif current:
+                # Subsequent partial delta or the final .completed event:
+                # update the same bubble in place — never create a new one.
+                overlay.update_user_message(current, text)
+                msg_id = current
             else:
+                # No placeholder and no active bubble (e.g. speech_stopped
+                # never fired): create a fresh bubble and track it.
                 msg_id = overlay.add_user_message(text)
-            self._pending_user_msg_id = None
+                self._current_user_msg_id = msg_id
 
-            # Background thread: correct grammar, then update the bubble
+            # Also update home say bar with user transcript
+            def _say_bar_user(_dt, _t=text):
+                if (self.screen_manager is not None
+                        and self.screen_manager.current == 'home'):
+                    try:
+                        self.screen_manager.get_screen('home').update_say_bar_transcription("You", _t)
+                    except Exception:
+                        pass
+            Clock.schedule_once(_say_bar_user, 0)
+
+            # Grammar correction — run only on non-trivial text so we don't
+            # fire an API call for every tiny streaming fragment. The corrected
+            # text replaces the bubble once the background call returns.
+            if not text or len(text) < 4:
+                return
             _backend = BACKEND_URL
             _token = tok
 
@@ -3013,6 +3277,14 @@ class MeetingBoxApp(App):
                     Clock.schedule_once(
                         lambda _dt: overlay.update_user_message(msg_id, corrected), 0
                     )
+                    def _say_bar_corrected(_dt, _c=corrected):
+                        if (self.screen_manager is not None
+                                and self.screen_manager.current == 'home'):
+                            try:
+                                self.screen_manager.get_screen('home').update_say_bar_transcription("You", _c)
+                            except Exception:
+                                pass
+                    Clock.schedule_once(_say_bar_corrected, 0)
 
             threading.Thread(target=_correct_and_update, daemon=True).start()
 
@@ -3034,6 +3306,15 @@ class MeetingBoxApp(App):
             if overlay is None:
                 return
             overlay.stream_ai_message(item_id, accumulated)
+            # Also update home say bar with streaming AI text
+            def _say_bar_ai(_dt, _t=accumulated):
+                if (self.screen_manager is not None
+                        and self.screen_manager.current == 'home'):
+                    try:
+                        self.screen_manager.get_screen('home').update_say_bar_transcription("AI", _t)
+                    except Exception:
+                        pass
+            Clock.schedule_once(_say_bar_ai, 0)
 
         try:
             self._realtime_connected_ok = False
@@ -3054,6 +3335,8 @@ class MeetingBoxApp(App):
                 on_ai_transcript=_on_ai_transcript,
                 on_ai_transcript_delta=_on_ai_transcript_delta,
                 on_user_speech_stopped=_on_user_speech_stopped,
+                on_email_draft=self._on_email_draft_directive,
+                on_recipient_picker=self._on_recipient_picker_directive,
             )
             self._sync_voice_assistant_state()
             self._realtime_voice_session.start()
@@ -3985,8 +4268,8 @@ class MeetingBoxApp(App):
             return
 
         if intent.name == "show_tasks":
-            self.goto_screen("meetings", "slide_left")
-            self._voice_reply("Opening meetings and action items.", duration=3.0)
+            self.goto_screen("tasks", "slide_left")
+            self._voice_reply("Opening your tasks.", duration=3.0)
             return
 
         if intent.name == "show_meetings":
@@ -4120,6 +4403,89 @@ class MeetingBoxApp(App):
 
     def _log_fps(self, _dt):
         logger.debug(f"FPS: {Clock.get_fps():.1f}")
+
+
+# ==================================================================
+# ==================================================================
+# SwipeHandle — dedicated widget that opens the QuickPanel
+# ==================================================================
+
+class _SwipeHandle(Widget):
+    """Invisible (but tappable) bar at the top of the screen.
+
+    A simple tap OR a short downward drag on this widget opens the
+    QuickPanel.  Using a real widget + touch.grab() is far more reliable
+    than Window-level coordinate math, which breaks when touchscreen
+    drivers use inverted or scaled Y axes.
+
+    Visual: a subtle white pill line (iOS-style pull handle) drawn in
+    the center of the bar so users can see where to interact.
+    """
+
+    _HANDLE_H = 22      # widget height in px
+    _DRAG_THRESHOLD = 8  # px of downward drag that triggers the panel
+
+    def __init__(self, app, **kwargs):
+        from kivy.graphics import Color, RoundedRectangle
+        kwargs.setdefault("size_hint", (1, None))
+        kwargs.setdefault("height", self._HANDLE_H)
+        kwargs.setdefault("pos_hint", {"top": 1})
+        super().__init__(**kwargs)
+        self._app = app
+        self._start_y: float | None = None
+
+        # Subtle pill indicator so users know this area is interactive
+        with self.canvas:
+            Color(1, 1, 1, 0.18)
+            self._pill = RoundedRectangle(radius=[3])
+        self.bind(pos=self._draw, size=self._draw)
+        self._draw()
+
+    def _draw(self, *_):
+        pw, ph = 36, 4
+        self._pill.pos = (self.center_x - pw / 2,
+                          self.y + (self.height - ph) / 2)
+        self._pill.size = (pw, ph)
+
+    # ------------------------------------------------------------------
+    # Touch handling
+    # ------------------------------------------------------------------
+
+    def on_touch_down(self, touch):
+        if not self.collide_point(*touch.pos):
+            return False
+        self._start_y = touch.y
+        touch.grab(self)
+        return True     # consume the touch so it doesn't fall through
+
+    def on_touch_move(self, touch):
+        if touch.grab_current is not self:
+            return False
+        if self._start_y is None:
+            return True
+        # Downward drag (in Kivy y=0 is bottom, so "down" = y decreases)
+        moved_down = self._start_y - touch.y
+        # Also handle inverted-Y touchscreens (y increases when moving down)
+        moved_any = abs(self._start_y - touch.y)
+        if moved_any >= self._DRAG_THRESHOLD:
+            self._open_panel()
+        return True
+
+    def on_touch_up(self, touch):
+        if touch.grab_current is not self:
+            return False
+        # Tap (very little movement) also opens the panel
+        if self._start_y is not None:
+            if abs(self._start_y - touch.y) < self._DRAG_THRESHOLD:
+                self._open_panel()
+        touch.ungrab(self)
+        self._start_y = None
+        return True
+
+    def _open_panel(self):
+        qp = getattr(self._app, "quick_panel", None)
+        if qp and not qp._visible:
+            qp.show()
 
 
 # ==================================================================
