@@ -343,7 +343,7 @@ def _fetch_news_sync(category: str = "top", limit: int = 6) -> dict:
 
 # Whitelist returned to the device; Kivy `goto_screen` must support the name.
 REALTIME_DEVICE_NAV_SCREENS = frozenset(
-    {"home", "calendar", "emails", "meetings", "morning_brief", "settings", "mic_test"}
+    {"home", "calendar", "emails", "meetings", "tasks", "morning_brief", "settings", "mic_test"}
 )
 
 _SIDE_EFFECT_HINTS = (
@@ -583,7 +583,7 @@ REALTIME_VOICE_TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "name": "navigate_device_ui",
         "description": (
             "Open a main screen on the tabletop device (Kivy UI). Use when the user asks to open/show/go to "
-            "calendar, email/inbox, meetings/tasks, home, morning brief, settings, or microphone test. "
+            "calendar, email/inbox, tasks/todos, meetings, home, morning brief, settings, or microphone test. "
             "Does not fetch data — combine with get_briefing_context or assistant_intent when they also want information."
         ),
         "parameters": {
@@ -601,6 +601,14 @@ REALTIME_VOICE_TOOL_DEFINITIONS: list[dict[str, Any]] = [
                         "Only used when screen=calendar. "
                         "Always resolve relative expressions such as 'next Tuesday', 'this Friday', "
                         "'31st of May', or 'tomorrow' to an actual YYYY-MM-DD date before passing here."
+                    ),
+                },
+                "target_tab": {
+                    "type": "string",
+                    "description": (
+                        "Section/tab to activate within the screen. "
+                        "For screen=tasks: today | upcoming | unfinished | unplanned. "
+                        "For screen=emails: today | all | unread | sent | drafts."
                     ),
                 },
             },
@@ -931,15 +939,15 @@ REALTIME_VOICE_TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "type": "function",
         "name": "show_recipient_picker",
         "description": (
-            "RESOLVE AND CONFIRM an email recipient the user referred to by NAME. This is the "
-            "REQUIRED first step whenever the user wants to email / draft / reply / forward to a "
-            "person without spelling the full address (e.g. 'email Rahul', 'draft a mail to Neha'). "
-            "The server searches ALL known contact sources (sent mail, received mail, draft "
-            "recipients, calendar attendees) ranked by interaction frequency, and displays the "
-            "matching contacts as tappable cards on the device screen so the user can confirm by "
-            "voice OR touch. "
-            "CRITICAL: you MUST call this and wait for the user to confirm BEFORE drafting — never "
-            "assume a recipient, even when only one match exists. "
+            "RESOLVE AND CONFIRM a person the user referred to by NAME — for email (draft / send / "
+            "reply / forward) AND for calendar invite attendees ('invite Rahul', 'schedule with Neha', "
+            "'add Priya to the meeting'). This is the REQUIRED first step whenever a person is named "
+            "without spelling their full email address. "
+            "The server searches ALL known contact sources (sent mail, received mail, draft recipients, "
+            "calendar attendees) ranked by interaction frequency, and displays the matching contacts as "
+            "tappable cards on the device screen so the user can confirm by voice OR touch. "
+            "CRITICAL: you MUST call this and wait for the user to confirm BEFORE drafting an email or "
+            "adding a calendar attendee — never assume a recipient, even when only one match exists. "
             "Behavior based on the returned 'count': "
             "1 match -> say e.g. 'I found [Name] at [email] — is that the right person?' and wait for "
             "a yes / tap. "
@@ -947,8 +955,8 @@ REALTIME_VOICE_TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "and wait for a spoken choice ('the first one' / a name) or a tap. "
             "0 matches -> say EXACTLY 'Sorry, I couldn't find anyone by that name. Could you tell me "
             "their email address?', take the dictated address, then call remember_contact. "
-            "For 'email Rahul and Neha', call show_recipient_picker once per person and confirm each "
-            "before continuing."
+            "For multiple names (e.g. 'invite Rahul and Neha'), call show_recipient_picker once per "
+            "person and confirm each before continuing."
         ),
         "parameters": {
             "type": "object",
@@ -1038,6 +1046,16 @@ REALTIME_VOICE_TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "draft_id": {
                     "type": "string",
                     "description": "Optional Gmail draft id once a draft has been created/updated.",
+                },
+                "reply_all_thread_id": {
+                    "type": "string",
+                    "description": (
+                        "Set this to the thread id when showing a REPLY-ALL draft. The server "
+                        "fills the popup's To + complete Cc list with every thread participant "
+                        "(minus the user) so the screen shows exactly who the reply will reach. "
+                        "Do NOT list the cc addresses yourself — just pass the thread id. Omit "
+                        "for new emails and normal single-recipient replies."
+                    ),
                 },
             },
         },
@@ -1347,8 +1365,8 @@ def execute_realtime_voice_tool(
             raw = str(args.get("screen") or "").strip().lower().replace(" ", "_")
             if raw in ("inbox", "mail", "gmail"):
                 raw = "emails"
-            if raw in ("task", "tasks", "action_items", "todo", "todos"):
-                raw = "meetings"
+            if raw in ("task", "action_items", "todo", "todos"):
+                raw = "tasks"
             if raw not in REALTIME_DEVICE_NAV_SCREENS:
                 return json.dumps(
                     {
@@ -1361,6 +1379,29 @@ def execute_realtime_voice_tool(
                 td = str(args.get("target_date") or "").strip()
                 if td:
                     payload["target_date"] = td
+            if raw == "tasks":
+                tab = str(args.get("target_tab") or "").strip().lower()
+                _task_tab_aliases = {
+                    "today": "due_today", "due_today": "due_today",
+                    "upcoming": "upcoming",
+                    "unfinished": "overdue", "overdue": "overdue", "past_due": "overdue",
+                    "unplanned": "unplanned", "no_date": "unplanned",
+                }
+                tab = _task_tab_aliases.get(tab, "")
+                if tab:
+                    payload["target_tab"] = tab
+            if raw == "emails":
+                tab = str(args.get("target_tab") or "").strip().lower()
+                _email_tab_aliases = {
+                    "today": "today",
+                    "all": "all", "all mail": "all", "everything": "all",
+                    "unread": "unread", "new": "unread",
+                    "sent": "sent", "sent mail": "sent", "outbox": "sent",
+                    "drafts": "drafts", "draft": "drafts",
+                }
+                tab = _email_tab_aliases.get(tab, "")
+                if tab:
+                    payload["target_tab"] = tab
             return json.dumps(payload)
 
         if name == "web_search":
@@ -1658,6 +1699,32 @@ def execute_realtime_voice_tool(
             except Exception as exc:
                 logger.warning("show_recipient_picker lookup failed: %s", exc)
                 matches = []
+            # Fallback: the local contacts book only learns addresses lazily.
+            # If nothing matches yet, harvest lifetime correspondents for this
+            # name from the user's Gmail — BOTH people they've emailed (To/Cc on
+            # sent mail) and people who've emailed them (From) — store them
+            # per-user, then look up again. This is what makes "email Shiva"
+            # resolve even if we've only ever sent to Shiva, not received.
+            if not matches:
+                try:
+                    from routes.integrations import get_credentials_for_provider
+                    from services.contacts_service import harvest_from_gmail
+                    creds = get_credentials_for_provider(user_id, "gmail")
+                    if creds:
+                        safe_q = query.replace('"', "")
+                        harvest_from_gmail(
+                            user_id,
+                            creds,
+                            query=(
+                                f'from:"{safe_q}" OR to:"{safe_q}" OR cc:"{safe_q}"'
+                            ),
+                            max_messages=60,
+                        )
+                        matches = lookup_contacts(user_id, query, limit=8)
+                except Exception as exc:
+                    logger.info(
+                        "show_recipient_picker gmail fallback skipped: %s", exc
+                    )
             candidates = [
                 {"name": m.get("name") or "", "email": m.get("email") or ""}
                 for m in matches
@@ -1689,7 +1756,11 @@ def execute_realtime_voice_tool(
             return json.dumps(payload, default=str)
 
         if name == "remember_contact":
-            from services.contacts_service import store_contacts
+            # VALIDATE ONLY — do NOT persist here. If we wrote on every call, a
+            # mis-heard address would stay in the book alongside the corrected
+            # one. The address is saved automatically (store-on-use) the moment
+            # it actually goes into a draft / send / cc-add, so only the final
+            # confirmed address is ever remembered.
             email_addr = str(args.get("email") or "").strip()
             person = str(args.get("name") or "").strip()
             parsed_name, parsed_addr = _parse_email_address(email_addr)
@@ -1700,35 +1771,68 @@ def execute_realtime_voice_tool(
                         f"'{email_addr}' is not a valid email address. Ask the user to repeat it."
                     ),
                 })
-            try:
-                store_contacts(user_id, [{"email": parsed_addr, "name": person or parsed_name}])
-            except Exception as exc:
-                logger.warning("remember_contact store failed: %s", exc)
-                return json.dumps({"error": "store_failed", "detail": str(exc)})
             return json.dumps({
                 "ok": True,
                 "contact": {"name": person or parsed_name, "email": parsed_addr},
-                "note": "Address validated and saved for future use. Read it back to confirm, then continue.",
+                "note": (
+                    "Address is valid. Read it back letter-by-letter to confirm. It will be "
+                    "remembered automatically once you use it in the draft — do NOT store a "
+                    "different address unless the user corrects this one."
+                ),
             })
 
         if name == "show_email_draft":
+            # IMPORTANT: emit ONLY the fields the model actually passed in this
+            # call. The device popup MERGES the payload onto the current draft —
+            # if we always sent to/cc/bcc/subject/body (even empty), a
+            # single-field edit would blank the other fields on screen. By
+            # omitting absent keys the device keeps their existing values, so an
+            # edit shows the full draft with just the changed field updated.
             draft = {
                 "state": str(args.get("state") or "drafting").strip().lower() or "drafting",
-                "to": _normalize_recipient_list(args.get("to")),
-                "cc": _normalize_recipient_list(args.get("cc")),
-                "bcc": _normalize_recipient_list(args.get("bcc")),
-                "subject": str(args.get("subject") or ""),
-                "body": str(args.get("body") or ""),
             }
+            if "to" in args:
+                draft["to"] = _normalize_recipient_list(args.get("to"))
+            if "cc" in args:
+                draft["cc"] = _normalize_recipient_list(args.get("cc"))
+            if "bcc" in args:
+                draft["bcc"] = _normalize_recipient_list(args.get("bcc"))
+            if "subject" in args:
+                draft["subject"] = str(args.get("subject") or "")
+            if "body" in args:
+                draft["body"] = str(args.get("body") or "")
             draft_id = str(args.get("draft_id") or "").strip()
             if draft_id:
                 draft["draft_id"] = draft_id
+            # Reply-all: fill the full participant list (To + every Cc) from the
+            # thread so the popup shows exactly who the reply will reach. These
+            # addresses go ONLY into device_email_draft (a device-only surface);
+            # the device strips device_email_draft before echoing this result to
+            # the model, so the model never receives the concrete recipients and
+            # can't use them to mis-send. The actual send always routes through
+            # gmail_reply_all, which recomputes recipients itself.
+            reply_all_thread_id = str(args.get("reply_all_thread_id") or "").strip()
+            if reply_all_thread_id:
+                try:
+                    from routes.integrations import get_credentials_for_provider
+                    from services.gmail import compute_reply_all_recipients
+                    creds = get_credentials_for_provider(user_id, "gmail")
+                    if creds:
+                        recips = compute_reply_all_recipients(creds, reply_all_thread_id)
+                        if recips.get("to"):
+                            draft["to"] = _normalize_recipient_list([recips["to"]])
+                        if recips.get("cc"):
+                            draft["cc"] = _normalize_recipient_list(recips["cc"])
+                        if recips.get("subject") and not draft.get("subject"):
+                            draft["subject"] = recips["subject"]
+                except Exception as exc:
+                    logger.info("show_email_draft reply-all fill skipped: %s", exc)
             return json.dumps({
                 "ok": True,
                 "device_email_draft": draft,
                 "note": (
-                    "Draft popup updated on screen. Keep your spoken reply short and do NOT read "
-                    "the body aloud unless the user asks."
+                    "Draft popup updated on screen (fields you omit are kept as-is). Keep your "
+                    "spoken reply short and do NOT read the body aloud unless the user asks."
                 ),
             }, default=str)
 
