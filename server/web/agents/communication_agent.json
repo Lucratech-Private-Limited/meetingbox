@@ -8,6 +8,11 @@
     "mail",
     "gmail",
     "send a message",
+    "send email",
+    "send an email",
+    "send the email",
+    "send this email",
+    "send my email",
     "draft an email",
     "write an email",
     "save as draft",
@@ -52,6 +57,7 @@
     "supported_operations": [
       "search_emails -> gmail_list_recent (with Gmail q syntax)",
       "filter_emails -> gmail_list_recent (with Gmail q syntax)",
+      "read_full_email_with_attachments -> gmail_read_email (requires message_id)",
       "create_draft -> gmail_create_draft (NEW drafts only)",
       "update_draft -> gmail_update_draft (EXISTING draft, requires draft_id)",
       "add_recipients -> gmail_add_recipients (requires draft_id)",
@@ -70,6 +76,8 @@
       "FINDING THREADS BY SUBJECT/SENDER: Use q='subject:Catchup enquiry' or q='from:Shiva' for inbox threads. Never pass a subject string as thread_id — only the real Gmail threadId resolved via $PREV.",
       "DRAFT UPDATE RULE: When the user modifies an existing draft (change subject, edit body, fix typo, add a punctuation mark, update a recipient) — ALWAYS plan list_recent(q='in:drafts ...') + gmail_update_draft with draft_id=$PREV. NEVER create a new draft for modifications.",
       "SEND DRAFT RULE: When the user says 'send the draft', 'send it', 'send that email' after a draft exists — plan list_recent(q='in:drafts ...') + gmail_send_draft with draft_id=$PREV. NEVER use gmail_send_email for a saved draft. The send_draft tool sends the existing content and clears the draft automatically — no body needed.",
+      "SEND WITH EXPLICIT DRAFT_ID (MANDATORY): When the request includes a literal draft_id (e.g. 'Send the saved Gmail draft (draft_id r8380694616385320393) to ...' ), use THAT exact draft_id for gmail_send_draft — do NOT run a list_recent lookup, do NOT substitute with any other draft. The literal draft_id is always authoritative.",
+      "SEND WITH FULL CONTENT BUT NO DRAFT_ID: When the request contains the full email body and recipient but NO draft_id (e.g. 'Send an email to X with subject Y and body Z'), use gmail_send_email directly — do NOT search Gmail drafts. Never discover and send an existing draft from the drafts folder just because the recipient name matches; that draft may be stale and contain completely different content. Draft discovery (in:drafts lookup) is ONLY valid when the user explicitly says 'send the draft I saved earlier' or when a draft_id was provided upfront.",
       "SEND WITHOUT READING BODY: When queuing a draft to send, do NOT insist on reading the body aloud. Tell the user: 'The draft is shown on the transcription screen — let me know if you'd like me to read it, otherwise approve to send.' Accept 'I've seen it', 'I approve', 'send it' as sufficient approval.",
       "REPLY-ALL RULE: For 'reply all' / 'reply to everyone' / 'respond to all participants' — plan list_recent(q='subject:...' or 'from:...') + gmail_reply_all with thread_id=$PREV. The tool collects all recipients from the thread automatically — do NOT fetch them manually. Never refuse reply-all.",
       "REPLY WITH RECIPIENT CHANGES: When the user asks to reply on an existing thread AND wants to add or remove someone from the recipients, plan list_recent(q='subject:...') + gmail_reply_to_thread (or gmail_reply_all if the intent is reply-all) with thread_id=$PREV and the new cc list. The reply tool sends in-thread and respects the recipient overrides.",
@@ -125,6 +133,7 @@
     ],
     "tool_selection_rules": [
       "gmail_list_recent — search or list inbox messages. Args: max_results (int 1-30, default 15), q (Gmail search string, optional). Use q='in:drafts' to list saved drafts. is_write: false.",
+      "gmail_read_email — fetch the full body and extract text from all attachments of a single email. Supports PDF, Word (.docx), Excel (.xlsx), PowerPoint (.pptx), and plain text files. Images are acknowledged by name only. Use after gmail_list_recent to get a message_id. Args: message_id (str, REQUIRED). is_write: false.",
       "gmail_create_draft — save a BRAND NEW outbound email as a Gmail draft (does not send). Use ONLY when the user is composing a new email that does not exist yet. NEVER use for modifying an existing draft. Args: to (str, optional), subject (str), body (str), cc (array, optional), bcc (array, optional). is_write: true, direct execution. Returns draft_id — include it in the confirmation message.",
       "gmail_update_draft — modify an EXISTING Gmail draft. Use whenever the user edits/changes/updates an existing draft in any way (subject, body, recipients, any field). Requires draft_id from context. Args: draft_id (str, REQUIRED), subject (str, optional), body (str, optional), to (str, optional), cc (array, optional), bcc (array, optional). Only provided fields change; others preserved. is_write: true, direct execution.",
       "gmail_send_draft — send an existing saved Gmail draft by draft_id. Use when the user wants to send a previously saved draft. The content is already in Gmail — no body needed. The draft is automatically removed from Drafts after sending. Args: draft_id (str, REQUIRED). is_write: true, REQUIRES APPROVAL.",
@@ -140,6 +149,7 @@
   },
   "tools": [
     "gmail_list_recent",
+    "gmail_read_email",
     "gmail_create_draft",
     "gmail_update_draft",
     "gmail_send_draft",
@@ -154,6 +164,7 @@
   ],
   "tool_policies": {
     "gmail_list_recent": { "requires_approval": false, "category": "read" },
+    "gmail_read_email": { "requires_approval": false, "category": "read" },
     "gmail_create_draft": { "requires_approval": false, "category": "drafts" },
     "gmail_update_draft": { "requires_approval": false, "category": "drafts" },
     "gmail_send_draft": { "requires_approval": true, "category": "outbound", "note": "Sends an existing saved draft — no body needed, auto-clears from Drafts." },
