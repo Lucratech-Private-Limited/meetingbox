@@ -80,7 +80,10 @@ services:
       - AUDIO_INPUT_DEVICE_NAME=${AUDIO_INPUT_DEVICE_NAME:-}
       - ALSA_CARD=${ALSA_CARD:-}
       - AUDIO_INPUT_GAIN=${AUDIO_INPUT_GAIN:-1}
-      - AUDIO_CAPTURE_BACKEND=${AUDIO_CAPTURE_BACKEND:-pyaudio}
+      # arecord opens the USB mic by stable ALSA card name, which survives
+      # PortAudio index changes when the mic is moved between USB ports.
+      - AUDIO_CAPTURE_BACKEND=${AUDIO_CAPTURE_BACKEND:-arecord}
+      - AUDIO_ALSA_INPUT_DEVICE=${AUDIO_ALSA_INPUT_DEVICE:-}
       - AUDIO_OUTPUT_DEVICE=${AUDIO_OUTPUT_DEVICE:-}
       # Explicit ALSA output device for the speaker (aplay -D). Leave unset to
       # auto-detect: if a USB device has both mic and speaker on the same card
