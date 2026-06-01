@@ -739,6 +739,7 @@ class MeetingBoxApp(App):
         self._realtime_session_pending = False
         self._realtime_session_start_monotonic = None
         self._realtime_connected_ok = False
+        self._wake_hide_ev = None        # ClockEvent that resets home after wake timeout
         self._realtime_mic_acquired = False
         self._voice_runtime_state = "idle"
         self.voice_realtime_assistant = False
@@ -2606,7 +2607,9 @@ class MeetingBoxApp(App):
                 try:
                     home = self.screen_manager.get_screen("home")
                     home.show_listening_state()
-                    Clock.schedule_once(
+                    if self._wake_hide_ev is not None:
+                        self._wake_hide_ev.cancel()
+                    self._wake_hide_ev = Clock.schedule_once(
                         lambda _dt2: self._hide_home_listening_state(),
                         timeout,
                     )
@@ -2646,7 +2649,9 @@ class MeetingBoxApp(App):
             try:
                 home = self.screen_manager.get_screen("home")
                 home.show_listening_state()
-                Clock.schedule_once(
+                if self._wake_hide_ev is not None:
+                    self._wake_hide_ev.cancel()
+                self._wake_hide_ev = Clock.schedule_once(
                     lambda _dt: self._hide_home_listening_state(),
                     timeout,
                 )
@@ -2680,7 +2685,9 @@ class MeetingBoxApp(App):
             try:
                 home = self.screen_manager.get_screen("home")
                 home.show_listening_state()
-                Clock.schedule_once(
+                if self._wake_hide_ev is not None:
+                    self._wake_hide_ev.cancel()
+                self._wake_hide_ev = Clock.schedule_once(
                     lambda _dt: self._hide_home_listening_state(),
                     timeout,
                 )
@@ -2767,7 +2774,16 @@ class MeetingBoxApp(App):
             )
 
     def _hide_home_listening_state(self, *_args) -> None:
-        """Called after wake-word timeout to restore the home screen to idle."""
+        """Called after wake-word timeout to restore the home screen to idle.
+
+        Skipped when the Realtime session is live — the session state
+        callbacks own the hide in that case, not the timeout timer.
+        """
+        self._wake_hide_ev = None
+        # Don't reset if a live Realtime session is running
+        if (getattr(self, '_realtime_connected_ok', False)
+                and self._realtime_voice_session is not None):
+            return
         if (self.screen_manager is not None
                 and self.screen_manager.current == 'home'):
             try:
@@ -2796,7 +2812,17 @@ class MeetingBoxApp(App):
             except Exception:
                 pass
 
-    def _realtime_voice_navigate(self, screen: str, target_date=None) -> None:
+    def _realtime_handle_start_recording(self) -> None:
+        """Called when the realtime agent asks to start a meeting recording."""
+        if self.recording_state.get("active"):
+            logger.info("Realtime start_recording: already recording, ignoring.")
+            return
+        try:
+            self.start_recording()
+        except Exception:
+            logger.exception("Realtime start_recording callback failed")
+
+    def _realtime_voice_navigate(self, screen: str, target_date=None, target_tab=None) -> None:
         """Open a main UI screen when the cloud Realtime model calls navigate_device_ui."""
         s = (screen or "").strip()
         routes = {
@@ -2804,6 +2830,7 @@ class MeetingBoxApp(App):
             "calendar": ("calendar", "slide_left"),
             "emails": ("emails", "slide_left"),
             "meetings": ("meetings", "slide_left"),
+            "tasks": ("tasks", "slide_left"),
             "morning_brief": ("morning_brief", "slide_left"),
             "settings": ("settings", "slide_left"),
             "mic_test": ("mic_test", "slide_left"),
@@ -2812,12 +2839,37 @@ class MeetingBoxApp(App):
         if not pair:
             return
         name, tr = pair
-        if target_date and name == "calendar":
+
+        if name == "calendar" and target_date:
             try:
                 cal = self.screen_manager.get_screen("calendar")
-                cal.set_target_date(target_date)
+                if self.screen_manager.current == "calendar":
+                    # Already on calendar screen — goto_screen would call on_leave()
+                    # which clears _target_date before on_enter() runs, causing the
+                    # screen to snap back to today.  Skip goto_screen entirely and
+                    # refresh directly instead.
+                    cal.set_target_date(target_date)
+                    cal.on_enter()
+                    return
+                else:
+                    cal.set_target_date(target_date)
             except Exception:
                 logger.exception("Failed to set calendar target_date")
+
+        if name == "tasks" and target_tab:
+            try:
+                tsk = self.screen_manager.get_screen("tasks")
+                tsk.set_active_tab(target_tab)
+            except Exception:
+                logger.exception("Failed to set tasks target_tab")
+
+        if name == "emails" and target_tab:
+            try:
+                em = self.screen_manager.get_screen("emails")
+                em.set_active_tab(target_tab)
+            except Exception:
+                logger.exception("Failed to set emails target_tab")
+
         try:
             self.goto_screen(name, tr)
         except Exception:
@@ -2840,11 +2892,35 @@ class MeetingBoxApp(App):
         except Exception:
             logger.debug("send_user_text failed", exc_info=True)
 
+    def _email_workflow_active(self) -> bool:
+        """True while the email draft popup or recipient picker is on screen.
+
+        Used to suppress the voice session's keyword farewell fallback so that
+        mid-email closers ("that's it", "thanks", "okay done") don't silently
+        end the session — the model's contextual end_session tool still works.
+        Called from the session's recv thread; only reads plain bool attrs.
+        """
+        popup = getattr(self, "_email_draft_popup", None)
+        recip = getattr(self, "_recipient_overlay", None)
+        try:
+            if popup is not None and popup.visible:
+                return True
+            if recip is not None and recip.visible:
+                return True
+        except Exception:
+            return False
+        return False
+
     def _on_email_draft_directive(self, draft: dict) -> None:
         """Open/update the draft popup from a show_email_draft directive."""
         popup = getattr(self, "_email_draft_popup", None)
         if popup is None or not isinstance(draft, dict):
             return
+        # The recipient picker's job ends once we're drafting — close it so it
+        # never lingers in front of (or behind) the draft popup.
+        recip = getattr(self, "_recipient_overlay", None)
+        if recip is not None and recip.visible:
+            recip.close()
         try:
             if popup.visible:
                 popup.update_draft(draft)
@@ -2869,8 +2945,15 @@ class MeetingBoxApp(App):
             overlay.close()
         email = (contact or {}).get("email", "")
         name = (contact or {}).get("name", "") or email
-        if email:
-            self._send_voice_user_text(f"Use {email} for {name}.")
+        if not email:
+            return
+        # Do NOT pre-open the email draft popup here. The picker is shared
+        # between the email flow AND the calendar-invite attendee flow. Opening
+        # the draft popup unconditionally caused it to appear (and stay) in the
+        # calendar flow where show_email_draft is never called. The model's next
+        # show_email_draft directive opens the popup in the email flow; for
+        # calendar there is no such directive so nothing extra appears.
+        self._send_voice_user_text(f"Use {email} for {name}.")
 
     def _on_recipient_dismissed(self) -> None:
         overlay = getattr(self, "_recipient_overlay", None)
@@ -2928,6 +3011,7 @@ class MeetingBoxApp(App):
 
     def _end_realtime_voice_session(self) -> None:
         self._realtime_mic_acquired = False
+        self._realtime_connected_ok = False
         self._pending_user_msg_id = None
         self._set_voice_runtime_state("idle")
         if self._transcript_overlay is not None:
@@ -3168,6 +3252,10 @@ class MeetingBoxApp(App):
             # Vosk is paused from on_before_open_mic right before ALSA opens for Realtime.
             def _ui(_dt):
                 self._realtime_connected_ok = True
+                # Cancel the wake-word timeout timer — the session owns the UI now
+                if self._wake_hide_ev is not None:
+                    self._wake_hide_ev.cancel()
+                    self._wake_hide_ev = None
                 self._set_voice_runtime_state("listening")
                 self._clear_voice_indicator_override()
                 self._set_voice_indicator_override(
@@ -3337,6 +3425,8 @@ class MeetingBoxApp(App):
                 on_user_speech_stopped=_on_user_speech_stopped,
                 on_email_draft=self._on_email_draft_directive,
                 on_recipient_picker=self._on_recipient_picker_directive,
+                on_start_recording=self._realtime_handle_start_recording,
+                should_suppress_farewell=self._email_workflow_active,
             )
             self._sync_voice_assistant_state()
             self._realtime_voice_session.start()
