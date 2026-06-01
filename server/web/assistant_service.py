@@ -42,6 +42,7 @@ from tools.gmail_tool import (
   gmail_draft_from_payload,
   gmail_forward_from_payload,
   gmail_list_recent,
+  gmail_read_email,
   gmail_remove_recipients_from_payload,
   gmail_reply_all_from_payload,
   gmail_reply_from_payload,
@@ -106,6 +107,8 @@ TOOL_GMAIL_REPLY_ALL = "gmail_reply_all"
 TOOL_GMAIL_FORWARD = "gmail_forward_email"
 TOOL_GMAIL_ARCHIVE = "gmail_archive_email"
 TOOL_GMAIL_DELETE = "gmail_delete_email"
+TOOL_GMAIL_READ_EMAIL = "gmail_read_email"
+TOOL_CONTACTS_LOOKUP = "lookup_email_contacts"
 TOOL_MEMORY_SEARCH = "memory_search_meetings"
 TOOL_MEMORY_FETCH = "memory_fetch_meeting"
 TOOL_RES_WEB = "research_web_search"
@@ -128,6 +131,7 @@ RESEARCH_TOOLS = frozenset({
 
 GMAIL_TOOLS = frozenset({
   TOOL_GMAIL_LIST,
+  TOOL_GMAIL_READ_EMAIL,
   TOOL_GMAIL_SEND,
   TOOL_GMAIL_DRAFT,
   TOOL_GMAIL_DRAFT_UPDATE,
@@ -139,6 +143,7 @@ GMAIL_TOOLS = frozenset({
   TOOL_GMAIL_FORWARD,
   TOOL_GMAIL_ARCHIVE,
   TOOL_GMAIL_DELETE,
+  TOOL_CONTACTS_LOOKUP,
 })
 
 # Tools that mutate user state (calendar events, mailbox, drafts). Used to flag
@@ -297,7 +302,7 @@ def _llm_calendar_plan(message: str) -> list[dict[str, Any]] | None:
     "- 'Put something on my calendar tomorrow at 4 PM for 30 minutes' has start/duration but NO real title → return clarify asking 'What should I call this event?' missing_field='title'.\n"
     "- NEVER ask the user about timezone — always use the default below.\n"
     "- For SOLO BLOCKS (request contains 'block', 'focus', 'myself', 'me-time', 'heads-down', 'focus block', 'focus time', 'block my calendar', 'block off'): set attendees=[] without asking. Set add_meet_link=false for solo blocks.\n"
-    "- For events WITH attendees: set add_meet_link=true unless the user explicitly says 'no link', 'no meet', or 'no video call'.\n"
+    "- For ALL OTHER EVENTS (meetings, calls, appointments, syncs, reviews — with OR without attendees): always set add_meet_link=true unless the user explicitly says 'no link', 'no meet', 'no video call', or 'no conference'. This is non-negotiable — do not omit add_meet_link from the payload for non-solo-block events.\n"
     "- For RECURRING ('every weekday for 2 weeks', 'daily for next month', 'Mondays for 4 weeks'): use ONE step with a proper recurrence RRULE (e.g. 'RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;COUNT=10').\n\n"
     "REQUIRED-FIELDS GATE for calendar_rsvp_event:\n"
     "- MUST HAVE: response_status ('accepted' / 'declined' / 'tentative') and (title + date) OR event_id.\n"
@@ -306,16 +311,17 @@ def _llm_calendar_plan(message: str) -> list[dict[str, Any]] | None:
     "REQUIRED-FIELDS GATE for calendar_update_event / calendar_delete_event:\n"
     "- MUST HAVE: title + date (when the user said which one) OR event_id.\n"
     "- Move/reschedule: include new_start_time (full ISO) or new_date + optionally new_duration_minutes.\n"
-    "- Add/remove attendee: include attendees_add OR attendees_remove (list of emails).\n"
+    "- Add/remove attendee: include attendees_add AND/OR attendees_remove (both can be set simultaneously in the same call).\n"
     "- Phrases like 'Move my 3 PM today to 4 PM' -> calendar_update_event with title='3 PM' or a sensible hint, date=today, new_start_time=today T16:00:00. DO NOT call list first.\n"
-    "- Phrases like 'Drop alex@example.com from the Friday review meeting' -> calendar_update_event with title='review', date=<Friday's date>, attendees_remove=['alex@example.com']. DO NOT call list first.\n\n"
+    "- Phrases like 'Drop alex@example.com from the Friday review meeting' -> calendar_update_event with title='review', date=<Friday's date>, attendees_remove=['alex@example.com']. DO NOT call list first.\n"
+    "- Phrases like 'Add alice@co.com and remove bob@co.com from the Friday review' -> calendar_update_event with title='review', date=<Friday's date>, attendees_add=['alice@co.com'], attendees_remove=['bob@co.com']. Set BOTH fields in one call — never split into two separate steps.\n\n"
     "FULL TOOL REFERENCE:\n\n"
     f"{rules_block}\n\n"
     f"Default timezone for new/updated events: {default_tz}.\n"
     f"Today is {today_str}.\n\n"
     f"User message: {message.strip()[:3000]}\n"
   )
-  model = os.getenv("AI_MODEL", "claude-sonnet-4-20250514")
+  model = os.getenv("AI_MODEL", "claude-sonnet-4-5-20250929")
   try:
     resp = client.messages.create(
       model=model,
@@ -482,6 +488,80 @@ def plan_calendar_steps(message: str) -> list[dict[str, Any]]:
   return _llm_calendar_plan(message) or _heuristic_calendar_plan(message)
 
 
+def _format_email_summary_plain(email_data: dict) -> str:
+  """Plain-text fallback summary when no LLM is available."""
+  subject = email_data.get("subject") or "(no subject)"
+  sender = email_data.get("from") or "unknown sender"
+  date = email_data.get("date") or ""
+  snippet = (email_data.get("body") or email_data.get("snippet") or "")[:300]
+  attachments = email_data.get("attachments") or []
+  lines = [f"Email from {sender}: \"{subject}\" ({date})."]
+  if snippet:
+    lines.append(f"Preview: {snippet}")
+  if attachments:
+    names = [a.get("filename") or "unnamed" for a in attachments]
+    lines.append(f"Attachments: {', '.join(names)}")
+  return " ".join(lines)
+
+
+def _summarize_email_with_attachments(email_data: dict) -> str:
+  """
+  Use Anthropic to produce a concise natural-language summary of an email and its
+  extracted attachment contents.  Falls back to a plain-text summary if the LLM
+  is unavailable or fails.
+  """
+  import os
+  client = _get_anthropic()
+  if not client:
+    return _format_email_summary_plain(email_data)
+
+  subject = email_data.get("subject") or "(no subject)"
+  sender = email_data.get("from") or "unknown sender"
+  date = email_data.get("date") or ""
+  body = (email_data.get("body") or email_data.get("snippet") or "")[:8000]
+  attachments = email_data.get("attachments") or []
+
+  context_parts: list[str] = [
+    f"From: {sender}",
+    f"Subject: {subject}",
+    f"Date: {date}",
+    f"\nEmail body:\n{body}",
+  ]
+
+  att_parts: list[str] = []
+  for att in attachments:
+    fname = att.get("filename") or "unnamed"
+    mtype = att.get("mime_type") or ""
+    text = att.get("extracted_text")
+    note = att.get("note") or att.get("error")
+    if text:
+      att_parts.append(f"\n[Attachment: {fname}]\n{text[:5000]}")
+    elif note:
+      att_parts.append(f"\n[Attachment: {fname} ({mtype})]: {note}")
+  if att_parts:
+    context_parts.append("\nAttachments:" + "".join(att_parts))
+
+  prompt = (
+    "You are summarizing an email on behalf of the user. Be concise and informative.\n\n"
+    + "\n".join(context_parts)
+    + "\n\nProvide a clear, concise summary covering: the sender's key message, any important "
+    "details or action items, and the main contents of any attachments. Keep it to 3-6 sentences "
+    "unless the content clearly warrants more."
+  )
+
+  model = os.getenv("AI_MODEL", "claude-sonnet-4-5-20250929")
+  try:
+    resp = client.messages.create(
+      model=model,
+      max_tokens=900,
+      messages=[{"role": "user", "content": prompt}],
+    )
+    return getattr(resp.content[0], "text", "") or _format_email_summary_plain(email_data)
+  except Exception:
+    logger.exception("email summarize LLM failed")
+    return _format_email_summary_plain(email_data)
+
+
 def _llm_communication_plan(message: str) -> list[dict[str, Any]] | None:
   client = _get_anthropic()
   if not client:
@@ -522,6 +602,11 @@ def _llm_communication_plan(message: str) -> list[dict[str, Any]] | None:
     "    {\"tool\":\"gmail_list_recent\",\"args\":{\"q\":\"from:Trilok subject:Lunch\",\"max_results\":3},\"is_write\":false},\n"
     "    {\"tool\":\"gmail_archive_email\",\"args\":{\"message_id\":\"$PREV\"},\"is_write\":true}\n"
     "  ]}\n\n"
+    "Example — 'Summarize the latest email' / 'What does the latest email say?' / 'Read the email from Priya' / 'What is in that attachment?':\n"
+    "  {\"steps\":[\n"
+    "    {\"tool\":\"gmail_list_recent\",\"args\":{\"q\":\"\",\"max_results\":1},\"is_write\":false},\n"
+    "    {\"tool\":\"gmail_read_email\",\"args\":{\"message_id\":\"$PREV\"},\"is_write\":false}\n"
+    "  ]}\n\n"
     "RULES:\n"
     "1. MODIFYING AN EXISTING DRAFT: emit list_recent (q='in:drafts ...') + gmail_update_draft with $PREV. NEVER use gmail_create_draft for modifications.\n"
     "2. SENDING AN EXISTING DRAFT: emit list_recent (q='in:drafts ...') + gmail_send_draft with $PREV. NEVER use gmail_send_email for a saved draft.\n"
@@ -530,19 +615,25 @@ def _llm_communication_plan(message: str) -> list[dict[str, Any]] | None:
     "5. REPLY-ALL: emit list_recent (q='subject:...') + gmail_reply_all with thread_id=$PREV. The reply_all tool collects all participants automatically — do NOT fetch recipients manually.\n"
     "6. FORWARD / ARCHIVE / DELETE: always need a message_id. If absent, emit list_recent + action with $PREV. Never call these with empty/literal-subject message_id.\n"
     "7. REPLY ON EXISTING THREAD (with or without recipient changes): emit list_recent (q='subject:...' or 'from:...') + gmail_reply_to_thread / gmail_reply_all with thread_id=$PREV. NEVER pass the subject string as thread_id — only the real Gmail thread id.\n"
-    "8. SIMPLE LISTING: gmail_list_recent only. Never default to listing unless the user explicitly asks to check / list / search / read emails.\n\n"
+    "8. SIMPLE LISTING: gmail_list_recent only. Never default to listing unless the user explicitly asks to check / list / search / read emails.\n"
+    "9. SUMMARIZE / READ FULL EMAIL / ATTACHMENT CONTENT: emit list_recent (narrow q, max_results=1) + gmail_read_email with message_id=$PREV. Use this whenever the user asks to summarize, read, or get details from a specific email or its attachments. NEVER use gmail_list_recent alone for summarization.\n\n"
     "OTHER TOOL SELECTION:\n"
     "- 'reply' / 'respond' (not reply all) → gmail_reply_to_thread\n"
     "- 'forward' → gmail_forward_email\n"
     "- 'archive' → gmail_archive_email\n"
     "- 'delete' / 'trash' (an email) → gmail_delete_email\n"
     "- 'add ... to the draft' (a person) → gmail_add_recipients (with $PREV draft_id if needed)\n"
-    "- 'remove ... from the draft' (a person) → gmail_remove_recipients\n\n"
+    "- 'remove ... from the draft' (a person) → gmail_remove_recipients\n"
+    "- KNOWN CONTACTS LOOKUP: When the user gives a recipient by name only (e.g. 'draft email to vivek', "
+    "'send to priya', 'write to rahul') and no email address is supplied, emit lookup_email_contacts "
+    "as Step 1 BEFORE creating the draft: {\"tool\":\"lookup_email_contacts\",\"args\":{\"query\":\"vivek\"},\"is_write\":false}. "
+    "Include the found email(s) in the response so the user can confirm before proceeding. "
+    "Do NOT skip this step and do NOT invent an email address.\n\n"
     "FULL TOOL REFERENCE:\n\n"
     f"{rules_block}\n\n"
     f"User message: {message.strip()[:3000]}\n"
   )
-  model = os.getenv("AI_MODEL", "claude-sonnet-4-20250514")
+  model = os.getenv("AI_MODEL", "claude-sonnet-4-5-20250929")
   try:
     resp = client.messages.create(
       model=model,
@@ -580,6 +671,30 @@ def _extract_emails_from_text(text: str) -> list[str]:
 
 def _heuristic_communication_plan(message: str) -> list[dict[str, Any]]:
   m = message.lower()
+
+  summarize_markers = (
+    "summarize",
+    "summarise",
+    "what does the email say",
+    "what does it say",
+    "read the email",
+    "read this email",
+    "read that email",
+    "what is in the email",
+    "what's in the email",
+    "email content",
+    "attachment content",
+    "what is the attachment",
+    "open the attachment",
+    "read the attachment",
+  )
+  if any(x in m for x in summarize_markers):
+    # Narrow the search if a sender/subject hint is present, otherwise fetch latest.
+    return [
+      {"tool": TOOL_GMAIL_LIST, "args": {"max_results": 1, "q": ""}, "is_write": False},
+      {"tool": TOOL_GMAIL_READ_EMAIL, "args": {"message_id": "$PREV"}, "is_write": False},
+    ]
+
   list_markers = (
     "inbox",
     "unread",
@@ -675,7 +790,7 @@ def _llm_memory_plan(message: str) -> list[dict[str, Any]] | None:
     f"{rules_block}\n\n"
     f"User message:\n{message.strip()[:4000]}\n"
   )
-  model = os.getenv("AI_MODEL", "claude-sonnet-4-20250514")
+  model = os.getenv("AI_MODEL", "claude-sonnet-4-5-20250929")
   try:
     resp = client.messages.create(
       model=model,
@@ -752,7 +867,7 @@ def _llm_research_plan(message: str) -> list[dict[str, Any]] | None:
     f"{rules_block}\n\n"
     f"User message: {message.strip()[:3000]}\n"
   )
-  model = os.getenv("AI_MODEL", "claude-sonnet-4-20250514")
+  model = os.getenv("AI_MODEL", "claude-sonnet-4-5-20250929")
   try:
     resp = client.messages.create(
       model=model,
@@ -899,7 +1014,7 @@ def _synthesize_memory_reply(question: str, tool_results: list[dict[str, Any]]) 
   blobbed = _memory_tools_blob(tool_results)
   if not blobbed:
     return None
-  model = os.getenv("AI_MODEL", "claude-sonnet-4-20250514")
+  model = os.getenv("AI_MODEL", "claude-sonnet-4-5-20250929")
   style = _memory_response_style()
   try:
     resp = client.messages.create(
@@ -1627,6 +1742,24 @@ def _dispatch_single_agent(
       tool = step["tool"]
       args = dict(step.get("args") or {})
 
+      if tool == TOOL_CONTACTS_LOOKUP:
+        from services.contacts_service import lookup_contacts
+        query = str(args.get("query") or "").strip()
+        matches = lookup_contacts(user_id, query, limit=5) if query else []
+        tool_results.append({
+          "tool": tool,
+          "result": {
+            "contacts": matches,
+            "count": len(matches),
+            "note": (
+              "Read these to the user and ask which one applies, or if it's a new address."
+              if matches else
+              f"No known contacts for '{query}'. Ask the user to spell out the full email address."
+            ),
+          },
+        })
+        continue
+
       if tool == TOOL_GMAIL_LIST:
         if not user_id:
           tool_results.append({
@@ -1640,6 +1773,29 @@ def _dispatch_single_agent(
             max_results=int(args.get("max_results", 15)),
             q=str(args.get("q") or ""),
           )
+          tool_results.append({"tool": tool, "result": res})
+        except ToolError as e:
+          tool_results.append({"tool": tool, "error": str(e)})
+        continue
+
+      if tool == TOOL_GMAIL_READ_EMAIL:
+        if not user_id:
+          tool_results.append({
+            "tool": tool,
+            "error": "Sign in is required to read Gmail.",
+          })
+          continue
+        # Resolve $PREV placeholder so LLM can use message_id="$PREV" after a list step.
+        args, prev_err = _resolve_prev_refs(tool, args)
+        if prev_err:
+          tool_results.append({"tool": tool, "error": prev_err})
+          continue
+        message_id = str(args.get("message_id") or "").strip()
+        if not message_id:
+          tool_results.append({"tool": tool, "error": "message_id is required to read an email."})
+          continue
+        try:
+          res = gmail_read_email(user_id, message_id)
           tool_results.append({"tool": tool, "result": res})
         except ToolError as e:
           tool_results.append({"tool": tool, "error": str(e)})
@@ -1703,6 +1859,9 @@ def _dispatch_single_agent(
       if t == TOOL_GMAIL_LIST and isinstance(tr.get("result"), dict):
         n = tr["result"].get("count", 0)
         assistant_lines.append(f"Pulled {n} recent messages; the thread list is in results.")
+      elif t == TOOL_GMAIL_READ_EMAIL and isinstance(tr.get("result"), dict):
+        summary = _summarize_email_with_attachments(tr["result"])
+        assistant_lines.append(summary)
       elif t == TOOL_GMAIL_DRAFT and isinstance(tr.get("result"), dict):
         r = tr["result"]
         did = r.get("draft_id") or ""
@@ -1936,16 +2095,36 @@ def _dispatch_single_agent(
             f"(rate {r.get('rate')}, {r.get('as_of', '')})."
           )
       elif t == TOOL_RES_STOCK:
-        qa = r.get("quick_answer")
-        results = r.get("results") or []
-        ticker = r.get("ticker", "")
-        if qa:
-          assistant_lines.append(f"{ticker}: {qa[:300]}")
-        elif results:
-          first = results[0]
-          assistant_lines.append(f"{ticker}: {first.get('title') or ''} — {first.get('snippet', '')[:240]}")
+        ticker = r.get("ticker") or r.get("symbol") or r.get("input") or ""
+        price = r.get("price")
+        if price is not None:
+          currency = r.get("currency") or "USD"
+          change_pct = r.get("change_pct")
+          change_abs = r.get("change_abs")
+          market_state = r.get("market_state") or ""
+          line = f"{ticker}: {currency} {price:,.2f}"
+          if change_pct is not None:
+            sign = "+" if float(change_pct) >= 0 else ""
+            line += f" ({sign}{float(change_pct):.2f}% today"
+            if change_abs is not None:
+              abs_sign = "+" if float(change_abs) >= 0 else ""
+              line += f", {abs_sign}{float(change_abs):.2f}"
+            line += ")"
+          if market_state and market_state.upper() != "REGULAR":
+            line += f" [{market_state}]"
+          assistant_lines.append(line)
+        elif r.get("error"):
+          assistant_lines.append(f"Couldn't fetch quote for {ticker} — {r.get('error')}.")
         else:
-          assistant_lines.append(f"No live quote came back for {ticker}.")
+          qa = r.get("quick_answer")
+          results = r.get("results") or []
+          if qa:
+            assistant_lines.append(f"{ticker}: {qa[:300]}")
+          elif results:
+            first = results[0]
+            assistant_lines.append(f"{ticker}: {first.get('title') or ''} — {first.get('snippet', '')[:240]}")
+          else:
+            assistant_lines.append(f"No live quote came back for {ticker}.")
       elif t == TOOL_RES_SPORTS:
         qa = r.get("quick_answer")
         results = r.get("results") or []
@@ -1986,6 +2165,264 @@ def _dispatch_single_agent(
 
     if not assistant_lines:
       assistant_lines.append("Nothing came back from that lookup.")
+
+  elif agent_id == "tasks_agent":
+    # Tasks agent dispatch — list / create / update / extract-from-emails.
+    # Heuristic planner: classify the user request into one of four operations.
+    # The voice path uses the dedicated realtime tools (create_task / list_tasks /
+    # update_task / extract_tasks_from_emails) and skips this branch entirely.
+    # This branch handles chat / multi-step flows arriving via assistant_intent.
+    from services.tasks_service import (
+      voice_create_task as _tsk_create,
+      voice_update_task as _tsk_update,
+      extract_tasks_from_emails_sync as _tsk_email_extract,
+      shorten_action_text_to_title as _tsk_shorten,
+      SimilarTaskExistsError as _SimilarErr,
+      AmbiguousTaskMatchError as _AmbigErr,
+      TaskNotFoundError as _NotFoundErr,
+      TaskFidelityError as _FidelityErr,
+    )
+    ml = (text or "").lower().strip()
+    op = "create"
+    if any(k in ml for k in (
+      "show my task", "show my todo", "what's on my list", "whats on my list",
+      "any tasks", "any todos", "what tasks", "what todos", "list my task",
+      "list my todo", "open tasks", "pending tasks", "unplanned tasks",
+      "due today", "due tomorrow", "what's due", "whats due", "show tasks",
+      "show todos",
+    )):
+      op = "list"
+    elif any(k in ml for k in (
+      "mark ", "complete ", "completed ", "i finished", "finished the",
+      "done with", "i'm done", "im done",
+    )) and "task" not in ml.split()[:2]:
+      op = "complete"
+    elif any(k in ml for k in (
+      "cancel the task", "delete the task", "remove the task", "drop the task",
+    )):
+      op = "cancel"
+    elif any(k in ml for k in (
+      "snooze ", "remind me later about", "push back the task",
+    )):
+      op = "snooze"
+    elif any(k in ml for k in (
+      "set the due date", "change the due date", "update the due date",
+      "update due date", "due date to", "move the due date", "push the due date",
+      "set a due date", "set due date",
+    )):
+      op = "set_due_date"
+    elif any(k in ml for k in (
+      "any tasks in my inbox", "tasks in my email", "tasks from email",
+      "extract tasks from", "turn this email into a task",
+      "turn that email into a task", "make a task from this email",
+    )):
+      op = "extract_email"
+
+    if not user_id:
+      assistant_lines.append("Sign in first and I can manage your tasks.")
+    elif op == "list":
+      status_filter = ""
+      if "unplanned" in ml:
+        # Unplanned = active with no due_at. We still query active and let the
+        # device UI bucket; for chat reply just say how many are open.
+        status_filter = "active"
+      elif "completed" in ml or "done " in ml:
+        status_filter = "completed"
+      elif "cancel" in ml:
+        status_filter = "cancelled"
+      else:
+        status_filter = "active"
+      try:
+        res = commitment_list_for_user(user_id, max_results=40, status=status_filter)
+        tool_results.append({"tool": "commitment_list", "result": res})
+        rows = res.get("commitments") or []
+        if not rows:
+          assistant_lines.append("Your task list is empty.")
+        else:
+          n = len(rows)
+          assistant_lines.append(
+            f"You have {n} task{'s' if n != 1 else ''}. Top ones: "
+            + ", ".join(f"'{(r.get('title') or '').strip()}'" for r in rows[:5])
+            + "."
+          )
+      except ToolError as e:
+        tool_results.append({"tool": "commitment_list", "error": str(e)})
+        assistant_lines.append(f"Couldn't fetch your tasks — {e}.")
+    elif op == "extract_email":
+      try:
+        res = _tsk_email_extract(user_id=user_id, query=None, max_emails=5)
+        tool_results.append({"tool": "extract_tasks_from_emails", "result": res})
+        props = res.get("proposals") or []
+        if not props:
+          assistant_lines.append(
+            "I scanned your recent emails and didn't find any tasks specifically assigned to you."
+          )
+        else:
+          bits = [f"'{p.get('title')}'" + (f" (by {p.get('due_date')})" if p.get("due_date") else "") for p in props[:5]]
+          assistant_lines.append(
+            f"I found {len(props)} possible task{'s' if len(props) != 1 else ''} in your recent emails: "
+            + ", ".join(bits)
+            + ". Want me to add them?"
+          )
+      except Exception as e:
+        logger.exception("tasks_agent email extract failed")
+        tool_results.append({"tool": "extract_tasks_from_emails", "error": str(e)})
+        assistant_lines.append("Couldn't scan your emails for tasks right now.")
+    elif op == "set_due_date":
+      # Parse: "set the due date for <title> to <date>" / "change the due date of <title> to <date>"
+      # Extract the title portion and the date portion.
+      due_match = re.search(
+        r"\bto\s+(?:this\s+)?(today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
+        r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|"
+        r"sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+\d{1,2}(?:\s+\d{4})?|"
+        r"\d{1,2}/\d{1,2}(?:/\d{2,4})?|\d{4}-\d{2}-\d{2})",
+        ml,
+        re.I,
+      )
+      raw_date = due_match.group(1).strip() if due_match else ""
+      # Resolve common relative date words to YYYY-MM-DD
+      import datetime as _dt
+      today_d = _dt.date.today()
+      resolved_date: str | None = None
+      if raw_date.lower() == "today":
+        resolved_date = today_d.isoformat()
+      elif raw_date.lower() == "tomorrow":
+        resolved_date = (today_d + _dt.timedelta(days=1)).isoformat()
+      elif raw_date.lower() in ("monday","tuesday","wednesday","thursday","friday","saturday","sunday"):
+        day_map = {"monday":0,"tuesday":1,"wednesday":2,"thursday":3,"friday":4,"saturday":5,"sunday":6}
+        target_wd = day_map[raw_date.lower()]
+        days_ahead = (target_wd - today_d.weekday()) % 7 or 7
+        resolved_date = (today_d + _dt.timedelta(days=days_ahead)).isoformat()
+      elif raw_date:
+        try:
+          for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y"):
+            try:
+              resolved_date = _dt.datetime.strptime(raw_date, fmt).date().isoformat()
+              break
+            except ValueError:
+              continue
+        except Exception:
+          resolved_date = None
+      # Title hint: text between verb phrase and "to <date>"
+      title_hint_raw = re.sub(
+        r"(?:please\s+)?(?:set|change|update|move|push)\s+(?:the\s+)?due\s+date\s+(?:of|for)\s+",
+        "",
+        ml,
+        flags=re.I,
+      )
+      if due_match:
+        title_hint_raw = title_hint_raw[:due_match.start()].strip()
+      title_hint_raw = re.sub(r"\s+(?:the\s+)?(?:task\s+)?(?:to\s+.*)?$", "", title_hint_raw.rstrip(), flags=re.I).strip()
+      if not resolved_date:
+        assistant_lines.append(
+          f"I couldn't parse a date from that. Try: 'set the due date for <task name> to Friday'."
+        )
+      elif not title_hint_raw:
+        assistant_lines.append("Which task should I update? Try: 'set the due date for <task name> to Friday'.")
+      else:
+        try:
+          row = _tsk_update(
+            user_id=user_id,
+            title_match=title_hint_raw,
+            due_date=resolved_date,
+          )
+          tool_results.append({"tool": "commitment_upsert", "result": {"commitment": row, "saved": True}})
+          assistant_lines.append(f"Updated '{row.get('title')}' — due {resolved_date}.")
+        except _NotFoundErr:
+          tool_results.append({"tool": "commitment_upsert", "error": "task_not_found"})
+          assistant_lines.append(
+            f"I couldn't find a task matching '{title_hint_raw}'. Try 'show my tasks' to see the list."
+          )
+        except _AmbigErr as e:
+          tool_results.append({"tool": "commitment_upsert", "error": "ambiguous_match", "candidates": e.candidates})
+          names = ", ".join(f"'{(c.get('title') or '').strip()}'" for c in e.candidates[:5])
+          assistant_lines.append(f"Multiple tasks match — did you mean {names}?")
+        except _FidelityErr as e:
+          tool_results.append({"tool": "commitment_upsert", "error": str(e)})
+          assistant_lines.append(f"Couldn't update — {e}.")
+        except Exception as e:
+          logger.exception("tasks_agent set_due_date failed")
+          tool_results.append({"tool": "commitment_upsert", "error": str(e)})
+          assistant_lines.append("Couldn't update the due date for that task.")
+    elif op in ("complete", "cancel", "snooze"):
+      # Strip the leading verb to get a title hint.
+      stripped = re.sub(
+        r"^(?:please\s+)?(?:mark|complete|completed|cancel|delete|remove|drop|snooze|i\s+finished|done\s+with|i'?m\s+done\s+with)\s+(?:the\s+task\s+)?",
+        "",
+        ml,
+        flags=re.I,
+      ).strip()
+      stripped = re.sub(r"\s+as\s+(done|completed|cancelled|canceled)\s*$", "", stripped, flags=re.I).strip()
+      target_status = "completed" if op == "complete" else ("cancelled" if op == "cancel" else "snoozed")
+      try:
+        row = _tsk_update(
+          user_id=user_id,
+          title_match=stripped or None,
+          status=target_status,
+        )
+        tool_results.append({"tool": "commitment_upsert", "result": {"commitment": row, "saved": True}})
+        verb = {"completed": "Marked", "cancelled": "Cancelled", "snoozed": "Snoozed"}[target_status]
+        assistant_lines.append(f"{verb} '{row.get('title')}'.")
+      except _NotFoundErr:
+        tool_results.append({"tool": "commitment_upsert", "error": "task_not_found"})
+        assistant_lines.append(
+          f"I couldn't find a task matching '{stripped or '(no title given)'}'. Try 'show my tasks' to see the list."
+        )
+      except _AmbigErr as e:
+        tool_results.append({"tool": "commitment_upsert", "error": "ambiguous_match", "candidates": e.candidates})
+        names = ", ".join(f"'{(c.get('title') or '').strip()}'" for c in e.candidates[:5])
+        assistant_lines.append(f"Multiple tasks match — did you mean {names}?")
+      except _FidelityErr as e:
+        tool_results.append({"tool": "commitment_upsert", "error": str(e)})
+        assistant_lines.append(f"Couldn't update — {e}.")
+      except Exception as e:
+        logger.exception("tasks_agent update failed")
+        tool_results.append({"tool": "commitment_upsert", "error": str(e)})
+        assistant_lines.append("Couldn't update that task.")
+    else:
+      # Create. Strip leading 'add a task to / remind me to / note that / save as task' prefixes.
+      stripped = re.sub(
+        r"^(?:please\s+)?(?:add\s+a\s+task\s+to|add\s+task\s+to|create\s+a\s+task\s+to|make\s+a\s+task\s+to|new\s+task\s+to|remind\s+me\s+to|note\s+that\s+(?:i\s+)?need\s+to|note\s+to\s+self\s+to|add\s+to\s+my\s+list\s+to|save\s+as\s+a?\s*task\s*:?)\s+",
+        "",
+        ml,
+        flags=re.I,
+      ).strip()
+      if not stripped:
+        stripped = ml
+      title_short = _tsk_shorten(stripped, max_words=8)
+      try:
+        row = _tsk_create(
+          user_id=user_id,
+          title=title_short or stripped,
+          due_date=None,
+          description=None,
+          confirm_duplicate=False,
+          source="chat",
+        )
+        tool_results.append({"tool": "commitment_upsert", "result": {"commitment": row, "saved": True}})
+        due_bit = ""
+        if row.get("due_at"):
+          due_bit = f", due {row.get('due_at')[:10]}"
+        else:
+          due_bit = " — in Unplanned. Set a date from the Tasks screen when you're ready."
+        assistant_lines.append(f"Added '{row.get('title')}'{due_bit}")
+      except _SimilarErr as e:
+        existing = e.similar
+        tool_results.append({
+          "tool": "commitment_upsert",
+          "warning": "similar_task_exists",
+          "similar": existing,
+        })
+        assistant_lines.append(
+          f"You already have a task '{existing.get('title')}'. Add this as a new task or update the existing one?"
+        )
+      except _FidelityErr as e:
+        tool_results.append({"tool": "commitment_upsert", "error": str(e)})
+        assistant_lines.append(f"Need a clearer task — {e}.")
+      except Exception as e:
+        logger.exception("tasks_agent create failed")
+        tool_results.append({"tool": "commitment_upsert", "error": str(e)})
+        assistant_lines.append("Couldn't add that task.")
 
   elif agent_id == "device_agent":
     if not assistant_device_tools_enabled():
@@ -2239,16 +2676,27 @@ def process_assistant_intent(
       )
 
   # Speech-to-text often misses exact trigger phrases; routing LLM may also fail offline.
-  # For Realtime voice, default to calendar+commitments agent (reads tasks/reminders/meetings)
-  # or communication agent when the utterance clearly mentions mail.
+  # For Realtime voice, default by hint: tasks for to-do phrasing, communication
+  # for mail phrasing, calendar otherwise.
   if not route.agent_id and user_id and (source or "").strip() == "voice_realtime":
     ml = text.lower()
     _mail_hint = ("email", "e-mail", "mail", "gmail", "inbox", "unread")
+    _task_hint = (
+      "task", "todo", "to-do", "to do list", "my list", "remind me to",
+      "add to my list", "note that", "follow up", "follow-up",
+      "mark done", "mark complete", "cancel the task", "snooze",
+    )
     if any(h in ml for h in _mail_hint):
       route = RouteResult(
           agent_id="communication_agent",
           method="voice_default",
           rationale="voice_fallback_email_hint",
+      )
+    elif any(h in ml for h in _task_hint):
+      route = RouteResult(
+          agent_id="tasks_agent",
+          method="voice_default",
+          rationale="voice_fallback_tasks_hint",
       )
     else:
       route = RouteResult(
@@ -2513,6 +2961,19 @@ def approve_pending_action(pending_id: str, user_id: str) -> dict[str, Any]:
     elif tool == TOOL_GMAIL_DELETE:
       result = gmail_delete_from_payload(user_id, payload)
       result_blob = {"gmail_delete": result}
+    elif tool == TOOL_CONTACTS_LOOKUP:
+      from services.contacts_service import lookup_contacts
+      query = str(payload.get("query") or "").strip()
+      matches = lookup_contacts(user_id, query, limit=5) if query else []
+      result_blob = {
+        "contacts": matches,
+        "count": len(matches),
+        "note": (
+          "Read these to the user and ask which one applies, or if it's a new address."
+          if matches else
+          f"No known contacts for '{query}'. Ask the user to spell out the full email address."
+        ),
+      }
     elif tool in DEVICE_TOOLS:
       result_raw = execute_device_tool(user_id, tool)
       result_blob = {"device": result_raw}

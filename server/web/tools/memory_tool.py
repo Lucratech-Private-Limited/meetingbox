@@ -79,8 +79,9 @@ def memory_search_meetings(
         )
         params.extend([pat, pat, pat, pat, pat])
       where_sql = " AND ".join(cond_parts)
-      params.extend(list(scope_params))
-      params.append(max_results)
+      # scope_params must come AFTER word params because scope_sql appears
+      # last in the WHERE clause (word LIKE params are bound first).
+      all_params = [*params, *scope_params, max_results]
       cur.execute(
         f"""
         SELECT DISTINCT m.id, m.title, m.start_time, m.end_time, m.created_at, m.status
@@ -88,11 +89,11 @@ def memory_search_meetings(
         LEFT JOIN summaries s ON s.meeting_id = m.id
         LEFT JOIN local_summaries ls ON ls.meeting_id = m.id
         LEFT JOIN segments seg ON seg.meeting_id = m.id
-        WHERE ({scope_sql}) AND ({where_sql})
+        WHERE ({where_sql}) AND ({scope_sql})
         ORDER BY COALESCE(m.created_at, m.start_time, '') DESC
         LIMIT ?
         """,
-        params,
+        all_params,
       )
 
     rows = cur.fetchall()

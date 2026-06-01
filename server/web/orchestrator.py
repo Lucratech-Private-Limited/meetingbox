@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -123,9 +124,18 @@ def _score_triggers(message_lower: str, triggers: list[str]) -> int:
   return score
 
 
+def _strip_email_addresses(text: str) -> str:
+  """Remove email-like tokens so embedded addresses don't inflate trigger scores.
+
+  E.g. 'add vivek@gmail.com to the meeting' would otherwise match 'gmail' and
+  'mail' triggers for the communication_agent even though this is a calendar op.
+  """
+  return re.sub(r"\S+@\S+\.\S+", " ", text)
+
+
 def route_with_triggers(message: str) -> RouteResult | None:
-  msg_lower = message.lower().strip()
-  if not msg_lower:
+  msg_lower = _strip_email_addresses(message.lower().strip())
+  if not msg_lower.strip():
     return None
 
   ranked: list[tuple[str, int, int]] = []
@@ -233,7 +243,7 @@ def route_with_llm(message: str, user_id: str | None = None) -> RouteResult | No
     f"Candidates:\n{json.dumps(candidates, indent=2)}\n"
     f"{mem0_part}\nUser message:\n{user_ask}\n"
   )
-  model = os.getenv("AI_MODEL", "claude-sonnet-4-20250514")
+  model = os.getenv("AI_MODEL", "claude-sonnet-4-5-20250929")
   try:
     resp = client.messages.create(
       model=model,
@@ -420,7 +430,7 @@ def _call_anthropic_multi_planner(
     + f"Candidates:\n{json.dumps(candidates, indent=2)}\n"
     + f"{mem0_part}\nUser message:\n{message[:4000]}\n"
   )
-  model = os.getenv("AI_MODEL", "claude-sonnet-4-20250514")
+  model = os.getenv("AI_MODEL", "claude-sonnet-4-5-20250929")
   try:
     resp = client.messages.create(
       model=model,
