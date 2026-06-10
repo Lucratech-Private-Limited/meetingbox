@@ -285,7 +285,7 @@ def _call_claude_json(prompt: str) -> Any:
     if not client:
         raise HTTPException(status_code=400, detail="ANTHROPIC_API_KEY is not configured.")
 
-    model = os.getenv("AI_MODEL", "claude-sonnet-4-20250514")
+    model = os.getenv("AI_MODEL", "claude-sonnet-4-5-20250929")
     try:
         resp = client.messages.create(
             model=model,

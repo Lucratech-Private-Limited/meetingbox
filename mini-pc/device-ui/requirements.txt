@@ -24,9 +24,6 @@ pyyaml>=6.0.1
 # webrtcvad needs pkg_resources at runtime; bare slim Python 3.12+ images drop it.
 setuptools>=69.0.0
 
-# Local Redis (receive audio_level from the in-process audio child)
-redis>=5.0.0
-
 # QR Code generation
 qrcode>=7.4.2
 

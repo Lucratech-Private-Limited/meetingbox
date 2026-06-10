@@ -30,6 +30,48 @@ services:
     networks:
       - meetingbox-server-net
 
+  mem0-postgres:
+    image: ankane/pgvector:v0.5.1
+    container_name: meetingbox-mem0-postgres
+    restart: unless-stopped
+    shm_size: "128mb"
+    environment:
+      - POSTGRES_USER=${MEM0_PGVECTOR_USER:-postgres}
+      - POSTGRES_PASSWORD=${MEM0_PGVECTOR_PASSWORD:?Set MEM0_PGVECTOR_PASSWORD in .env}
+      - POSTGRES_DB=${MEM0_PGVECTOR_DB:-postgres}
+    volumes:
+      - mem0-postgres-data:/var/lib/postgresql/data
+    networks:
+      - meetingbox-server-net
+    healthcheck:
+      test: ["CMD", "pg_isready", "-q", "-d", "${MEM0_PGVECTOR_DB:-postgres}", "-U", "${MEM0_PGVECTOR_USER:-postgres}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  mem0-neo4j:
+    image: neo4j:5.26.4
+    container_name: meetingbox-mem0-neo4j
+    restart: unless-stopped
+    environment:
+      - NEO4J_AUTH=neo4j/${MEM0_NEO4J_PASSWORD:?Set MEM0_NEO4J_PASSWORD in .env}
+      - NEO4J_PLUGINS=["apoc"]
+      - NEO4J_apoc_export_file_enabled=true
+      - NEO4J_apoc_import_file_enabled=true
+      - NEO4J_apoc_import_file_use__neo4j__config=true
+      - NEO4J_dbms_memory_heap_initial__size=512m
+      - NEO4J_dbms_memory_heap_max__size=1G
+    volumes:
+      - mem0-neo4j-data:/data
+    networks:
+      - meetingbox-server-net
+    healthcheck:
+      test: wget -O /dev/null -q http://localhost:7474 || exit 1
+      interval: 5s
+      timeout: 10s
+      retries: 20
+      start_period: 90s
+
   web:
     build:
       context: ./web
@@ -37,6 +79,13 @@ services:
     restart: unless-stopped
     depends_on:
       redis:
+        condition: service_started
+      mem0-postgres:
+        condition: service_healthy
+      # Fix 13: Neo4j is a soft dependency — the web service starts even if Neo4j
+      # is unavailable. Set MEM0_NEO4J_OPTIONAL=1 in .env so mem0_service.py
+      # falls back to pgvector-only mode when Neo4j is down or slow to start.
+      mem0-neo4j:
         condition: service_started
     environment:
       - PYTHONUNBUFFERED=1
@@ -50,19 +99,37 @@ services:
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - OPENAI_ROUTER_MODEL=${OPENAI_ROUTER_MODEL:-}
-      - MEM0_API_KEY=${MEM0_API_KEY:-}
+      - MEM0_PGVECTOR_HOST=${MEM0_PGVECTOR_HOST:-mem0-postgres}
+      - MEM0_PGVECTOR_PORT=${MEM0_PGVECTOR_PORT:-5432}
+      - MEM0_PGVECTOR_USER=${MEM0_PGVECTOR_USER:-postgres}
+      - MEM0_PGVECTOR_PASSWORD=${MEM0_PGVECTOR_PASSWORD:-}
+      - MEM0_PGVECTOR_DB=${MEM0_PGVECTOR_DB:-postgres}
+      - MEM0_NEO4J_URI=${MEM0_NEO4J_URI:-bolt://mem0-neo4j:7687}
+      - MEM0_NEO4J_USERNAME=${MEM0_NEO4J_USERNAME:-neo4j}
+      - MEM0_NEO4J_PASSWORD=${MEM0_NEO4J_PASSWORD:-}
+      - MEM0_NEO4J_OPTIONAL=${MEM0_NEO4J_OPTIONAL:-1}
+      - MEM0_LLM_MODEL=${MEM0_LLM_MODEL:-gpt-4o-mini}
       - OPENAI_TRANSCRIBE_MODEL=${OPENAI_TRANSCRIBE_MODEL:-whisper-1}
+      - OPENAI_TRANSCRIBE_PROMPT=${OPENAI_TRANSCRIBE_PROMPT:-}
+      - OPENAI_TRANSCRIBE_LANGUAGE=${OPENAI_TRANSCRIBE_LANGUAGE:-}
+      - OPENAI_TRANSCRIBE_CHUNK_SECONDS=${OPENAI_TRANSCRIBE_CHUNK_SECONDS:-600}
+      - OPENAI_TRANSCRIBE_MAX_BYTES=${OPENAI_TRANSCRIBE_MAX_BYTES:-25165824}
+      - MEETINGBOX_MAX_UPLOAD_BYTES=${MEETINGBOX_MAX_UPLOAD_BYTES:-2147483648}
+      - MEETINGBOX_MAX_MEETING_UPLOAD_SECONDS=${MEETINGBOX_MAX_MEETING_UPLOAD_SECONDS:-28800}
+      - MEETINGBOX_FFMPEG_TIMEOUT_SECONDS=${MEETINGBOX_FFMPEG_TIMEOUT_SECONDS:-1800}
       - OPENAI_TTS_VOICE=${OPENAI_TTS_VOICE:-shimmer}
       - OPENAI_TTS_MODEL=${OPENAI_TTS_MODEL:-tts-1}
       # Realtime voice: enable in server .env — device uses OpenAI WebSocket + /api/voice/tool invoke
       - MEETINGBOX_REALTIME_VOICE_ENABLED=${MEETINGBOX_REALTIME_VOICE_ENABLED:-1}
       - OPENAI_REALTIME_MODEL=${OPENAI_REALTIME_MODEL:-gpt-realtime-2}
+      - OPENAI_REALTIME_VOICE=${OPENAI_REALTIME_VOICE:-marin}
       # Mem0 ingest: keep calendar + Gmail in Mem0 so voice assistant can recall them
       - MEETINGBOX_MEM0_INGEST_CALENDAR=${MEETINGBOX_MEM0_INGEST_CALENDAR:-1}
       - MEETINGBOX_MEM0_INGEST_GMAIL=${MEETINGBOX_MEM0_INGEST_GMAIL:-1}
       - MEETINGBOX_MEM0_INGEST_CHAT=${MEETINGBOX_MEM0_INGEST_CHAT:-1}
-      - AI_MODEL=${AI_MODEL:-claude-sonnet-4-20250514}
+      - AI_MODEL=${AI_MODEL:-claude-sonnet-4-5-20250929}
       - AI_REPORT_MAX_TOKENS=${AI_REPORT_MAX_TOKENS:-16384}
+      - BRAVE_SEARCH_API_KEY=${BRAVE_SEARCH_API_KEY:-}
       - JWT_SECRET_KEY=${JWT_SECRET_KEY:?Set JWT_SECRET_KEY in .env}
       - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:-}
       - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET:-}
@@ -96,6 +163,8 @@ services:
 
 volumes:
   server-redis-data:
+  mem0-postgres-data:
+  mem0-neo4j-data:
 
 networks:
   meetingbox-server-net:

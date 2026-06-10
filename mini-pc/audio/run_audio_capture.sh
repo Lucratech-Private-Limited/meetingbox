@@ -107,4 +107,19 @@ echo "[MeetingBox audio] UPLOAD_AUDIO_API_URL=$UPLOAD_AUDIO_API_URL" >&2
 echo "[MeetingBox audio] UPLOAD_AUDIO_TIMEOUT_SECONDS=$UPLOAD_AUDIO_TIMEOUT_SECONDS" >&2
 echo "[MeetingBox audio] PYTHON=$("$PYTHON_CMD" -c 'import sys; print(sys.executable)')" >&2
 
-exec "$PYTHON_CMD" audio_capture.py "$@"
+# Supervisor loop — if ``audio_capture.py`` exits unexpectedly (e.g.
+# unrecoverable PortAudio / ALSA error after the in-process watchdog
+# bailed out), wait briefly and restart. ``MEETINGBOX_AUDIO_NO_RESPAWN=1``
+# skips the loop and runs the program once in-place (useful for
+# debugging or under systemd which already handles restart).
+if [[ "${MEETINGBOX_AUDIO_NO_RESPAWN:-0}" == "1" ]]; then
+  exec "$PYTHON_CMD" audio_capture.py "$@"
+fi
+
+RESTART_DELAY="${MEETINGBOX_AUDIO_RESTART_DELAY:-2}"
+while true; do
+  "$PYTHON_CMD" audio_capture.py "$@"
+  rc=$?
+  echo "[MeetingBox audio] audio_capture.py exited (rc=$rc) — restarting in ${RESTART_DELAY}s" >&2
+  sleep "$RESTART_DELAY"
+done

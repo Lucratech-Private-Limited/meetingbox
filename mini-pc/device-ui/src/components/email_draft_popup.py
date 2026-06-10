@@ -144,6 +144,12 @@ class EmailDraftPopup(FloatLayout):
         self._auto_close_ev = None
         self._row_widgets: dict[str, BoxLayout] = {}
         self._sep_widgets: dict[str, Widget] = {}
+        # Persisted draft fields. Updates MERGE into this — a directive that
+        # omits a field keeps the previous value, so a single-field edit (e.g.
+        # adding cc) never blanks the rest of the draft.
+        self._fields: dict[str, str] = {
+            "to": "", "cc": "", "bcc": "", "subject": "", "body": "", "draft_id": "",
+        }
         self.opacity = 0
         self._build_ui()
 
@@ -203,7 +209,7 @@ class EmailDraftPopup(FloatLayout):
         topbar.add_widget(self._status)
 
         close_btn = Label(
-            text="\u2715", font_size=int(24 * s), color=_CLOSE_COLOR,
+            text="\u00d7", font_size=int(32 * s), bold=True, color=_CLOSE_COLOR,
             size_hint=(None, 1), width=int(40 * s),
             halign="center", valign="middle",
         )
@@ -332,24 +338,34 @@ class EmailDraftPopup(FloatLayout):
     def update_draft(self, data: dict):
         if not isinstance(data, dict):
             return
-        to_txt = _fmt_recipients(data.get("to"))
-        cc_txt = _fmt_recipients(data.get("cc"))
-        bcc_txt = _fmt_recipients(data.get("bcc"))
-        subject = str(data.get("subject") or "").strip()
-        body = str(data.get("body") or "")
+        # MERGE semantics: only overwrite a field the directive actually
+        # carries. Missing keys keep their previous value so progressive fills
+        # and single-field edits (add cc, change subject, edit body) never wipe
+        # the rest of the draft.
+        for key in ("to", "cc", "bcc"):
+            if key in data:
+                self._fields[key] = _fmt_recipients(data.get(key))
+        if "subject" in data:
+            self._fields["subject"] = str(data.get("subject") or "").strip()
+        if "body" in data:
+            self._fields["body"] = str(data.get("body") or "")
+        if "draft_id" in data:
+            self._fields["draft_id"] = str(data.get("draft_id") or "")
         state = str(data.get("state") or self._state or "drafting").strip().lower()
         self._state = state
 
         # To & subject rows always present; show a dim placeholder while empty
         # so there is never a blank loading state.
-        self._set_row("to", to_txt, placeholder="\u2026")
-        self._set_row("subject", subject, placeholder="\u2026")
+        self._set_row("to", self._fields["to"], placeholder="\u2026")
+        self._set_row("subject", self._fields["subject"], placeholder="\u2026")
 
-        # cc / bcc rows are removed entirely when empty so their space goes to
-        # the body, per the design.
-        self._toggle_optional_row("cc", cc_txt)
-        self._toggle_optional_row("bcc", bcc_txt)
+        # cc / bcc rows collapse when empty so their space goes to the body,
+        # and expand the moment they have a value — so To, cc and bcc are all
+        # visible together whenever each is set.
+        self._toggle_optional_row("cc", self._fields["cc"])
+        self._toggle_optional_row("bcc", self._fields["bcc"])
 
+        body = self._fields["body"]
         if body:
             self._body_label.text = body
             self._body_label.color = _VALUE_COLOR
@@ -458,6 +474,9 @@ class EmailDraftPopup(FloatLayout):
         if self._visible:
             return
         self._state = "drafting"
+        self._fields = {
+            "to": "", "cc": "", "bcc": "", "subject": "", "body": "", "draft_id": "",
+        }
         self._status.text = ""
         self._body_label.text = ""
         for key in ("to", "subject"):
@@ -494,4 +513,24 @@ class EmailDraftPopup(FloatLayout):
         if self.opacity < 0.05:
             return False
         super().on_touch_down(touch)
+        # Grab the touch so move + up of this gesture cannot leak through to
+        # the screen behind the modal.
+        touch.grab(self)
+        return True
+
+    def on_touch_move(self, touch):
+        if touch.grab_current is self:
+            return True
+        if self.opacity < 0.05:
+            return False
+        super().on_touch_move(touch)
+        return True
+
+    def on_touch_up(self, touch):
+        if touch.grab_current is self:
+            touch.ungrab(self)
+            return True
+        if self.opacity < 0.05:
+            return False
+        super().on_touch_up(touch)
         return True

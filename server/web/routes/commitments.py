@@ -2,10 +2,19 @@
 
 import logging
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel
 
 from auth import get_current_actor
-from services.commitments_service import list_commitments_for_user
+from services.commitments_service import list_commitments_for_user, upsert_commitment
+from services.tasks_service import (
+    AmbiguousTaskMatchError,
+    SimilarTaskExistsError,
+    TaskFidelityError,
+    TaskNotFoundError,
+    voice_create_task,
+    voice_update_task,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -23,3 +32,78 @@ async def list_user_commitments(
     sf = status.strip().lower() if status else None
     rows = list_commitments_for_user(user_id, status_filter=sf, limit=limit)
     return {"commitments": rows, "count": len(rows)}
+
+
+class CommitmentCreate(BaseModel):
+    title: str
+    due_date: str | None = None
+    description: str | None = None
+    confirm_duplicate: bool = False
+    source: str = "manual"
+
+
+@router.post("/commitments")
+async def create_user_commitment(
+    body: CommitmentCreate,
+    actor: dict = Depends(get_current_actor),
+):
+    """Create a task. Used by the device Tasks screen '+ Add' button.
+
+    Honors the same fidelity + duplicate guardrails as the voice path. On a
+    duplicate hit, returns HTTP 409 with the existing task so the UI can ask
+    the user whether to update or add anyway (pass confirm_duplicate=true).
+    """
+    user_id = actor["user"]["id"]
+    try:
+        row = voice_create_task(
+            user_id=user_id,
+            title=body.title,
+            due_date=body.due_date,
+            description=body.description,
+            confirm_duplicate=bool(body.confirm_duplicate),
+            source=(body.source or "manual"),
+        )
+    except SimilarTaskExistsError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "similar_task_exists", "similar": exc.similar},
+        )
+    except TaskFidelityError as exc:
+        raise HTTPException(status_code=400, detail={"error": "task_fidelity", "detail": str(exc)})
+    return row
+
+
+class CommitmentPatch(BaseModel):
+    status: str | None = None
+    due_date: str | None = None
+
+
+@router.patch("/commitments/{commitment_id}")
+async def patch_commitment(
+    commitment_id: str,
+    body: CommitmentPatch,
+    actor: dict = Depends(get_current_actor),
+):
+    """Update a single commitment.
+
+    Supports:
+      • status change (active / snoozed / completed / cancelled)
+      • due_date assignment / re-assignment (sets due_at on the task)
+    """
+    user_id = actor["user"]["id"]
+    if body.status is None and body.due_date is None:
+        raise HTTPException(status_code=400, detail="status or due_date required")
+    try:
+        row = voice_update_task(
+            user_id=user_id,
+            task_id=commitment_id,
+            status=body.status,
+            due_date=body.due_date,
+        )
+    except TaskNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except AmbiguousTaskMatchError as exc:
+        raise HTTPException(status_code=400, detail={"error": "ambiguous", "candidates": exc.candidates})
+    except TaskFidelityError as exc:
+        raise HTTPException(status_code=400, detail={"error": "task_fidelity", "detail": str(exc)})
+    return row

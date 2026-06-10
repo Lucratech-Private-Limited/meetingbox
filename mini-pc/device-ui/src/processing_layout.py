@@ -1,27 +1,25 @@
-"""Processing screen layout — Figma ``397:261`` (VelsLhL4YHeVRZSCEmCrGw).
+"""Processing / "Summarizing" screen layout — Figma ``1036:16``
+(dvqlN0JtWQODt6jYbTrbDG, "Copy").
 
-Canvas: 1260 × 800.  Every value is the exact Figma absolute coordinate (or the
-derived position for stroke layers that overflow their bounding box).
+Light-theme post-recording screen drawn with Kivy primitives:
 
-Layer reference (Figma node IDs)::
+  * slate wash background
+  * "Recording Complete" + "Meeting Name · 32 min" header
+  * centre orb with a calm, breathing concentric-ring animation
+  * "Summarizing your meeting..." / "This may take a few seconds" captions
+  * a rotating stage line ("Extracting key points...")
+  * a bottom countdown — "Back to home screen in N seconds" — that returns the
+    user to the home screen (the summary-ready notification is surfaced there)
 
-    414:1232  back button (round)
-    414:1266  Listening pill (composite)
-    415:53    settings button (round)
-    399:447   green check badge
-    399:432   "Recording complete" headline
-    399:434   "Product Sync" meeting title
-    399:438   separator dot
-    399:436   "32min" duration
-    399:456   Ellipse 17 — outer radial glow (orb)
-    399:454   Ellipse 16 stroke — soft outer glow (inset -6.64%)
-    399:455   Ellipse 16 stroke — wide diffuse glow (inset -39.34%)
-    399:451   Ellipse 16 stroke — solid bright rim (no inset)
-    399:452   Ellipse 16 stroke — outer rim highlight (inset -1.9% / -3.79%)
-    399:477   "Summarizing your meeting…" headline
-    399:480   "This may take a few seconds" subtitle
-    399:466   3-stage step list card (composite)
-    407:639   "We'll notify you…" bottom pill (composite)
+Canvas 1260 × 800; values are exact Figma absolute coordinates.
+
+Layer reference (Figma node IDs):
+  1036:199 Recording Complete
+  1036:200 Meeting Name · 32 min
+  1036:148 Group 199  centre orb (concentric rings)
+  1036:173 Summarizing your meeting...
+  1036:175 This may take a few seconds
+  1036:182 Extracting key points...  (rotating stage line)
 """
 
 from __future__ import annotations
@@ -41,7 +39,6 @@ CANVAS_H = 800.0
 
 
 def canvas_box(lx: float, ly: float, lw: float, lh: float) -> Box:
-    """Figma absolute px on 1260×800 → ratio box."""
     return dict(
         x=lx / CANVAS_W,
         y_top=ly / CANVAS_H,
@@ -50,82 +47,50 @@ def canvas_box(lx: float, ly: float, lw: float, lh: float) -> Box:
     )
 
 
-# ── Header (top row) ──────────────────────────────────────────────────────
-BACK_BTN = canvas_box(24.013, 21.188, 76.278, 76.278)
-LISTENING_PILL = canvas_box(805.157, 21.188, 302.287, 76.278)
-SETTINGS_BTN = canvas_box(1159.708, 21.188, 76.278, 76.278)
+# ── Boxes ─────────────────────────────────────────────────────────────────
+# Centred labels span a wide box so longer copy never ellipsises.
+STATUS_BAR = canvas_box(1120.0, 24.0, 116.0, 30.0)
+ORB = canvas_box(502.0, 226.0, 258.0, 258.0)
 
+HEADLINE = canvas_box(130.0, 90.0, 1000.0, 58.0)         # "Recording Complete"
+META = canvas_box(180.0, 168.0, 900.0, 40.0)             # "Meeting Name · 32 min"
 
-# ── "Recording complete" status row (Group 45) ────────────────────────────
-CHECK_BADGE = canvas_box(100.291, 153.968, 46.614, 46.614)
-HEADLINE_LABEL = canvas_box(159.617, 152.555, 360.0, 44.0)
-TITLE_LABEL = canvas_box(159.617, 199.170, 180.0, 34.0)
-DOT_SEPARATOR = canvas_box(348.900, 216.120, 5.65, 5.65)
-DURATION_LABEL = canvas_box(370.088, 199.170, 100.0, 34.0)
+SUMMARIZING = canvas_box(130.0, 504.0, 1000.0, 54.0)     # centred
+SUBTITLE = canvas_box(180.0, 572.0, 900.0, 32.0)         # centred
+STAGE = canvas_box(180.0, 642.0, 900.0, 40.0)            # rotating, centred
+COUNTDOWN = canvas_box(180.0, 712.0, 900.0, 32.0)        # centred
 
+# ── Typography (Figma px on the 800-tall canvas) ──────────────────────────
+HEADLINE_FS_RATIO = 45.0 / CANVAS_H
+META_FS_RATIO = 30.0 / CANVAS_H
+SUMMARIZING_FS_RATIO = 40.0 / CANVAS_H
+SUBTITLE_FS_RATIO = 23.0 / CANVAS_H
+STAGE_FS_RATIO = 28.0 / CANVAS_H
+COUNTDOWN_FS_RATIO = 24.0 / CANVAS_H
 
-# ── Centre orb (left half) ────────────────────────────────────────────────
-# Stroke layers — coords account for Figma's per-layer overflow insets.
-_RING_ORIGIN_X = 146.906
-_RING_ORIGIN_Y = 292.399
-_RING_SIZE = 298.049
+# ── Colours ───────────────────────────────────────────────────────────────
+# Light paper-swirl bitmap background; gradient below is only the fallback.
+BG_TOP = (0.965, 0.965, 0.972, 1.0)
+BG_BOT = (0.902, 0.910, 0.925, 1.0)
 
-ORB_GLOW = canvas_box(0.0, 0.0, 927.0, 800.0)
-RING_GLOW = canvas_box(
-    _RING_ORIGIN_X - _RING_SIZE * 0.0664,
-    _RING_ORIGIN_Y - _RING_SIZE * 0.0664,
-    _RING_SIZE * 1.1328,
-    _RING_SIZE * 1.1328,
-)
-RING_LIGHTEN = canvas_box(
-    _RING_ORIGIN_X - _RING_SIZE * 0.3934,
-    _RING_ORIGIN_Y - _RING_SIZE * 0.3934,
-    _RING_SIZE * 1.7868,
-    _RING_SIZE * 1.7868,
-)
-RING_SOLID = canvas_box(_RING_ORIGIN_X, _RING_ORIGIN_Y, _RING_SIZE, _RING_SIZE)
-RING_OUTER = canvas_box(
-    _RING_ORIGIN_X - _RING_SIZE * 0.019,
-    _RING_ORIGIN_Y,
-    _RING_SIZE * 1.038,
-    _RING_SIZE * 1.0379,
-)
+COL_HEADLINE = (47 / 255, 47 / 255, 47 / 255, 1.0)       # #2F2F2F
+COL_TEXT = (53 / 255, 57 / 255, 59 / 255, 1.0)           # #35393B
+COL_MUTED = (53 / 255, 57 / 255, 59 / 255, 0.78)
+COL_COUNTDOWN = (53 / 255, 57 / 255, 59 / 255, 0.70)
+COL_PURPLE = (109 / 255, 73 / 255, 204 / 255, 1.0)       # #6D49CC
+COL_BATT_GREEN = (52 / 255, 199 / 255, 89 / 255, 1.0)    # battery fill
 
-
-# ── Bottom-left captions (under orb) ──────────────────────────────────────
-HEADLINE_BOTTOM = canvas_box(49.439, 649.776, 540.0, 44.0)
-SUBTITLE_BOTTOM = canvas_box(49.439, 707.691, 540.0, 34.0)
-
-
-# ── Right-side cards ──────────────────────────────────────────────────────
-STEPS_CARD = canvas_box(577.735, 261.323, 639.888, 251.435)
-NOTIFY_BAR = canvas_box(569.260, 542.422, 658.251, 76.278)
-
-
-# ── Typography (Figma px on 800-tall canvas) ──────────────────────────────
-HEADLINE_FS_RATIO = 36.726 / CANVAS_H   # "Recording complete", "Summarizing…"
-TITLE_FS_RATIO = 28.251 / CANVAS_H      # "Product Sync"
-DURATION_FS_RATIO = 28.251 / CANVAS_H
-SUBTITLE_FS_RATIO = 28.251 / CANVAS_H
-
-
-# ── Colours (sampled from Figma) ──────────────────────────────────────────
-BG_RGB = (1, 8, 26)  # #01081A
-
-COL_WHITE = (1.0, 1.0, 1.0, 1.0)
-COL_MUTED = (182 / 255, 186 / 255, 242 / 255, 1.0)   # #B6BAF2
-COL_HINT = (155 / 255, 162 / 255, 178 / 255, 1.0)    # #9BA2B2 (notify bar text)
-COL_BLUE = (0 / 255, 149 / 255, 255 / 255, 1.0)      # #0095FF (ring stroke)
+# Waveform / ring purple gradient (top → bottom), matching Figma.
+RING_TOP = (164 / 255, 143 / 255, 210 / 255, 1.0)        # #A48FD2
+RING_BOT = (109 / 255, 73 / 255, 195 / 255, 1.0)         # #6D49C3
+# Orb interior is a soft light glow over the background (not a dark disc),
+# with faint concentric rings and a soft outer purple ring.
+ORB_FILL = (1.0, 1.0, 1.0, 0.22)
+ORB_CONCENTRIC = (138 / 255, 110 / 255, 205 / 255, 0.22)
+ORB_RING = (138 / 255, 110 / 255, 205 / 255, 0.80)       # #8A6ECD
 
 
 def scaled_canvas(screen_w: float, screen_h: float) -> tuple[float, float]:
-    """Aspect-preserving canvas size for the current screen.
-
-    Uses ``min(sw/cw, sh/ch)`` so design proportions (circles, ring radii,
-    composite aspect ratios) survive on any monitor. The remaining screen
-    area is filled by the root background colour so the UI always covers
-    the whole display.
-    """
     if screen_w <= 0 or screen_h <= 0:
         return CANVAS_W, CANVAS_H
     scale = min(screen_w / CANVAS_W, screen_h / CANVAS_H)
@@ -139,13 +104,5 @@ def kivy_hints(box: Box) -> dict:
     }
 
 
-# Minimum/maximum font size guards. The min keeps text readable on tiny
-# panels (e.g. 800×480) and the cap stops the headline from looking
-# cartoonish on 4K displays where the canvas height is huge.
-_FONT_MIN_PX = 10
-_FONT_MAX_PX = 96
-
-
 def font_px(fs_ratio: float, canvas_height: float) -> int:
-    raw = round(fs_ratio * canvas_height)
-    return max(_FONT_MIN_PX, min(_FONT_MAX_PX, raw))
+    return max(6, round(fs_ratio * canvas_height))

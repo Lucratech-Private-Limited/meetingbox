@@ -216,6 +216,9 @@ class TranscriptionOverlay(FloatLayout):
         # message lands or a response ends.
         self._active_ai_msg_ids: dict[str, str] = {}
         self.opacity = 0
+        # When True, new messages do NOT auto-show the overlay (used on the
+        # home screen where the say bar handles transcription display).
+        self.suppress_auto_show = False
         self._build_ui()
 
     # ── Build ─────────────────────────────────────────────────────────────────
@@ -437,8 +440,10 @@ class TranscriptionOverlay(FloatLayout):
                 lambda _dt: setattr(self._scroll, 'scroll_y', 0), 0.12
             )
 
-            # Always make the overlay visible when new content arrives
-            self.show()
+            # Auto-show unless suppressed (e.g. on home screen where the
+            # say bar handles transcription display instead).
+            if not self.suppress_auto_show:
+                self.show()
 
             logger.info(
                 "TranscriptionOverlay: added %s bubble #%d (compact=%s, "

@@ -82,7 +82,23 @@ def _recording_redis(callable_fn):
 RECORDINGS_DIR = Path(os.getenv("RECORDINGS_DIR", "/data/audio/recordings"))
 RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
 
-MAX_UPLOAD_SIZE = 500 * 1024 * 1024  # 500 MB
+def _env_int(name: str, default: int) -> int:
+    try:
+      return int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+      return default
+
+
+MAX_UPLOAD_SIZE = _env_int("MEETINGBOX_MAX_UPLOAD_BYTES", 2 * 1024 * 1024 * 1024)
+OPENAI_TRANSCRIBE_MAX_BYTES = _env_int("OPENAI_TRANSCRIBE_MAX_BYTES", 24 * 1024 * 1024)
+OPENAI_TRANSCRIBE_CHUNK_SECONDS = _env_int("OPENAI_TRANSCRIBE_CHUNK_SECONDS", 10 * 60)
+DEFAULT_MAX_MEETING_UPLOAD_SECONDS = _env_int("MEETINGBOX_MAX_MEETING_UPLOAD_SECONDS", 8 * 60 * 60)
+DEFAULT_TRANSCRIBE_PROMPT = (
+  "This is a multilingual meeting. Speakers may switch between English, Telugu, Hindi, "
+  "and other Indian languages. Transcribe all speech accurately in the language spoken. "
+  "Preserve names, numbers, dates, product names, English technical terms, and code-mixed phrases. "
+  "Do not translate during transcription."
+)
 
 
 def _generate_session_id() -> str:
@@ -164,6 +180,10 @@ class MeetingSummary(BaseModel):
   decisions: list
   topics: list
   sentiment: str
+  # ISO timestamp when the summary row was persisted. Surfaced so the
+  # device-ui footer can show "Created: <date>" instead of falling back
+  # to the meeting's ``started_at``.
+  generated_at: Optional[str] = None
 
 
 class LocalSummary(BaseModel):
@@ -175,6 +195,7 @@ class LocalSummary(BaseModel):
   topics: list
   sentiment: str
   model_name: str
+  generated_at: Optional[str] = None
 
 
 def _normalize_summary_data(data: dict) -> dict:
@@ -207,8 +228,32 @@ def _normalize_summary_data(data: dict) -> dict:
   data["open_questions"] = _coerce_str_list(data.get("open_questions"))
   data["risks_or_concerns"] = _coerce_str_list(data.get("risks_or_concerns"))
 
-  # Topics/sentiment are not generated or shown in the product; keep API/DB columns empty.
-  data["topics"] = []
+  # Normalize topics into [{"name": str, "value": int 0-100}] so the device-ui
+  # Key Topics / Key Points views can render progress bars directly. Drop
+  # malformed entries; tolerate plain strings as zero-value labels.
+  raw_topics = data.get("topics", [])
+  topics: list[dict] = []
+  for t in raw_topics or []:
+    if isinstance(t, dict):
+      name = (t.get("name") or t.get("topic") or "").strip()
+      if not name:
+        continue
+      val_raw = t.get("value")
+      if val_raw is None:
+        val_raw = t.get("percentage")
+      try:
+        value = int(round(float(val_raw or 0)))
+      except (TypeError, ValueError):
+        value = 0
+      topics.append({"name": name[:60], "value": max(0, min(100, value))})
+    elif isinstance(t, str):
+      n = t.strip()
+      if n:
+        topics.append({"name": n[:60], "value": 0})
+  # Cap at 6 to keep the UI grid tidy.
+  data["topics"] = topics[:6]
+
+  # Sentiment is not surfaced in the product; keep the column empty.
   data["sentiment"] = ""
 
   return data
@@ -247,6 +292,11 @@ class MeetingDetail(BaseModel):
   local_summary: Optional[LocalSummary]
 
 
+class RecordingControlRequest(BaseModel):
+  device_id: Optional[str] = None
+  target_device_id: Optional[str] = None
+
+
 def _app_setting_int(key: str, default: int) -> int:
   conn = get_connection()
   try:
@@ -271,19 +321,135 @@ def _actor_user_id(actor: Optional[dict]) -> Optional[str]:
   return actor["user"]["id"]
 
 
+def _user_display_names(user_id: str) -> list[str]:
+  """Best-effort fetch of names the user is likely called by in meeting transcripts.
+
+  Returns display_name, username, and the local part of the email (if any),
+  so the meeting -> tasks bridge can match owner mentions like 'Vivek to send...'.
+  """
+  if not (user_id or "").strip():
+    return []
+  conn = get_connection()
+  try:
+    cur = conn.cursor()
+    cur.execute(
+      "SELECT display_name, username, email FROM users WHERE id = ?",
+      (user_id,),
+    )
+    row = cur.fetchone()
+  finally:
+    conn.close()
+  if not row:
+    return []
+  names: list[str] = []
+  display_name = row[0] if isinstance(row, (list, tuple)) else row.get("display_name")
+  username = row[1] if isinstance(row, (list, tuple)) else row.get("username")
+  email = row[2] if isinstance(row, (list, tuple)) else row.get("email")
+  if display_name:
+    names.append(str(display_name).strip())
+    parts = str(display_name).strip().split()
+    if parts:
+      names.append(parts[0])
+  if username:
+    names.append(str(username).strip())
+  if email and "@" in str(email):
+    local = str(email).split("@", 1)[0].strip()
+    if local:
+      names.append(local)
+  return [n for n in dict.fromkeys(names) if n]
+
+
 def _actor_device_id(actor: Optional[dict]) -> Optional[str]:
   if not actor or actor["type"] != "device":
     return None
   return actor["device"]["id"]
 
 
+def _recording_state_key(device_id: Optional[str]) -> str:
+  return f"recording_state:{device_id}" if device_id else "recording_state"
+
+
+def _current_meeting_key(device_id: Optional[str]) -> str:
+  return f"current_meeting_id:{device_id}" if device_id else "current_meeting_id"
+
+
+def _active_user_device_ids(user_id: str) -> list[str]:
+  conn = get_connection()
+  try:
+    cur = conn.cursor()
+    cur.execute(
+      """
+      SELECT id FROM devices
+      WHERE user_id = ?
+        AND (status IS NULL OR TRIM(COALESCE(status, '')) = ''
+             OR LOWER(TRIM(status)) = 'active')
+      ORDER BY datetime(COALESCE(last_seen_at, paired_at, created_at, '1970-01-01')) DESC
+      """,
+      (user_id,),
+    )
+    return [str(row[0]) for row in cur.fetchall() if row and row[0]]
+  finally:
+    conn.close()
+
+
+def _resolve_recording_device_id(actor: dict, requested_device_id: Optional[str] = None) -> Optional[str]:
+  """Resolve the one appliance a recording command is allowed to control."""
+  actor_device_id = _actor_device_id(actor)
+  if actor_device_id:
+    return actor_device_id
+
+  requested = (requested_device_id or "").strip() or None
+  user_id = _actor_user_id(actor)
+  if not user_id:
+    return None
+
+  active_ids = _active_user_device_ids(user_id)
+  if requested:
+    if requested not in active_ids:
+      raise HTTPException(status_code=404, detail="Device not found for this account.")
+    return requested
+  if len(active_ids) == 1:
+    return active_ids[0]
+  if len(active_ids) > 1:
+    raise HTTPException(
+      status_code=400,
+      detail="Multiple devices are paired. Choose a device_id for this recording command.",
+    )
+  return None
+
+
+def emit_audio_command(actor: dict, payload: dict, device_id: Optional[str] = None) -> Optional[str]:
+  """Publish one recording command, scoped to exactly one appliance when possible."""
+  target_device_id = device_id or _resolve_recording_device_id(actor)
+  cmd = dict(payload)
+  if target_device_id:
+    cmd["device_id"] = target_device_id
+  _get_redis().publish("commands", json.dumps(cmd))
+  return target_device_id
+
+
+def _publish_recording_ws_event(event_type: str, session_id: Optional[str], device_id: Optional[str] = None) -> None:
+  payload = {
+    "type": event_type,
+    "session_id": session_id,
+    "timestamp": datetime.now().isoformat(),
+  }
+  if device_id:
+    payload["device_id"] = device_id
+  _get_redis().publish("events", json.dumps(payload))
+
+
 def _session_owner_key(session_id: str) -> str:
   return f"meeting_session_owner:{session_id}"
 
 
-def _store_session_owner(session_id: str, actor: Optional[dict]) -> None:
+def _store_session_owner(
+  session_id: str,
+  actor: Optional[dict],
+  device_id_override: Optional[str] = None,
+) -> None:
   user_id = _actor_user_id(actor)
-  device_id = _actor_device_id(actor)
+  device_id = device_id_override or _actor_device_id(actor)
   if not session_id or (not user_id and not device_id):
     return
   _get_redis().setex(
@@ -340,35 +506,48 @@ def _meeting_access_filter(actor: Optional[dict], alias: str = "meetings") -> tu
 # Recording control accepts a signed-in user or a paired device token.
 
 @router.post("/start")
-async def start_meeting(current_actor: Optional[dict] = Depends(get_optional_actor)):
+async def start_meeting(
+  body: Optional[RecordingControlRequest] = None,
+  current_actor: Optional[dict] = Depends(get_optional_actor),
+):
   """Start a new recording. Sends command to audio service via Redis."""
-  _require_actor(current_actor)
+  actor = _require_actor(current_actor)
   session_id = _generate_session_id()
+  requested_device_id = (body.device_id or body.target_device_id) if body else None
+  device_id = _resolve_recording_device_id(actor, requested_device_id)
 
   def _work(r):
-    _store_session_owner(session_id, current_actor)
-    r.publish("commands", json.dumps({"action": "start_recording", "session_id": session_id}))
-    r.set("current_meeting_id", session_id)
-    r.set("recording_state", "recording")
+    _store_session_owner(session_id, current_actor, device_id_override=device_id)
+    cmd = {"action": "start_recording", "session_id": session_id}
+    if device_id:
+      cmd["device_id"] = device_id
+    r.publish("commands", json.dumps(cmd))
+    r.set(_current_meeting_key(device_id), session_id)
+    r.set(_recording_state_key(device_id), "recording")
 
   _recording_redis(_work)
   return {"session_id": session_id, "status": "recording_started"}
 
 
 @router.post("/stop")
-async def stop_meeting(current_actor: Optional[dict] = Depends(get_optional_actor)):
+async def stop_meeting(
+  body: Optional[RecordingControlRequest] = None,
+  current_actor: Optional[dict] = Depends(get_optional_actor),
+):
   """Stop the current recording. Sends command to audio service via Redis."""
-  _require_actor(current_actor)
+  actor = _require_actor(current_actor)
+  requested_device_id = (body.device_id or body.target_device_id) if body else None
+  device_id = _resolve_recording_device_id(actor, requested_device_id)
 
   def _work(r):
-    session_id = r.get("current_meeting_id")
-    r.publish(
-      "commands",
-      json.dumps({"action": "stop_recording", "session_id": session_id}),
-    )
-    r.set("recording_state", "processing")
+    session_id = r.get(_current_meeting_key(device_id))
+    cmd = {"action": "stop_recording", "session_id": session_id}
+    if device_id:
+      cmd["device_id"] = device_id
+    r.publish("commands", json.dumps(cmd))
+    r.set(_recording_state_key(device_id), "processing")
     if session_id:
-      r.delete("current_meeting_id")
+      r.delete(_current_meeting_key(device_id))
     return session_id
 
   session_id = _recording_redis(_work)
@@ -376,46 +555,60 @@ async def stop_meeting(current_actor: Optional[dict] = Depends(get_optional_acto
 
 
 @router.get("/recording-status")
-async def recording_status(current_actor: Optional[dict] = Depends(get_optional_actor)):
+async def recording_status(
+  device_id: Optional[str] = None,
+  current_actor: Optional[dict] = Depends(get_optional_actor),
+):
   """Current recording state for the dashboard."""
-  _require_actor(current_actor)
+  actor = _require_actor(current_actor)
+  target_device_id = _resolve_recording_device_id(actor, device_id)
 
   def _read(r):
-    state = r.get("recording_state") or "idle"
-    current_id = r.get("current_meeting_id")
+    state = r.get(_recording_state_key(target_device_id)) or "idle"
+    current_id = r.get(_current_meeting_key(target_device_id))
     return {"state": state, "session_id": current_id}
 
   return _recording_redis(_read)
 
 
 @router.post("/reset-recording-state")
-async def reset_recording_state(current_actor: Optional[dict] = Depends(get_optional_actor)):
+async def reset_recording_state(
+  body: Optional[RecordingControlRequest] = None,
+  current_actor: Optional[dict] = Depends(get_optional_actor),
+):
   """Clear recording state so the dashboard shows Start/Record buttons again (e.g. if stuck on Processing)."""
-  _require_actor(current_actor)
+  actor = _require_actor(current_actor)
+  requested_device_id = (body.device_id or body.target_device_id) if body else None
+  device_id = _resolve_recording_device_id(actor, requested_device_id)
 
   def _reset(r):
-    r.set("recording_state", "idle")
-    r.delete("current_meeting_id")
+    r.set(_recording_state_key(device_id), "idle")
+    r.delete(_current_meeting_key(device_id))
 
   _recording_redis(_reset)
   return {"status": "idle"}
 
 
 @router.post("/pause")
-async def pause_meeting(current_actor: Optional[dict] = Depends(get_optional_actor)):
+async def pause_meeting(
+  body: Optional[RecordingControlRequest] = None,
+  current_actor: Optional[dict] = Depends(get_optional_actor),
+):
   """Pause the current recording."""
-  _require_actor(current_actor)
+  actor = _require_actor(current_actor)
+  requested_device_id = (body.device_id or body.target_device_id) if body else None
+  device_id = _resolve_recording_device_id(actor, requested_device_id)
 
   def _work(r):
-    state = r.get("recording_state") or "idle"
+    state = r.get(_recording_state_key(device_id)) or "idle"
     if state != "recording":
       raise HTTPException(status_code=400, detail="No active recording to pause")
-    session_id = r.get("current_meeting_id")
-    r.publish(
-      "commands",
-      json.dumps({"action": "pause_recording", "session_id": session_id}),
-    )
-    r.set("recording_state", "paused")
+    session_id = r.get(_current_meeting_key(device_id))
+    cmd = {"action": "pause_recording", "session_id": session_id}
+    if device_id:
+      cmd["device_id"] = device_id
+    r.publish("commands", json.dumps(cmd))
+    r.set(_recording_state_key(device_id), "paused")
     return session_id
 
   session_id = _recording_redis(_work)
@@ -423,20 +616,25 @@ async def pause_meeting(current_actor: Optional[dict] = Depends(get_optional_act
 
 
 @router.post("/resume")
-async def resume_meeting(current_actor: Optional[dict] = Depends(get_optional_actor)):
+async def resume_meeting(
+  body: Optional[RecordingControlRequest] = None,
+  current_actor: Optional[dict] = Depends(get_optional_actor),
+):
   """Resume a paused recording."""
-  _require_actor(current_actor)
+  actor = _require_actor(current_actor)
+  requested_device_id = (body.device_id or body.target_device_id) if body else None
+  device_id = _resolve_recording_device_id(actor, requested_device_id)
 
   def _work(r):
-    state = r.get("recording_state") or "idle"
+    state = r.get(_recording_state_key(device_id)) or "idle"
     if state != "paused":
       raise HTTPException(status_code=400, detail="No paused recording to resume")
-    session_id = r.get("current_meeting_id")
-    r.publish(
-      "commands",
-      json.dumps({"action": "resume_recording", "session_id": session_id}),
-    )
-    r.set("recording_state", "recording")
+    session_id = r.get(_current_meeting_key(device_id))
+    cmd = {"action": "resume_recording", "session_id": session_id}
+    if device_id:
+      cmd["device_id"] = device_id
+    r.publish("commands", json.dumps(cmd))
+    r.set(_recording_state_key(device_id), "recording")
     return session_id
 
   session_id = _recording_redis(_work)
@@ -564,27 +762,92 @@ def _ensure_16k_mono_wav(source: Path, dest: Path) -> None:
     ],
     check=True,
     capture_output=True,
-    timeout=300,
+    timeout=_env_int("MEETINGBOX_FFMPEG_TIMEOUT_SECONDS", 1800),
   )
 
 
+def _transcribe_audio_file_once(client, model: str, audio_path: Path) -> str:
+  with open(audio_path, "rb") as audio_fp:
+    kwargs = {
+      "model": model,
+      "file": (audio_path.name, audio_fp, "audio/wav"),
+    }
+    prompt = (os.getenv("OPENAI_TRANSCRIBE_PROMPT") or DEFAULT_TRANSCRIBE_PROMPT).strip()
+    language = os.getenv("OPENAI_TRANSCRIBE_LANGUAGE", "").strip()
+    if prompt:
+      kwargs["prompt"] = prompt
+    if language:
+      kwargs["language"] = language
+    tr = client.audio.transcriptions.create(**kwargs)
+  return (getattr(tr, "text", None) or "").strip()
+
+
+def _split_wav_for_transcription(audio_path: Path) -> list[Path]:
+  """Split a PCM WAV into chunks small enough for OpenAI's transcription file cap."""
+  chunks: list[Path] = []
+  try:
+    with wave.open(str(audio_path), "rb") as src:
+      channels = src.getnchannels()
+      sample_width = src.getsampwidth()
+      frame_rate = src.getframerate()
+      bytes_per_second = max(1, channels * sample_width * frame_rate)
+      max_seconds_by_size = max(60, (OPENAI_TRANSCRIBE_MAX_BYTES // bytes_per_second) - 5)
+      chunk_seconds = max(60, min(OPENAI_TRANSCRIBE_CHUNK_SECONDS, max_seconds_by_size))
+      frames_per_chunk = int(frame_rate * chunk_seconds)
+      idx = 0
+      while True:
+        frames = src.readframes(frames_per_chunk)
+        if not frames:
+          break
+        fd, raw_chunk_path = tempfile.mkstemp(
+          prefix=f"{audio_path.stem}_part{idx:03d}_",
+          suffix=".wav",
+          dir=str(audio_path.parent),
+        )
+        os.close(fd)
+        chunk_path = Path(raw_chunk_path)
+        with wave.open(str(chunk_path), "wb") as out:
+          out.setnchannels(channels)
+          out.setsampwidth(sample_width)
+          out.setframerate(frame_rate)
+          out.writeframes(frames)
+        chunks.append(chunk_path)
+        idx += 1
+  except Exception:
+    for chunk in chunks:
+      chunk.unlink(missing_ok=True)
+    raise
+  return chunks
+
+
 def _transcribe_audio_with_openai(audio_path: Path) -> str:
-  """Transcribe meeting WAV via OpenAI Audio API (e.g. whisper-1). Anthropic is used only for summarization."""
+  """Transcribe meeting WAV via OpenAI Audio API, chunking long recordings."""
   client = _get_openai_client()
   if not client:
     raise HTTPException(status_code=400, detail="OPENAI_API_KEY is not configured on the server.")
   model = os.getenv("OPENAI_TRANSCRIBE_MODEL", "whisper-1")
   logger.info("Transcribing %s with OpenAI (%s)", audio_path.name, model)
   try:
-    with open(audio_path, "rb") as audio_fp:
-      tr = client.audio.transcriptions.create(
-        model=model,
-        file=(audio_path.name, audio_fp, "audio/wav"),
-      )
+    if audio_path.stat().st_size <= OPENAI_TRANSCRIBE_MAX_BYTES:
+      transcript = _transcribe_audio_file_once(client, model, audio_path)
+    else:
+      chunks = _split_wav_for_transcription(audio_path)
+      try:
+        parts: list[str] = []
+        total = len(chunks)
+        logger.info("Transcribing %s in %d chunks", audio_path.name, total)
+        for idx, chunk_path in enumerate(chunks, start=1):
+          logger.info("Transcribing chunk %d/%d for %s", idx, total, audio_path.name)
+          part = _transcribe_audio_file_once(client, model, chunk_path)
+          if part:
+            parts.append(part)
+        transcript = "\n\n".join(parts).strip()
+      finally:
+        for chunk_path in chunks:
+          chunk_path.unlink(missing_ok=True)
   except Exception as exc:
     logger.exception("OpenAI transcription failed: %s", exc)
     raise HTTPException(status_code=502, detail=f"OpenAI transcription failed: {exc}") from exc
-  transcript = (getattr(tr, "text", None) or "").strip()
   if not transcript:
     raise HTTPException(status_code=500, detail="OpenAI transcription returned empty text.")
   return transcript
@@ -627,8 +890,6 @@ async def upload_audio(
   finally:
     tmp_path.unlink(missing_ok=True)
 
-  _get_redis().set("recording_state", "processing")
-  _get_redis().set("current_meeting_id", session_id)
   now_iso = datetime.now().isoformat()
 
   duration_seconds = 0
@@ -640,7 +901,10 @@ async def upload_audio(
   except Exception:
     duration_seconds = 0
 
-  max_duration_seconds = _app_setting_int("max_meeting_upload_seconds", 10800)
+  max_duration_seconds = max(
+    _app_setting_int("max_meeting_upload_seconds", DEFAULT_MAX_MEETING_UPLOAD_SECONDS),
+    DEFAULT_MAX_MEETING_UPLOAD_SECONDS,
+  )
   if duration_seconds and duration_seconds > max_duration_seconds:
     dest_wav.unlink(missing_ok=True)
     raise HTTPException(
@@ -653,11 +917,15 @@ async def upload_audio(
   if not owner_user_id and not owner_device_id:
     owner_user_id, owner_device_id = _load_session_owner(session_id)
 
+  _get_redis().set(_recording_state_key(owner_device_id), "processing")
+  _get_redis().set(_current_meeting_key(owner_device_id), session_id)
+
   _get_redis().publish(
     "events",
     json.dumps({
       "type": "processing_started",
       "meeting_id": session_id,
+      "device_id": owner_device_id,
       "title": f"Meeting {session_id}",
       "duration": duration_seconds,
       "timestamp": now_iso,
@@ -716,13 +984,13 @@ async def upload_audio(
       current_actor,
     )
 
-    _get_redis().set("recording_state", "idle")
-    _get_redis().delete("current_meeting_id")
+    _get_redis().set(_recording_state_key(owner_device_id), "idle")
+    _get_redis().delete(_current_meeting_key(owner_device_id))
     _get_redis().delete(_session_owner_key(session_id))
     return {"session_id": session_id, "path": str(dest_wav), "status": "completed"}
   except HTTPException as exc:
-    _get_redis().set("recording_state", "idle")
-    _get_redis().delete("current_meeting_id")
+    _get_redis().set(_recording_state_key(owner_device_id), "idle")
+    _get_redis().delete(_current_meeting_key(owner_device_id))
     _get_redis().delete(_session_owner_key(session_id))
     _get_redis().publish(
       "events",
@@ -731,14 +999,15 @@ async def upload_audio(
         "error_type": "Processing Failed",
         "message": exc.detail,
         "meeting_id": session_id,
+        "device_id": owner_device_id,
         "timestamp": datetime.now().isoformat(),
       }),
     )
     raise
   except Exception as exc:
     logger.exception("upload_audio pipeline failed meeting_id=%s", session_id)
-    _get_redis().set("recording_state", "idle")
-    _get_redis().delete("current_meeting_id")
+    _get_redis().set(_recording_state_key(owner_device_id), "idle")
+    _get_redis().delete(_current_meeting_key(owner_device_id))
     _get_redis().delete(_session_owner_key(session_id))
     err_msg = str(exc).strip() or "Unexpected processing error"
     _get_redis().publish(
@@ -748,6 +1017,7 @@ async def upload_audio(
         "error_type": "Processing Failed",
         "message": err_msg,
         "meeting_id": session_id,
+        "device_id": owner_device_id,
         "timestamp": datetime.now().isoformat(),
       }),
     )
@@ -764,6 +1034,8 @@ async def list_meetings(limit: int = 50, offset: int = 0, status: Optional[str] 
     cur = conn.cursor()
     query = """
       SELECT m.*,
+             EXISTS(SELECT 1 FROM summaries s WHERE s.meeting_id = m.id) AS has_summary,
+             (SELECT COUNT(*) FROM segments seg WHERE seg.meeting_id = m.id) AS transcript_segments,
              (SELECT COUNT(*) FROM actions a
               WHERE a.meeting_id = m.id
                 AND a.status = 'pending'
@@ -816,8 +1088,8 @@ def _anthropic_message_text(resp) -> str:
 
 
 @router.post("/{meeting_id}/summarize")
-async def summarize_meeting(meeting_id: str, current_actor: Optional[dict] = Depends(get_optional_actor)):
-  """Generate a detailed meeting report from the transcript using Claude (stored in summaries.summary)."""
+async def summarize_meeting(meeting_id: str, force: bool = False, current_actor: Optional[dict] = Depends(get_optional_actor)):
+  """Generate a concise meeting summary from the transcript using Claude."""
   _require_actor(current_actor)
   client = _get_anthropic_client()
   if not client:
@@ -842,7 +1114,7 @@ async def summarize_meeting(meeting_id: str, current_actor: Optional[dict] = Dep
 
     cur.execute("SELECT * FROM summaries WHERE meeting_id = ?", (meeting_id,))
     existing = cur.fetchone()
-    if existing:
+    if existing and not force:
       result = _normalize_summary_data({
         "summary": existing["summary"],
         "action_items": json.loads(existing["action_items"] or "[]"),
@@ -873,91 +1145,56 @@ async def summarize_meeting(meeting_id: str, current_actor: Optional[dict] = Dep
   transcript = "\n\n".join(parts)
 
   prompt = (
-          "You are producing a **FULL MEETING REPORT** from the transcript. Output must read like a substantive written record, "
-          "**not** an executive summary, **not** a handful of bullets, and **not** one short page.\n\n"
+          "You are summarizing an entire meeting from its transcript. First read and understand the "
+          "WHOLE transcript, then write a single overall summary of the meeting and present that "
+          "summary as bullet points. Someone who did not attend should be able to read the bullets "
+          "and fully understand what the meeting was about and what came out of it.\n\n"
 
-          "CORE PRINCIPLE:\n"
-          "- The report must scale with informational density, not just transcript length.\n"
-          "- Do not expand beyond what the transcript can realistically support.\n\n"
+          "HOW TO SUMMARIZE:\n"
+          "- Summarize the meeting as a whole. Do NOT convert the transcript line by line into bullets.\n"
+          "- Synthesize: combine related discussion across the transcript into a few meaningful summary points.\n"
+          "- Each bullet should capture a theme or key takeaway, not a single sentence someone said.\n"
+          "- Condense the conversation: merge repeated or scattered points into one clear bullet.\n"
+          "- Aim for a small set of high-level bullets that together tell the full story of the meeting "
+          "(typically 4-10 bullets; use more only if the meeting genuinely covered many distinct topics).\n\n"
 
-          "LENGTH & DEPTH (adaptive):\n"
-          "- If the transcript is short (<150–200 words) OR contains a single speaker with limited content:\n"
-          "  - Keep the report concise but complete.\n"
-          "  - Do NOT artificially increase length.\n"
-          "  - Avoid repeating the same idea in multiple ways.\n"
-          "  - Prefer clarity and accuracy over volume.\n"
-          "- If the transcript is medium or long:\n"
-          "  - Expand proportionally with depth and detail.\n"
-          "  - Include multiple sections and detailed explanations where supported.\n\n"
+          "OUTPUT STYLE:\n"
+          "- Write the summary as bullet points in `full_report`.\n"
+          "- Start every bullet with \"- \" and put each bullet on its own line.\n"
+          "- Order the bullets to follow the overall flow of the meeting so it reads as a coherent summary.\n"
+          "- Keep the important specifics that appear: names, numbers, dates, decisions, outcomes, and follow-ups.\n\n"
 
-          "WRITING STYLE:\n"
-          "- Use dense prose paragraphs for the main narrative.\n"
-          "- Bullets are allowed ONLY for:\n"
-          "  - action-like lists\n"
-          "  - clearly enumerated items from the transcript\n"
-          "- Do NOT replace narrative with bullet-heavy output.\n\n"
+          "STRICTLY AVOID:\n"
+          "- Do NOT quote or paraphrase the transcript turn by turn.\n"
+          "- Do NOT add meta commentary about the meeting itself, such as \"this was a brief meeting\", "
+          "\"the transcript is short\", \"the discussion was limited\", or any similar filler.\n"
+          "- Do NOT add an introduction, conclusion, headings, or generic phrases.\n"
+          "- Do NOT restate the same point in different words.\n"
+          "- Do NOT invent anything that is not supported by the transcript.\n\n"
 
-          "ANTI-PADDING RULES (strict):\n"
-          "- Every paragraph must introduce new information.\n"
-          "- Do NOT restate the same point using different wording.\n"
-          "- Do NOT use generic filler phrases like:\n"
-          "  - 'methodical approach'\n"
-          "  - 'comprehensive evaluation'\n"
-          "  - 'significant findings'\n"
-          "  unless explicitly supported by the transcript.\n\n"
+          "MULTILINGUAL TRANSCRIPTS:\n"
+          "- The transcript may contain English, Telugu, Hindi, other Indian languages, or code-switched speech.\n"
+          "- Understand all languages from context, then write every bullet in clear English.\n"
+          "- Preserve original names, quoted phrases, numbers, dates, product names, and technical terms accurately.\n"
+          "- Do not drop a point just because it appears in Telugu, Hindi, or mixed-language speech.\n\n"
 
-          "FORMATTING (critical for display):\n"
-          "- Include ONLY the following section inside full_report:"
-          "  **DETAILED ACCOUNT**"
-
-          "STRUCTURE RULE:"
-          "- The `full_report` must contain narrative sections only."
-          "- Do NOT duplicate structured data (decisions, risks, questions) as standalone sections inside the report."
-          "- You may reference them naturally in prose, but not as headings or lists."
-
-          "- Do NOT include sections titled:"
-          "**OPEN QUESTIONS**, **RISKS**, **CONCERNS**, **DECISIONS**, or similar,"
-          " as these are handled separately in structured fields. "
-          "insert two newline characters (\\n\\n).\n"
-          "- Use a single newline between paragraphs within a section.\n\n"
-
-          "DETAILED ACCOUNT (mandatory section):\n"
-          "- Include a section titled **DETAILED ACCOUNT**.\n"
-          "- Present what happened:\n"
-          "  - in chronological order OR\n"
-          "  - grouped by topic with clear transitions\n"
-          "- Ground everything in the transcript:\n"
-          "  - include numbers, dates, system stats, tools, and decisions\n"
-          "- If timestamps like [MM:SS] exist, reference them when relevant.\n"
-          "- Attribute statements when possible (e.g., 'the speaker noted...').\n\n"
-
-          "REALISM CONSTRAINT:\n"
-          "- If the transcript is thin, explicitly acknowledge that.\n"
-          "- Do NOT invent:\n"
-          "  - additional participants\n"
-          "  - hidden reasoning\n"
-          "  - implied processes not stated in the transcript\n\n"
-
-          "- `decisions`: concrete decisions or conclusions reached (strings). Empty list if none.\n"
-          "- `action_items`: only items explicitly assigned or committed in the meeting. Each object MUST include "
-          "\"type\": one of \"email_draft\" | \"calendar_invite\" | \"task\".\n"
-          "- `open_questions`: unresolved questions or ambiguities visible in the transcript.\n"
-          "- `risks_or_concerns`: risks, blockers, or worries stated in the meeting.\n\n"
-
-          "Return only valid JSON with this shape (no markdown fences outside the JSON):\n"
+          "Return only valid JSON with this exact shape (no markdown fences outside the JSON). "
+          "Put the entire summary in `full_report` as bullet lines, and leave `decisions`, "
+          "`action_items`, `open_questions`, `risks_or_concerns`, and `topics` as empty arrays:\n"
           "{\n"
           "  \"report_title\": \"Short title for the meeting (max ~80 chars)\",\n"
-          "  \"full_report\": \"(long string) multi-section narrative with a DETAILED ACCOUNT; use single quotes for quoted speech where possible so JSON stays valid\",\n"
-          "  \"decisions\": [\"...\"],\n"
-          "  \"action_items\": [{\"task\": \"...\", \"assignee\": \"...\", \"due_date\": \"\", \"type\": \"task\"}],\n"
-          "  \"open_questions\": [\"...\"],\n"
-          "  \"risks_or_concerns\": [\"...\"]\n"
+          "  \"full_report\": \"- First bullet point\\n- Second bullet point\",\n"
+          "  \"decisions\": [],\n"
+          "  \"action_items\": [],\n"
+          "  \"open_questions\": [],\n"
+          "  \"risks_or_concerns\": [],\n"
+          "  \"topics\": []\n"
           "}\n\n"
 
           f"Transcript:\n\n{transcript}"
   )
 
-  model = os.getenv("AI_MODEL", "claude-sonnet-4-20250514")
+  model = os.getenv("AI_MODEL", "claude-sonnet-4-5-20250929")
   max_tokens = int(os.getenv("AI_REPORT_MAX_TOKENS", os.getenv("AI_MAX_TOKENS", "16384")))
 
   try:
@@ -1050,12 +1287,79 @@ async def summarize_meeting(meeting_id: str, current_actor: Optional[dict] = Dep
         exc,
       )
 
+  # Persist meeting action_items as user_commitments so they surface on the Tasks screen.
+  # Clear-user-owned items become active tasks; items with no named owner become tasks
+  # tagged 'needs-review' (visible but flagged for user confirmation); items clearly
+  # owned by someone else are skipped.
+  uid_for_tasks = meeting.get("user_id") or user_for_actions
+  if uid_for_tasks:
+    try:
+      user_names = _user_display_names(uid_for_tasks)
+      from services.tasks_service import create_tasks_from_meeting
+
+      task_summary = create_tasks_from_meeting(
+        user_id=uid_for_tasks,
+        meeting_id=meeting_id,
+        meeting_title=meeting.get("title") or "",
+        meeting_date=meeting.get("start_time") or "",
+        action_items=data.get("action_items", []),
+        user_display_names=user_names,
+      )
+      logger.info(
+        "meeting %s -> tasks: created=%d needs_review=%d skipped_other=%d",
+        meeting_id,
+        task_summary.get("created_count", 0),
+        task_summary.get("needs_review_count", 0),
+        task_summary.get("skipped_other_owner_count", 0),
+      )
+    except Exception as exc:
+      logger.warning(
+        "Meeting -> tasks bridge failed for meeting %s: %s", meeting_id, exc
+      )
+
+  # Fix 2 (populate participants): extract unique participant names from action_items
+  # and save them back to the meetings row so memory_search_meetings can filter on them.
+  try:
+    participant_names: list[str] = []
+    for ai in (data.get("action_items") or []):
+      if isinstance(ai, dict):
+        for key in ("owner", "assignee", "assigned_to", "person"):
+          val = (ai.get(key) or "").strip()
+          if val and val not in participant_names:
+            participant_names.append(val)
+    if participant_names:
+      import json as _json
+      participants_json = _json.dumps(participant_names, ensure_ascii=False)
+      _p_conn = get_connection()
+      try:
+        _p_conn.execute(
+          "UPDATE meetings SET participants = ? WHERE id = ?",
+          (participants_json, meeting_id),
+        )
+        _p_conn.commit()
+      finally:
+        _p_conn.close()
+  except Exception:
+    logger.debug("participants update after summarize failed", exc_info=True)
+
   try:
     from services.mem0_service import maybe_ingest_meeting_summary, maybe_ingest_meeting_sqlite_artifacts
 
-    uid_mem = meeting.get("user_id") or _actor_user_id(current_actor)
-    maybe_ingest_meeting_summary(uid_mem, meeting_id, report_body)
-    maybe_ingest_meeting_sqlite_artifacts(uid_mem, meeting_id)
+    # Fix 5C: for device-uploaded meetings meeting.user_id may be empty.
+    # Fall back to the resolved action-user (which already does a device->user lookup)
+    # so Mem0 ingest is never silently skipped for device recordings.
+    uid_mem = (meeting.get("user_id") or "").strip() or user_for_actions or _actor_user_id(current_actor)
+    if not uid_mem:
+      logger.warning("mem0 ingest skipped meeting_id=%s: could not resolve user_id", meeting_id)
+    else:
+      maybe_ingest_meeting_summary(uid_mem, meeting_id, report_body)
+      maybe_ingest_meeting_sqlite_artifacts(uid_mem, meeting_id)
+      # Fix 9: trigger background cross-meeting synthesis after each summarize.
+      try:
+        from services.analysis_service import run_post_meeting_analysis
+        run_post_meeting_analysis(uid_mem, meeting_id)
+      except Exception:
+        pass
   except Exception:
     logger.debug("mem0 ingest after summarize failed", exc_info=True)
 
@@ -1414,6 +1718,10 @@ async def get_meeting(meeting_id: str, current_actor: Optional[dict] = Depends(g
       "decisions": json.loads(summary_row["decisions"] or "[]"),
       "topics": json.loads(summary_row["topics"] or "[]"),
       "sentiment": summary_row["sentiment"],
+      # Surface the DB ``generated_at`` so the device-ui footer can
+      # render "Created: <date>" instead of falling back to the
+      # meeting's start_time.
+      "generated_at": summary_row.get("generated_at"),
     })
 
   local_summary = None
@@ -1424,6 +1732,7 @@ async def get_meeting(meeting_id: str, current_actor: Optional[dict] = Depends(g
       "decisions": json.loads(local_summary_row["decisions"] or "[]"),
       "topics": json.loads(local_summary_row["topics"] or "[]"),
       "sentiment": local_summary_row["sentiment"],
+      "generated_at": local_summary_row.get("generated_at"),
     })
     local_summary["model_name"] = local_summary_row.get("model_name", "unknown")
 

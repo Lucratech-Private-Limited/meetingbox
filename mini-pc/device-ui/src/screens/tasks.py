@@ -38,6 +38,7 @@ Figma font sizes (cross-referenced from morning_brief.py, same design file)
 from __future__ import annotations
 
 import asyncio
+import calendar as _cal_module
 import json
 import logging
 from datetime import date, datetime, timedelta
@@ -135,6 +136,12 @@ def _ff(fs: float) -> int:
     """Scale a Figma pixel value by the display scale factor → int px."""
     scale = min(DISPLAY_WIDTH / FW, DISPLAY_HEIGHT / FH)
     return max(6, round(fs * scale))
+
+
+def _ffb(fs: float) -> int:
+    """Font size for the filter bar and everything below it — 25% larger
+    than the base Figma scale (_ff). Used only for text in those regions."""
+    return _ff(fs * 1.25)
 
 
 # ── Gradient texture cache ─────────────────────────────────────────────────────
@@ -387,126 +394,225 @@ class _TapPill(ButtonBehavior, _ModalCard):
     """Tappable pill — gradient card with text."""
 
 
-class _DatePickerModal(ModalView):
-    """Modal with quick-pick date buttons + a custom YYYY-MM-DD input.
+class _CalendarPickerModal(ModalView):
+    """Full-month calendar date picker with prev/next month navigation.
 
-    on_pick(picked_iso: str | None)  — None = clear (no date)
+    on_pick(picked_iso: str | None)  — None = clear (no date, when allow_clear=True)
+    Tap < > arrows to switch months.
     """
+
+    _MONTH_NAMES = (
+        "January", "February", "March", "April", "May", "June",
+        "July", "August", "September", "October", "November", "December",
+    )
+    _DOW_LABELS = ("Su", "Mo", "Tu", "We", "Th", "Fr", "Sa")
 
     def __init__(self, on_pick, *, allow_clear: bool = False, **kw):
         super().__init__(
-            size_hint=(0.6, 0.7),
+            size_hint=(0.68, None),   # height computed dynamically in _build
             background_color=(0, 0, 0, 0.6),
             **kw,
         )
         self._on_pick = on_pick
+        self._allow_clear = allow_clear
+        self._today = display_now().date()
+        self._year = self._today.year
+        self._month = self._today.month
+        self._selected: date | None = None
 
-        root = _ModalCard(ct=_CARD_T, cb=_CARD_B, bdr=_BDR, r=_ff(20))
-        self.add_widget(root)
+        self._root = _ModalCard(ct=_CARD_T, cb=_CARD_B, bdr=_BDR, r=_ff(20))
+        self.add_widget(self._root)
+        self._build()
 
-        root.add_widget(_lbl(
-            "Pick a date", _FSB, _ff(24), _WHITE,
-            ha="center", va="middle",
-            size_hint=(0.9, None), height=_ff(50),
-            pos_hint={"x": 0.05, "top": 0.97},
-        ))
+    # ── Build / rebuild ────────────────────────────────────────────────────────
 
-        sv = ScrollView(
-            size_hint=(0.9, 0.62),
-            pos_hint={"x": 0.05, "y": 0.22},
-            do_scroll_x=False, do_scroll_y=True,
-            bar_width=_ff(4),
+    def _build(self) -> None:
+        root = self._root
+        root.clear_widgets()
+
+        # Fixed row heights
+        GAP    = _ff(6)
+        NAV_H  = _ff(50)
+        DOW_H  = _ff(26)
+        CELL_H = _ff(44)
+        FOOT_H = _ff(48)
+        PAD    = _ff(14)   # vertical padding inside vbox (top + bottom)
+        CELL_G = _ff(4)    # gap between day cells
+
+        weeks = _cal_module.Calendar(firstweekday=6).monthdayscalendar(
+            self._year, self._month
         )
-        opts_box = BoxLayout(
+        n_weeks = len(weeks)
+
+        # Compute exact vbox height: no spacer, no guessing
+        vbox_h = (
+            PAD
+            + NAV_H + GAP
+            + DOW_H + GAP
+            + n_weeks * CELL_H + max(0, n_weeks - 1) * GAP
+            + GAP
+            + FOOT_H
+            + PAD
+        )
+        # Modal height = vbox_h / 0.90 (vbox is 90% of modal height)
+        self.height = vbox_h / 0.90
+
+        # Vertical BoxLayout with exact height, centred in the card
+        vbox = BoxLayout(
             orientation="vertical",
-            size_hint_y=None, spacing=_ff(8),
-            padding=[0, _ff(4), 0, _ff(4)],
+            size_hint=(0.90, None),
+            height=vbox_h,
+            pos_hint={"center_x": 0.5, "center_y": 0.5},
+            spacing=GAP,
+            padding=[0, PAD, 0, PAD],
         )
-        opts_box.bind(minimum_height=opts_box.setter("height"))
-        for label, dt in _quick_date_options():
-            pill = _TapPill(ct=_ROW_T, cb=_ROW_B, bdr=_BDR, r=_ff(10))
-            pill.size_hint_y = None
-            pill.height = _ff(56)
-            pill.add_widget(_lbl(
-                label, _FMD, _ff(18), _WHITE,
-                ha="center", va="middle",
-                size_hint=(1, 1), pos_hint={"x": 0, "y": 0},
-            ))
-            iso = dt.isoformat()
-            pill.bind(on_release=lambda *_a, _iso=iso: self._pick_and_close(_iso))
-            opts_box.add_widget(pill)
 
-        # Custom date input
-        custom_row = BoxLayout(
+        # ── Month navigation row ──────────────────────────────────────────────
+        nav = BoxLayout(
             orientation="horizontal",
-            size_hint_y=None, height=_ff(56), spacing=_ff(8),
+            size_hint=(1, None), height=NAV_H,
+            spacing=_ff(8),
         )
-        self._custom_input = TextInput(
-            multiline=False,
-            hint_text="YYYY-MM-DD",
-            font_size=_ff(16),
-            size_hint=(0.65, 1),
-            background_color=(0.04, 0.07, 0.18, 1),
-            foreground_color=(1, 1, 1, 1),
-            cursor_color=(1, 1, 1, 1),
-        )
-        custom_row.add_widget(self._custom_input)
-        ok_btn = _TapPill(ct=_GREEN_T, cb=_GREEN_B, bdr=_GREEN_BDR, r=_ff(10))
-        ok_btn.size_hint = (0.35, 1)
-        ok_btn.add_widget(_lbl(
-            "Set custom", _FSB, _ff(15), _WHITE,
+        prev_btn = _TapPill(ct=_CARD_T, cb=_CARD_B, bdr=_BDR, r=_ff(10))
+        prev_btn.size_hint = (None, 1)
+        prev_btn.width = _ff(50)
+        prev_btn.add_widget(_lbl(
+            "‹", _FSB, _ff(26), _WHITE,
             ha="center", va="middle",
             size_hint=(1, 1), pos_hint={"x": 0, "y": 0},
         ))
-        ok_btn.bind(on_release=lambda *_: self._submit_custom())
-        custom_row.add_widget(ok_btn)
-        opts_box.add_widget(custom_row)
+        prev_btn.bind(on_release=lambda *_: self._go_month(-1))
+        nav.add_widget(prev_btn)
 
-        sv.add_widget(opts_box)
-        root.add_widget(sv)
+        nav.add_widget(_lbl(
+            f"{self._MONTH_NAMES[self._month - 1]}  {self._year}",
+            _FSB, _ff(18), _WHITE,
+            ha="center", va="middle", size_hint=(1, 1),
+        ))
 
-        # Footer: optional Clear + Cancel
+        next_btn = _TapPill(ct=_CARD_T, cb=_CARD_B, bdr=_BDR, r=_ff(10))
+        next_btn.size_hint = (None, 1)
+        next_btn.width = _ff(50)
+        next_btn.add_widget(_lbl(
+            "›", _FSB, _ff(26), _WHITE,
+            ha="center", va="middle",
+            size_hint=(1, 1), pos_hint={"x": 0, "y": 0},
+        ))
+        next_btn.bind(on_release=lambda *_: self._go_month(1))
+        nav.add_widget(next_btn)
+        vbox.add_widget(nav)
+
+        # ── Day-of-week header ────────────────────────────────────────────────
+        dow_row = BoxLayout(
+            orientation="horizontal",
+            size_hint=(1, None), height=DOW_H,
+            spacing=CELL_G,
+        )
+        for label in self._DOW_LABELS:
+            dow_row.add_widget(_lbl(
+                label, _FMD, _ff(11), _DIM,
+                ha="center", va="middle", size_hint=(1, 1),
+            ))
+        vbox.add_widget(dow_row)
+
+        # ── Calendar grid (Sunday-first) ──────────────────────────────────────
+        for week in weeks:
+            week_row = BoxLayout(
+                orientation="horizontal",
+                size_hint=(1, None), height=CELL_H,
+                spacing=CELL_G,
+            )
+            for day_num in week:
+                if day_num == 0:
+                    week_row.add_widget(Widget(size_hint=(1, 1)))
+                else:
+                    d          = date(self._year, self._month, day_num)
+                    is_past     = (d < self._today)
+                    is_today    = (d == self._today)
+                    is_selected = (d == self._selected)
+
+                    if is_selected:
+                        ct, cb, bdr = _GREEN_T, _GREEN_B, _GREEN_BDR
+                        text_col = _WHITE
+                    elif is_today:
+                        ct, cb, bdr = _ROW_T, _ROW_B, _BDR
+                        text_col = _BLUE
+                    elif is_past:
+                        ct, cb, bdr = _CARD_T, _CARD_B, (0.25, 0.26, 0.33, 0.4)
+                        text_col = (1.0, 1.0, 1.0, 0.22)
+                    else:
+                        ct, cb, bdr = _CARD_T, _CARD_B, _BDR
+                        text_col = _WHITE
+
+                    cell = _TapPill(ct=ct, cb=cb, bdr=bdr, r=_ff(7))
+                    cell.size_hint = (1, 1)
+                    cell.add_widget(_lbl(
+                        str(day_num), _FMD, _ff(13), text_col,
+                        ha="center", va="middle",
+                        size_hint=(1, 1), pos_hint={"x": 0, "y": 0},
+                    ))
+                    if not is_past:
+                        _iso = d.isoformat()
+                        cell.bind(on_release=lambda *_, iso=_iso: self._select(iso))
+                    week_row.add_widget(cell)
+            vbox.add_widget(week_row)
+
+        # ── Footer ────────────────────────────────────────────────────────────
         footer = BoxLayout(
             orientation="horizontal",
-            size_hint=(0.9, 0.13),
-            pos_hint={"x": 0.05, "y": 0.05},
+            size_hint=(1, None), height=FOOT_H,
             spacing=_ff(10),
         )
-        if allow_clear:
+        if self._allow_clear:
             clr = _TapPill(ct=_CARD_T, cb=_CARD_B, bdr=_BDR, r=_ff(10))
             clr.size_hint = (0.5, 1)
             clr.add_widget(_lbl(
-                "No date", _FMD, _ff(16), _MUTED,
+                "No date", _FMD, _ff(14), _MUTED,
                 ha="center", va="middle",
                 size_hint=(1, 1), pos_hint={"x": 0, "y": 0},
             ))
             clr.bind(on_release=lambda *_: self._pick_and_close(None))
             footer.add_widget(clr)
         cancel = _TapPill(ct=_CARD_T, cb=_CARD_B, bdr=_BDR, r=_ff(10))
-        cancel.size_hint = (1, 1) if not allow_clear else (0.5, 1)
+        cancel.size_hint = (1, 1) if not self._allow_clear else (0.5, 1)
         cancel.add_widget(_lbl(
-            "Cancel", _FMD, _ff(16), _WHITE,
+            "Cancel", _FMD, _ff(14), _WHITE,
             ha="center", va="middle",
             size_hint=(1, 1), pos_hint={"x": 0, "y": 0},
         ))
         cancel.bind(on_release=lambda *_: self.dismiss())
         footer.add_widget(cancel)
-        root.add_widget(footer)
+        vbox.add_widget(footer)
 
-    def _submit_custom(self) -> None:
-        raw = (self._custom_input.text or "").strip()
-        iso = _valid_iso_date(raw)
-        if iso is None:
-            self._custom_input.text = ""
-            self._custom_input.hint_text = "Use YYYY-MM-DD"
-            return
+        root.add_widget(vbox)
+
+    # ── Navigation / selection ────────────────────────────────────────────────
+
+    def _go_month(self, delta: int) -> None:
+        month = self._month + delta
+        year = self._year
+        if month < 1:
+            month = 12
+            year -= 1
+        elif month > 12:
+            month = 1
+            year += 1
+        self._month = month
+        self._year = year
+        self._build()
+
+    def _select(self, iso: str) -> None:
+        try:
+            self._selected = date.fromisoformat(iso)
+        except Exception:
+            pass
         self._pick_and_close(iso)
 
     def _pick_and_close(self, iso: str | None) -> None:
         try:
             self._on_pick(iso)
         except Exception:
-            logger.exception("date pick callback failed")
+            logger.exception("calendar date pick callback failed")
         self.dismiss()
 
 
@@ -648,7 +754,7 @@ class _AddTaskModal(ModalView):
     def _open_date_picker(self) -> None:
         def _picked(iso: str | None):
             self._set_due(iso)
-        _DatePickerModal(_picked, allow_clear=True).open()
+        _CalendarPickerModal(_picked, allow_clear=True).open()
 
     def _set_due(self, iso: str | None) -> None:
         self._due_iso = iso
@@ -689,23 +795,32 @@ class _AddTaskModal(ModalView):
 def _categorize(row: dict) -> str | None:
     """Return bucket string or None (skip completed/cancelled).
 
-    Snoozed tasks remain visible — they appear in their time bucket.
-    Uses _now_naive() so that both sides of the comparison are naive
-    datetimes and no TypeError is raised.
+    Buckets:
+      "overdue"   — due strictly before today (unfinished past tasks)
+      "due_today" — due today (midnight → 23:59)
+      "upcoming"  — due tomorrow or later
+      "unplanned" — no due date set
+
+    Snoozed tasks remain visible in their time bucket.
+    Uses _now_naive() so comparisons are always between naive datetimes.
     """
     status = (row.get("status") or "").lower()
     if status in ("completed", "cancelled", "canceled"):
         return None
-    # Use due_at preferentially; fall back to remind_at
     raw = (row.get("due_at") or row.get("remind_at") or "").strip()
     if not raw:
         return "unplanned"
     d = _parse_dt(raw)
     if d is None:
         return "unplanned"
-    # Both d and today_end are naive — comparison is safe
-    today_end = _now_naive().replace(hour=23, minute=59, second=59, microsecond=0)
-    return "due_today" if d <= today_end else "upcoming"
+    now_naive    = _now_naive()
+    today_start  = now_naive.replace(hour=0,  minute=0,  second=0,  microsecond=0)
+    today_end    = now_naive.replace(hour=23, minute=59, second=59, microsecond=0)
+    if d < today_start:
+        return "overdue"
+    if d <= today_end:
+        return "due_today"
+    return "upcoming"
 
 
 def _source_kind(row: dict) -> str:
@@ -724,9 +839,20 @@ def _source_kind(row: dict) -> str:
 
 # ── Display metadata ───────────────────────────────────────────────────────────
 
-_BUCKET_COLOR = {"due_today": _BLUE, "upcoming": _PURPLE, "unplanned": _ORANGE}
-_BUCKET_LABEL = {"due_today": "TODAY",    "upcoming": "UPCOMING",  "unplanned": "UNPLANNED"}
+_BUCKET_COLOR = {
+    "overdue":   _RED,
+    "due_today": _BLUE,
+    "upcoming":  _PURPLE,
+    "unplanned": _ORANGE,
+}
+_BUCKET_LABEL = {
+    "overdue":   "UNFINISHED",
+    "due_today": "TODAY",
+    "upcoming":  "UPCOMING",
+    "unplanned": "UNPLANNED",
+}
 _BUCKET_ICONS = {
+    "overdue":   "icon_task_1.png",
     "due_today": "icon_task_1.png",
     "upcoming":  "icon_task_2.png",
     "unplanned": "icon_task_3.png",
@@ -755,9 +881,9 @@ class TasksScreen(BaseScreen):
     def __init__(self, **kw):
         super().__init__(**kw)
 
-        self._active_tab: str = "all"
+        self._active_tab: str = "due_today"
         self._rows: dict[str, list] = {
-            "due_today": [], "upcoming": [], "unplanned": []
+            "overdue": [], "due_today": [], "upcoming": [], "unplanned": []
         }
         self._loading: bool = False
         self._refresh_ev = None
@@ -864,9 +990,9 @@ class TasksScreen(BaseScreen):
 
     def _build_filter_bar(self, root: FloatLayout) -> None:
         TABS = [
-            ("all",       "All"),
             ("due_today", "Today"),
             ("upcoming",  "Upcoming"),
+            ("overdue",   "Unfinished"),
             ("unplanned", "Unplanned"),
         ]
         bar = _Card(ct=_CARD_T, cb=_CARD_B, bdr=_BDR,
@@ -883,7 +1009,7 @@ class TasksScreen(BaseScreen):
             is_active = (tab_id == self._active_tab)
 
             # Tab label  _ff(21.19) SemiBold
-            lbl = _lbl(tab_text, _FSB, _ff(21.19),
+            lbl = _lbl(tab_text, _FSB, _ffb(21.19),
                        _BLUE if is_active else _MUTED,
                        ha="center", va="middle",
                        size_hint=(0.65, 0.72),
@@ -892,7 +1018,7 @@ class TasksScreen(BaseScreen):
             self._tab_labels[tab_id] = lbl
 
             # Count badge  _ff(16.95) Medium
-            cnt = _lbl("", _FMD, _ff(16.95),
+            cnt = _lbl("", _FMD, _ffb(16.95),
                        _BLUE if is_active else _WHITE,
                        ha="left", va="middle",
                        size_hint=(0.28, 0.72),
@@ -946,11 +1072,26 @@ class TasksScreen(BaseScreen):
 
         # Initial loading state
         box.add_widget(_lbl(
-            "Loading tasks…", _FMD, _ff(21.19), _MUTED,
+            "Loading tasks…", _FMD, _ffb(21.19), _MUTED,
             ha="center", va="middle",
             size_hint=(1, None), height=_ff(100)))
 
     # ── Tab selection ──────────────────────────────────────────────────────────
+
+    def set_active_tab(self, tab_id: str) -> None:
+        """Called by main.py to jump to a specific tab (today/upcoming/overdue/unplanned).
+
+        Safe to call before or after on_enter; stores the requested tab so it
+        is applied when the task list is next built.
+        """
+        valid = {"due_today", "upcoming", "overdue", "unplanned"}
+        if tab_id not in valid:
+            return
+        self._active_tab = tab_id
+        # If the screen is already visible (we're navigating within it), refresh now.
+        if self._tab_labels:
+            self._sync_tab_styles()
+            self._rebuild_task_list()
 
     def _on_tab(self, tab_id: str) -> None:
         if tab_id == self._active_tab:
@@ -982,14 +1123,13 @@ class TasksScreen(BaseScreen):
         if error_msg:
             self._list_box.add_widget(_lbl(
                 f"Could not load tasks\n{error_msg[:80]}",
-                _FMD, _ff(18.0), _ORANGE,
+                _FMD, _ffb(18.0), _ORANGE,
                 ha="center", va="middle",
                 size_hint=(1, None), height=_ff(120)))
             return
 
-        buckets = (["due_today", "upcoming", "unplanned"]
-                   if self._active_tab == "all"
-                   else [self._active_tab])
+        # Each tab maps to exactly one bucket: Today, Upcoming, Unfinished, Unplanned.
+        buckets = [self._active_tab]
 
         has_any = False
         for bucket in buckets:
@@ -1004,7 +1144,7 @@ class TasksScreen(BaseScreen):
 
         if not has_any:
             self._list_box.add_widget(_lbl(
-                "No tasks to show", _FMD, _ff(21.19), _MUTED,
+                "No tasks to show", _FMD, _ffb(21.19), _MUTED,
                 ha="center", va="middle",
                 size_hint=(1, None), height=_ff(120)))
 
@@ -1041,14 +1181,14 @@ class TasksScreen(BaseScreen):
 
         # Bucket label  _ff(16.95) SemiBold
         hdr.add_widget(_lbl(
-            _BUCKET_LABEL[bucket], _FSB, _ff(16.95), col,
+            _BUCKET_LABEL[bucket], _FSB, _ffb(16.95), col,
             ha="left", va="middle",
             size_hint=(0.45, 1.0),
             pos_hint={"x": _ff(55) / 1200, "y": 0.0}))
 
         # Count  _ff(16.95) SemiBold
         hdr.add_widget(_lbl(
-            str(count), _FSB, _ff(16.95), col,
+            str(count), _FSB, _ffb(16.95), col,
             ha="left", va="middle",
             size_hint=(0.06, 1.0),
             pos_hint={"x": 0.56, "y": 0.0}))
@@ -1070,8 +1210,7 @@ class TasksScreen(BaseScreen):
         updated    = _relative_updated(row)
 
         has_extra = bool(detail or tags)
-        # Unplanned rows are a touch taller to fit the buttons
-        ROW_H = _ff(88) if (has_extra or is_unplan) else _ff(72)
+        ROW_H = _ff(88) if has_extra else _ff(72)
 
         card = _Card(ct=_ROW_T, cb=_ROW_B, bdr=_BDR,
                      r=_ff(14), size_hint=(1, None), height=ROW_H)
@@ -1102,7 +1241,7 @@ class TasksScreen(BaseScreen):
             title_box = BoxLayout(orientation="vertical", size_hint=(1, 1),
                                   spacing=_ff(3))
             title_box.add_widget(_lbl(
-                title, _FSB, _ff(21.19), _WHITE,
+                title, _FSB, _ffb(21.19), _WHITE,
                 ha="left", va="bottom", size_hint=(1, 0.55)))
 
             sub_parts = []
@@ -1112,41 +1251,45 @@ class TasksScreen(BaseScreen):
                 sub_parts.append("  ".join(f"#{t}" for t in tags[:3]))
             sub_txt = "  ·  ".join(sub_parts)
             title_box.add_widget(_lbl(
-                sub_txt, _FMD, _ff(14.13), _DIM,
+                sub_txt, _FMD, _ffb(14.13), _DIM,
                 ha="left", va="top", size_hint=(1, 0.45)))
             inner.add_widget(title_box)
         else:
             inner.add_widget(_lbl(
-                title, _FSB, _ff(21.19), _WHITE,
+                title, _FSB, _ffb(21.19), _WHITE,
                 ha="left", va="middle", size_hint=(1, 1)))
 
         # ── Right section ───────────────────────────────────────────────────
-        if is_unplan and not is_snoozed:
-            # Three actions for unplanned tasks: assign date, complete, cancel.
+        if not is_snoozed:
+            # Action buttons for all active tasks.
+            # Unplanned gets 3 buttons (date + tick + X); others get 2 (tick + X).
             BTN = _ff(44)
+            btn_row_width = BTN * 3 + _ff(20) if is_unplan else BTN * 2 + _ff(10)
             btn_row = BoxLayout(
                 orientation="horizontal",
                 size_hint=(None, 1),
-                width=BTN * 3 + _ff(20),
+                width=btn_row_width,
                 spacing=_ff(10),
             )
 
-            # Assign date — blue pill with calendar icon (or "Date" text fallback)
-            date_btn = _TapCard(ct=_CARD_T, cb=_CARD_B, bdr=_BDR, r=_ff(10),
-                                size_hint=(None, None), size=(BTN, BTN),
-                                pos_hint={"center_y": 0.5})
-            cal_icon = _brief_asset("icon_calendar.png")
-            if cal_icon:
-                date_btn.add_widget(Image(source=cal_icon, fit_mode="contain",
-                                         size_hint=(0.7, 0.7),
-                                         pos_hint={"center_x": 0.5, "center_y": 0.5}))
-            else:
-                date_btn.add_widget(_lbl("Date", _FMD, _ff(13), _BLUE,
-                                         ha="center", va="middle",
-                                         size_hint=(1, 1), pos_hint={"x": 0, "y": 0}))
-            date_btn.bind(on_release=lambda *_, tid=task_id: self._on_task_assign_date(tid))
-            btn_row.add_widget(date_btn)
+            if is_unplan:
+                # Assign date — calendar icon (unplanned tasks only)
+                date_btn = _TapCard(ct=_CARD_T, cb=_CARD_B, bdr=_BDR, r=_ff(10),
+                                    size_hint=(None, None), size=(BTN, BTN),
+                                    pos_hint={"center_y": 0.5})
+                cal_icon = _brief_asset("icon_calendar.png")
+                if cal_icon:
+                    date_btn.add_widget(Image(source=cal_icon, fit_mode="contain",
+                                             size_hint=(0.7, 0.7),
+                                             pos_hint={"center_x": 0.5, "center_y": 0.5}))
+                else:
+                    date_btn.add_widget(_lbl("Date", _FMD, _ffb(13), _BLUE,
+                                             ha="center", va="middle",
+                                             size_hint=(1, 1), pos_hint={"x": 0, "y": 0}))
+                date_btn.bind(on_release=lambda *_, tid=task_id: self._on_task_assign_date(tid))
+                btn_row.add_widget(date_btn)
 
+            # Tick — complete
             acc = _TapCard(ct=_GREEN_T, cb=_GREEN_B, bdr=_GREEN_BDR, r=_ff(10),
                            size_hint=(None, None), size=(BTN, BTN),
                            pos_hint={"center_y": 0.5})
@@ -1156,17 +1299,18 @@ class TasksScreen(BaseScreen):
                                      size_hint=(0.65, 0.65),
                                      pos_hint={"center_x": 0.5, "center_y": 0.5}))
             else:
-                acc.add_widget(_lbl("Done", _FMD, _ff(13), _WHITE,
+                acc.add_widget(_lbl("Done", _FMD, _ffb(13), _WHITE,
                                     ha="center", va="middle",
                                     size_hint=(1, 1), pos_hint={"x": 0, "y": 0}))
             acc.bind(on_release=lambda *_, tid=task_id: self._on_task_accept(tid))
             btn_row.add_widget(acc)
 
+            # X — cancel
             rej = _TapCard(ct=_RED_T, cb=_RED_B, bdr=_RED_BDR, r=_ff(10),
                            size_hint=(None, None), size=(BTN, BTN),
                            pos_hint={"center_y": 0.5})
             # × (U+00D7) is a basic Latin char present in 42dot fonts
-            rej.add_widget(_lbl("×", _FMD, _ff(26), _WHITE,
+            rej.add_widget(_lbl("×", _FMD, _ffb(26), _WHITE,
                                 ha="center", va="middle",
                                 size_hint=(1, 1), pos_hint={"x": 0, "y": 0}))
             rej.bind(on_release=lambda *_, tid=task_id: self._on_task_reject(tid))
@@ -1175,7 +1319,7 @@ class TasksScreen(BaseScreen):
             inner.add_widget(btn_row)
 
         else:
-            # Source area (icon + label, or SNOOZED badge)
+            # Snoozed: show source badge + due date (no action buttons)
             SRC_W = _ff(110)
             src_box = BoxLayout(
                 orientation="horizontal",
@@ -1183,20 +1327,9 @@ class TasksScreen(BaseScreen):
                 width=SRC_W,
                 spacing=_ff(5),
             )
-            if is_snoozed:
-                src_box.add_widget(_lbl(
-                    "SNOOZED", _FSB, _ff(12), _YELLOW,
-                    ha="center", va="middle", size_hint=(1, 1)))
-            else:
-                src_img_path = _brief_asset(_SRC_ICONS.get(src_kind, "icon_tick.png"))
-                if src_img_path:
-                    src_box.add_widget(Image(
-                        source=src_img_path, fit_mode="contain",
-                        size_hint=(None, 1), width=_ff(22)))
-                src_box.add_widget(_lbl(
-                    _SRC_LABELS.get(src_kind, "Assistant"),
-                    _FMD, _ff(14.13), _DIM,
-                    ha="left", va="middle", size_hint=(1, 1)))
+            src_box.add_widget(_lbl(
+                "SNOOZED", _FSB, _ffb(12), _YELLOW,
+                ha="center", va="middle", size_hint=(1, 1)))
             inner.add_widget(src_box)
 
             # Due date + updated label stacked vertically
@@ -1207,12 +1340,12 @@ class TasksScreen(BaseScreen):
                 spacing=0,
             )
             due_box.add_widget(_lbl(
-                due_text, _FMD, _ff(16.95), col,
+                due_text, _FMD, _ffb(16.95), col,
                 ha="right", va="middle" if not updated else "bottom",
                 size_hint=(1, 0.58 if updated else 1)))
             if updated:
                 due_box.add_widget(_lbl(
-                    updated, _FMD, _ff(11.3), _DIM,
+                    updated, _FMD, _ffb(11.3), _DIM,
                     ha="right", va="top",
                     size_hint=(1, 0.42)))
             inner.add_widget(due_box)
@@ -1232,7 +1365,7 @@ class TasksScreen(BaseScreen):
                 return
             self._patch_task(task_id, status=None, due_date=iso)
 
-        _DatePickerModal(_picked, allow_clear=False).open()
+        _CalendarPickerModal(_picked, allow_clear=False).open()
 
     def _on_task_accept(self, task_id: str) -> None:
         """Mark an unplanned task as completed (green-tick tap)."""
@@ -1398,15 +1531,16 @@ class TasksScreen(BaseScreen):
     # ── Count badges ──────────────────────────────────────────────────────────
 
     def _update_counts(self) -> None:
+        n_overdue   = len(self._rows.get("overdue", []))
         n_today     = len(self._rows["due_today"])
         n_upcoming  = len(self._rows["upcoming"])
         n_unplanned = len(self._rows["unplanned"])
-        total = n_today + n_upcoming + n_unplanned
+        total = n_overdue + n_today + n_upcoming + n_unplanned
 
         counts = {
-            "all":       total,
             "due_today": n_today,
             "upcoming":  n_upcoming,
+            "overdue":   n_overdue,
             "unplanned": n_unplanned,
         }
         for tid, lbl in self._count_labels.items():
@@ -1442,7 +1576,7 @@ class TasksScreen(BaseScreen):
         """
         async def _go():
             bucketed: dict[str, list] = {
-                "due_today": [], "upcoming": [], "unplanned": []
+                "overdue": [], "due_today": [], "upcoming": [], "unplanned": []
             }
             error_msg: str = ""
             try:
@@ -1476,7 +1610,7 @@ class TasksScreen(BaseScreen):
         if self._list_box is not None:
             self._list_box.clear_widgets()
             self._list_box.add_widget(_lbl(
-                "Loading tasks…", _FMD, _ff(21.19), _MUTED,
+                "Loading tasks…", _FMD, _ffb(21.19), _MUTED,
                 ha="center", va="middle",
                 size_hint=(1, None), height=_ff(120)))
         # Immediate fetch

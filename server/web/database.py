@@ -28,7 +28,8 @@ def init_database() -> None:
               duration INTEGER,
               audio_path TEXT,
               status TEXT,
-              created_at TEXT
+              created_at TEXT,
+              participants TEXT
             )
             """
         )
@@ -386,6 +387,27 @@ def init_database() -> None:
 
         cursor.execute(
             """
+            CREATE TABLE IF NOT EXISTS mem0_soft_deleted (
+              id          TEXT PRIMARY KEY,
+              memory_id   TEXT NOT NULL,
+              user_id     TEXT NOT NULL,
+              deleted_at  TEXT NOT NULL,
+              deleted_by  TEXT,
+              FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+            """
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_mem0_soft_deleted_user "
+            "ON mem0_soft_deleted(user_id)"
+        )
+        cursor.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_mem0_soft_deleted_mem_user "
+            "ON mem0_soft_deleted(memory_id, user_id)"
+        )
+
+        cursor.execute(
+            """
             CREATE TABLE IF NOT EXISTS user_commitments (
               id TEXT PRIMARY KEY,
               user_id TEXT NOT NULL,
@@ -414,8 +436,46 @@ def init_database() -> None:
         )
 
         cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS known_contacts (
+              user_id TEXT NOT NULL,
+              email TEXT NOT NULL,
+              name TEXT NOT NULL DEFAULT '',
+              last_seen TEXT NOT NULL,
+              interaction_count INTEGER NOT NULL DEFAULT 1,
+              PRIMARY KEY (user_id, email),
+              FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+            """
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_known_contacts_user_name ON known_contacts(user_id, name)"
+        )
+
+        cursor.execute(
             "INSERT OR IGNORE INTO app_settings (key, value, updated_at) VALUES (?, ?, datetime('now'))",
             ("max_meeting_upload_seconds", "10800"),
+        )
+
+        # Idempotency table for background analysis jobs (Fix 9).
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS analysis_runs (
+              id TEXT PRIMARY KEY,
+              user_id TEXT NOT NULL,
+              job_type TEXT NOT NULL,
+              run_date TEXT NOT NULL,
+              status TEXT NOT NULL DEFAULT 'pending',
+              result_summary TEXT,
+              created_at TEXT NOT NULL,
+              completed_at TEXT,
+              FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+            """
+        )
+        cursor.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_analysis_runs_user_job_date "
+            "ON analysis_runs(user_id, job_type, run_date)"
         )
 
         conn.commit()

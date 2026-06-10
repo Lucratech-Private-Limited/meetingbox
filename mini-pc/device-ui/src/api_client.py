@@ -557,6 +557,37 @@ class BackendClient:
             logger.error(f"Failed to fetch meeting {meeting_id}: {e}")
             raise
 
+    def get_meeting_audio_url(self, meeting_id: str) -> str:
+        """Return the GET URL for a meeting's audio file (no auth header
+        applied — the device's session token is sent automatically by
+        :attr:`client` if the caller uses :meth:`download_meeting_audio`).
+        """
+        return f"{self.base_url}/api/meetings/{meeting_id}/audio"
+
+    async def download_meeting_audio(
+        self, meeting_id: str, dest_path: str
+    ) -> Optional[str]:
+        """Stream the meeting recording to ``dest_path``.
+
+        Returns the absolute path on success or ``None`` if the backend
+        returned 404 / has no audio for this meeting. Other errors raise.
+        """
+        try:
+            async with self.client.stream(
+                "GET", self.get_meeting_audio_url(meeting_id)
+            ) as resp:
+                if resp.status_code == 404:
+                    return None
+                resp.raise_for_status()
+                with open(dest_path, "wb") as fh:
+                    async for chunk in resp.aiter_bytes():
+                        if chunk:
+                            fh.write(chunk)
+            return dest_path
+        except Exception as e:
+            logger.error(f"Failed to download audio for {meeting_id}: {e}")
+            raise
+
     async def delete_meeting(self, meeting_id: str) -> None:
         """DELETE /api/meetings/{meeting_id}"""
         try:
@@ -611,6 +642,32 @@ class BackendClient:
             return resp.json()
         except Exception as e:
             logger.error(f"Failed to generate actions for meeting {meeting_id}: {e}")
+            raise
+
+    async def create_manual_action(self, meeting_id: str, body: Dict) -> Dict:
+        """POST /api/meetings/{meeting_id}/actions/manual"""
+        try:
+            resp = await self.client.post(
+                f"{self.base_url}/api/meetings/{meeting_id}/actions/manual",
+                json=body,
+                timeout=120.0,
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except httpx.HTTPStatusError as e:
+            detail = ""
+            try:
+                data = e.response.json()
+                if isinstance(data, dict) and data.get("detail") is not None:
+                    d = data["detail"]
+                    detail = d if isinstance(d, str) else json.dumps(d)
+            except Exception:
+                detail = (e.response.text or "")[:500]
+            msg = (detail or e.response.reason_phrase or str(e)).strip()
+            logger.error("Failed to create manual action for meeting %s: HTTP %s %s", meeting_id, e.response.status_code, msg)
+            raise RuntimeError(msg) from e
+        except Exception as e:
+            logger.error(f"Failed to create manual action for meeting {meeting_id}: {e}")
             raise
 
     async def execute_action(
@@ -890,6 +947,78 @@ class BackendClient:
         except Exception as e:
             logger.debug("get_commitments failed: %s", e)
             return {"commitments": [], "count": 0}
+
+    async def patch_commitment(
+        self,
+        commitment_id: str,
+        status: str | None = None,
+        due_date: str | None = None,
+    ) -> Dict:
+        """PATCH /api/commitments/{id} — change status and/or assign a due_date.
+
+        Pass status='completed' / 'cancelled' / 'snoozed' / 'active' to change state,
+        and/or due_date='YYYY-MM-DD' to assign or change the deadline. At least one
+        of status or due_date is required.
+        """
+        try:
+            body: Dict = {}
+            if status:
+                body["status"] = status
+            if due_date:
+                body["due_date"] = due_date
+            resp = await self.client.patch(
+                f"{self.base_url}/api/commitments/{commitment_id}",
+                json=body,
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.debug("patch_commitment failed: %s", e)
+            return {}
+
+    async def create_commitment(
+        self,
+        *,
+        title: str,
+        due_date: str | None = None,
+        description: str | None = None,
+        confirm_duplicate: bool = False,
+        source: str = "manual",
+    ) -> Dict:
+        """POST /api/commitments — create a task manually from the device Tasks screen.
+
+        Returns the created row on success, or {'error': 'similar_task_exists',
+        'similar': {...}} on a 409 duplicate hit so the UI can ask the user
+        whether to add anyway (pass confirm_duplicate=True on retry).
+        """
+        body: Dict = {
+            "title": (title or "").strip(),
+            "confirm_duplicate": bool(confirm_duplicate),
+            "source": source,
+        }
+        if due_date:
+            body["due_date"] = due_date
+        if description:
+            body["description"] = description
+        try:
+            resp = await self.client.post(
+                f"{self.base_url}/api/commitments",
+                json=body,
+            )
+            if resp.status_code == 409:
+                try:
+                    detail = resp.json().get("detail") or {}
+                except Exception:
+                    detail = {}
+                return {
+                    "error": "similar_task_exists",
+                    "similar": detail.get("similar") if isinstance(detail, dict) else None,
+                }
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.debug("create_commitment failed: %s", e)
+            return {"error": "request_failed", "detail": str(e)}
 
     async def create_realtime_voice_session(self) -> Dict:
         """POST /api/voice/realtime/session — OpenAI Realtime client secret (Bearer token)."""

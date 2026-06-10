@@ -143,9 +143,9 @@ def create_event(
             recurrence = [recurrence]
         event_body["recurrence"] = [r if r.upper().startswith("RRULE:") else f"RRULE:{r}" for r in recurrence]
 
-    # Meet link: default ON when there are attendees, OFF for solo blocks, unless explicitly overridden
+    # Meet link: default ON for all events unless explicitly disabled (solo blocks pass False).
     if add_meet_link is None:
-        add_meet_link = bool(attendees)
+        add_meet_link = True
 
     insert_kwargs: dict = {
         "calendarId": "primary",
@@ -782,6 +782,30 @@ def calendar_event_to_device_meeting(ev: dict, tz_name: str) -> dict:
     if start_dt is not None and end_dt is not None:
         duration_sec = max(0, int((end_dt - start_dt).total_seconds()))
 
+    # Flatten attendees to a list of {name, email, self, organizer} dicts
+    raw_attendees = ev.get("attendees") or []
+    org_info = ev.get("organizer") or {}
+    attendees_out = []
+    for a in raw_attendees:
+        attendees_out.append({
+            "name": (a.get("displayName") or a.get("email") or "").strip(),
+            "email": (a.get("email") or "").strip(),
+            "self": bool(a.get("self")),
+            "organizer": bool(a.get("organizer")),
+            "responseStatus": a.get("responseStatus") or "",
+        })
+
+    # Reminders: extract minutes before from overrides or default
+    reminders_raw = ev.get("reminders") or {}
+    reminder_minutes = None
+    overrides = reminders_raw.get("overrides") or []
+    if overrides:
+        popup = next((r for r in overrides if r.get("method") == "popup"), None)
+        if popup:
+            reminder_minutes = popup.get("minutes")
+    if reminder_minutes is None and reminders_raw.get("useDefault"):
+        reminder_minutes = 10  # Google Calendar default
+
     return {
         "id": ev.get("id"),
         "title": ev.get("summary") or "(No title)",
@@ -790,6 +814,23 @@ def calendar_event_to_device_meeting(ev: dict, tz_name: str) -> dict:
         "start_time": start_dt.isoformat() if start_dt else "",
         "duration": duration_sec,
         "htmlLink": ev.get("htmlLink") or "",
+        "hangoutLink": (ev.get("hangoutLink") or "").strip(),
+        "description": (ev.get("description") or "").strip(),
+        "organizer_name": (org_info.get("displayName") or org_info.get("email") or "").strip(),
+        "organizer_email": (org_info.get("email") or "").strip(),
+        "attendees": attendees_out,
+        "calendar_name": (ev.get("organizer", {}).get("displayName") or "Work").strip(),
+        "reminder_minutes": reminder_minutes,
+        "location": (ev.get("location") or "").strip(),
+        "attachments": [
+            {
+                "title": att.get("title") or "",
+                "fileUrl": att.get("fileUrl") or "",
+                "iconLink": att.get("iconLink") or "",
+                "mimeType": att.get("mimeType") or "",
+            }
+            for att in (ev.get("attachments") or [])
+        ],
     }
 
 

@@ -582,3 +582,81 @@ def get_usb_devices_one_liners() -> list[str]:
     except Exception:
         pass
     return sorted(set(rows))[:48]
+
+
+# ---------------------------------------------------------------------------
+# Battery
+# ---------------------------------------------------------------------------
+
+def get_battery_info() -> dict:
+    """Read battery state from /sys/class/power_supply.
+
+    Returns dict with keys:
+      ``percent``  – int 0-100 or None if no battery found
+      ``charging`` – bool or None
+    """
+    ps_root = Path("/sys/class/power_supply")
+    if not ps_root.exists():
+        return {"percent": None, "charging": None}
+    for entry in sorted(ps_root.iterdir()):
+        typ_f = entry / "type"
+        cap_f = entry / "capacity"
+        status_f = entry / "status"
+        try:
+            if typ_f.exists():
+                t = typ_f.read_text().strip().lower()
+                if t != "battery":
+                    continue
+            if not cap_f.exists():
+                continue
+            pct = max(0, min(100, int(cap_f.read_text().strip())))
+            charging = False
+            if status_f.exists():
+                st = status_f.read_text().strip().lower()
+                charging = st in ("charging", "full")
+            return {"percent": pct, "charging": charging}
+        except Exception:
+            continue
+    return {"percent": None, "charging": None}
+
+
+# ---------------------------------------------------------------------------
+# Volume read
+# ---------------------------------------------------------------------------
+
+def get_sink_volume_pct() -> int | None:
+    """Read current default audio output volume as 0-100.  Returns None on failure."""
+    import re as _re
+    # Try wpctl (PipeWire)
+    exe = shutil.which("wpctl")
+    if exe:
+        try:
+            out = subprocess.check_output(
+                [exe, "get-volume", "@DEFAULT_AUDIO_SINK@"],
+                timeout=3,
+                stderr=subprocess.DEVNULL,
+                env={**os.environ},
+            ).decode(errors="ignore")
+            for part in out.split():
+                try:
+                    return min(100, int(round(float(part) * 100)))
+                except ValueError:
+                    continue
+        except Exception:
+            pass
+    # Try pactl (PulseAudio)
+    exe = shutil.which("pactl")
+    if exe:
+        try:
+            out = subprocess.check_output(
+                [exe, "get-sink-volume", "@DEFAULT_SINK@"],
+                timeout=3,
+                stderr=subprocess.DEVNULL,
+                env={**os.environ},
+            ).decode(errors="ignore")
+            m = _re.search(r"(\d+)%", out)
+            if m:
+                return int(m.group(1))
+        except Exception:
+            pass
+    return None

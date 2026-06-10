@@ -1,4 +1,4 @@
-# MeetingBox appliance — device-ui (includes audio capture) + Redis.
+# MeetingBox appliance — device-ui (includes audio capture).
 # Use this folder as its own git repo on the mini PC, or as part of the monorepo.
 #
 # Copy .env.example → .env and set BACKEND_URL / UPLOAD_AUDIO_API_URL for your cloud API.
@@ -8,23 +8,13 @@
 # Profiles (set COMPOSE_PROFILES in .env — see .env.example):
 #   mini-pc, screen  — Kivy container (needs X11); also runs audio_capture.py as a child.
 #
-# Redis runs as its own container (default on with profile ``mini-pc``).
+# The appliance no longer runs Redis: audio_capture.py emits events to
+# stdout (parsed by audio_supervisor) and commands arrive from the cloud
+# via the device HTTP long-poll endpoint.
 
 name: meetingbox-appliance
 
 services:
-  redis:
-    image: redis:7-alpine
-    container_name: meetingbox-appliance-redis
-    restart: unless-stopped
-    profiles: ["mini-pc"]
-    ports:
-      - "127.0.0.1:6379:6379"
-    volumes:
-      - appliance-redis-data:/data
-    networks:
-      - appliance-net
-
   device-ui:
     build:
       context: ./device-ui
@@ -38,8 +28,7 @@ services:
     restart: unless-stopped
     profiles: ["mini-pc", "screen"]
     # Host network: ``ip`` / ``hostname -I`` / route source match the real LAN (enp1s0, DHCP
-    # renewals) — no wrong 172.18.x container address on the home-screen footer. ``redis``
-    # is not resolvable here; use 127.0.0.1 (Redis publishes 127.0.0.1:6379 on the host).
+    # renewals) — no wrong 172.18.x container address on the home-screen footer.
     network_mode: host
     # Share host PID namespace so ``nsenter -t 1`` in meetingbox-host-reboot targets
     # the real systemd (PID 1 on the mini-PC). Without this, -t 1 is the container's
@@ -72,35 +61,28 @@ services:
       # the bridge (172.18.x); set this on the host or use data/config/lan_ip — see .env.example.
       - MEETINGBOX_LAN_IP=${MEETINGBOX_LAN_IP:-}
       - MEETINGBOX_LAN_IP_FILE=${MEETINGBOX_LAN_IP_FILE:-/data/config/lan_ip}
-      # With ``network_mode: host``, Redis is reached on the host loopback (see redis service ports).
-      - LOCAL_REDIS_HOST=${LOCAL_REDIS_HOST:-127.0.0.1}
-      - LOCAL_REDIS_PORT=${LOCAL_REDIS_PORT:-6379}
       - MOCK_BACKEND=${MOCK_BACKEND:-0}
       - AUDIO_INPUT_DEVICE_INDEX=${AUDIO_INPUT_DEVICE_INDEX:-}
       - AUDIO_INPUT_DEVICE_NAME=${AUDIO_INPUT_DEVICE_NAME:-}
       - ALSA_CARD=${ALSA_CARD:-}
       - AUDIO_INPUT_GAIN=${AUDIO_INPUT_GAIN:-1}
-      - AUDIO_CAPTURE_BACKEND=${AUDIO_CAPTURE_BACKEND:-pyaudio}
+      # arecord opens the USB mic by stable ALSA card name, which survives
+      # PortAudio index changes when the mic is moved between USB ports.
+      - AUDIO_CAPTURE_BACKEND=${AUDIO_CAPTURE_BACKEND:-arecord}
+      - AUDIO_ALSA_INPUT_DEVICE=${AUDIO_ALSA_INPUT_DEVICE:-}
       - AUDIO_OUTPUT_DEVICE=${AUDIO_OUTPUT_DEVICE:-}
       # Explicit ALSA output device for the speaker (aplay -D). Leave unset to
       # auto-detect: if a USB device has both mic and speaker on the same card
       # (e.g. a conference puck), it is automatically used for both.
       # Example: AUDIO_OUTPUT_DEVICE_NAME=plughw:1,0
       - AUDIO_OUTPUT_DEVICE_NAME=${AUDIO_OUTPUT_DEVICE_NAME:-}
-<<<<<<< Updated upstream
-=======
       # Fallback ALSA output when no USB speaker is found. Defaults to plughw:0,0
       # (internal speaker). Change to plughw:0,3 for HDMI, or plughw:0,7 for HDMI 1, etc.
       - AUDIO_OUTPUT_FALLBACK_DEVICE=${AUDIO_OUTPUT_FALLBACK_DEVICE:-plughw:0,0}
->>>>>>> Stashed changes
->>>>>>> Stashed changes
       # --- Merged audio capture (formerly the standalone "audio" container) ---
       # device-ui spawns mini-pc/audio/audio_capture.py via audio_supervisor.py.
       # Set MEETINGBOX_SPAWN_AUDIO=0 if you reintroduce a separate audio process.
       - MEETINGBOX_SPAWN_AUDIO=${MEETINGBOX_SPAWN_AUDIO:-1}
-      - REDIS_HOST=${REDIS_HOST:-127.0.0.1}
-      - REDIS_PORT=${REDIS_PORT:-6379}
-      - AUDIO_COMMAND_SOURCE=${AUDIO_COMMAND_SOURCE:-}
       - AUDIO_POLL_BASE_URL=${AUDIO_POLL_BASE_URL:-}
       - RECORDINGS_DIR=${RECORDINGS_DIR:-/data/audio/recordings}
       - TEMP_SEGMENTS_DIR=${TEMP_SEGMENTS_DIR:-/data/audio/temp}
@@ -152,9 +134,12 @@ services:
       - ./scripts/meetingbox-timedatectl:/usr/local/bin/meetingbox-timedatectl:ro
       # nmcli/bluetoothctl in the container talks to host NetworkManager / BlueZ via D-Bus.
       - /run/dbus/system_bus_socket:/run/dbus/system_bus_socket
+      # Bind the whole sound device directory so USB mic hot-plug creates new
+      # pcmC* nodes inside the already-running container. Docker `devices`
+      # snapshots /dev/snd at container start and misses later re-plugs.
+      - /dev/snd:/dev/snd
     devices:
       - /dev/dri:/dev/dri
-      - /dev/snd:/dev/snd
     # Host group names (Docker resolves GIDs on this machine). Omit ``render`` here because
     # some minimal images have no ``render`` group — Docker then fails to start the container.
     # If EGL logs show renderD128 permission denied, add the group on the host and use
@@ -173,10 +158,3 @@ services:
     cap_add:
       - SYS_ADMIN
       - SYS_PTRACE
-
-volumes:
-  appliance-redis-data:
-
-networks:
-  appliance-net:
-    driver: bridge

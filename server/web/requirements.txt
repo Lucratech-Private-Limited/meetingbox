@@ -24,6 +24,19 @@ alembic==1.15.2
 sqlalchemy==2.0.38
 slowapi==0.1.9
 mem0ai==2.0.2
+# Self-hosted Mem0 backends — must be installed explicitly (not pulled by bare mem0ai==2.0.2).
+# Mirrors the packages in the official mem0 Docker image (blog.mem0.ai/self-host-mem0-docker).
+psycopg[binary,pool]>=3.1,<4  # pgvector async connection pool
+psycopg2-binary>=2.9,<3       # psycopg2 fallback (mem0 pgvector provider uses this internally)
+neo4j>=5.14,<6                # Neo4j Bolt driver
+langchain-neo4j>=0.2,<1       # Neo4j graph store wrapper used by mem0 graph provider
+rank-bm25>=0.2.2               # BM25 hybrid search scorer
+apscheduler>=3.10,<4           # background analysis jobs (daily digest, post-meeting synthesis)
 # Pipecat AI voice pipeline: STT (OpenAI Realtime) + LLM (GPT-4o) + TTS (OpenAI).
 # Requires websockets>=13.1 and aiofiles>=24.1.0.
 pipecat-ai[openai]==1.2.1
+# Email attachment text extraction (PDF, Word, Excel, PowerPoint).
+pypdf>=4.0.0
+python-docx>=1.1.0
+openpyxl>=3.1.0
+python-pptx>=0.6.23

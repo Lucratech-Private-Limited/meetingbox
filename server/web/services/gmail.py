@@ -6,6 +6,7 @@ import base64
 import logging
 import os
 import re
+import time
 from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -413,6 +414,18 @@ def list_recent_messages(
 
     list_batch = 40
 
+    _META_HEADERS = [
+        "From",
+        "Subject",
+        "Date",
+        "List-Unsubscribe",
+        "List-Unsubscribe-Post",
+        "List-Id",
+        "Precedence",
+        "Auto-Submitted",
+        "Feedback-ID",
+    ]
+
     while len(out) < max_results and rounds < max_rounds and inspected < max_inspect:
         kwargs: dict = {"userId": "me", "maxResults": list_batch, "q": q_use}
         if page_token:
@@ -425,9 +438,11 @@ def list_recent_messages(
         if not msg_refs:
             break
 
+        # Collect this page's ids in list order (newest-first), de-duped and
+        # capped by max_inspect — identical selection to the previous per-message
+        # loop, just gathered up front so the metadata gets can be batched.
+        page_ids: list[str] = []
         for ref in msg_refs:
-            if len(out) >= max_results:
-                break
             mid = ref.get("id")
             if not mid or mid in seen_ids:
                 continue
@@ -435,23 +450,55 @@ def list_recent_messages(
             inspected += 1
             if inspected > max_inspect:
                 break
+            page_ids.append(mid)
 
-            m = service.users().messages().get(
-                userId="me",
-                id=mid,
-                format="metadata",
-                metadataHeaders=[
-                    "From",
-                    "Subject",
-                    "Date",
-                    "List-Unsubscribe",
-                    "List-Unsubscribe-Post",
-                    "List-Id",
-                    "Precedence",
-                    "Auto-Submitted",
-                    "Feedback-ID",
-                ],
-            ).execute()
+        # Fetch all metadata for this page in ONE batched HTTP request instead of
+        # one sequential round-trip per message (the prior N+1 that dominated
+        # latency). Results may arrive out of order, so key them by message id and
+        # then walk page_ids in original order to preserve identical output.
+        fetched: dict[str, dict] = {}
+
+        def _collect(request_id, response, exception, _store=fetched):
+            if exception is None and response is not None:
+                _store[request_id] = response
+
+        # Fetch this page's metadata in batched rounds, retrying only the ids
+        # that did not come back (transient 429/5xx under load). Without the
+        # retry a dropped message would be silently skipped and the early-stop
+        # below would substitute an OLDER message, yielding an incomplete and
+        # unstable inbox view. Retrying keeps the result the true newest-N set.
+        pending = list(page_ids)
+        for _attempt in range(3):
+            if not pending:
+                break
+            if _attempt:
+                time.sleep(0.4 * _attempt)
+            batch = service.new_batch_http_request(callback=_collect)
+            for mid in pending:
+                batch.add(
+                    service.users().messages().get(
+                        userId="me",
+                        id=mid,
+                        format="metadata",
+                        metadataHeaders=_META_HEADERS,
+                    ),
+                    request_id=mid,
+                )
+            batch.execute()
+            pending = [mid for mid in pending if mid not in fetched]
+        if pending:
+            logger.warning(
+                "gmail list: %d/%d message metadata fetch(es) failed after retries",
+                len(pending),
+                len(page_ids),
+            )
+
+        for mid in page_ids:
+            if len(out) >= max_results:
+                break
+            m = fetched.get(mid)
+            if not m:
+                continue
             raw_headers = m.get("payload", {}).get("headers", [])
             headers_lc = _headers_lc_from_meta(raw_headers)
             label_ids = list(m.get("labelIds") or [])
@@ -487,6 +534,87 @@ def list_recent_messages(
                 "is_read": "UNREAD" not in label_ids,
             })
 
+        if not page_token:
+            break
+
+    return out
+
+
+def get_self_email(credentials) -> str:
+    """Return the authenticated user's own Gmail address (lower-cased)."""
+    try:
+        service = build("gmail", "v1", credentials=credentials, cache_discovery=False)
+        prof = service.users().getProfile(userId="me").execute()
+        return str(prof.get("emailAddress") or "").strip().lower()
+    except Exception as exc:
+        logger.debug("get_self_email failed: %s", exc)
+        return ""
+
+
+def harvest_contact_addresses(
+    credentials,
+    query: str = "",
+    max_messages: int = 200,
+) -> list[str]:
+    """Collect raw From / To / Cc header strings across the user's mailbox.
+
+    Unlike ``list_recent_messages`` this fetches the recipient headers (To/Cc)
+    and applies NO personal-inbox allowlist — the goal is to learn EVERY person
+    the user has corresponded with (sent or received), so the contacts book can
+    resolve a name regardless of direction.
+
+    Returns a flat list of address-field strings (e.g. 'Jane Roe <jane@x.com>')
+    suitable for ``email.utils.getaddresses`` / contacts parsing.
+    """
+    service = build("gmail", "v1", credentials=credentials, cache_discovery=False)
+    max_messages = max(1, min(int(max_messages), 1000))
+    out: list[str] = []
+    seen: set[str] = set()
+    page_token: str | None = None
+    fetched = 0
+
+    while fetched < max_messages:
+        kwargs: dict = {
+            "userId": "me",
+            "maxResults": min(100, max_messages - fetched),
+            "q": query or "",
+        }
+        if page_token:
+            kwargs["pageToken"] = page_token
+        try:
+            resp = service.users().messages().list(**kwargs).execute()
+        except Exception as exc:
+            logger.debug("harvest list failed: %s", exc)
+            break
+        refs = resp.get("messages", []) or []
+        page_token = resp.get("nextPageToken")
+        if not refs:
+            break
+        for ref in refs:
+            mid = ref.get("id")
+            if not mid or mid in seen:
+                continue
+            seen.add(mid)
+            fetched += 1
+            try:
+                m = (
+                    service.users()
+                    .messages()
+                    .get(
+                        userId="me",
+                        id=mid,
+                        format="metadata",
+                        metadataHeaders=["From", "To", "Cc"],
+                    )
+                    .execute()
+                )
+            except Exception:
+                continue
+            for h in m.get("payload", {}).get("headers", []) or []:
+                if (h.get("name") or "").lower() in ("from", "to", "cc"):
+                    val = h.get("value") or ""
+                    if val.strip():
+                        out.append(val)
         if not page_token:
             break
 
@@ -583,8 +711,27 @@ def send_draft(credentials, draft_id: str) -> dict:
     """
     Send an existing Gmail draft by draft_id using the drafts.send API.
     Gmail automatically moves it from Drafts to Sent and removes it from Drafts.
+
+    Also reads the draft's recipient headers (To/Cc/Bcc) BEFORE sending and
+    returns them as ``recipients`` so the caller can remember confirmed
+    contacts — addresses are learned only on a real send, never from a draft
+    that may still hold a mis-heard address.
     """
     service = build("gmail", "v1", credentials=credentials, cache_discovery=False)
+
+    recipients: list[str] = []
+    try:
+        draft = (
+            service.users()
+            .drafts()
+            .get(userId="me", id=draft_id, format="metadata")
+            .execute()
+        )
+        env = _parse_gmail_message_envelope(draft.get("message", {}))
+        recipients = [v for v in (env.get("to"), env.get("cc"), env.get("bcc")) if v]
+    except Exception as exc:
+        logger.debug("send_draft: could not read recipients for %s: %s", draft_id, exc)
+
     result = (
         service.users()
         .drafts()
@@ -602,6 +749,7 @@ def send_draft(credentials, draft_id: str) -> dict:
         "thread_id": result.get("threadId"),
         "draft_id": draft_id,
         "status": "sent",
+        "recipients": recipients,
     }
 
 
@@ -656,6 +804,207 @@ def _extract_body(payload: dict) -> str:
         if result:
             return result
     return ""
+
+
+_ATTACHMENT_MAX_TEXT_BYTES = 50_000  # 50 KB of extracted text per attachment
+_ATTACHMENT_MAX_COUNT = 5            # max attachments to process per message
+
+
+def _extract_attachments_metadata(payload: dict) -> list[dict]:
+    """
+    Recursively walk a Gmail message payload and collect every attachment part.
+    A part is an attachment when it carries a non-empty filename.
+    Returns list of {attachment_id, data_inline, filename, mime_type, size}.
+    data_inline is the base64-encoded body data if the content is embedded directly;
+    attachment_id is set when the content must be fetched via attachments.get.
+    """
+    results: list[dict] = []
+    filename = (payload.get("filename") or "").strip()
+    body = payload.get("body") or {}
+    if filename:
+        results.append({
+            "attachment_id": body.get("attachmentId", ""),
+            "data_inline": body.get("data", ""),
+            "filename": filename,
+            "mime_type": payload.get("mimeType", ""),
+            "size": body.get("size", 0),
+        })
+    for part in payload.get("parts", []):
+        results.extend(_extract_attachments_metadata(part))
+    return results
+
+
+def download_attachment(credentials, message_id: str, attachment_id: str) -> bytes:
+    """
+    Download a Gmail attachment by its attachmentId and return raw decoded bytes.
+    Requires gmail.readonly scope.
+    """
+    service = build("gmail", "v1", credentials=credentials, cache_discovery=False)
+    att = service.users().messages().attachments().get(
+        userId="me",
+        messageId=message_id,
+        id=attachment_id,
+    ).execute()
+    data = att.get("data", "")
+    return base64.urlsafe_b64decode(data + "==")
+
+
+def extract_text_from_attachment(filename: str, mime_type: str, data_bytes: bytes) -> str | None:
+    """
+    Extract plain text from an attachment's raw bytes.
+    Dispatches by MIME type and file extension.
+    Returns extracted text (truncated to _ATTACHMENT_MAX_TEXT_BYTES) or None when
+    the type is unsupported or parsing fails.  Never raises.
+    """
+    import io
+
+    name_lower = (filename or "").lower()
+    mime_lower = (mime_type or "").lower()
+
+    try:
+        # PDF
+        if mime_lower == "application/pdf" or name_lower.endswith(".pdf"):
+            import pypdf
+            reader = pypdf.PdfReader(io.BytesIO(data_bytes))
+            pages = [page.extract_text() or "" for page in reader.pages]
+            text = "\n".join(pages).strip()
+            return text[:_ATTACHMENT_MAX_TEXT_BYTES] or None
+
+        # Word .docx
+        if (
+            mime_lower == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            or name_lower.endswith(".docx")
+        ):
+            import docx as python_docx
+            doc = python_docx.Document(io.BytesIO(data_bytes))
+            text = "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+            return text[:_ATTACHMENT_MAX_TEXT_BYTES] or None
+
+        # Excel .xlsx
+        if (
+            mime_lower == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            or name_lower.endswith(".xlsx")
+        ):
+            import openpyxl
+            wb = openpyxl.load_workbook(io.BytesIO(data_bytes), read_only=True, data_only=True)
+            rows: list[str] = []
+            for sheet in wb.worksheets:
+                rows.append(f"[Sheet: {sheet.title}]")
+                for row in sheet.iter_rows(values_only=True):
+                    cells = [str(c) if c is not None else "" for c in row]
+                    if any(c.strip() for c in cells):
+                        rows.append("\t".join(cells))
+            text = "\n".join(rows).strip()
+            return text[:_ATTACHMENT_MAX_TEXT_BYTES] or None
+
+        # PowerPoint .pptx
+        if (
+            mime_lower == "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+            or name_lower.endswith(".pptx")
+        ):
+            from pptx import Presentation
+            prs = Presentation(io.BytesIO(data_bytes))
+            slides: list[str] = []
+            for i, slide in enumerate(prs.slides, 1):
+                parts: list[str] = []
+                for shape in slide.shapes:
+                    if shape.has_text_frame:
+                        for para in shape.text_frame.paragraphs:
+                            t = para.text.strip()
+                            if t:
+                                parts.append(t)
+                if parts:
+                    slides.append(f"[Slide {i}] " + " | ".join(parts))
+            text = "\n".join(slides).strip()
+            return text[:_ATTACHMENT_MAX_TEXT_BYTES] or None
+
+        # Plain text variants
+        if mime_lower.startswith("text/") or name_lower.endswith(
+            (".txt", ".csv", ".json", ".md", ".html", ".xml", ".yaml", ".yml")
+        ):
+            text = data_bytes.decode("utf-8", errors="replace").strip()
+            return text[:_ATTACHMENT_MAX_TEXT_BYTES] or None
+
+        # Images — caller should note these separately; return None to signal unsupported
+        return None
+
+    except Exception as exc:
+        logger.debug("extract_text_from_attachment failed for %s: %s", filename, exc)
+        return None
+
+
+def get_message_with_attachments(credentials, message_id: str) -> dict:
+    """
+    Fetch a single Gmail message including full body text and extracted attachment content.
+    Returns the same shape as get_message_full plus an 'attachments' list where each
+    entry contains {filename, mime_type, size} and either extracted_text or a note/error.
+    Attachments are capped at _ATTACHMENT_MAX_COUNT per message.
+    """
+    service = build("gmail", "v1", credentials=credentials, cache_discovery=False)
+    m = service.users().messages().get(
+        userId="me",
+        id=message_id,
+        format="full",
+    ).execute()
+
+    headers = {h["name"]: h["value"] for h in m.get("payload", {}).get("headers", [])}
+    label_ids = m.get("labelIds", [])
+    payload = m.get("payload", {})
+    body = _extract_body(payload)
+
+    msg: dict = {
+        "id": m["id"],
+        "threadId": m.get("threadId"),
+        "from": headers.get("From", ""),
+        "to": headers.get("To", ""),
+        "subject": headers.get("Subject", ""),
+        "date": headers.get("Date", ""),
+        "snippet": m.get("snippet", ""),
+        "body": body or m.get("snippet", ""),
+        "is_read": "UNREAD" not in label_ids,
+        "label_ids": label_ids,
+    }
+
+    att_meta = _extract_attachments_metadata(payload)
+    attachments: list[dict] = []
+    for meta in att_meta[:_ATTACHMENT_MAX_COUNT]:
+        entry: dict = {
+            "filename": meta["filename"],
+            "mime_type": meta["mime_type"],
+            "size": meta["size"],
+        }
+        mime_lower = (meta["mime_type"] or "").lower()
+        name_lower = (meta["filename"] or "").lower()
+        is_image = mime_lower.startswith("image/") or name_lower.endswith(
+            (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".svg", ".tiff", ".ico")
+        )
+        if is_image:
+            entry["note"] = "Image attachment — content not extracted"
+        else:
+            try:
+                if meta.get("data_inline"):
+                    raw_bytes = base64.urlsafe_b64decode(meta["data_inline"] + "==")
+                elif meta.get("attachment_id"):
+                    raw_bytes = download_attachment(credentials, message_id, meta["attachment_id"])
+                else:
+                    entry["note"] = "Attachment content unavailable"
+                    attachments.append(entry)
+                    continue
+                text = extract_text_from_attachment(meta["filename"], meta["mime_type"], raw_bytes)
+                if text:
+                    entry["extracted_text"] = text
+                else:
+                    entry["note"] = "Unsupported attachment type — content not extracted"
+            except Exception as exc:
+                logger.warning(
+                    "Attachment download/parse failed for %s in message %s: %s",
+                    meta["filename"], message_id, exc,
+                )
+                entry["error"] = f"Could not extract content: {exc}"
+        attachments.append(entry)
+
+    msg["attachments"] = attachments
+    return msg
 
 
 def mark_message_unread(credentials, message_id: str) -> dict:
@@ -721,6 +1070,20 @@ def _parse_gmail_message_envelope(msg: dict) -> dict:
         "in_reply_to": headers.get("in-reply-to", ""),
         "references": headers.get("references", ""),
     }
+
+
+def _apply_threading_headers(mime, env: dict) -> None:
+    """Set In-Reply-To / References on a reply so Gmail keeps it in the SAME
+    conversation. Gmail threads by these RFC-2822 headers (plus a matching
+    Re: subject) — supplying threadId alone is not enough and sends a new
+    conversation. *env* is the parsed envelope of the message being replied to.
+    """
+    last_id = (env.get("message_id") or "").strip()
+    if not last_id:
+        return
+    refs = (env.get("references") or "").strip()
+    mime["In-Reply-To"] = last_id
+    mime["References"] = f"{refs} {last_id}".strip() if refs else last_id
 
 
 def _format_address_pairs(pairs: list[tuple[str, str]]) -> str:
@@ -972,6 +1335,9 @@ def reply_to_thread(
     cc_str = _to_list_or_str(cc)
     if cc_str:
         mime["cc"] = cc_str
+    # Thread the reply: Gmail needs In-Reply-To + References matching the
+    # thread's Message-IDs — threadId alone sends a NEW conversation.
+    _apply_threading_headers(mime, env)
 
     raw = base64.urlsafe_b64encode(mime.as_bytes()).decode("utf-8")
     result = service.users().messages().send(
@@ -986,6 +1352,61 @@ def reply_to_thread(
         "to": reply_to,
         "subject": subject,
     }
+
+
+def compute_reply_all_recipients(credentials, thread_id: str) -> dict:
+    """
+    Compute the To + Cc list a reply-all would use, WITHOUT sending anything.
+    Mirrors the participant logic in reply_all_in_thread so the on-screen draft
+    popup can display every recipient before the user confirms. The model cannot
+    reliably aggregate/dedup participants across all thread messages itself, so
+    the server is the source of truth.
+    Returns {"to": str, "cc": list[str], "subject": str}.
+    """
+    service = build("gmail", "v1", credentials=credentials, cache_discovery=False)
+
+    profile = service.users().getProfile(userId="me").execute()
+    my_email = (profile.get("emailAddress") or "").lower().strip()
+
+    thread = service.users().threads().get(
+        userId="me",
+        id=thread_id,
+        format="metadata",
+        metadataHeaders=["From", "To", "Cc", "Subject", "Message-ID", "References"],
+    ).execute()
+    messages = thread.get("messages", [])
+    if not messages:
+        return {"to": "", "cc": [], "subject": ""}
+
+    participants: dict[str, str] = {}
+    for msg in messages:
+        env = _parse_gmail_message_envelope(msg)
+        for field in ("from", "to", "cc"):
+            for name, email in _addr_pairs(env.get(field, "")):
+                e_lc = email.lower()
+                if not e_lc or e_lc == my_email:
+                    continue
+                if e_lc not in participants:
+                    participants[e_lc] = f"{name} <{email}>" if name else email
+
+    last_env = _parse_gmail_message_envelope(messages[-1])
+    primary_to = ""
+    primary_lc = ""
+    for name, email in _addr_pairs(last_env.get("from", "")):
+        if email.lower() != my_email:
+            primary_to = f"{name} <{email}>" if name else email
+            primary_lc = email.lower()
+            break
+    if not primary_to and participants:
+        primary_lc, primary_to = next(iter(participants.items()))
+
+    cc_list = [v for k, v in participants.items() if k != primary_lc]
+
+    subject = last_env.get("subject", "")
+    if subject and not subject.lower().startswith("re:"):
+        subject = "Re: " + subject
+
+    return {"to": primary_to, "cc": cc_list, "subject": subject}
 
 
 def reply_all_in_thread(
@@ -1008,7 +1429,7 @@ def reply_all_in_thread(
         userId="me",
         id=thread_id,
         format="metadata",
-        metadataHeaders=["From", "To", "Cc", "Subject"],
+        metadataHeaders=["From", "To", "Cc", "Subject", "Message-ID", "References"],
     ).execute()
     messages = thread.get("messages", [])
     if not messages:
@@ -1051,6 +1472,10 @@ def reply_all_in_thread(
     mime["subject"] = subject
     if cc_list:
         mime["cc"] = ", ".join(cc_list)
+    # Keep the reply-all in the SAME conversation: set In-Reply-To + References
+    # from the last message. Without these Gmail starts a new thread even when
+    # threadId is supplied.
+    _apply_threading_headers(mime, last_env)
 
     raw = base64.urlsafe_b64encode(mime.as_bytes()).decode("utf-8")
     result = service.users().messages().send(

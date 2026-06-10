@@ -3,18 +3,22 @@
 Enabled with ``MEETINGBOX_SPAWN_AUDIO=1`` (the Docker image sets this by
 default in the merged image). This is the in-process alternative to running
 ``audio_capture.py`` as its own Docker / systemd service. Use only one at a
-time ΓÇö two audio processes would compete for the mic and Redis channels.
+time -- two audio processes would compete for the mic.
 
 Responsibilities:
 * Locate ``audio_capture.py`` next to device-ui (Docker or native checkout).
 * Spawn it with the UI's environment plus light defaults.
-* Re-log child stdout/stderr through the UI logger as ``[audio] ...``.
+* Parse ``MEETINGBOX_EVT|<json>`` sentinel lines from the child's stdout and
+  invoke the ``on_event`` callback; remaining stdout lines pass through to
+  the supervisor logger as ``[audio] ...``. This replaces the appliance
+  Redis ``events`` channel that previously bridged the two processes.
 * Restart the child with bounded exponential backoff if it dies while the UI is up.
 * Terminate the child cleanly on ``stop()`` / shutdown.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import signal
@@ -22,9 +26,11 @@ import subprocess
 import sys
 import threading
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 logger = logging.getLogger("meetingbox.audio_supervisor")
+
+EVT_PREFIX = "MEETINGBOX_EVT|"
 
 
 def _truthy(value: Optional[str]) -> bool:
@@ -71,12 +77,26 @@ class AudioSupervisor:
 
     _BACKOFF_SECONDS = (1.0, 2.0, 5.0, 10.0, 30.0)
 
-    def __init__(self, audio_script: Path, python: str) -> None:
+    def __init__(
+        self,
+        audio_script: Path,
+        python: str,
+        on_event: Optional[Callable[[dict], None]] = None,
+    ) -> None:
         self._script = audio_script
         self._python = python
+        self._on_event = on_event
         self._proc: Optional[subprocess.Popen] = None
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
+
+    def set_on_event(self, on_event: Optional[Callable[[dict], None]]) -> None:
+        """Set or replace the event callback after construction.
+
+        Useful when the supervisor is created in ``maybe_create_from_env``
+        before the device-ui app object exists.
+        """
+        self._on_event = on_event
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -117,8 +137,6 @@ class AudioSupervisor:
     def _spawn_once(self) -> None:
         env = os.environ.copy()
         env.setdefault("PYTHONUNBUFFERED", "1")
-        env.setdefault("REDIS_HOST", env.get("LOCAL_REDIS_HOST", "127.0.0.1"))
-        env.setdefault("REDIS_PORT", env.get("LOCAL_REDIS_PORT", "6379"))
 
         cmd = [self._python, str(self._script)]
         cwd = str(self._script.parent)
@@ -147,12 +165,36 @@ class AudioSupervisor:
                     line = line.rstrip()
                     if not line:
                         continue
-                    logger.info("[audio] %s", line)
+                    if line.startswith(EVT_PREFIX):
+                        self._dispatch_event_line(line[len(EVT_PREFIX):])
+                    else:
+                        logger.info("[audio] %s", line)
                     if self._stop.is_set():
                         break
             proc.wait()
         finally:
             self._proc = None
+
+    def _dispatch_event_line(self, raw: str) -> None:
+        """Parse a ``MEETINGBOX_EVT|<json>`` body and forward to ``on_event``.
+
+        Bad JSON or a callback exception is logged but never crashes the
+        stdout-reader thread -- a single malformed line must not stop the
+        live audio_level stream.
+        """
+        if self._on_event is None:
+            return
+        try:
+            payload = json.loads(raw)
+        except (ValueError, TypeError):
+            logger.warning("[audio] bad event line: %s", raw[:200])
+            return
+        if not isinstance(payload, dict):
+            return
+        try:
+            self._on_event(payload)
+        except Exception:  # noqa: BLE001
+            logger.exception("on_event callback raised")
 
     def _terminate_child(self, *, timeout: float) -> None:
         proc = self._proc
@@ -183,7 +225,9 @@ class AudioSupervisor:
             logger.error("audio child still running after SIGKILL")
 
 
-def maybe_create_from_env() -> Optional[AudioSupervisor]:
+def maybe_create_from_env(
+    on_event: Optional[Callable[[dict], None]] = None,
+) -> Optional[AudioSupervisor]:
     """Return a configured supervisor when enabled and runnable, else None."""
     if not _truthy(os.environ.get("MEETINGBOX_SPAWN_AUDIO")):
         return None
@@ -194,4 +238,8 @@ def maybe_create_from_env() -> Optional[AudioSupervisor]:
             "(set MEETINGBOX_AUDIO_SCRIPT or run from the mini-pc tree)",
         )
         return None
-    return AudioSupervisor(audio_script=script, python=_resolve_python())
+    return AudioSupervisor(
+        audio_script=script,
+        python=_resolve_python(),
+        on_event=on_event,
+    )

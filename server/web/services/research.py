@@ -418,24 +418,406 @@ def fetch_currency_convert_sync(amount: float, from_ccy: str, to_ccy: str) -> di
 
 
 # ---------------------------------------------------------------------------
-# Stock price (uses web_search since user opted for it)
+# Stock price — Yahoo Finance v8 chart endpoint (no key, free, very reliable)
 # ---------------------------------------------------------------------------
 
+# Common Indian-company → NSE ticker shortcuts so users can speak the company name.
+_INDIAN_TICKER_ALIASES: dict[str, str] = {
+    "tata steel": "TATASTEEL.NS",
+    "reliance": "RELIANCE.NS",
+    "reliance industries": "RELIANCE.NS",
+    "tcs": "TCS.NS",
+    "tata consultancy": "TCS.NS",
+    "infosys": "INFY.NS",
+    "infy": "INFY.NS",
+    "hdfc bank": "HDFCBANK.NS",
+    "icici bank": "ICICIBANK.NS",
+    "sbi": "SBIN.NS",
+    "state bank of india": "SBIN.NS",
+    "axis bank": "AXISBANK.NS",
+    "bharti airtel": "BHARTIARTL.NS",
+    "airtel": "BHARTIARTL.NS",
+    "wipro": "WIPRO.NS",
+    "itc": "ITC.NS",
+    "larsen": "LT.NS",
+    "l&t": "LT.NS",
+    "lt": "LT.NS",
+    "mahindra": "M&M.NS",
+    "maruti": "MARUTI.NS",
+    "maruti suzuki": "MARUTI.NS",
+    "adani": "ADANIENT.NS",
+    "adani enterprises": "ADANIENT.NS",
+    "asian paints": "ASIANPAINT.NS",
+    "bajaj finance": "BAJFINANCE.NS",
+    "tata motors": "TATAMOTORS.NS",
+    "tata gold": "GOLDBEES.NS",  # popular Tata gold ETF
+    "kotak": "KOTAKBANK.NS",
+    "ongc": "ONGC.NS",
+    "ntpc": "NTPC.NS",
+    "powergrid": "POWERGRID.NS",
+    "sun pharma": "SUNPHARMA.NS",
+    # Indices
+    "nifty": "^NSEI",
+    "nifty 50": "^NSEI",
+    "sensex": "^BSESN",
+    "bank nifty": "^NSEBANK",
+    "nifty bank": "^NSEBANK",
+    "nasdaq": "^IXIC",
+    "dow jones": "^DJI",
+    "dow": "^DJI",
+    "s&p 500": "^GSPC",
+    "sp500": "^GSPC",
+    "ftse": "^FTSE",
+    "nikkei": "^N225",
+}
+
+
+def _resolve_ticker_symbol(raw: str) -> str:
+    """Normalize a user-facing ticker/company name into a Yahoo Finance symbol.
+
+    - Symbols with a dot suffix (.NS, .BO, .L, .HK …) or starting with '^' are used as-is.
+    - Known Indian company aliases are translated to <SYM>.NS.
+    - Otherwise the input is upper-cased and returned (works for AAPL, TSLA, MSFT …).
+    """
+    s = (raw or "").strip()
+    if not s:
+        return ""
+    if s.startswith("^") or "." in s:
+        return s.upper().replace(" ", "")
+    low = s.lower()
+    if low in _INDIAN_TICKER_ALIASES:
+        return _INDIAN_TICKER_ALIASES[low]
+    return s.upper().replace(" ", "")
+
+
+def _yahoo_quote_sync(symbol: str) -> dict | None:
+    """Hit Yahoo Finance v8 chart endpoint for a single symbol.
+
+    Returns a small dict with regularMarketPrice, previousClose, currency, and
+    a few price-history points, or None on failure.
+    """
+    if not symbol:
+        return None
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+    try:
+        with httpx.Client(timeout=6.0, follow_redirects=True) as client:
+            resp = client.get(
+                url,
+                params={"range": "1d", "interval": "5m"},
+                headers={"User-Agent": "Mozilla/5.0 (MeetingBox)"},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        result = (data.get("chart") or {}).get("result") or []
+        if not result:
+            return None
+        meta = result[0].get("meta") or {}
+        price = meta.get("regularMarketPrice")
+        if price is None:
+            return None
+        prev = meta.get("chartPreviousClose") or meta.get("previousClose")
+        change_pct = None
+        change_abs = None
+        if prev not in (None, 0):
+            try:
+                change_abs = round(float(price) - float(prev), 4)
+                change_pct = round((float(price) - float(prev)) / float(prev) * 100.0, 2)
+            except Exception:
+                pass
+        return {
+            "symbol": meta.get("symbol") or symbol,
+            "exchange": meta.get("exchangeName"),
+            "currency": meta.get("currency") or "",
+            "price": round(float(price), 4),
+            "previous_close": round(float(prev), 4) if prev is not None else None,
+            "change_abs": change_abs,
+            "change_pct": change_pct,
+            "day_high": meta.get("regularMarketDayHigh"),
+            "day_low": meta.get("regularMarketDayLow"),
+            "market_state": meta.get("marketState"),  # PRE / REGULAR / POST / CLOSED
+            "instrument_type": meta.get("instrumentType"),
+            "as_of_epoch": meta.get("regularMarketTime"),
+        }
+    except Exception as exc:
+        logger.warning("Yahoo quote failed for %r: %s", symbol, exc)
+        return None
+
+
 def fetch_stock_price_sync(ticker: str) -> dict:
-    t = (ticker or "").strip().upper()
-    if not t:
+    """Get a live quote.
+
+    Tries Yahoo Finance first. If the resolved symbol fails and it has no
+    suffix, retries with '.NS' (NSE) so users can say "TATASTEEL" or
+    "tata steel" without knowing the exchange.
+
+    Falls back to a focused web_search snippet only when Yahoo returns nothing.
+    """
+    raw = (ticker or "").strip()
+    if not raw:
         return {"error": "missing_ticker"}
-    # Use a focused query and surface the top snippet as the "price line".
-    query = f"{t} stock price today"
+
+    symbol = _resolve_ticker_symbol(raw)
+
+    quote = _yahoo_quote_sync(symbol)
+    # If raw user input had no suffix and direct lookup failed, try .NS too.
+    if quote is None and "." not in symbol and not symbol.startswith("^"):
+        quote = _yahoo_quote_sync(f"{symbol}.NS")
+        if quote is not None:
+            symbol = f"{symbol}.NS"
+
+    if quote is not None:
+        return {
+            "source": "yahoo_finance",
+            "ticker": symbol,
+            "input": raw,
+            **quote,
+        }
+
+    # Fallback: snippet-based web search so the agent still has something to read.
+    query = f"{raw} stock price today"
     web = fetch_web_search_sync(query, num_results=4)
-    out: dict = {
-        "ticker": t,
-        "query": query,
+    return {
         "source": web.get("source", "web_search"),
+        "ticker": symbol,
+        "input": raw,
+        "query": query,
         "quick_answer": web.get("quick_answer"),
         "results": web.get("results") or [],
+        "note": "Live quote unavailable — showing search snippets.",
     }
-    return out
+
+
+# ---------------------------------------------------------------------------
+# Research papers — Semantic Scholar Graph API (no key, free, citations)
+# ---------------------------------------------------------------------------
+
+def _crossref_paper_search_sync(query: str, limit: int) -> dict:
+    """Fallback paper search when Semantic Scholar is rate-limited.
+
+    Crossref is the canonical DOI registrar — it indexes essentially every
+    peer-reviewed paper with a DOI. Free, no key, generous rate-limits, and
+    returns citation count via `is-referenced-by-count` plus venue / journal
+    info via `container-title`. Reliable from server environments where
+    arXiv export-api may be firewalled.
+    """
+    url = "https://api.crossref.org/works"
+    with httpx.Client(timeout=10.0, follow_redirects=True) as client:
+        resp = client.get(
+            url,
+            params={
+                "query.bibliographic": query,
+                "rows": limit,
+                "select": (
+                    "DOI,title,author,issued,container-title,abstract,URL,"
+                    "is-referenced-by-count,references-count,type"
+                ),
+            },
+            headers={"User-Agent": "MeetingBox/1.0 (mailto:research@meetingbox.local)"},
+        )
+        resp.raise_for_status()
+        body = resp.json()
+
+    items = (body.get("message") or {}).get("items") or []
+    papers: list[dict] = []
+    for it in items[:limit]:
+        title = ""
+        ttls = it.get("title")
+        if isinstance(ttls, list) and ttls:
+            title = (ttls[0] or "").strip()
+
+        authors_raw = it.get("author") or []
+        authors: list[str] = []
+        for a in authors_raw:
+            if not isinstance(a, dict):
+                continue
+            given = (a.get("given") or "").strip()
+            family = (a.get("family") or "").strip()
+            if given and family:
+                authors.append(f"{given} {family}")
+            elif family:
+                authors.append(family)
+            elif a.get("name"):
+                authors.append(str(a["name"]).strip())
+
+        year = None
+        issued = (it.get("issued") or {}).get("date-parts") or []
+        if issued and isinstance(issued[0], list) and issued[0]:
+            try:
+                if issued[0][0] is not None:
+                    year = int(issued[0][0])
+            except (TypeError, ValueError):
+                year = None
+
+        venue = ""
+        ct = it.get("container-title")
+        if isinstance(ct, list) and ct:
+            venue = (ct[0] or "").strip()
+
+        doi = (it.get("DOI") or "").strip()
+        paper_url = (it.get("URL") or (f"https://doi.org/{doi}" if doi else "")).strip()
+        # Crossref abstracts are JATS XML — strip the wrapping tags for a clean
+        # readable excerpt the voice agent can speak aloud.
+        abstract_raw = it.get("abstract") or ""
+        abstract_clean = ""
+        if abstract_raw:
+            import re as _re
+            abstract_clean = _re.sub(r"<[^>]+>", " ", abstract_raw)
+            abstract_clean = _re.sub(r"\s+", " ", abstract_clean).strip()
+
+        short_cite = ""
+        if authors and year:
+            first = authors[0]
+            short_cite = f"{first.split()[-1]} et al., {year}" if len(authors) > 1 else f"{first}, {year}"
+        elif authors:
+            short_cite = authors[0]
+
+        papers.append({
+            "title": title,
+            "authors": authors[:8],
+            "year": year,
+            "venue": venue,
+            "citation_count": it.get("is-referenced-by-count"),
+            "reference_count": it.get("references-count"),
+            "abstract": abstract_clean[:600],
+            "url": paper_url,
+            "doi": doi,
+            "arxiv_id": "",
+            "pdf_url": "",
+            "short_citation": short_cite,
+            "type": it.get("type"),
+        })
+
+    return {
+        "source": "crossref",
+        "query": query,
+        "count": len(papers),
+        "papers": papers,
+        "note": "Results from Crossref (Semantic Scholar was unavailable).",
+    }
+
+
+
+def fetch_research_paper_sync(query: str, limit: int = 5) -> dict:
+    """Find academic papers by free-text query.
+
+    Uses the Semantic Scholar Graph API (no key). Returns title, authors, year,
+    venue, citation count, abstract, paper URL and an inline citation-friendly
+    short reference for each match.
+
+    Semantic Scholar's anonymous tier is aggressively rate-limited; we do a
+    short retry with backoff on 429/5xx, and an arXiv fallback so a single
+    flaky upstream call doesn't leave the voice agent empty-handed.
+    """
+    import time as _time
+
+    q = (query or "").strip()
+    if not q:
+        return {"error": "missing_query"}
+    n = max(1, min(int(limit or 5), 10))
+
+    fields = (
+        "title,authors,year,venue,citationCount,referenceCount,"
+        "abstract,url,externalIds,openAccessPdf"
+    )
+
+    api_key = os.getenv("SEMANTIC_SCHOLAR_API_KEY") or os.getenv("S2_API_KEY")
+    headers = {"User-Agent": "MeetingBox/1.0 (mailto:research@meetingbox.local)"}
+    if api_key:
+        headers["x-api-key"] = api_key
+
+    # Build a relaxed alt-query — Semantic Scholar sometimes 429s on exotic
+    # tokens like 'Placeit3D' but accepts a spaced/lowercased rephrase.
+    import re as _re
+    relaxed = _re.sub(r"(?<=[a-z])(?=[A-Z0-9])|(?<=[0-9])(?=[A-Za-z])", " ", q).lower()
+    relaxed = _re.sub(r"\s+", " ", relaxed).strip()
+    query_variants = [q] if relaxed == q.lower() else [q, relaxed]
+
+    data = None
+    last_err: str = ""
+    for variant in query_variants:
+        for attempt in range(3):
+            try:
+                with httpx.Client(timeout=10.0, follow_redirects=True) as client:
+                    resp = client.get(
+                        "https://api.semanticscholar.org/graph/v1/paper/search",
+                        params={"query": variant, "limit": n, "fields": fields},
+                        headers=headers,
+                    )
+                    if resp.status_code == 429:
+                        last_err = "rate_limited"
+                        _time.sleep(1.5 * (attempt + 1))
+                        continue
+                    if 500 <= resp.status_code < 600:
+                        last_err = f"http_{resp.status_code}"
+                        _time.sleep(0.8 * (attempt + 1))
+                        continue
+                    resp.raise_for_status()
+                    data = resp.json()
+                    break
+            except Exception as exc:
+                last_err = str(exc) or type(exc).__name__
+                _time.sleep(0.4 * (attempt + 1))
+        if data is not None:
+            break
+
+    if data is None:
+        logger.warning("Semantic Scholar search failed for %r: %s", q, last_err)
+        # Fallback to Crossref — canonical DOI registry, very reliable.
+        try:
+            return _crossref_paper_search_sync(q, n)
+        except Exception as exc2:
+            logger.warning("Crossref fallback failed for %r: %s", q, exc2)
+            return {
+                "error": "fetch_failed",
+                "detail": last_err or str(exc2),
+                "query": q,
+                "papers": [],
+                "hint": (
+                    "Both Semantic Scholar and Crossref were unavailable. "
+                    "Try web_search for this paper instead."
+                ),
+            }
+
+    papers: list[dict] = []
+    for r in (data.get("data") or [])[:n]:
+        if not isinstance(r, dict):
+            continue
+        authors = [a.get("name") for a in (r.get("authors") or []) if isinstance(a, dict) and a.get("name")]
+        first_author = authors[0] if authors else ""
+        year = r.get("year")
+        venue = r.get("venue") or ""
+        ext = r.get("externalIds") or {}
+        doi = ext.get("DOI") or ""
+        arxiv = ext.get("ArXiv") or ""
+        oa = r.get("openAccessPdf") or {}
+        pdf_url = oa.get("url") if isinstance(oa, dict) else None
+        # Format a short citation marker the agent can read aloud
+        short_cite = ""
+        if first_author and year:
+            short_cite = f"{first_author.split()[-1]} et al., {year}" if len(authors) > 1 else f"{first_author}, {year}"
+        elif first_author:
+            short_cite = first_author
+        papers.append({
+            "title": r.get("title") or "",
+            "authors": authors[:8],
+            "year": year,
+            "venue": venue,
+            "citation_count": r.get("citationCount"),
+            "reference_count": r.get("referenceCount"),
+            "abstract": (r.get("abstract") or "")[:600],
+            "url": r.get("url") or "",
+            "doi": doi,
+            "arxiv_id": arxiv,
+            "pdf_url": pdf_url,
+            "short_citation": short_cite,
+        })
+
+    return {
+        "source": "semantic_scholar",
+        "query": q,
+        "count": len(papers),
+        "papers": papers,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -498,7 +880,7 @@ def _plan_sub_queries(topic: str, n: int) -> list[str]:
             f"{{\"queries\": [\"...\", \"...\", ...]}}.\n\n"
             f"Research topic: {topic.strip()[:600]}"
         )
-        model = os.getenv("AI_MODEL", "claude-sonnet-4-20250514")
+        model = os.getenv("AI_MODEL", "claude-sonnet-4-5-20250929")
         resp = client.messages.create(model=model, max_tokens=400, messages=[{"role": "user", "content": prompt}])
         text = getattr(resp.content[0], "text", "") or ""
         match = re.search(r"\{[\s\S]*\}", text)
@@ -555,7 +937,7 @@ def _synthesize_research(topic: str, snippets: list[dict], target_words: int) ->
             f"Topic: {topic.strip()[:600]}\n\n"
             f"Sources:\n{blob}\n"
         )
-        model = os.getenv("AI_MODEL", "claude-sonnet-4-20250514")
+        model = os.getenv("AI_MODEL", "claude-sonnet-4-5-20250929")
         max_tokens = min(2400, max(400, target_words * 4))
         resp = client.messages.create(model=model, max_tokens=max_tokens, messages=[{"role": "user", "content": prompt}])
         text = getattr(resp.content[0], "text", "") or ""

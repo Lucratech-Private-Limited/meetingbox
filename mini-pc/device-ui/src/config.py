@@ -131,27 +131,6 @@ WS_RECONNECT_DELAY = 0.5  # seconds; exponential: ~0.5 → 1 → 2 → … cappe
 WS_MAX_RECONNECT_ATTEMPTS = 10
 
 # ============================================================================
-# LOCAL REDIS (receive audio_level / mic_test_level from audio container)
-# ============================================================================
-# Default host is loopback — matches docker-compose (host network: Redis on the mini-PC).
-# The old default "redis" only resolves inside a Compose bridge network and breaks native
-# ./run_device_ui.sh or any machine where Docker DNS for "redis" does not exist.
-#
-# Remote/cloud API only (no Redis on this device): set LOCAL_REDIS_ENABLED=0 to silence retries.
-
-LOCAL_REDIS_HOST = (os.getenv("LOCAL_REDIS_HOST", "") or "").strip() or "127.0.0.1"
-LOCAL_REDIS_PORT = int(os.getenv("LOCAL_REDIS_PORT", "6379"))
-_lr_en = (os.getenv("LOCAL_REDIS_ENABLED", "") or "").strip().lower()
-LOCAL_REDIS_ENABLED = _lr_en not in ("0", "false", "no", "off")
-if (os.getenv("MEETINGBOX_DISABLE_LOCAL_REDIS", "") or "").strip().lower() in (
-    "1",
-    "true",
-    "yes",
-    "on",
-):
-    LOCAL_REDIS_ENABLED = False
-
-# ============================================================================
 # MICROPHONE (mic test + should match mini-pc/audio capture device)
 # ============================================================================
 

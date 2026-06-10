@@ -12,6 +12,8 @@ import platform
 import shutil
 import subprocess
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -89,6 +91,12 @@ WIFI_IFACE = os.getenv("WIFI_INTERFACE", "wlan0")
 
 FIRMWARE_VERSION = os.getenv("FIRMWARE_VERSION", "1.0.0")
 DEVICE_MODEL = "MeetingBox v1.0"
+
+RECORDINGS_DIR_PATH = Path(os.getenv("RECORDINGS_DIR", "/data/audio/recordings"))
+TEMP_SEGMENTS_PATH = Path(os.getenv("TEMP_SEGMENTS_DIR", "/data/audio/temp"))
+TRANSCRIPTS_FALLBACK_DIR = Path(
+    os.getenv("TRANSCRIPTS_FALLBACK_DIR", "/data/transcripts")
+)
 
 # Boot time for uptime calculation
 _BOOT_TIME = time.time()
@@ -239,6 +247,76 @@ def _nmcli_run(args: list, timeout: float = 30) -> subprocess.CompletedProcess:
     return res
 
 
+def _timedatectl_run(args: list[str], timeout: float = 25) -> subprocess.CompletedProcess:
+    res = subprocess.run(
+        ["timedatectl", *args],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    if res.returncode != 0 and shutil.which("sudo"):
+        res2 = subprocess.run(
+            ["sudo", "-n", "timedatectl", *args],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        return res2
+    return res
+
+
+def _bluetoothctl_run(args: list[str], timeout: float = 35) -> subprocess.CompletedProcess:
+    bt = shutil.which("bluetoothctl")
+    if not bt:
+        return subprocess.CompletedProcess(args, 127, "", "bluetoothctl not found")
+    res = subprocess.run(
+        [bt, *args],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    if res.returncode != 0 and shutil.which("sudo"):
+        return subprocess.run(
+            ["sudo", "-n", bt, *args],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    return res
+
+
+def _safe_dir_size_bytes(top: Path, cap_files: int = 40_000) -> int:
+    if not top.is_dir():
+        return 0
+    total = 0
+    n = 0
+    try:
+        for p in top.rglob("*"):
+            n += 1
+            if n > cap_files:
+                break
+            if p.is_file():
+                try:
+                    total += p.stat().st_size
+                except OSError:
+                    continue
+    except Exception:
+        pass
+    return total
+
+
+def _http_probe_ms(url: str, timeout: float = 3.0) -> tuple[bool, float]:
+    t0 = time.perf_counter()
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            resp.read(128)
+            code = resp.getcode()
+            ok = bool(code and 200 <= int(code) < 400)
+        return ok, (time.perf_counter() - t0) * 1000.0
+    except Exception:
+        return False, (time.perf_counter() - t0) * 1000.0
+
+
 # ======================================================================
 # HELPERS
 # ======================================================================
@@ -247,16 +325,40 @@ def _load_settings() -> dict:
     """Load device settings from disk, with defaults."""
     defaults = {
         "device_name": "MeetingBox",
+        "room_label": "",
         "timezone": "UTC",
         "auto_delete_days": "never",
         "brightness": "high",
         "screen_timeout": "never",
+        "idle_screen_timeout": "30",
         "privacy_mode": False,
         "auto_record": False,
+        "auto_summarize": False,
+        "transcript_storage_enabled": True,
+        "recording_consent_reminder": False,
         "voice_wake_phrase": "hey buddy",
         "voice_realtime_assistant": False,
         "voice_assistant_enabled": True,
         "assistant_speech_volume": 85,
+        "system_output_volume": 85,
+        "mic_input_volume": 90,
+        "notification_enabled": True,
+        "meeting_reminder_minutes": 10,
+        "dnd_enabled": False,
+        "dnd_start": "22:00",
+        "dnd_end": "07:00",
+        "email_notifications_enabled": True,
+        "assistant_notifications_enabled": True,
+        "auto_update_enabled": False,
+        "update_channel": "stable",
+        "session_timeout_minutes": 0,
+        "font_size": "medium",
+        "screen_always_on_recording": False,
+        "meeting_chime_enabled": True,
+        "alert_sounds_enabled": True,
+        "trusted_wifi_ssids": "",
+        "settings_pin_hash": "",
+        "settings_pin_salt": "",
     }
     if SETTINGS_FILE.exists():
         try:
@@ -517,32 +619,61 @@ async def get_settings(current_user: Optional[dict] = Depends(get_optional_user)
 
 
 @router.post("/mic-test/start")
-async def start_mic_test(current_user: Optional[dict] = Depends(get_optional_user)):
+async def start_mic_test(current_actor: Optional[dict] = Depends(get_optional_actor)):
     """Start live microphone level stream for device UI test screen."""
-    _redis_publish_commands({"action": "start_mic_test"})
+    payload = {"action": "start_mic_test"}
+    if current_actor and current_actor.get("type") == "device":
+        payload["device_id"] = current_actor["device"]["id"]
+    _redis_publish_commands(payload)
     return {"status": "mic_test_started"}
 
 
 @router.post("/mic-test/stop")
-async def stop_mic_test(current_user: Optional[dict] = Depends(get_optional_user)):
+async def stop_mic_test(current_actor: Optional[dict] = Depends(get_optional_actor)):
     """Stop live microphone level stream for device UI test screen."""
-    _redis_publish_commands({"action": "stop_mic_test"})
+    payload = {"action": "stop_mic_test"}
+    if current_actor and current_actor.get("type") == "device":
+        payload["device_id"] = current_actor["device"]["id"]
+    _redis_publish_commands(payload)
     return {"status": "mic_test_stopped"}
 
 
 class SettingsUpdate(BaseModel):
     device_name: Optional[str] = None
+    room_label: Optional[str] = None
     timezone: Optional[str] = None
     auto_delete_days: Optional[str] = None
     brightness: Optional[str] = None
     screen_timeout: Optional[str] = None
+    idle_screen_timeout: Optional[str] = None
     privacy_mode: Optional[bool] = None
     auto_record: Optional[bool] = None
     auto_summarize: Optional[bool] = None
+    transcript_storage_enabled: Optional[bool] = None
+    recording_consent_reminder: Optional[bool] = None
     voice_wake_phrase: Optional[str] = None
     voice_realtime_assistant: Optional[bool] = None
     voice_assistant_enabled: Optional[bool] = None
     assistant_speech_volume: Optional[int] = None  # 0–100 → espeak amplitude
+    system_output_volume: Optional[int] = None
+    mic_input_volume: Optional[int] = None
+    notification_enabled: Optional[bool] = None
+    meeting_reminder_minutes: Optional[int] = None
+    dnd_enabled: Optional[bool] = None
+    dnd_start: Optional[str] = None
+    dnd_end: Optional[str] = None
+    email_notifications_enabled: Optional[bool] = None
+    assistant_notifications_enabled: Optional[bool] = None
+    auto_update_enabled: Optional[bool] = None
+    update_channel: Optional[str] = None
+    session_timeout_minutes: Optional[int] = None
+    font_size: Optional[str] = None
+    screen_always_on_recording: Optional[bool] = None
+    meeting_chime_enabled: Optional[bool] = None
+    alert_sounds_enabled: Optional[bool] = None
+    trusted_wifi_ssids: Optional[str] = None
+    settings_pin_hash: Optional[str] = None
+    settings_pin_salt: Optional[str] = None
     action: Optional[str] = None  # restart / poweroff / factory_reset
 
 
@@ -558,6 +689,36 @@ async def update_settings(body: SettingsUpdate, current_user: Optional[dict] = D
             updates["assistant_speech_volume"] = max(0, min(100, int(vol)))
         except (TypeError, ValueError):
             updates.pop("assistant_speech_volume", None)
+
+    for key, lo, hi in (
+        ("system_output_volume", 0, 100),
+        ("mic_input_volume", 0, 150),
+    ):
+        vv = updates.get(key)
+        if vv is None:
+            continue
+        try:
+            updates[key] = max(lo, min(hi, int(vv)))
+        except (TypeError, ValueError):
+            updates.pop(key, None)
+
+    mm = updates.get("meeting_reminder_minutes")
+    if mm is not None:
+        try:
+            updates["meeting_reminder_minutes"] = max(
+                0, min(120, int(mm))
+            )
+        except (TypeError, ValueError):
+            updates.pop("meeting_reminder_minutes", None)
+
+    st = updates.get("session_timeout_minutes")
+    if st is not None:
+        try:
+            updates["session_timeout_minutes"] = max(
+                0, min(24 * 60, int(st))
+            )
+        except (TypeError, ValueError):
+            updates.pop("session_timeout_minutes", None)
 
     # Handle special actions
     action = updates.pop("action", None)
@@ -802,6 +963,253 @@ async def wifi_disconnect(current_user: Optional[dict] = Depends(get_optional_us
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ---- Additional host-integration endpoints (called from device-ui or dashboards) ---
+class WiFiRadioBody(BaseModel):
+    enabled: bool
+
+
+class WiFiForgetBody(BaseModel):
+    connection_name: str
+
+
+class TimezoneBody(BaseModel):
+    timezone: str
+
+
+class DateTimeBody(BaseModel):
+    iso_datetime: str
+
+
+class BluetoothRadioBody(BaseModel):
+    enabled: bool
+
+
+class BluetoothPairBody(BaseModel):
+    mac: str
+
+
+class FeedbackBody(BaseModel):
+    message: str
+
+
+@router.post("/wifi/radio")
+async def wifi_radio_set(body: WiFiRadioBody):
+    """Enable/disable Wi-Fi radio on the NetworkManager host."""
+    arg = "on" if body.enabled else "off"
+    r = _nmcli_run(["radio", "wifi", arg], timeout=20)
+    ok = r.returncode == 0 or "enabled" in (r.stdout or "").lower()
+    return {
+        "ok": ok,
+        "message": (r.stderr or r.stdout or "").strip()[:320],
+    }
+
+
+@router.get("/wifi/saved")
+async def wifi_saved_connections():
+    """List saved Wi-Fi connection profile names."""
+    r = _nmcli_run(["-t", "-f", "NAME,TYPE", "connection", "show"], timeout=20)
+    if r.returncode != 0:
+        return {"connections": [], "message": (r.stderr or "").strip()[:320]}
+    names: list[str] = []
+    for line in r.stdout.splitlines():
+        if ":" not in line:
+            continue
+        name, typ = line.split(":", 1)
+        low = typ.strip().lower()
+        nm = name.strip()
+        if not nm:
+            continue
+        if "wireless" in low or "wifi" in low or low == "802-11-wireless":
+            names.append(nm)
+    return {"connections": sorted(set(names)), "message": ""}
+
+
+@router.post("/wifi/forget")
+async def wifi_forget_saved(body: WiFiForgetBody):
+    """Delete a saved Wi-Fi NM connection profile."""
+    nm = body.connection_name.strip()
+    if not nm:
+        raise HTTPException(status_code=400, detail="connection_name required")
+    r = _nmcli_run(["connection", "delete", nm], timeout=25)
+    if r.returncode == 0:
+        return {"ok": True}
+    return {
+        "ok": False,
+        "message": (r.stderr or r.stdout or "").strip()[:400],
+    }
+
+
+@router.post("/system/timezone")
+async def device_set_timezone(body: TimezoneBody):
+    tz = body.timezone.strip()
+    if not tz:
+        raise HTTPException(status_code=400, detail="timezone required")
+    r = _timedatectl_run(["set-timezone", tz])
+    ok = r.returncode == 0
+    settings = _load_settings()
+    if ok:
+        settings["timezone"] = tz
+        _save_settings(settings)
+    return {"ok": ok, "message": (r.stderr or r.stdout or "").strip()[:400]}
+
+
+@router.post("/system/datetime")
+async def device_set_datetime(body: DateTimeBody):
+    when = body.iso_datetime.strip()
+    if not when:
+        raise HTTPException(status_code=400, detail="iso_datetime required")
+    r = _timedatectl_run(["set-time", when])
+    return {"ok": r.returncode == 0, "message": (r.stderr or r.stdout or "").strip()[:400]}
+
+
+@router.post("/bluetooth/radio")
+async def bluetooth_radio(body: BluetoothRadioBody):
+    arg = "on" if body.enabled else "off"
+    r = _bluetoothctl_run(["power", arg])
+    return {"ok": r.returncode == 0, "message": (r.stderr or r.stdout or "").strip()[:400]}
+
+
+@router.get("/bluetooth/devices")
+async def bluetooth_devices():
+    """Paired bluetooth devices via bluetoothctl (best-effort)."""
+    r = _bluetoothctl_run(["devices", "Paired"], timeout=20)
+    rows: list[dict[str, str]] = []
+    for line in (r.stdout or "").splitlines():
+        line = line.strip()
+        if not line.startswith("Device "):
+            continue
+        parts = line.split(None, 2)
+        if len(parts) >= 3:
+            rows.append({"mac": parts[1], "name": parts[2]})
+    return {"paired": rows, "ok": r.returncode == 0, "stderr": r.stderr.strip()[:200]}
+
+
+@router.post("/bluetooth/pair")
+async def bluetooth_pair(body: BluetoothPairBody):
+    mac = body.mac.strip()
+    if not mac:
+        raise HTTPException(status_code=400, detail="mac required")
+    r = _bluetoothctl_run(["pair", mac], timeout=45)
+    return {"ok": r.returncode == 0, "message": (r.stderr or r.stdout or "").strip()[:400]}
+
+
+@router.get("/storage-breakdown")
+async def storage_breakdown():
+    rec = _safe_dir_size_bytes(RECORDINGS_DIR_PATH)
+    tmp = _safe_dir_size_bytes(TEMP_SEGMENTS_PATH)
+    tr = _safe_dir_size_bytes(TRANSCRIPTS_FALLBACK_DIR)
+    cache = _safe_dir_size_bytes(Path(os.getenv("MEETINGBOX_CACHE_DIR", "/tmp/meetingbox-cache")))
+    return {
+        "recordings_gb": round(rec / (1024**3), 3),
+        "temp_segments_gb": round(tmp / (1024**3), 3),
+        "transcripts_cache_gb": round(tr / (1024**3), 3),
+        "app_cache_gb": round(cache / (1024**3), 3),
+        "meetings_gb": round(rec / (1024**3), 3),
+    }
+
+
+@router.post("/clear-cache")
+async def clear_device_cache_endpoint():
+    n = 0
+    roots = [
+        Path(os.getenv("MEETINGBOX_CACHE_DIR", "/tmp/meetingbox-cache")),
+        TEMP_SEGMENTS_PATH,
+    ]
+    for root in roots:
+        if root.is_dir():
+            try:
+                for child in root.iterdir():
+                    try:
+                        if child.is_file():
+                            child.unlink(missing_ok=True)
+                            n += 1
+                        elif child.is_dir():
+                            shutil.rmtree(child, ignore_errors=True)
+                            n += 1
+                    except OSError:
+                        continue
+            except Exception:
+                pass
+    return {"ok": True, "entries_removed": n}
+
+
+@router.post("/recordings/clear-all")
+async def clear_all_recordings():
+    deleted = 0
+    if RECORDINGS_DIR_PATH.is_dir():
+        for p in list(RECORDINGS_DIR_PATH.glob("*")):
+            try:
+                if p.is_file():
+                    p.unlink(missing_ok=True)
+                    deleted += 1
+                elif p.is_dir():
+                    shutil.rmtree(p, ignore_errors=True)
+                    deleted += 1
+            except OSError:
+                continue
+    return {"ok": True, "removed": deleted}
+
+
+@router.post("/transcripts/clear-all")
+async def clear_transcript_files():
+    """Remove transcript JSON artefacts from the fallback transcripts directory."""
+    deleted = 0
+    if TRANSCRIPTS_FALLBACK_DIR.is_dir():
+        for p in TRANSCRIPTS_FALLBACK_DIR.rglob("*"):
+            try:
+                if p.is_file() and p.suffix.lower() in {".json", ".txt", ".vtt"}:
+                    p.unlink(missing_ok=True)
+                    deleted += 1
+            except OSError:
+                continue
+    return {"ok": True, "removed": deleted}
+
+
+@router.get("/connectivity")
+async def connectivity_probe():
+    """Measure HTTP latency to configurable probe URL (defaults to /health on APP_BASE_URL)."""
+    env_url = os.getenv("MEETINGBOX_CONNECTIVITY_URL", "").strip()
+    if env_url:
+        url = env_url
+    else:
+        base = (os.getenv("APP_BASE_URL") or "http://127.0.0.1:8000").rstrip("/")
+        url = f"{base}/health"
+    ok, ms = _http_probe_ms(url, timeout=float(os.getenv("CONNECTIVITY_PROBE_TIMEOUT", "3")))
+    return {"ok": ok, "latency_ms": round(ms, 2), "url": url}
+
+
+@router.get("/diagnostic-log")
+async def diagnostic_journal_tail(lines: int = 120):
+    """Last *lines* of journalctl (host) if available."""
+    nlines = max(20, min(500, lines))
+    try:
+        r = subprocess.run(
+            ["journalctl", "-n", str(nlines), "--no-pager"],
+            capture_output=True,
+            text=True,
+            timeout=8,
+        )
+        txt = r.stdout if r.stdout else r.stderr
+        return {"lines": txt or "(no journal output)", "ok": r.returncode == 0}
+    except Exception as e:
+        return {"lines": "", "ok": False, "message": str(e)[:300]}
+
+
+@router.post("/diagnostic-report")
+async def diagnostic_submit(body: FeedbackBody):
+    """Store a lightweight diagnostic ticket (logged server-side — extend to ticketing)."""
+    msg = body.message.strip()[:2000]
+    logger.info("device_diagnostic_report: %s", msg or "(empty)")
+    return {"ok": True, "received": True}
+
+
+@router.post("/feedback")
+async def device_feedback(body: FeedbackBody):
+    msg = body.message.strip()[:4000]
+    logger.info("device_feedback: %s", msg)
+    return {"ok": True}
+
+
 # ======================================================================
 # UPDATES
 # ======================================================================
@@ -827,7 +1235,13 @@ async def install_update(current_user: Optional[dict] = Depends(get_optional_use
 # AUDIO COMMAND LONG-POLL (cloud mode — no local Redis on device)
 # ======================================================================
 
-async def _wait_for_redis_command(redis_host: str, timeout: float) -> dict | None:
+def _command_matches_device(command: dict, device_id: str) -> bool:
+    """Return true when a command is global or addressed to this device."""
+    cmd_device_id = str(command.get("device_id") or "").strip()
+    return not cmd_device_id or cmd_device_id == device_id
+
+
+async def _wait_for_redis_command(redis_host: str, timeout: float, device_id: str) -> dict | None:
     """Subscribe to the Redis 'commands' channel and wait up to *timeout* seconds."""
     import redis.asyncio as aioredis
     import asyncio
@@ -848,9 +1262,11 @@ async def _wait_for_redis_command(redis_host: str, timeout: float) -> dict | Non
                     )
                     if msg is not None:
                         try:
-                            return json.loads(msg["data"])
+                            command = json.loads(msg["data"])
                         except (json.JSONDecodeError, TypeError, KeyError):
                             continue
+                        if isinstance(command, dict) and _command_matches_device(command, device_id):
+                            return command
                 except asyncio.TimeoutError:
                     pass
     finally:
@@ -869,7 +1285,11 @@ async def audio_command_wait(
     """
     from starlette.responses import Response
 
-    command = await _wait_for_redis_command(REDIS_HOST, timeout=28.0)
+    command = await _wait_for_redis_command(
+        REDIS_HOST,
+        timeout=28.0,
+        device_id=str(current_device["id"]),
+    )
     if command is None:
         return Response(status_code=204)
     return command
@@ -940,7 +1360,7 @@ async def list_integrations(current_actor: dict | None = Depends(get_optional_ac
         try:
             cur = conn.cursor()
             cur.execute(
-                "SELECT email FROM integrations WHERE user_id = ? AND provider = ?",
+                "SELECT email, connected_at FROM integrations WHERE user_id = ? AND provider = ?",
                 (user_id, m["id"]),
             )
             row = cur.fetchone()
@@ -950,6 +1370,7 @@ async def list_integrations(current_actor: dict | None = Depends(get_optional_ac
             **m,
             "connected": row is not None,
             "email": row["email"] if row else None,
+            "last_sync": row.get("connected_at") if row else None,
         })
     return results
 
@@ -964,11 +1385,29 @@ async def get_integration_auth_url(integration_id: str, current_user: Optional[d
 
 
 @router.post("/integrations/{integration_id}/disconnect")
-async def disconnect_integration(integration_id: str, current_user: Optional[dict] = Depends(get_optional_user)):
-    """Proxy to the real disconnect in the integrations router."""
-    if not current_user:
-        raise HTTPException(status_code=401, detail="Authentication required to disconnect integrations")
+async def disconnect_integration(
+    integration_id: str,
+    current_actor: Optional[dict] = Depends(get_optional_actor),
+):
+    """Proxy disconnect — works with dashboard JWT or paired device Bearer token."""
+    if not current_actor:
+        raise HTTPException(
+            status_code=401, detail="Authentication required to disconnect integrations"
+        )
+    current_user = current_actor["user"]
     from routes.integrations import disconnect_integration as real_disconnect
+
     return await real_disconnect(integration_id, current_user)
 
 
+@router.post("/integrations/{integration_id}/sync")
+async def integration_manual_sync(
+    integration_id: str,
+    current_actor: Optional[dict] = Depends(get_optional_actor),
+):
+    """Manual re-sync acknowledgement (hooks can enqueue background jobs later)."""
+    del integration_id  # gmail / calendar
+    if not current_actor:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return {"ok": True, "synced_at": ts}

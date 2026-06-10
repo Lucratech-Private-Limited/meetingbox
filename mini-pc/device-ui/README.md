@@ -94,7 +94,7 @@ $env:MOCK_BACKEND = "1"; .\run_device_ui.ps1
 
 Use `FULLSCREEN=0` in `.env` (default for local `config.py`) for a windowed app while developing.
 
-**Bare-metal + real backend:** If Redis is not hostname `redis`, set e.g. `LOCAL_REDIS_HOST=127.0.0.1` in `.env` when you need live audio-level from a local Redis.
+**Bare-metal + real backend:** Audio-level events from the in-process audio capture child are delivered via stdout (parsed by `audio_supervisor`). No local Redis is required.
 
 ## Configuration
 

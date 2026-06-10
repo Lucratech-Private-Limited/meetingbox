@@ -88,8 +88,12 @@ def list_commitments_for_user(
 
 
 def commitments_context_for_prompt(user_id: str, *, limit: int = 22) -> str:
-    """Compact text block for LLM context (tags, status, dates)."""
-    rows = list_commitments_for_user(user_id, status_filter="all", limit=limit)
+    """Compact text block for LLM context (tags, status, dates).
+
+    Filters to active/snoozed tasks only so cancelled and completed work
+    does not pollute the LLM context and cause stale assumptions (Fix 7).
+    """
+    rows = list_commitments_for_user(user_id, status_filter=None, limit=limit)
     if not rows:
         return ""
     lines: list[str] = []

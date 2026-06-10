@@ -42,6 +42,7 @@ from routes.emails import router as emails_router
 from routes.commitments import router as commitments_router
 from routes.briefing import router as briefing_router
 from routes.admin_memory import router as admin_memory_router
+from routes.memory import router as memory_router
 from routes.voice import router as voice_router
 from routes.pipecat_voice import router as pipecat_voice_router
 from routes.weather import router as weather_router
@@ -254,9 +255,50 @@ def _check_mem0_startup() -> None:
     logger.info("Mem0: initialized successfully — long-term memory is active")
 
 
+def _start_analysis_scheduler() -> object | None:
+  """Start APScheduler background job for daily meeting analysis.
+
+  Only active when MEETINGBOX_ANALYSIS_ENABLED=1. Returns the scheduler
+  instance so it can be shut down cleanly in the lifespan teardown.
+  Safe to call even when APScheduler is not installed — returns None.
+  """
+  if os.getenv("MEETINGBOX_ANALYSIS_ENABLED", "").strip() not in ("1", "true", "yes", "on"):
+    logger.info("Analysis scheduler: disabled (MEETINGBOX_ANALYSIS_ENABLED not set)")
+    return None
+  try:
+    from apscheduler.schedulers.background import BackgroundScheduler
+    from services.analysis_service import run_daily_digest_all_users
+
+    scheduler = BackgroundScheduler(timezone="UTC", daemon=True)
+    # Run daily at 02:00 UTC — low-traffic window.
+    scheduler.add_job(
+      run_daily_digest_all_users,
+      trigger="cron",
+      hour=2,
+      minute=0,
+      id="daily_digest",
+      replace_existing=True,
+      max_instances=1,
+      coalesce=True,
+    )
+    scheduler.start()
+    logger.info("Analysis scheduler: started — daily digest at 02:00 UTC")
+    return scheduler
+  except ImportError:
+    logger.warning(
+      "APScheduler not installed — analysis jobs disabled. "
+      "Run: pip install apscheduler"
+    )
+    return None
+  except Exception:
+    logger.exception("Analysis scheduler failed to start")
+    return None
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):  # type: ignore[override]
   _check_mem0_startup()
+  scheduler = _start_analysis_scheduler()
   loop = asyncio.get_running_loop()
   queue: asyncio.Queue = asyncio.Queue()
   thread = threading.Thread(target=_redis_listener_thread, args=(queue, loop), daemon=True)
@@ -270,6 +312,11 @@ async def lifespan(app: FastAPI):  # type: ignore[override]
     await relay
   except asyncio.CancelledError:
     pass
+  if scheduler is not None:
+    try:
+      scheduler.shutdown(wait=False)
+    except Exception:
+      pass
 
 
 app = FastAPI(title="MeetingBox API", version="1.0.0", lifespan=lifespan)
@@ -307,6 +354,7 @@ app.include_router(emails_router, prefix="/api", tags=["emails"])
 app.include_router(commitments_router, prefix="/api", tags=["commitments"])
 app.include_router(briefing_router, prefix="/api")
 app.include_router(admin_memory_router, prefix="/api")
+app.include_router(memory_router, prefix="/api")
 app.include_router(voice_router, prefix="/api/voice")
 app.include_router(pipecat_voice_router, prefix="/api/voice")
 app.include_router(weather_router, prefix="/api", tags=["weather"])

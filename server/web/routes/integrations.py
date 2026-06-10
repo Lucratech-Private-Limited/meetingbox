@@ -328,6 +328,7 @@ async def list_integrations(current_user: dict = Depends(get_current_user)):
         ("calendar", {"name": "Google Calendar", "icon": "calendar", "description": "Create calendar events from meeting action items"}),
     ]:
         integration = _get_integration(user_id, provider_id)
+        last_sync_val = integration.get("connected_at") if integration else None
         results.append({
             "id": provider_id,
             "name": meta["name"],
@@ -335,6 +336,7 @@ async def list_integrations(current_user: dict = Depends(get_current_user)):
             "description": meta["description"],
             "connected": integration is not None,
             "email": integration["email"] if integration else None,
+            "last_sync": last_sync_val,
         })
 
     return results

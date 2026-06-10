@@ -2,14 +2,20 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from routes.integrations import get_credentials_for_provider
+from services.contacts_service import (
+    extract_and_store_from_gmail_messages,
+    store_contact_from_address_string,
+)
 from services.gmail import (
   add_recipients_to_draft,
   archive_message,
   create_draft,
   forward_message,
+  get_message_with_attachments,
   list_recent_messages,
   remove_recipients_from_draft,
   reply_all_in_thread,
@@ -21,6 +27,7 @@ from services.gmail import (
 )
 from tools.base_tool import ToolError
 
+logger = logging.getLogger(__name__)
 
 # ----------------- shared payload helpers -----------------
 
@@ -112,6 +119,11 @@ def gmail_list_recent(
       did = mid_to_did.get(m.get("id"))
       if did:
         m["draft_id"] = did
+  # Auto-populate the known contacts book from sender addresses.
+  try:
+    extract_and_store_from_gmail_messages(user_id, messages)
+  except Exception as exc:
+    logger.debug("contacts auto-store from gmail_list_recent failed: %s", exc)
   return {"messages": messages, "count": len(messages)}
 
 
@@ -129,7 +141,7 @@ def gmail_send_from_payload(user_id: str, payload: dict[str, Any]) -> dict[str, 
   thread_id_raw = payload.get("thread_id") or payload.get("threadId")
   thread_id = str(thread_id_raw).strip() if thread_id_raw else None
 
-  return send_email(
+  result = send_email(
     credentials=creds,
     to=to,
     subject=subject,
@@ -139,6 +151,13 @@ def gmail_send_from_payload(user_id: str, payload: dict[str, Any]) -> dict[str, 
     bcc=bcc_str,
     thread_id=thread_id,
   )
+  # Store recipients in the known-contacts book.
+  try:
+    for addr_raw in filter(None, [to, cc_str, bcc_str]):
+      store_contact_from_address_string(user_id, addr_raw)
+  except Exception as exc:
+    logger.debug("contacts store from send failed: %s", exc)
+  return result
 
 
 def gmail_draft_from_payload(user_id: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -148,6 +167,9 @@ def gmail_draft_from_payload(user_id: str, payload: dict[str, Any]) -> dict[str,
   subject = str(payload.get("subject") or "(no subject)")
   body = str(payload.get("body") or "")
   cc_str = _addr_field_str(payload.get("cc")) or None
+  # NOTE: do NOT store contacts at draft creation. A draft's recipient can be a
+  # mis-heard address the user later corrects; storing here would leave both the
+  # wrong and right address in the book. Contacts are remembered only on send.
   result = create_draft(credentials=creds, to=to, subject=subject, body=body, cc=cc_str)
   return {
     "draft_id": result.get("id"),
@@ -196,6 +218,12 @@ def gmail_add_recipients_from_payload(user_id: str, payload: dict[str, Any]) -> 
   bcc_add = _addr_field_list(payload.get("bcc_add"))
   if not (to_add or cc_add or bcc_add):
     raise ToolError("At least one of to_add / cc_add / bcc_add is required.")
+
+  # NOTE: intentionally do NOT store contacts here. A draft can hold a
+  # mis-heard address that the user then corrects (add wrong -> add right),
+  # which would leave BOTH in the contacts book. Addresses are remembered only
+  # when the email is actually sent (gmail_send_*), guaranteeing we keep just
+  # the final, correct recipients.
 
   return add_recipients_to_draft(
     credentials=creds,
@@ -326,4 +354,24 @@ def gmail_send_draft_from_payload(user_id: str, payload: dict[str, Any]) -> dict
   draft_id = str(payload.get("draft_id") or "").strip()
   if not draft_id:
     raise ToolError("draft_id is required to send a draft. Use gmail_list_recent with q='in:drafts' to find it.")
-  return send_draft(credentials=creds, draft_id=draft_id)
+  result = send_draft(credentials=creds, draft_id=draft_id)
+  # Remember the confirmed recipients now that the draft was actually sent.
+  try:
+    for addr_raw in result.get("recipients", []) or []:
+      store_contact_from_address_string(user_id, addr_raw)
+  except Exception as exc:
+    logger.debug("contacts store from send_draft failed: %s", exc)
+  return result
+
+
+def gmail_read_email(user_id: str, message_id: str) -> dict[str, Any]:
+  """
+  Fetch a single email's full body and extract text content from all attachments.
+  Supports PDF, Word (.docx), Excel (.xlsx), PowerPoint (.pptx), and plain text files.
+  Images are acknowledged by name but not extracted.
+  Returns message fields (from, subject, date, body) plus an 'attachments' list.
+  """
+  creds = _require_creds(user_id)
+  if not message_id:
+    raise ToolError("message_id is required to read an email.")
+  return get_message_with_attachments(creds, message_id)

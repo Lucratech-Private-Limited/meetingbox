@@ -1,16 +1,27 @@
-"""Recording screen layout — Figma `863:626` (VelsLhL4YHeVRZSCEmCrGw).
+"""Recording screen layout — Figma ``1031:58`` (dvqlN0JtWQODt6jYbTrbDG, "Copy").
 
-Canvas: 1260 × 800.  Every value is the exact Figma absolute coordinate.
+New light-theme recording design. Canvas: 1260 × 800, every value is the exact
+Figma absolute coordinate on that reference canvas. The screen is drawn entirely
+with Kivy primitives (no PNG assets) so it scales crisply from a 7" panel to a
+24" display and needs no exported bitmaps:
+
+  * full-bleed slate wash background (``Layer 35 1`` swirl + 45 % white overlay
+    flatten to ≈ #7C8499)
+  * centre orb: dark-navy disc + purple ring + 7-bar voice waveform that reacts
+    to live mic levels (lavender → deep-purple vertical gradient, rounded caps)
+  * top-centre status: red/grey dot + "Recording...." / "Recording Paused"
+    + "Started at hh:mm AM"
+  * purple timer ``HH:MM:SS``
+  * bottom controls: round Pause/Play capsule (in-place toggle) + "Stop
+    Recording" capsule
 
 Layer reference (Figma node IDs):
-  863:552  back button (round)
-  863:594  recording-status group (red dot + "Recording..." + "Started at ...")
-  863:598  meeting title group (people + title + participants + video + provider)
-  863:554  listening pill
-  863:635  centre Frame 19 — rings + side dots + timer + status text
-  863:609  pause button (round)
-  863:615  stop-recording pill
-  863:613  settings button (round)
+  1031:66  Group 194  centre orb + waveform bars
+  1031:75  Group 195  status group (dot + Recording.... + Started at …)
+  1031:79  timer 00:01:21
+  1031:84  Frame 23   pause button (round)
+  1031:88  Frame 22   play button (round, same slot, hidden until paused)
+  1031:80  Frame 22   stop-recording capsule
 """
 
 from __future__ import annotations
@@ -39,89 +50,65 @@ def canvas_box(lx: float, ly: float, lw: float, lh: float) -> Box:
     )
 
 
-# Frame 19 origin (centre graphic container)
-_F19_X = 389.0
-_F19_Y = 105.0
+# ── Top status bar (wifi + battery) — Group 203 ───────────────────────────
+STATUS_BAR = canvas_box(1129.0, 30.0, 91.13, 21.0)
 
+# ── Centre orb (Group 194) ────────────────────────────────────────────────
+# 258×258 disc centred at (631, 355).
+ORB = canvas_box(502.0, 226.0, 258.0, 258.0)
 
-def _f19(lx: float, ly: float, lw: float, lh: float) -> Box:
-    """Frame-19-local px → canvas ratio box."""
-    return canvas_box(_F19_X + lx, _F19_Y + ly, lw, lh)
+# Voice waveform — bounding box of the 7 Figma bars (548..714 × 287..423),
+# centred on the orb. The bars themselves are generated dynamically.
+WAVEBAR = canvas_box(548.0, 287.0, 166.0, 136.0)
 
+# ── Top-centre status group (Group 195) ───────────────────────────────────
+# Figma centres the caption at x≈647 and floats the dot at a fixed x=501.
+REC_DOT = canvas_box(501.0, 113.0, 16.97, 16.97)
+REC_LABEL = canvas_box(447.0, 95.0, 400.0, 50.0)        # centred ≈ 647
+STARTED_LABEL = canvas_box(431.0, 152.0, 400.0, 27.0)   # centred ≈ 631
 
-# ── Header (top row) ──────────────────────────────────────────────────────
-BACK_BTN = canvas_box(24.013, 21.188, 76.278, 76.278)
-
-# Recording status group (124.305, 29.664) 189 × 58.90
-# In the new Figma `863:626` the header carries only the back button and the
-# recording status (red/grey dot + "Recording..." + "Started at …"). The
-# previously-rendered meeting-title group (people icon + title + participants
-# + video icon + provider) and the top-right Listening pill have been removed
-# from the design.
-REC_DOT = canvas_box(124.305, 36.726, 19.776, 19.776)
-REC_LABEL = canvas_box(151.144, 29.663, 161.0, 34.0)
-STARTED_LABEL = canvas_box(124.305, 63.564, 189.0, 25.0)
-
-# ── Frame 19 (centre graphic, 420×420 at 389,105) ─────────────────────────
-# Ellipse 18 strokes: dark/gradient sit at exact box; glow overflows by
-# inset -16.86% top/bottom, -16.71% left/right (per Figma class).
-_GLOW_INSET_X = 0.1671
-_GLOW_INSET_Y = 0.1686
-_RING_W = 219.845
-_RING_H = 217.888
-
-RING_GLOW_W = _RING_W * (1 + 2 * _GLOW_INSET_X)
-RING_GLOW_H = _RING_H * (1 + 2 * _GLOW_INSET_Y)
-RING_GLOW = _f19(
-    101.973 - _RING_W * _GLOW_INSET_X,
-    44.684 - _RING_H * _GLOW_INSET_Y,
-    RING_GLOW_W,
-    RING_GLOW_H,
-)
-RING_DARK = _f19(101.973, 46.664, _RING_W, _RING_H)
-RING_GRADIENT = _f19(101.973, 44.684, _RING_W, _RING_H)
-
-LEFT_VEC = _f19(52.0, 67.473, 36.975, 173.319)
-RIGHT_VEC = _f19(331.030, 67.473, 36.975, 173.319)
-
-# Voice wavebar (Group 46) — sits inside the orb, animates with mic input.
-# Figma local coords inside Frame 19: (126.951, 111.039) 168.882 × 85.174
-WAVEBAR = _f19(126.951, 111.039, 168.882, 85.174)
-
-# Timer + status (centred inside Frame 19)
-TIMER = _f19(89.0, 300.0, 243.0, 42.0)
-STATUS = _f19(65.0, 346.0, 290.0, 34.0)
+# ── Timer (1031:79) ───────────────────────────────────────────────────────
+TIMER = canvas_box(431.0, 500.0, 400.0, 66.0)           # centred ≈ 631
 
 # ── Bottom controls ───────────────────────────────────────────────────────
-BTN_PAUSE = canvas_box(146.906, 661.727, 101.704, 101.704)
-STOP_PILL = canvas_box(285.336, 666.726, 646.951, 101.704)
-BTN_SETTINGS = canvas_box(969.013, 661.726, 101.704, 101.704)
+BTN_PAUSE = canvas_box(351.0, 638.0, 88.0, 88.0)        # Frame 23 (pause)
+BTN_PLAY = canvas_box(351.0, 638.0, 88.0, 88.0)         # Frame 22 (play, same slot)
+STOP_PILL = canvas_box(479.0, 638.5, 430.0, 88.0)
 
-# ── Typography (Figma px on 800-tall canvas) ──────────────────────────────
-TIMER_FS_RATIO = 35.0 / CANVAS_H
-STATUS_FS_RATIO = 28.251 / CANVAS_H
-REC_LABEL_FS_RATIO = 28.251 / CANVAS_H
-STARTED_FS_RATIO = 21.188 / CANVAS_H
+# ── Typography (Figma px on the 800-tall canvas) ──────────────────────────
+REC_LABEL_FS_RATIO = 40.0 / CANVAS_H
+STARTED_FS_RATIO = 23.0 / CANVAS_H
+TIMER_FS_RATIO = 55.0 / CANVAS_H
+STOP_FS_RATIO = 40.0 / CANVAS_H
 
-BG_RGB = (1, 8, 26)  # #01081A
+# ── Colours (sampled from Figma design context) ───────────────────────────
+# Background: light paper-swirl bitmap + rgba(255,255,255,0.40) wash. The
+# gradient values below are only the fallback when the bitmap is missing.
+BG_TOP = (0.965, 0.965, 0.972, 1.0)
+BG_BOT = (0.902, 0.910, 0.925, 1.0)
 
-# Text colours (Figma)
+COL_TEXT = (53 / 255, 57 / 255, 59 / 255, 1.0)          # #35393B
+COL_PURPLE = (109 / 255, 72 / 255, 204 / 255, 1.0)      # #6D48CC
+COL_REC_RED = (254 / 255, 36 / 255, 0 / 255, 1.0)       # #FE2400
+COL_REC_GREY = (130 / 255, 134 / 255, 150 / 255, 1.0)   # paused dot
+COL_BATT_GREEN = (52 / 255, 199 / 255, 89 / 255, 1.0)   # battery fill (Group 203)
+
+# Waveform vertical gradient (top → bottom).
+WAVE_TOP = (164 / 255, 143 / 255, 210 / 255, 1.0)       # #A48FD2
+WAVE_BOT = (109 / 255, 73 / 255, 195 / 255, 1.0)        # #6D49C3
+
+# Orb — light translucent glow disc with a soft purple ring (matches Figma,
+# where the orb interior is near-transparent over the light background).
+ORB_FILL = (1.0, 1.0, 1.0, 0.22)
+ORB_RING = (138 / 255, 110 / 255, 205 / 255, 0.85)      # #8A6ECD
+
+# Capsule buttons (pause / play / stop).
+PILL_FILL = (244 / 255, 245 / 255, 247 / 255, 1.0)      # #F4F5F7
+PILL_BORDER = (1.0, 1.0, 1.0, 1.0)
+PILL_SHADOW = (118 / 255, 129 / 255, 127 / 255, 0.30)   # rgba(118,129,127,.3)
+
 COL_WHITE = (1.0, 1.0, 1.0, 1.0)
-COL_MUTED = (182 / 255, 186 / 255, 242 / 255, 1.0)   # #B6BAF2
-COL_BLUE = (0.0, 107 / 255, 249 / 255, 1.0)          # #006BF9
-
-# Status-dot fills (recording vs paused). The previously-exported
-# `icon_rec_dot_red.png` is a solid-black PNG (the red was lost in the
-# Figma export pipeline), so the dot is now drawn with Kivy primitives
-# in two states. Colours sampled from the Figma reference plus a neutral
-# grey for the paused state.
-COL_REC_DOT_RED = (255 / 255, 59 / 255, 48 / 255, 1.0)   # #FF3B30
-COL_REC_DOT_GREY = (130 / 255, 134 / 255, 150 / 255, 1.0)  # #828696
-
-# The orb glow ring asset is a greyscale soft halo. We multiply its
-# texture by this colour at runtime to produce the blue halo the Figma
-# design calls for, without needing a re-export.
-COL_GLOW_BLUE = (0.0, 107 / 255, 249 / 255, 1.0)         # #006BF9
+COL_MUTED = COL_TEXT
 
 
 def scaled_canvas(screen_w: float, screen_h: float) -> tuple[float, float]:

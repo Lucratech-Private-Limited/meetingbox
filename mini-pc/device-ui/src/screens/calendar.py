@@ -385,6 +385,7 @@ class CalendarScreen(BaseScreen):
 
         # Week navigation state
         self._view_week_mon: date | None = None   # Monday of the week currently shown
+        self._target_date: date | None = None     # Set by main.py before on_enter to deep-link to a date
 
         # Dynamic day-view state
         self._week_data: dict = {}          # ISO date str -> {"meetings": [...]}
@@ -1098,12 +1099,23 @@ class CalendarScreen(BaseScreen):
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
+    def set_target_date(self, d: date) -> None:
+        """Called by main.py before on_enter to jump to a specific date instead of today."""
+        self._target_date = d
+
     def on_enter(self) -> None:
         today = display_now().date()
-        # Always reset to the current week when entering the screen
-        self._view_week_mon = today - timedelta(days=today.weekday())
+        # NOTE: do NOT consume self._target_date here. goto_screen() in main.py
+        # manually fires on_enter() once, and Kivy fires it again automatically
+        # after the transition completes — so on_enter runs twice per entry.
+        # If we cleared _target_date on the first call, the second call would
+        # fall back to "today" and overwrite _sel_date / heading / meeting list,
+        # which is exactly the "shows today even when I asked for tomorrow" bug.
+        # _target_date is cleared in on_leave() instead.
+        target = self._target_date if self._target_date is not None else today
+        self._view_week_mon = target - timedelta(days=target.weekday())
         self._col_dates = [self._view_week_mon + timedelta(days=i) for i in range(7)]
-        self._sel_date = today
+        self._sel_date = target
         cache_key = f"calendar_week:{self._view_week_mon.isoformat()}"
         cached_week = self.app.ui_cache_get(cache_key)
         if isinstance(cached_week, dict) and cached_week:
@@ -1114,12 +1126,15 @@ class CalendarScreen(BaseScreen):
             lbl.text = str(self._col_dates[i].day)
 
         for col_date, hl in zip(self._col_dates, self._highlights):
-            hl.set_mode("today" if col_date == today else "none")
+            if col_date == target:
+                hl.set_mode("today" if col_date == today else "sel")
+            else:
+                hl.set_mode("none")
 
         if self._heading_lbl:
-            self._heading_lbl.text = "Today"
+            self._heading_lbl.text = "Today" if target == today else target.strftime("%A")
         if self._datestr_lbl:
-            self._datestr_lbl.text = _fmt_date(today)
+            self._datestr_lbl.text = _fmt_date(target)
 
         # Only show "Loading calendar..." when there is no cached data to display.
         # If _week_data is already populated (e.g. returning from idle), keep the
@@ -1140,6 +1155,10 @@ class CalendarScreen(BaseScreen):
         # No per-screen polling; centralized app sync loop updates this cache.
 
     def on_leave(self) -> None:
+        # Clear target_date so the next entry without an explicit set_target_date()
+        # call defaults to today.  (We do NOT clear it in on_enter because Kivy
+        # fires on_enter twice per navigation — see comment in on_enter.)
+        self._target_date = None
         if self._view_week_mon is not None:
             self.app.ui_cache_unsubscribe(
                 f"calendar_week:{self._view_week_mon.isoformat()}",

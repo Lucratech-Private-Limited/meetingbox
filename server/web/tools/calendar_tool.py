@@ -113,11 +113,11 @@ def calendar_create_from_payload(user_id: str, payload: dict[str, Any]) -> dict[
   location = str(payload.get("location") or "")
   timezone = str(payload.get("timezone") or default_calendar_tz_name())
   recurrence = payload.get("recurrence") or None
-  # Meet link: default ON when there are attendees and not explicitly disabled.
+  # Meet link: default ON for all events unless explicitly disabled or a solo block.
   # Accept bool, "true"/"false", "yes"/"no" from the planner.
   raw_meet = payload.get("add_meet_link")
   if raw_meet is None:
-    add_meet_link = bool(attendees)
+    add_meet_link = True
   elif isinstance(raw_meet, bool):
     add_meet_link = raw_meet
   else:

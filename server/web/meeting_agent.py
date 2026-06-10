@@ -102,10 +102,18 @@ async def run_meeting_agent_pipeline(
     },
   )
 
-  _emit_stage(redis_client, session_id, "reporting", "Building meeting report…")
+  # Drive the three device-side stage rows (Extracting key points →
+  # Identifying action items → Structuring summary). They're shown in
+  # the processing screen's stage card and animate as each `stage`
+  # event arrives. All three substages happen inside the single
+  # ``summarize_meeting`` Claude call below, so we emit them just
+  # before/after that call to give the user clear visual progress.
+  _emit_stage(redis_client, session_id, "extracting_key_points", "Extracting key points…")
   summary_result: dict[str, Any] = {}
   try:
     summary_result = await meetings_routes.summarize_meeting(session_id, current_actor)
+    _emit_stage(redis_client, session_id, "identifying_action_items", "Identifying action items…")
+    _emit_stage(redis_client, session_id, "structuring_summary", "Structuring summary…")
   except HTTPException as exc:
     logger.warning(
       "summarize_meeting HTTP error meeting_id=%s: %s",

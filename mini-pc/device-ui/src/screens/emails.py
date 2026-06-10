@@ -1482,6 +1482,23 @@ class EmailsScreen(BaseScreen):
     # Interactions
     # ─────────────────────────────────────────────────────────────────────────
 
+    def set_active_tab(self, tab_id: str) -> None:
+        """Called by main.py to jump to a specific tab via voice command.
+
+        Tab ids: today, all, unread, sent, drafts.
+        Safe to call before or after on_enter; stores tab and triggers lazy
+        loads for sent/drafts if needed.
+        """
+        valid = {"today", "all", "unread", "sent", "drafts"}
+        if tab_id not in valid:
+            return
+        if tab_id == self._active_tab:
+            # Already on the right tab — force a visual refresh if labels exist.
+            if self._tab_labels:
+                self._set_tab(tab_id)
+            return
+        self._on_tab(tab_id)
+
     def _on_tab(self, tab_id: str):
         if tab_id == self._active_tab:
             return

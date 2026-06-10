@@ -170,7 +170,7 @@ class RecipientConfirmOverlay(FloatLayout):
         self._title.bind(size=self._title.setter("text_size"))
         header.add_widget(self._title)
         close_btn = Label(
-            text="\u2715", font_size=int(22 * s), color=_CLOSE_COLOR,
+            text="\u00d7", font_size=int(30 * s), bold=True, color=_CLOSE_COLOR,
             size_hint=(None, 1), width=int(36 * s), halign="center", valign="middle",
         )
         close_btn.bind(size=close_btn.setter("text_size"))
@@ -301,4 +301,24 @@ class RecipientConfirmOverlay(FloatLayout):
         if self.opacity < 0.05:
             return False
         super().on_touch_down(touch)
+        # Grab the touch so the ENTIRE gesture (move + up) is owned by this
+        # modal overlay and never leaks through to the screen behind it.
+        touch.grab(self)
+        return True
+
+    def on_touch_move(self, touch):
+        if touch.grab_current is self:
+            return True
+        if self.opacity < 0.05:
+            return False
+        super().on_touch_move(touch)
+        return True
+
+    def on_touch_up(self, touch):
+        if touch.grab_current is self:
+            touch.ungrab(self)
+            return True
+        if self.opacity < 0.05:
+            return False
+        super().on_touch_up(touch)
         return True

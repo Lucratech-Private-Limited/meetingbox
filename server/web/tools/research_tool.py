@@ -9,6 +9,7 @@ from services.research import (
     fetch_currency_convert_sync,
     fetch_deep_research_sync,
     fetch_news_sync,
+    fetch_research_paper_sync,
     fetch_sports_score_sync,
     fetch_stock_price_sync,
     fetch_weather_sync,
@@ -177,4 +178,27 @@ def research_deep_research_from_payload(payload: dict[str, Any]) -> dict[str, An
         topic=str(payload.get("topic") or payload.get("query") or ""),
         depth=(payload.get("depth") or None),
         original_message=(payload.get("original_message") or None),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Research papers (Semantic Scholar)
+# ---------------------------------------------------------------------------
+
+def research_paper_search(query: str, limit: int = 5) -> dict[str, Any]:
+    q = (query or "").strip()
+    if not q:
+        raise ToolError("Provide a search query for the paper lookup.")
+    try:
+        return fetch_research_paper_sync(query=q, limit=max(1, min(int(limit or 5), 10)))
+    except Exception as exc:
+        logger.warning("research_paper_search failed: %s", exc)
+        raise ToolError("Paper search is temporarily unavailable.") from exc
+
+
+def research_paper_search_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    payload = payload or {}
+    return research_paper_search(
+        query=str(payload.get("query") or payload.get("topic") or ""),
+        limit=int(payload.get("limit") or 5),
     )

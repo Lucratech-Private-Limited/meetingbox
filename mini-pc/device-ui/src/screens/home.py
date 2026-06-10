@@ -660,10 +660,31 @@ class HomeScreen(BaseScreen):
         va.simulate_wake()
         app._handle_voice_wake_phrase("")
 
+    # ── Voice-session routing helper ─────────────────────────────────────────
+
+    def _voice_session(self):
+        """Return the VoiceSessionScreen if registered, else None."""
+        if self.manager and "voice_session" in self.manager.screen_names:
+            return self.manager.get_screen("voice_session")
+        return None
+
+    def _navigate_to_voice_session(self) -> None:
+        """Switch to the voice-session screen, clearing previous transcript."""
+        vs = self._voice_session()
+        if vs and self.manager and self.manager.current != "voice_session":
+            vs.clear_say_bar_transcription()
+            self.manager.current = "voice_session"
+
     # ── Public voice-state API (called by main.py) ────────────────────────────
 
     def show_listening_state(self) -> None:
-        """Wake word detected — show Listening pill and start waveform animation."""
+        """Wake word detected — open voice-session screen and set Listening state."""
+        vs = self._voice_session()
+        if vs:
+            self._navigate_to_voice_session()
+            vs.show_listening_state()
+            return
+        # Fallback: no voice_session screen registered (legacy behaviour)
         self._listening_active  = True
         self._current_amplitude = 0.0
         if self._voice_pill is not None:
@@ -681,7 +702,11 @@ class HomeScreen(BaseScreen):
         self._start_waveform_tick()
 
     def hide_listening_state(self) -> None:
-        """End of voice interaction — fade out pill, stop waveform, reset mic."""
+        """End of voice interaction — forward to voice-session or reset home."""
+        vs = self._voice_session()
+        if vs:
+            vs.hide_listening_state()
+            return
         self._listening_active  = False
         self._current_amplitude = 0.0
         self._stop_waveform_tick()
@@ -693,13 +718,12 @@ class HomeScreen(BaseScreen):
             Animation(orb_scale=1.0, duration=0.3).start(self._mic_btn)
 
     def set_voice_session_state(self, state: str) -> None:
-        """Update the voice-state pill for Realtime session state transitions.
-
-        "listening" → pill shows "Listening", waveform animates
-        "thinking"  → pill shows "Thinking",  waveform at rest
-        "speaking"  → pill shows "Talking",   waveform at rest
-        "idle"      → pill fades out
-        """
+        """Forward state updates to voice-session screen if active, else handle locally."""
+        vs = self._voice_session()
+        if vs:
+            vs.set_voice_session_state(state)
+            return
+        # Fallback
         if state == "listening":
             self._listening_active = True
             if self._voice_pill is not None:
@@ -707,7 +731,6 @@ class HomeScreen(BaseScreen):
                 Animation.cancel_all(self._voice_pill, "opacity")
                 Animation(opacity=1.0, duration=0.22, t="out_cubic").start(self._voice_pill)
             self._start_waveform_tick()
-
         elif state == "thinking":
             self._listening_active  = False
             self._current_amplitude = 0.0
@@ -716,7 +739,6 @@ class HomeScreen(BaseScreen):
                 Animation.cancel_all(self._voice_pill, "opacity")
                 Animation(opacity=1.0, duration=0.18).start(self._voice_pill)
             self._stop_waveform_tick()
-
         elif state == "speaking":
             self._listening_active  = False
             self._current_amplitude = 0.0
@@ -725,26 +747,38 @@ class HomeScreen(BaseScreen):
                 Animation.cancel_all(self._voice_pill, "opacity")
                 Animation(opacity=1.0, duration=0.18).start(self._voice_pill)
             self._stop_waveform_tick()
-
         else:
-            # "idle" or any unknown state → hide pill
             self.hide_listening_state()
 
     def update_amplitude(self, amp: float) -> None:
-        """Receive microphone amplitude (0–1); drives the waveform animation."""
+        """Receive microphone amplitude (0–1); forward to voice-session or home waveform."""
+        vs = self._voice_session()
+        if vs:
+            vs.update_amplitude(amp)
+            return
         if self._listening_active:
             self._current_amplitude = amp
 
-    # ── Stubs kept for main.py compatibility (say-bar removed in new design) ──
+    # ── Say-bar API — now routes to voice_session screen ─────────────────────
 
     def activate_say_bar(self) -> None:
-        pass
+        """Navigate to the voice-session screen to start showing the conversation."""
+        self._navigate_to_voice_session()
 
     def deactivate_say_bar(self) -> None:
-        pass
+        """Session over — delegate to voice_session (which navigates back to home)."""
+        vs = self._voice_session()
+        if vs:
+            vs.deactivate_say_bar()
 
     def update_say_bar_transcription(self, speaker: str, text: str) -> None:
-        pass
+        """Forward transcript line to voice-session screen."""
+        vs = self._voice_session()
+        if vs:
+            vs.update_say_bar_transcription(speaker, text)
 
     def clear_say_bar_transcription(self) -> None:
-        pass
+        """Clear transcript on voice-session screen."""
+        vs = self._voice_session()
+        if vs:
+            vs.clear_say_bar_transcription()

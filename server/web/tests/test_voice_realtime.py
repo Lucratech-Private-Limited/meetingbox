@@ -7,7 +7,7 @@ import json
 import sqlite3
 import uuid
 from datetime import datetime
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 from starlette.testclient import TestClient
 from zoneinfo import ZoneInfo
@@ -75,12 +75,12 @@ def test_realtime_session_ok_with_mock_openai(tmp_path, monkeypatch):
         session = _Sess()
 
     fake_cs = MagicMock()
-    fake_cs.create.return_value = _Created()
+    fake_cs.create = AsyncMock(return_value=_Created())
     fake_rt = MagicMock()
     fake_rt.client_secrets = fake_cs
     fake_client = MagicMock()
     fake_client.realtime = fake_rt
-    monkeypatch.setattr(voice_routes, "OpenAI", lambda **kwargs: fake_client)
+    monkeypatch.setattr(voice_routes, "AsyncOpenAI", lambda **kwargs: fake_client)
 
     token = auth.create_access_token({"sub": uid})
     client = TestClient(app)
@@ -269,6 +269,47 @@ def test_realtime_tool_assistant_intent_mocked(tmp_path, monkeypatch):
     assert out["truth_status"]["pending_count"] == 1
 
 
+def test_realtime_tool_assistant_intent_starts_recording_immediately(tmp_path, monkeypatch):
+    app, uid = _app_with_user(
+        tmp_path,
+        monkeypatch,
+        MEETINGBOX_REALTIME_VOICE_ENABLED="1",
+    )
+    import auth
+    import services.realtime_voice_tools as rv
+
+    called = {"start": 0}
+
+    def _fake_execute_device_tool(user_id: str, tool: str):
+        called["start"] += 1
+        return {"session_id": "sess-1", "status": "recording_started"}
+
+    monkeypatch.setattr(rv, "execute_device_tool", _fake_execute_device_tool)
+    monkeypatch.setattr(
+        rv,
+        "process_assistant_intent",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("should not use generic assistant_intent")),
+    )
+
+    token = auth.create_access_token({"sub": uid})
+    client = TestClient(app)
+    res = client.post(
+        "/api/voice/realtime/tools/invoke",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "call_id": "call_ai_start",
+            "name": "assistant_intent",
+            "arguments": '{"message":"start meeting"}',
+        },
+    )
+    assert res.status_code == 200
+    out = json.loads(res.json()["output"])
+    assert called["start"] == 1
+    assert out["assistant_message"] == "Starting recording now."
+    assert out["truth_status"]["writes_committed"] is True
+    assert out["pending_actions"] == []
+
+
 def test_realtime_tool_list_pending_empty(tmp_path, monkeypatch):
     app, uid = _app_with_user(
         tmp_path,
@@ -324,12 +365,12 @@ def test_realtime_session_mock_receives_turn_detection_fields(tmp_path, monkeypa
         return _Created()
 
     fake_cs = MagicMock()
-    fake_cs.create = _capture_create
+    fake_cs.create = AsyncMock(side_effect=_capture_create)
     fake_rt = MagicMock()
     fake_rt.client_secrets = fake_cs
     fake_client = MagicMock()
     fake_client.realtime = fake_rt
-    monkeypatch.setattr(voice_routes, "OpenAI", lambda **kwargs: fake_client)
+    monkeypatch.setattr(voice_routes, "AsyncOpenAI", lambda **kwargs: fake_client)
 
     token = auth.create_access_token({"sub": uid})
     client = TestClient(app)
@@ -384,12 +425,12 @@ def test_realtime_session_coerces_translate_whisper_to_speech_model(tmp_path, mo
         return _Created()
 
     fake_cs = MagicMock()
-    fake_cs.create = _capture_create
+    fake_cs.create = AsyncMock(side_effect=_capture_create)
     fake_rt = MagicMock()
     fake_rt.client_secrets = fake_cs
     fake_client = MagicMock()
     fake_client.realtime = fake_rt
-    monkeypatch.setattr(voice_routes, "OpenAI", lambda **kwargs: fake_client)
+    monkeypatch.setattr(voice_routes, "AsyncOpenAI", lambda **kwargs: fake_client)
 
     token = auth.create_access_token({"sub": uid})
     client = TestClient(app)
@@ -432,12 +473,12 @@ def test_realtime_session_default_voice_is_marin(tmp_path, monkeypatch):
         return _Created()
 
     fake_cs = MagicMock()
-    fake_cs.create = _capture_create
+    fake_cs.create = AsyncMock(side_effect=_capture_create)
     fake_rt = MagicMock()
     fake_rt.client_secrets = fake_cs
     fake_client = MagicMock()
     fake_client.realtime = fake_rt
-    monkeypatch.setattr(voice_routes, "OpenAI", lambda **kwargs: fake_client)
+    monkeypatch.setattr(voice_routes, "AsyncOpenAI", lambda **kwargs: fake_client)
 
     token = auth.create_access_token({"sub": uid})
     client = TestClient(app)
