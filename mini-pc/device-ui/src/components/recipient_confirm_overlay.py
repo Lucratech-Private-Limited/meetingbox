@@ -79,7 +79,7 @@ def _ff(fs: float) -> int:
 
 
 # ── Colours ───────────────────────────────────────────────────────────────────
-_C_SCRIM      = (1.0, 1.0, 1.0, 0.05)       # light scrim (backdrop-blur approx)
+_C_SCRIM      = (0.0, 0.0, 0.0, 0.45)       # dim backdrop so the popup stands out
 _C_HEADER     = (0.427, 0.282, 0.800, 1.0)  # #6D48CC  purple
 _C_WHITE      = (1.0, 1.0, 1.0, 1.0)
 _C_ROW_TEXT   = (0.208, 0.224, 0.231, 1.0)  # #35393B
@@ -149,8 +149,15 @@ class _ContactRow(BoxLayout):
             valign="middle",
             size_hint=(None, None),
             size=(_ff(36), _ff(36)),
+            pos=badge.pos,
         )
         num_lbl.bind(size=num_lbl.setter("text_size"))
+        # A plain Widget does not lay out its children, so the number label must
+        # track the badge's position/size explicitly or it renders at (0, 0).
+        badge.bind(
+            pos=lambda w, p: setattr(num_lbl, "pos", p),
+            size=lambda w, s: setattr(num_lbl, "size", s),
+        )
         badge.add_widget(num_lbl)
         self.add_widget(badge)
 

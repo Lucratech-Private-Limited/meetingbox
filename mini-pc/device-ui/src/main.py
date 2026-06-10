@@ -2987,6 +2987,11 @@ class MeetingBoxApp(App):
                 self.goto_screen("email_draft")
             screen = sm.get_screen("email_draft") if sm else None
             if screen is not None:
+                # A new draft beginning after the previous one was sent/saved/
+                # discarded must start blank — don't merge into the old fields.
+                state = str(draft.get("state") or "drafting").strip().lower()
+                if state == "drafting" and getattr(screen, "draft_is_terminal", False):
+                    screen.reset()
                 screen.set_draft(draft)
         except Exception:
             logger.exception("Failed to render email draft directive")
@@ -3104,6 +3109,14 @@ class MeetingBoxApp(App):
             sm = getattr(self, "screen_manager", None)
             if sm is not None and sm.current == "email_draft":
                 self.goto_screen("home")
+        except Exception:
+            pass
+        # Clear any leftover draft fields so the next session never shows a
+        # stale draft from a previous conversation (set_draft merges fields,
+        # so without this the old to/subject/body would reappear).
+        try:
+            if sm is not None:
+                sm.get_screen("email_draft").reset()
         except Exception:
             pass
         Clock.schedule_once(lambda _dt: self._clear_home_say_bar(), 0)
