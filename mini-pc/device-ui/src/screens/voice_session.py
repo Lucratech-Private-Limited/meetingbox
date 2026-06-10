@@ -534,7 +534,21 @@ class VoiceSessionScreen(BaseScreen):
     # ── back button ────────────────────────────────────────────────────────────
 
     def _on_back(self) -> None:
-        if self.manager:
+        """End the live voice session, then return to home.
+
+        Tapping Back must actually tear the Realtime session down — otherwise
+        the agent keeps listening and talking in the background. ``stop()``
+        sets ``_user_ended=True`` so this counts as a user-intended end and
+        does NOT trigger the auto-reconnect path.
+        """
+        app = self.app
+        if app is not None:
+            try:
+                app._end_realtime_voice_session()
+            except Exception:
+                logger.debug("voice_session back: end session failed", exc_info=True)
+        # Safety net: navigate home even if teardown didn't (e.g. no live session).
+        if self.manager and self.manager.current == "voice_session":
             self.manager.current = "home"
 
     # ── voice-state API  (identical signature to home screen) ─────────────────
