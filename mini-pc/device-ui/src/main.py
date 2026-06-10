@@ -321,6 +321,7 @@ from screens.calendar import CalendarScreen
 from screens.morning_brief import MorningBriefScreen
 from screens.emails import EmailsScreen
 from screens.tasks import TasksScreen
+from screens.email_draft import EmailDraftScreen
 from components.quick_panel import QuickPanel
 
 # ------------------------------------------------------------------
@@ -1061,6 +1062,7 @@ class MeetingBoxApp(App):
 
         self.screen_manager.add_widget(HomeScreen(name='home'))
         self.screen_manager.add_widget(VoiceSessionScreen(name='voice_session'))
+        self.screen_manager.add_widget(EmailDraftScreen(name='email_draft'))
         self.screen_manager.add_widget(RecordingScreen(name='recording'))
         self.screen_manager.add_widget(ProcessingScreen(name='processing'))
         self.screen_manager.add_widget(CompleteScreen(name='complete'))
@@ -1123,27 +1125,26 @@ class MeetingBoxApp(App):
         self._sync_voice_assistant_state()
         self._refresh_voice_indicator()
 
-        # Email draft popup + recipient confirmation overlay (voice-first email
-        # workflow). Added BEFORE the transcript overlay so the transcript bar
-        # renders on top and stays visible while drafting. Both start hidden.
+        # Email draft screen: wire tap callbacks from the already-registered screen.
+        # The screen itself is a full ScreenManager screen (not a floating overlay),
+        # so no widget is added to root_layout here.
         try:
-            from components.email_draft_popup import EmailDraftPopup
-            self._email_draft_popup = EmailDraftPopup(
-                on_send=self._on_email_draft_send_tapped,
-                on_save_draft=self._on_email_draft_save_tapped,
-                on_discard=self._on_email_draft_discard_tapped,
-                on_close=self._on_email_draft_close_tapped,
-            )
-            self.root_layout.add_widget(self._email_draft_popup)
+            draft_screen = self.screen_manager.get_screen("email_draft")
+            draft_screen.on_send       = self._on_email_draft_send_tapped
+            draft_screen.on_save_draft = self._on_email_draft_save_tapped
+            draft_screen.on_discard    = self._on_email_draft_discard_tapped
         except Exception:
-            logger.exception("EmailDraftPopup failed to load")
-            self._email_draft_popup = None
+            logger.exception("EmailDraftScreen callback wiring failed")
 
+        # Recipient confirmation overlay — root-level floating popup (sits on top
+        # of whatever screen is current, including email_draft). Added BEFORE the
+        # transcript overlay so the transcript bar renders above it.
         try:
             from components.recipient_confirm_overlay import RecipientConfirmOverlay
             self._recipient_overlay = RecipientConfirmOverlay(
                 on_select=self._on_recipient_selected,
                 on_dismiss=self._on_recipient_dismissed,
+                on_none=self._on_recipient_none,
             )
             self.root_layout.add_widget(self._recipient_overlay)
         except Exception:
@@ -2838,11 +2839,17 @@ class MeetingBoxApp(App):
         )
 
     def _apply_amplitude_to_home(self, amplitude: float) -> None:
-        if (self.screen_manager is not None
-                and self.screen_manager.current == 'home'):
+        if self.screen_manager is None:
+            return
+        current = self.screen_manager.current
+        if current == 'home':
             try:
-                home = self.screen_manager.get_screen('home')
-                home.update_amplitude(amplitude)
+                self.screen_manager.get_screen('home').update_amplitude(amplitude)
+            except Exception:
+                pass
+        elif current == 'email_draft':
+            try:
+                self.screen_manager.get_screen('email_draft').update_amplitude(amplitude)
             except Exception:
                 pass
 
@@ -2927,17 +2934,17 @@ class MeetingBoxApp(App):
             logger.debug("send_user_text failed", exc_info=True)
 
     def _email_workflow_active(self) -> bool:
-        """True while the email draft popup or recipient picker is on screen.
+        """True while the email draft screen or recipient picker is on screen.
 
         Used to suppress the voice session's keyword farewell fallback so that
         mid-email closers ("that's it", "thanks", "okay done") don't silently
         end the session — the model's contextual end_session tool still works.
         Called from the session's recv thread; only reads plain bool attrs.
         """
-        popup = getattr(self, "_email_draft_popup", None)
         recip = getattr(self, "_recipient_overlay", None)
         try:
-            if popup is not None and popup.visible:
+            sm = getattr(self, "screen_manager", None)
+            if sm is not None and sm.current == "email_draft":
                 return True
             if recip is not None and recip.visible:
                 return True
@@ -2946,20 +2953,20 @@ class MeetingBoxApp(App):
         return False
 
     def _on_email_draft_directive(self, draft: dict) -> None:
-        """Open/update the draft popup from a show_email_draft directive."""
-        popup = getattr(self, "_email_draft_popup", None)
-        if popup is None or not isinstance(draft, dict):
+        """Navigate to / update the email draft screen from a show_email_draft directive."""
+        if not isinstance(draft, dict):
             return
-        # The recipient picker's job ends once we're drafting — close it so it
-        # never lingers in front of (or behind) the draft popup.
+        # The recipient picker's job ends once we're drafting — close it.
         recip = getattr(self, "_recipient_overlay", None)
         if recip is not None and recip.visible:
             recip.close()
         try:
-            if popup.visible:
-                popup.update_draft(draft)
-            else:
-                popup.open_draft(draft)
+            sm = getattr(self, "screen_manager", None)
+            if sm is not None and sm.current != "email_draft":
+                self.goto_screen("email_draft")
+            screen = sm.get_screen("email_draft") if sm else None
+            if screen is not None:
+                screen.set_draft(draft)
         except Exception:
             logger.exception("Failed to render email draft directive")
 
@@ -2974,25 +2981,36 @@ class MeetingBoxApp(App):
             logger.exception("Failed to render recipient picker directive")
 
     def _on_recipient_selected(self, index: int, contact: dict) -> None:
+        # overlay.close() is already called by RecipientConfirmOverlay._on_row_tap
+        # (after the 400 ms highlight), but guard anyway.
         overlay = getattr(self, "_recipient_overlay", None)
-        if overlay is not None:
+        if overlay is not None and overlay.visible:
             overlay.close()
         email = (contact or {}).get("email", "")
         name = (contact or {}).get("name", "") or email
         if not email:
             return
-        # Do NOT pre-open the email draft popup here. The picker is shared
-        # between the email flow AND the calendar-invite attendee flow. Opening
-        # the draft popup unconditionally caused it to appear (and stay) in the
-        # calendar flow where show_email_draft is never called. The model's next
-        # show_email_draft directive opens the popup in the email flow; for
-        # calendar there is no such directive so nothing extra appears.
+        # After confirming a recipient, ensure we land on the email draft page
+        # so "go back to email screen" always works (even before show_email_draft
+        # has arrived).  The screen starts in blank/loading state; set_draft()
+        # will fill it when the directive arrives.
+        try:
+            sm = getattr(self, "screen_manager", None)
+            if sm is not None and sm.current != "email_draft":
+                self.goto_screen("email_draft")
+        except Exception:
+            pass
         self._send_voice_user_text(f"Use {email} for {name}.")
 
     def _on_recipient_dismissed(self) -> None:
         overlay = getattr(self, "_recipient_overlay", None)
         if overlay is not None:
             overlay.close()
+
+    def _on_recipient_none(self) -> None:
+        """User tapped 'None' in the recipient picker — inject voice turn."""
+        # overlay already closed by RecipientConfirmOverlay._on_row_tap
+        self._send_voice_user_text("None of those.")
 
     def _on_email_draft_send_tapped(self) -> None:
         self._send_voice_user_text("Yes, send it.")
@@ -3001,15 +3019,7 @@ class MeetingBoxApp(App):
         self._send_voice_user_text("Save it as a draft.")
 
     def _on_email_draft_discard_tapped(self) -> None:
-        popup = getattr(self, "_email_draft_popup", None)
-        if popup is not None:
-            popup.close()
         self._send_voice_user_text("Discard the email.")
-
-    def _on_email_draft_close_tapped(self) -> None:
-        popup = getattr(self, "_email_draft_popup", None)
-        if popup is not None:
-            popup.close()
 
     def _sync_transcript_overlay_mode(self, screen_name: str | None = None) -> None:
         """Sync the transcript overlay mode for the current screen.
@@ -3026,8 +3036,9 @@ class MeetingBoxApp(App):
         )
         # Always compact — the full-screen overlay mode is no longer used.
         overlay.set_compact(True)
-        if name in ('home', 'voice_session'):
-            # Home + voice-session both handle transcription natively; keep overlay hidden.
+        if name in ('home', 'voice_session', 'email_draft'):
+            # Home + voice-session + email_draft all handle transcription natively;
+            # keep overlay hidden.
             overlay.suppress_auto_show = True
             overlay.hide()
         else:
@@ -3050,13 +3061,17 @@ class MeetingBoxApp(App):
         self._set_voice_runtime_state("idle")
         if self._transcript_overlay is not None:
             self._transcript_overlay.hide()
-        # Tear down the email workflow overlays when the voice session ends.
-        popup = getattr(self, "_email_draft_popup", None)
-        if popup is not None and popup.visible:
-            popup.close()
+        # Tear down the email workflow when the voice session ends.
         recip = getattr(self, "_recipient_overlay", None)
         if recip is not None and recip.visible:
             recip.close()
+        # Navigate back to home if the user is still on the email draft screen.
+        try:
+            sm = getattr(self, "screen_manager", None)
+            if sm is not None and sm.current == "email_draft":
+                self.goto_screen("home")
+        except Exception:
+            pass
         Clock.schedule_once(lambda _dt: self._clear_home_say_bar(), 0)
         sess = self._realtime_voice_session
         started = getattr(self, "_realtime_session_start_monotonic", None)
@@ -3424,11 +3439,17 @@ class MeetingBoxApp(App):
             self._set_voice_runtime_state(state)
 
             def _update_home(_dt):
-                if (self.screen_manager is not None
-                        and self.screen_manager.current in ('home', 'voice_session')):
+                if self.screen_manager is None:
+                    return
+                current = self.screen_manager.current
+                if current in ('home', 'voice_session'):
                     try:
-                        home = self.screen_manager.get_screen('home')
-                        home.set_voice_session_state(state)
+                        self.screen_manager.get_screen('home').set_voice_session_state(state)
+                    except Exception:
+                        pass
+                elif current == 'email_draft':
+                    try:
+                        self.screen_manager.get_screen('email_draft').set_voice_session_state(state)
                     except Exception:
                         pass
 
