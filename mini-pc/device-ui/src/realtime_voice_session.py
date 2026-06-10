@@ -137,6 +137,33 @@ _DEFAULT_INPUT_TRANSCRIPTION_MODEL = (
 # Deliberately neutral — see server/web/routes/voice.py for the rationale.
 _INPUT_TRANSCRIPTION_PROMPT = "Conversational English."
 
+
+def _is_prompt_echo(text: str) -> bool:
+    """True if a transcript is a Whisper *prompt-echo hallucination*.
+
+    When the AI's own playback audio leaks into the mic (imperfect AEC) or the
+    captured segment is near-silence, the transcription model echoes the
+    transcription ``prompt`` back — OpenAI wraps it as ``context: ### <prompt> ###``.
+    These phantom utterances must NOT be shown as user speech or trigger a
+    model turn / grammar correction.
+    """
+    if not text:
+        return False
+    t = text.strip().lower()
+    if not t:
+        return False
+    # The wrapped prompt always carries the "###" fence — a reliable marker
+    # that a real spoken utterance would essentially never contain.
+    if "###" in t:
+        return True
+    if "context:" in t and "conversational english" in t:
+        return True
+    # A bare echo of just the prompt text (no real words around it).
+    prompt = _INPUT_TRANSCRIPTION_PROMPT.strip().lower().rstrip(".")
+    if prompt and prompt in t and len(t) <= len(prompt) + 12:
+        return True
+    return False
+
 # Turn-end detection eagerness for semantic VAD. Higher = the assistant
 # replies sooner after the user stops talking (less dead air); lower =
 # waits longer to be sure the user is done. "low" was historically forced
@@ -1406,11 +1433,14 @@ class RealtimeVoiceSession:
                             self._active_user_transcript_item_id = str(item_id)
                             self._user_transcript_buf = ""
                         self._user_transcript_buf += delta
+                        # Suppress streaming partials that are prompt-echo
+                        # hallucinations so the phantom never paints a bubble.
                         # Partial — not final, so the UI skips grammar
                         # correction until the .completed event.
-                        self._emit_user_transcript(
-                            self._user_transcript_buf, is_final=False
-                        )
+                        if not _is_prompt_echo(self._user_transcript_buf):
+                            self._emit_user_transcript(
+                                self._user_transcript_buf, is_final=False
+                            )
 
                 # ---- User transcript (final) ---------------------------
                 elif t in (
@@ -1423,6 +1453,9 @@ class RealtimeVoiceSession:
                     # next utterance starts clean.
                     self._user_transcript_buf = ""
                     self._active_user_transcript_item_id = ""
+                    if spoken and _is_prompt_echo(spoken):
+                        logger.debug("Realtime: dropped prompt-echo phantom %r", spoken)
+                        spoken = ""
                     if spoken:
                         logger.info("User said: %r", spoken)
                         self._emit_user_transcript(spoken, is_final=True)
