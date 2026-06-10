@@ -2881,6 +2881,27 @@ class MeetingBoxApp(App):
             return
         name, tr = pair
 
+        # Keep the user on the email draft page while a draft is still undecided.
+        # The model is instructed to auto-save (terminal state) before navigating
+        # away, so only honour a navigation off email_draft once the draft has
+        # been sent, saved, or discarded.
+        try:
+            sm = getattr(self, "screen_manager", None)
+            if (
+                sm is not None
+                and sm.current == "email_draft"
+                and name != "email_draft"
+            ):
+                draft_screen = sm.get_screen("email_draft")
+                if not getattr(draft_screen, "draft_is_terminal", True):
+                    logger.info(
+                        "Ignoring navigate_device_ui(%s): email draft still open/undecided",
+                        name,
+                    )
+                    return
+        except Exception:
+            logger.debug("email_draft navigation guard check failed", exc_info=True)
+
         if name == "calendar" and target_date:
             try:
                 cal = self.screen_manager.get_screen("calendar")
@@ -2998,9 +3019,22 @@ class MeetingBoxApp(App):
             sm = getattr(self, "screen_manager", None)
             if sm is not None and sm.current != "email_draft":
                 self.goto_screen("email_draft")
+            # Optimistic UI: reflect the picked recipient in the To field RIGHT
+            # NOW so the user sees their choice instantly, without waiting for the
+            # model's show_email_draft round-trip. The model's later directive is
+            # authoritative and will overwrite this if needed.
+            screen = sm.get_screen("email_draft") if sm is not None else None
+            if screen is not None and hasattr(screen, "set_draft"):
+                cur = list((getattr(screen, "_fields", {}) or {}).get("to", []))
+                disp = f"{name} <{email}>" if (name and name != email) else email
+                if not any(email in str(c) for c in cur):
+                    cur.append(disp)
+                    screen.set_draft({"to": cur})
         except Exception:
-            pass
-        self._send_voice_user_text(f"Use {email} for {name}.")
+            logger.debug("optimistic recipient fill failed", exc_info=True)
+        self._send_voice_user_text(
+            f"I picked {name} ({email}) on screen — use that address."
+        )
 
     def _on_recipient_dismissed(self) -> None:
         overlay = getattr(self, "_recipient_overlay", None)

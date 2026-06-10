@@ -205,7 +205,7 @@ class _FieldRow(BoxLayout):
 
     _ROW_H = _ff(82)
 
-    def __init__(self, label_text: str, **kw):
+    def __init__(self, label_text: str, label_width: float | None = None, **kw):
         super().__init__(
             orientation="horizontal",
             size_hint=(1, None),
@@ -222,9 +222,14 @@ class _FieldRow(BoxLayout):
             halign="left",
             valign="middle",
             size_hint=(None, 1),
-            width=_ff(120),
+            width=label_width if label_width is not None else _ff(120),
         )
-        self._lbl.bind(size=self._lbl.setter("text_size"))
+        # Keep the label on a single line (only constrain wrap height, not width)
+        # so longer labels like "Subject:" don't break across two lines.
+        self._lbl.bind(
+            height=lambda l, h: setattr(l, "text_size", (l.width, h)),
+            width=lambda l, w: setattr(l, "text_size", (w, l.height)),
+        )
         self.add_widget(self._lbl)
 
         # Chip container scrolls horizontally if many chips
@@ -272,7 +277,9 @@ class _FieldRow(BoxLayout):
 # ──────────────────────────────────────────────────────────────────────────────
 class _Sep(Widget):
     def __init__(self, **kw):
-        super().__init__(size_hint=(1, None), height=1, **kw)
+        kw.setdefault("size_hint", (1, None))
+        kw.setdefault("height", 1)
+        super().__init__(**kw)
         with self.canvas:
             Color(*_C_SEP)
             self._r = Rectangle(pos=self.pos, size=self.size)
@@ -287,7 +294,8 @@ class _Sep(Widget):
 # ──────────────────────────────────────────────────────────────────────────────
 class _PillButton(BoxLayout):
     def __init__(self, text: str, bg_color: tuple, on_tap, **kw):
-        super().__init__(size_hint=(None, None), **kw)
+        kw.setdefault("size_hint", (None, None))
+        super().__init__(**kw)
         self._on_tap = on_tap
         self._enabled = True
         with self.canvas.before:
@@ -353,6 +361,8 @@ class EmailDraftScreen(BaseScreen):
         self._amplitude   = 0.0
         self._voice_tick_ev: object | None = None
         self._auto_back_ev:  object | None = None
+        # Lifecycle state of the current draft (drafting/ready/sending/sent/saved/discarded).
+        self._state = "drafting"
 
         # Draft state store — missing keys are preserved across updates
         self._fields: dict = {
@@ -448,8 +458,8 @@ class EmailDraftScreen(BaseScreen):
         inner.add_widget(self._row_cc)
         inner.add_widget(self._sep_cc)
 
-        # Subject row
-        self._row_subject = _FieldRow("Subject:")
+        # Subject row — wider label so "Subject:" stays on one line
+        self._row_subject = _FieldRow("Subject:", label_width=_ff(210))
         inner.add_widget(self._row_subject)
         inner.add_widget(_Sep())
 
@@ -575,6 +585,7 @@ class EmailDraftScreen(BaseScreen):
     def reset(self) -> None:
         """Clear all draft fields and return to blank state."""
         self._cancel_auto_back()
+        self._state = "drafting"
         self._fields = {"to": [], "cc": [], "bcc": [], "subject": "", "body": ""}
         self._refresh_ui()
         if self._voice_pill:
@@ -644,7 +655,13 @@ class EmailDraftScreen(BaseScreen):
                 self._body_label.text  = "Drafting…"
                 self._body_label.color = _C_PH_TXT
 
+    @property
+    def draft_is_terminal(self) -> bool:
+        """True once the draft has been sent, saved, or discarded."""
+        return self._state in ("sent", "saved", "discarded")
+
     def _apply_state(self, state: str) -> None:
+        self._state = state
         terminal = {
             "sent":      "Sent ✓",
             "saved":     "Saved to drafts",
@@ -681,8 +698,13 @@ class EmailDraftScreen(BaseScreen):
         self._cancel_auto_back()
         try:
             app = self.app
-            if app and app.screen_manager and app.screen_manager.current == "email_draft":
-                app.goto_screen("home")
+            sm = app.screen_manager if app else None
+            if sm and sm.current == "email_draft":
+                # The voice session is still live — return to the audio-agent
+                # screen (not home) so the user sees the send/save confirmation
+                # in the transcript. Home happens only when the session ends.
+                target = "voice_session" if sm.has_screen("voice_session") else "home"
+                app.goto_screen(target)
         except Exception:
             pass
 
