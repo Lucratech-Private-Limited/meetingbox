@@ -280,6 +280,13 @@ class _TranscriptionBox(FloatLayout):
     def __init__(self, **kw):
         super().__init__(**kw)
 
+        # Tracks the currently-streaming bubble so repeated callbacks for the
+        # same logical message (placeholder → final → grammar-corrected for the
+        # user; multiple streaming deltas for the AI) update one line in place
+        # instead of appending duplicates.
+        self._cur_speaker: str | None = None
+        self._cur_label:   Label | None = None
+
         # ── rounded-rectangle background ────────────────────────────────────
         with self.canvas.before:
             Color(*_BOX_BG)
@@ -327,12 +334,32 @@ class _TranscriptionBox(FloatLayout):
     # ── public API ────────────────────────────────────────────────────────────
 
     def add_message(self, speaker: str, text: str) -> None:
-        is_user = speaker.strip().lower() in ("you", "user")
+        """Add or update a transcript line.
+
+        Consecutive calls from the same speaker update the same bubble in place
+        (so streaming deltas / re-transcriptions don't pile up duplicates). A
+        new bubble is started when the speaker changes, or when a fresh user
+        turn begins (signalled by the "…" placeholder).
+        """
+        norm    = speaker.strip().lower()
+        is_user = norm in ("you", "user")
         color   = _TEXT_USER if is_user else _TEXT_AI
         prefix  = f"{speaker}: " if speaker.strip() else ""
+        full    = f"{prefix}{text}"
+
+        is_placeholder = text.strip() in ("…", "...")
+        same_speaker   = self._cur_label is not None and self._cur_speaker == norm
+
+        # Update the live bubble in place when it's the same speaker and this
+        # isn't the start of a brand-new user turn.
+        if same_speaker and not is_placeholder:
+            self._cur_label.text  = full
+            self._cur_label.color = color
+            Clock.schedule_once(lambda _dt: self._scroll_bottom(), 0.05)
+            return
 
         lbl = Label(
-            text=f"{prefix}{text}",
+            text=full,
             font_name=_FONT_SB,
             font_size=_ff(37),
             color=color,
@@ -348,10 +375,14 @@ class _TranscriptionBox(FloatLayout):
             texture_size=lambda w, ts: setattr(w, "height", ts[1] + _ff(6)),
         )
         self._inner.add_widget(lbl)
+        self._cur_label   = lbl
+        self._cur_speaker = norm
         Clock.schedule_once(lambda _dt: self._scroll_bottom(), 0.05)
 
     def clear_messages(self) -> None:
         self._inner.clear_widgets()
+        self._cur_label   = None
+        self._cur_speaker = None
 
     # ── helpers ───────────────────────────────────────────────────────────────
 
