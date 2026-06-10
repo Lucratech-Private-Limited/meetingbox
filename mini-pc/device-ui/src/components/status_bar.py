@@ -25,7 +25,7 @@ from config import (
     other_screen_vertical_scale,
 )
 
-_GEAR_ICON = ASSETS_DIR / "recording" / "setteing gear icon.png"
+_GEAR_ICON = ASSETS_DIR / "recording" / "icon_settings_gear.png"
 
 
 def _suv(px):

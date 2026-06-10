@@ -22,7 +22,9 @@ def has_nmcli() -> bool:
 
 def nmcli_run(args: list, timeout: float = 30):
     """
-    Run nmcli; on PolicyKit denial retry with sudo -n nmcli (passwordless sudoers).
+    Run nmcli; on PolicyKit denial retry with sudo -n nmcli (root bypasses polkit).
+    /usr/bin/nmcli is in the container sudoers NOPASSWD list so this works without
+    a password prompt.
     """
     cmd = ["nmcli"] + args
     res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
@@ -35,25 +37,21 @@ def nmcli_run(args: list, timeout: float = 30):
             "permission denied",
             "not allowed to",
             "polkit",
+            "not authorized to control",
         )
     )
     if res.returncode != 0 and priv and shutil.which("sudo"):
         res2 = subprocess.run(
-            ["sudo", "-n", "nmcli"] + args,
+            ["sudo", "-n", "/usr/bin/nmcli"] + args,
             capture_output=True,
             text=True,
             timeout=timeout,
         )
         sudo_msg = ((res2.stderr or "") + (res2.stdout or "")).lower()
+        # If sudo itself asks for a password, return the original result
         if res2.returncode != 0 and any(
             s in sudo_msg
-            for s in (
-                "a password is required",
-                "password is required",
-                "terminal is required",
-                "no tty present",
-                "sudo: a password",
-            )
+            for s in ("a password is required", "no tty present", "sudo: a password")
         ):
             return res
         return res2
@@ -86,12 +84,18 @@ def _nmcli_version_skew_warning(stderr: str) -> bool:
     s = (stderr or "").lower()
     if not s.strip():
         return False
-    if "don't match" in s or "do not match" in s:
-        if "networkmanager" in s or "nmcli" in s:
-            return True
-    if "restarting network manager" in s or "restart networkmanager" in s:
+    # Covers: "don't match", "doesn't match", "do not match", "does not match"
+    has_mismatch = (
+        "don't match" in s
+        or "doesn't match" in s
+        or "do not match" in s
+        or "does not match" in s
+        or "versions don't match" in s
+        or "versions doesn't match" in s
+    )
+    if has_mismatch and ("networkmanager" in s or "nmcli" in s):
         return True
-    if "versions don't match" in s:
+    if "restarting network manager" in s or "restart networkmanager" in s:
         return True
     return False
 
@@ -264,6 +268,20 @@ def scan_wifi_networks(rescan: bool = False) -> list[dict]:
     return nets
 
 
+def _is_connected_to(ssid: str) -> bool:
+    """Return True if NetworkManager reports an active connection to the given SSID."""
+    try:
+        r = nmcli_run(["-t", "-f", "ACTIVE,SSID", "dev", "wifi"], timeout=6)
+        for line in (r.stdout or "").splitlines():
+            parts = line.split(":", 1)
+            if len(parts) == 2 and parts[0].strip().lower() == "yes":
+                if parts[1].strip() == ssid:
+                    return True
+    except Exception:
+        pass
+    return False
+
+
 def connect_wifi_network(ssid: str, password: Optional[str]) -> dict:
     iface = detect_wifi_iface()
     args = ["device", "wifi", "connect", ssid]
@@ -272,9 +290,41 @@ def connect_wifi_network(ssid: str, password: Optional[str]) -> dict:
     if iface:
         args += ["ifname", iface]
     res = nmcli_run(args, timeout=30)
+
+    stderr = (res.stderr or "").strip()
+    stdout = (res.stdout or "").strip()
+    combined = (stderr + " " + stdout).lower()
+
+    # Immediate success
     if res.returncode == 0:
         return {"status": "connected", "message": f"Connected to {ssid}"}
-    msg = (res.stderr or "").strip() or (res.stdout or "").strip() or "Connection failed"
+
+    # nmcli reports "successfully activated" in stdout even when exit != 0
+    if "successfully activated" in combined or "successfully connected" in combined:
+        return {"status": "connected", "message": f"Connected to {ssid}"}
+
+    # Version skew between the container's nmcli and the host's NetworkManager
+    # causes a non-zero exit regardless of whether the operation succeeded.
+    # Wait up to 4 s and verify via the actual device state.
+    if _nmcli_version_skew_warning(stderr) or _nmcli_version_skew_warning(stdout):
+        for _attempt in range(4):
+            time.sleep(1.0)
+            if _is_connected_to(ssid):
+                logger.info(
+                    "connect_wifi_network: connected to %s (nmcli version-skew warning ignored)",
+                    ssid,
+                )
+                return {"status": "connected", "message": f"Connected to {ssid}"}
+        # Still not connected — real failure, but strip the version warning from the
+        # user-facing message so only the actionable part is shown.
+        real_lines = [
+            ln for ln in (stderr + "\n" + stdout).splitlines()
+            if ln.strip() and not _nmcli_version_skew_warning(ln)
+        ]
+        msg = "\n".join(real_lines).strip() or "Connection failed"
+        return {"status": "failed", "message": msg}
+
+    msg = stderr or stdout or "Connection failed"
     ml = msg.lower()
     if "password" not in ml and "802" not in ml:
         if any(s in ml for s in ("sudo", "privileges", "not authorized", "polkit")):
@@ -283,3 +333,45 @@ def connect_wifi_network(ssid: str, password: Optional[str]) -> dict:
                 "See scripts/sudoers.meetingbox-nmcli.example or scripts/polkit/"
             )
     return {"status": "failed", "message": msg}
+
+
+def list_saved_wifi_connection_names() -> list[str]:
+    """Return NetworkManager connection profile names that are Wi‑Fi type."""
+    if not has_nmcli():
+        return []
+    try:
+        res = nmcli_run(["-t", "-f", "NAME,TYPE", "connection", "show"], timeout=12)
+        if res.returncode != 0:
+            return []
+        names: list[str] = []
+        for line in (res.stdout or "").splitlines():
+            if ":" not in line:
+                continue
+            name, typ = line.split(":", 1)
+            name = name.strip()
+            low = typ.strip().lower()
+            if not name:
+                continue
+            if "wireless" in low or "wifi" in low or low == "802-11-wireless":
+                names.append(name)
+        return sorted(set(names))
+    except Exception:
+        return []
+
+
+def forget_wifi_connection(con_name: str) -> dict:
+    """Delete a saved Wi‑Fi profile by connection name (``nmcli connection delete``)."""
+    if not has_nmcli():
+        return {"ok": False, "message": "nmcli not available"}
+    con = (con_name or "").strip()
+    if not con:
+        return {"ok": False, "message": "No connection name"}
+    try:
+        res = nmcli_run(["connection", "delete", con], timeout=20)
+        if res.returncode == 0:
+            return {"ok": True, "message": ""}
+        msg = (res.stderr or res.stdout or "").strip() or "Delete failed"
+        return {"ok": False, "message": msg[:400]}
+    except Exception as e:
+        return {"ok": False, "message": str(e)[:400]}
+

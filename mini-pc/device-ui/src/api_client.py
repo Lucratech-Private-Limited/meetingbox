@@ -8,8 +8,12 @@ Aligned with the actual backend routes in server/web/.
 import asyncio
 import json
 import logging
-from typing import List, Dict, Optional, AsyncIterator
-from datetime import datetime
+import os
+import re
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from typing import AsyncIterator, Dict, List, Optional
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import httpx
 import websockets
@@ -23,9 +27,296 @@ from config import (
     WS_MAX_RECONNECT_ATTEMPTS,
     get_device_auth_token,
     persist_device_auth_token,
+    _strip_trailing_rest_api_path,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _response_ok_json_api(resp: httpx.Response) -> bool:
+    """True when the response looks like our JSON API, not SPA index.html (nginx mis-route)."""
+    if resp.status_code != 200:
+        return False
+    ct = (resp.headers.get("content-type") or "").lower()
+    if "text/html" in ct:
+        return False
+    if "json" in ct:
+        return True
+    sample = (resp.text or "")[:512].lstrip()
+    return sample.startswith("{") or sample.startswith("[")
+
+
+# Match dashboard Emails tab (`frontend/src/pages/Emails.tsx`).
+_GMAIL_RECENT_DAYS = 90
+
+
+def _meetings_to_calendar_days(meetings: list, start_date: str, end_date: str) -> dict:
+    """
+    Convert a list of local recorded meetings into the calendar/week dict format:
+      {"days": {"YYYY-MM-DD": {"meetings": [...]}}}
+    Used as a fallback when Google Calendar is not connected.
+    """
+    from datetime import date as _date
+    try:
+        d_start = _date.fromisoformat(start_date)
+        d_end = _date.fromisoformat(end_date)
+    except ValueError:
+        return {"days": {}}
+
+    days: dict = {}
+    for m in meetings:
+        # start_time may be in various formats
+        raw_start = m.get("start_time") or m.get("started_at") or m.get("created_at") or ""
+        if not raw_start:
+            continue
+        try:
+            if raw_start.endswith("Z"):
+                raw_start = raw_start[:-1] + "+00:00"
+            dt = datetime.fromisoformat(raw_start)
+            day_str = dt.date().isoformat()
+        except ValueError:
+            continue
+        try:
+            meeting_date = _date.fromisoformat(day_str)
+        except ValueError:
+            continue
+        if not (d_start <= meeting_date <= d_end):
+            continue
+
+        event = {
+            "id": m.get("id", ""),
+            "title": m.get("title") or "Meeting",
+            "start": m.get("start_time") or raw_start,
+            "end": m.get("end_time") or m.get("stop_time") or m.get("start_time") or raw_start,
+            "status": m.get("status", "completed"),
+            "source": "local",
+        }
+        days.setdefault(day_str, {"meetings": []})["meetings"].append(event)
+
+    return {"days": days}
+
+
+def _parse_sender_display(raw: str) -> str:
+    """Parse 'Display Name <addr@host>' into a short display name (same idea as server emails route)."""
+    m = re.match(r"^(.*?)\s*<([^>]+)>", (raw or "").strip())
+    if m:
+        name = m.group(1).strip().strip('"')
+        addr = m.group(2).strip()
+        return name or addr
+    s = (raw or "").strip()
+    return s or "—"
+
+
+def _parse_message_date(raw_date: str) -> Optional[datetime]:
+    s = (raw_date or "").strip()
+    if not s:
+        return None
+    try:
+        return parsedate_to_datetime(s)
+    except Exception:
+        pass
+    try:
+        if len(s) >= 10 and s[4] == "-" and s[7] == "-":
+            return datetime.fromisoformat(s[:10]).replace(tzinfo=timezone.utc)
+    except Exception:
+        pass
+    return None
+
+
+def _is_today_rfc(raw_date: str) -> bool:
+    dt = _parse_message_date(raw_date)
+    if dt is None:
+        return False
+    try:
+        now = datetime.now(tz=timezone.utc)
+        return (now - dt).days == 0
+    except Exception:
+        return False
+
+
+def _friendly_time_rfc(raw_date: str) -> str:
+    """Portable version of server emails `_friendly_time` (no platform-specific strftime)."""
+    dt = _parse_message_date(raw_date)
+    if dt is None:
+        return (raw_date or "")[:10] if raw_date else "—"
+    try:
+        now = datetime.now(tz=timezone.utc)
+        local_dt = dt.astimezone()
+        delta_days = (now - dt).days
+        if delta_days == 0:
+            h24 = local_dt.hour
+            h12 = h24 % 12 or 12
+            ampm = "AM" if h24 < 12 else "PM"
+            return f"{h12}:{local_dt.minute:02d} {ampm}"
+        if delta_days < 7:
+            return local_dt.strftime("%a %d")
+        return local_dt.strftime("%b %d")
+    except Exception:
+        return raw_date[:10] if raw_date else "—"
+
+
+def _map_gmail_recent_row(msg: Dict) -> Dict:
+    """Shape from `GET /api/integrations/gmail/recent` `messages[]` → device EmailsScreen row."""
+    raw_from = msg.get("from") or ""
+    raw_date = msg.get("date") or ""
+    snippet = msg.get("snippet") or ""
+    return {
+        "id": msg["id"],
+        "thread_id": msg.get("threadId"),
+        "sender": _parse_sender_display(raw_from),
+        "sender_email": raw_from,
+        "subject": (msg.get("subject") or "(no subject)").strip() or "(no subject)",
+        "preview": snippet,
+        "body": snippet,
+        "time": _friendly_time_rfc(raw_date),
+        "date": raw_date,
+        "is_today": _is_today_rfc(raw_date),
+        "is_read": bool(msg.get("is_read", True)),
+        "to": "",
+    }
+
+
+def summarize_gmail_feed_for_home(feed: Optional[Dict]) -> Dict[str, object]:
+    """
+    Normalize `GET /api/integrations/gmail/recent` (same as frontend `Emails.tsx`)
+    for home / morning-brief widgets: unread count + one-line preview.
+    """
+    out: Dict[str, object] = {
+        "connected": False,
+        "unread_count": 0,
+        "message_count": 0,
+        "brief_subtitle": "Connect Gmail for updates",
+        "top_raw": None,
+    }
+    if not isinstance(feed, dict):
+        return out
+    out["connected"] = bool(feed.get("connected"))
+    raw_msgs = feed.get("messages")
+    if not isinstance(raw_msgs, list):
+        raw_msgs = []
+    normalized: List[Dict] = []
+    unread = 0
+    for m in raw_msgs:
+        if not isinstance(m, dict) or not m.get("id"):
+            continue
+        normalized.append(m)
+        if not m.get("is_read", True):
+            unread += 1
+    out["message_count"] = len(normalized)
+    out["unread_count"] = unread
+    err = (feed.get("error") or "").strip()
+    if not out["connected"]:
+        out["brief_subtitle"] = "Connect Gmail for updates"
+        return out
+    if not normalized:
+        out["brief_subtitle"] = err or "No recent messages"
+        return out
+    out["top_raw"] = normalized[0]
+
+    def _name(mi: Dict) -> str:
+        return _parse_sender_display(mi.get("from") or "")
+
+    first = _name(normalized[0])
+    if len(normalized) == 1:
+        subj = (normalized[0].get("subject") or normalized[0].get("snippet") or "").strip()
+        out["brief_subtitle"] = f"{first}: {subj[:40]}" if subj else first
+        return out
+    second = _name(normalized[1])
+    rest = len(normalized) - 2
+    if rest > 0:
+        out["brief_subtitle"] = f"{first}, {second} +{rest}"
+    else:
+        out["brief_subtitle"] = f"{first}, {second}"
+    return out
+
+
+def build_websocket_url(base_ws_url: str) -> str:
+    """
+    Match server/web WebSocket auth: optional MEETINGBOX_WS_REQUIRE_AUTH (access_token query)
+    and/or MEETINGBOX_WS_SHARED_SECRET (token query). Harmless extras when server auth is off.
+    """
+    base = (base_ws_url or "").strip()
+    if not base:
+        return base
+    parts = urlparse(base)
+    q = dict(parse_qsl(parts.query, keep_blank_values=False))
+    tok = (get_device_auth_token() or "").strip()
+    if tok:
+        q["access_token"] = tok
+    secret = (
+        (os.getenv("BACKEND_WS_SHARED_SECRET") or os.getenv("MEETINGBOX_WS_SHARED_SECRET") or "")
+        .strip()
+    )
+    if secret:
+        q["token"] = secret
+    new_query = urlencode(q) if q else ""
+    return urlunparse(
+        (parts.scheme, parts.netloc, parts.path, parts.params, new_query, parts.fragment)
+    )
+
+
+def invoke_realtime_tool_sync(
+    base_url: str,
+    bearer_token: str,
+    *,
+    call_id: str,
+    name: str,
+    arguments: str = "{}",
+    timeout: float = 90.0,
+) -> str:
+    """
+    POST /api/voice/realtime/tools/invoke (blocking).
+    Used by the Realtime WebSocket worker thread; mirrors BackendClient.invoke_realtime_tool.
+    """
+    root = _strip_trailing_rest_api_path((base_url or "").strip().rstrip("/"))
+    tok = (bearer_token or "").strip()
+    if not root or not tok:
+        return json.dumps({"error": "missing_backend_or_token"})
+    url = f"{root}/api/voice/realtime/tools/invoke"
+    headers = {"Authorization": f"Bearer {tok}"}
+    payload = {
+        "call_id": (call_id or "").strip(),
+        "name": (name or "").strip(),
+        "arguments": arguments if arguments is not None else "{}",
+    }
+    try:
+        with httpx.Client(timeout=timeout) as client:
+            resp = client.post(url, json=payload, headers=headers)
+            resp.raise_for_status()
+            body = resp.json()
+        if isinstance(body, dict) and "output" in body:
+            return str(body["output"])
+        return ""
+    except Exception as e:
+        logger.warning("invoke_realtime_tool_sync failed: %s", e)
+        return json.dumps({"error": "invoke_failed", "detail": str(e)})
+
+
+def correct_transcript_sync(
+    base_url: str,
+    bearer_token: str,
+    text: str,
+    timeout: float = 10.0,
+) -> str:
+    """POST /api/voice/correct-text (blocking). Returns corrected text or original on failure."""
+    root = _strip_trailing_rest_api_path((base_url or "").strip().rstrip("/"))
+    tok = (bearer_token or "").strip()
+    if not root or not tok or not (text or "").strip():
+        return text
+    url = f"{root}/api/voice/correct-text"
+    try:
+        with httpx.Client(timeout=timeout) as client:
+            resp = client.post(
+                url,
+                json={"text": text.strip()},
+                headers={"Authorization": f"Bearer {tok}"},
+            )
+            resp.raise_for_status()
+            body = resp.json()
+        return body.get("corrected") or text
+    except Exception as exc:
+        logger.debug("correct_transcript_sync failed: %s", exc)
+        return text
 
 
 class BackendClient:
@@ -50,20 +341,35 @@ class BackendClient:
       WiFi connect:    POST /api/device/wifi/connect       (device route)
       Check updates:   GET  /api/device/check-updates      (device route)
       Install update:  POST /api/device/install-update     (device route)
-      WebSocket:       ws://host:port/ws
+      WebSocket:       ws://host:port/ws (?access_token= / ?token= when server requires it)
       Claim pairing:   POST /api/devices/claim              (no auth)
     """
 
     def __init__(self, base_url: str = BACKEND_URL):
-        self.base_url = base_url.rstrip('/')
+        self.base_url = _strip_trailing_rest_api_path(base_url.rstrip("/"))
         self.ws_url = BACKEND_WS_URL
-        headers = {}
-        token = get_device_auth_token()
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
-        self.client = httpx.AsyncClient(timeout=API_TIMEOUT, headers=headers)
+        # Short connect timeout so unreachable hosts fail fast; read/write use API_TIMEOUT.
+        self.client = httpx.AsyncClient(
+            timeout=httpx.Timeout(
+                float(API_TIMEOUT),
+                connect=min(10.0, float(API_TIMEOUT)),
+            ),
+        )
+        self._refresh_auth_header()
         self.ws_connection = None
         self._ws_reconnect_attempts = 0
+
+    def _refresh_auth_header(self) -> None:
+        """Re-read the device auth token and update the httpx client header.
+
+        Called at init and after claim_device so the token is always current
+        without requiring a full client restart.
+        """
+        token = (get_device_auth_token() or "").strip()
+        if token:
+            self.client.headers["Authorization"] = f"Bearer {token}"
+        else:
+            self.client.headers.pop("Authorization", None)
 
     async def close(self):
         await self.client.aclose()
@@ -106,7 +412,7 @@ class BackendClient:
         if not access:
             raise ValueError("Claim response missing access_token")
         persist_device_auth_token(access)
-        self.set_device_auth_header(access)
+        self._refresh_auth_header()
         return data
 
     # ==================================================================
@@ -187,10 +493,7 @@ class BackendClient:
     async def get_meetings(self, limit: int = 20, offset: int = 0) -> List[Dict]:
         """
         GET /api/meetings/?limit=&offset=
-        Returns list of meeting dicts.
-        Backend shape: { id, title, start_time, end_time, duration, status,
-                         audio_path, created_at }
-        We normalise to the shape the UI expects.
+        Returns list of meeting dicts. Returns [] on any error so callers never crash.
         """
         try:
             resp = await self.client.get(
@@ -199,13 +502,17 @@ class BackendClient:
             )
             resp.raise_for_status()
             meetings = resp.json()
-            # Normalise: add pending_actions=0 if missing
+            if not isinstance(meetings, list):
+                return []
             for m in meetings:
                 m.setdefault('pending_actions', 0)
             return meetings
+        except httpx.HTTPStatusError as e:
+            logger.warning("get_meetings HTTP %s: %s", e.response.status_code, e.response.text[:200])
+            return []
         except Exception as e:
-            logger.error(f"Failed to fetch meetings: {e}")
-            raise
+            logger.warning("get_meetings failed: %s", e)
+            return []
 
     async def get_meeting_detail(self, meeting_id: str) -> Dict:
         """
@@ -248,6 +555,37 @@ class BackendClient:
             return result
         except Exception as e:
             logger.error(f"Failed to fetch meeting {meeting_id}: {e}")
+            raise
+
+    def get_meeting_audio_url(self, meeting_id: str) -> str:
+        """Return the GET URL for a meeting's audio file (no auth header
+        applied — the device's session token is sent automatically by
+        :attr:`client` if the caller uses :meth:`download_meeting_audio`).
+        """
+        return f"{self.base_url}/api/meetings/{meeting_id}/audio"
+
+    async def download_meeting_audio(
+        self, meeting_id: str, dest_path: str
+    ) -> Optional[str]:
+        """Stream the meeting recording to ``dest_path``.
+
+        Returns the absolute path on success or ``None`` if the backend
+        returned 404 / has no audio for this meeting. Other errors raise.
+        """
+        try:
+            async with self.client.stream(
+                "GET", self.get_meeting_audio_url(meeting_id)
+            ) as resp:
+                if resp.status_code == 404:
+                    return None
+                resp.raise_for_status()
+                with open(dest_path, "wb") as fh:
+                    async for chunk in resp.aiter_bytes():
+                        if chunk:
+                            fh.write(chunk)
+            return dest_path
+        except Exception as e:
+            logger.error(f"Failed to download audio for {meeting_id}: {e}")
             raise
 
     async def delete_meeting(self, meeting_id: str) -> None:
@@ -304,6 +642,32 @@ class BackendClient:
             return resp.json()
         except Exception as e:
             logger.error(f"Failed to generate actions for meeting {meeting_id}: {e}")
+            raise
+
+    async def create_manual_action(self, meeting_id: str, body: Dict) -> Dict:
+        """POST /api/meetings/{meeting_id}/actions/manual"""
+        try:
+            resp = await self.client.post(
+                f"{self.base_url}/api/meetings/{meeting_id}/actions/manual",
+                json=body,
+                timeout=120.0,
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except httpx.HTTPStatusError as e:
+            detail = ""
+            try:
+                data = e.response.json()
+                if isinstance(data, dict) and data.get("detail") is not None:
+                    d = data["detail"]
+                    detail = d if isinstance(d, str) else json.dumps(d)
+            except Exception:
+                detail = (e.response.text or "")[:500]
+            msg = (detail or e.response.reason_phrase or str(e)).strip()
+            logger.error("Failed to create manual action for meeting %s: HTTP %s %s", meeting_id, e.response.status_code, msg)
+            raise RuntimeError(msg) from e
+        except Exception as e:
+            logger.error(f"Failed to create manual action for meeting {meeting_id}: {e}")
             raise
 
     async def execute_action(
@@ -363,20 +727,60 @@ class BackendClient:
             message: str,
             meeting_id: Optional[str] = None,
     ) -> Dict:
-        """POST /api/assistant/intent — route a natural-language request."""
+        """POST /api/assistant/intent — route a natural-language request.
+        Raises on failure so callers (voice assistant) can distinguish network
+        errors from empty responses.
+        """
+        payload: Dict = {"message": message}
+        if meeting_id:
+            payload["meeting_id"] = meeting_id
+        resp = await self.client.post(
+            f"{self.base_url}/api/assistant/intent",
+            json=payload,
+            timeout=120.0,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    async def approve_assistant_pending(self, pending_id: str) -> Dict:
+        """POST /api/assistant/pending-actions/{id}/approve"""
         try:
-            payload: Dict = {"message": message}
-            if meeting_id:
-                payload["meeting_id"] = meeting_id
             resp = await self.client.post(
-                f"{self.base_url}/api/assistant/intent",
-                json=payload,
+                f"{self.base_url}/api/assistant/pending-actions/{pending_id}/approve",
                 timeout=120.0,
             )
             resp.raise_for_status()
             return resp.json()
         except Exception as e:
-            logger.error("Assistant intent failed: %s", e)
+            logger.error("approve_assistant_pending failed: %s", e)
+            raise
+
+    async def reject_assistant_pending(self, pending_id: str) -> Dict:
+        """POST /api/assistant/pending-actions/{id}/reject"""
+        try:
+            resp = await self.client.post(
+                f"{self.base_url}/api/assistant/pending-actions/{pending_id}/reject",
+                timeout=60.0,
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.error("reject_assistant_pending failed: %s", e)
+            raise
+
+    async def patch_assistant_pending_payload(
+            self, pending_id: str, payload: Dict) -> Dict:
+        """PATCH /api/assistant/pending-actions/{id} (email or calendar draft)."""
+        try:
+            resp = await self.client.patch(
+                f"{self.base_url}/api/assistant/pending-actions/{pending_id}",
+                json={"payload": payload},
+                timeout=60.0,
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.error("patch_assistant_pending_payload failed: %s", e)
             raise
 
     # ==================================================================
@@ -480,6 +884,319 @@ class BackendClient:
         except Exception as e:
             logger.error(f"Failed to disconnect {integration_id}: {e}")
             raise
+
+    # ==================================================================
+    # CALENDAR API
+    # ==================================================================
+
+    async def get_calendar_week(self, start_date: str, end_date: str) -> Dict:
+        """GET /api/calendar/week?start=YYYY-MM-DD&end=YYYY-MM-DD
+
+        Returns meetings grouped by date:
+          {"days": {"2026-05-04": {"meetings": [{id, title, start, end, ...}]}}}
+
+        Falls back to local recorded meetings when Google Calendar is not connected.
+        """
+        # --- Primary: Google Calendar via server ---
+        try:
+            resp = await self.client.get(
+                f"{self.base_url}/api/calendar/week",
+                params={"start": start_date, "end": end_date},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            if isinstance(data, dict) and "days" in data:
+                return data
+        except Exception as e:
+            logger.debug("get_calendar_week google failed: %s — using meetings fallback", e)
+
+        # --- Fallback: build calendar view from local recorded meetings ---
+        try:
+            meetings = await self.get_meetings(limit=100)
+            return _meetings_to_calendar_days(meetings, start_date, end_date)
+        except Exception as e:
+            logger.debug("get_calendar_week fallback failed: %s", e)
+
+        return {"days": {}}
+
+    async def get_briefing_context(self, days_ahead: int = 1) -> Dict:
+        """GET /api/briefing/context — calendar slice, tasks, mem0, Gmail preview."""
+        try:
+            resp = await self.client.get(
+                f"{self.base_url}/api/briefing/context",
+                params={"days_ahead": int(days_ahead)},
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.debug("get_briefing_context failed: %s", e)
+            return {}
+
+    async def get_commitments(self, status: str = "", limit: int = 40) -> Dict:
+        """GET /api/commitments"""
+        try:
+            params: Dict = {"limit": int(limit)}
+            if (status or "").strip():
+                params["status"] = status.strip()
+            resp = await self.client.get(
+                f"{self.base_url}/api/commitments",
+                params=params,
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.debug("get_commitments failed: %s", e)
+            return {"commitments": [], "count": 0}
+
+    async def patch_commitment(
+        self,
+        commitment_id: str,
+        status: str | None = None,
+        due_date: str | None = None,
+    ) -> Dict:
+        """PATCH /api/commitments/{id} — change status and/or assign a due_date.
+
+        Pass status='completed' / 'cancelled' / 'snoozed' / 'active' to change state,
+        and/or due_date='YYYY-MM-DD' to assign or change the deadline. At least one
+        of status or due_date is required.
+        """
+        try:
+            body: Dict = {}
+            if status:
+                body["status"] = status
+            if due_date:
+                body["due_date"] = due_date
+            resp = await self.client.patch(
+                f"{self.base_url}/api/commitments/{commitment_id}",
+                json=body,
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.debug("patch_commitment failed: %s", e)
+            return {}
+
+    async def create_commitment(
+        self,
+        *,
+        title: str,
+        due_date: str | None = None,
+        description: str | None = None,
+        confirm_duplicate: bool = False,
+        source: str = "manual",
+    ) -> Dict:
+        """POST /api/commitments — create a task manually from the device Tasks screen.
+
+        Returns the created row on success, or {'error': 'similar_task_exists',
+        'similar': {...}} on a 409 duplicate hit so the UI can ask the user
+        whether to add anyway (pass confirm_duplicate=True on retry).
+        """
+        body: Dict = {
+            "title": (title or "").strip(),
+            "confirm_duplicate": bool(confirm_duplicate),
+            "source": source,
+        }
+        if due_date:
+            body["due_date"] = due_date
+        if description:
+            body["description"] = description
+        try:
+            resp = await self.client.post(
+                f"{self.base_url}/api/commitments",
+                json=body,
+            )
+            if resp.status_code == 409:
+                try:
+                    detail = resp.json().get("detail") or {}
+                except Exception:
+                    detail = {}
+                return {
+                    "error": "similar_task_exists",
+                    "similar": detail.get("similar") if isinstance(detail, dict) else None,
+                }
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.debug("create_commitment failed: %s", e)
+            return {"error": "request_failed", "detail": str(e)}
+
+    async def create_realtime_voice_session(self) -> Dict:
+        """POST /api/voice/realtime/session — OpenAI Realtime client secret (Bearer token)."""
+        resp = await self.client.post(f"{self.base_url}/api/voice/realtime/session")
+        resp.raise_for_status()
+        return resp.json()
+
+    async def invoke_realtime_tool(
+        self,
+        *,
+        call_id: str,
+        name: str,
+        arguments: str = "{}",
+    ) -> str:
+        """POST /api/voice/realtime/tools/invoke — Mem0 / briefing tools for Realtime voice."""
+        resp = await self.client.post(
+            f"{self.base_url}/api/voice/realtime/tools/invoke",
+            json={
+                "call_id": (call_id or "").strip(),
+                "name": (name or "").strip(),
+                "arguments": arguments if (arguments is not None) else "{}",
+            },
+        )
+        resp.raise_for_status()
+        body = resp.json()
+        if isinstance(body, dict) and "output" in body:
+            return str(body["output"])
+        return ""
+
+    # ==================================================================
+    # GMAIL (same feed as dashboard: GET /api/integrations/gmail/recent)
+    # ==================================================================
+
+    async def fetch_gmail_recent(
+            self,
+            *,
+            max_results: int = 40,
+            days: int = _GMAIL_RECENT_DAYS,
+            q: str = "",
+            folder: str = "all",
+    ) -> Dict:
+        """
+        Fetch Gmail messages. folder= "all"|"today"|"unread"|"sent"|"drafts".
+        Tries the dedicated /api/emails endpoint first (purpose-built for device
+        + user Bearer), then falls back to /api/integrations/gmail/recent.
+        """
+        # --- Primary: /api/emails (returns list directly) ---
+        try:
+            resp = await self.client.get(
+                f"{self.base_url}/api/emails",
+                params={"filter": folder, "limit": int(max_results)},
+            )
+            resp.raise_for_status()
+            rows = resp.json()
+            if isinstance(rows, list):
+                return {"connected": True, "messages": rows, "count": len(rows)}
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code not in (401, 403):
+                logger.debug("fetch_gmail_recent /api/emails HTTP %s", e.response.status_code)
+            # Fall through to legacy endpoint on auth errors too (device may not be paired yet)
+        except Exception as e:
+            logger.debug("fetch_gmail_recent /api/emails failed: %s", e)
+
+        # --- Fallback: /api/integrations/gmail/recent ---
+        try:
+            resp = await self.client.get(
+                f"{self.base_url}/api/integrations/gmail/recent",
+                params={
+                    "max_results": int(max_results),
+                    "days": int(days),
+                    "q": (q or "").strip(),
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            if not isinstance(data, dict):
+                return {"connected": False, "messages": [], "error": "Invalid response"}
+            # This endpoint returns raw Gmail API format (from/date/snippet keys).
+            # Pre-map to device format here so callers always receive shaped data.
+            raw_msgs = data.get("messages") or []
+            mapped = [
+                _map_gmail_recent_row(m)
+                for m in raw_msgs
+                if isinstance(m, dict) and m.get("id")
+            ]
+            return {
+                "connected": bool(data.get("connected")),
+                "messages": mapped,
+                "count": len(mapped),
+                "error": data.get("error"),
+            }
+        except httpx.HTTPStatusError as e:
+            sc = e.response.status_code
+            logger.warning("fetch_gmail_recent HTTP %s: %s", sc, (e.response.text or "")[:300])
+            if sc == 401:
+                error_msg = "HTTP 401 — not authenticated"
+            elif sc == 403:
+                error_msg = "HTTP 403 — Gmail not connected"
+            else:
+                error_msg = f"HTTP {sc}"
+            return {"connected": False, "messages": [], "error": error_msg}
+        except httpx.TimeoutException as e:
+            logger.warning("fetch_gmail_recent timeout: %s", e)
+            return {"connected": False, "messages": [], "error": "timeout — network or server issue"}
+        except Exception as e:
+            logger.warning("fetch_gmail_recent failed: %s", e)
+            return {"connected": False, "messages": [], "error": str(e)}
+
+    async def get_emails(self, filter: str = "all", limit: int = 50) -> List[Dict]:
+        """Load Gmail rows using the same API as the web dashboard (filter applied locally by EmailsScreen)."""
+        data = await self.fetch_gmail_recent(max_results=limit, days=_GMAIL_RECENT_DAYS, q="")
+        if not data.get("connected"):
+            err = (data.get("error") or "").strip()
+            if err:
+                logger.warning("get_emails: Gmail not connected: %s", err[:300])
+            else:
+                logger.warning("get_emails: connected=false (connect Gmail from dashboard Settings)")
+            return []
+        rows = data.get("messages") or []
+        if not isinstance(rows, list):
+            return []
+        return [_map_gmail_recent_row(m) for m in rows if isinstance(m, dict) and m.get("id")]
+
+    async def get_email_detail(self, email_id: str) -> Dict:
+        """GET /api/emails/{id} — full body (falls back to integrations route)."""
+        for url in (
+            f"{self.base_url}/api/emails/{email_id}",
+            f"{self.base_url}/api/integrations/gmail/messages/{email_id}",
+        ):
+            try:
+                resp = await self.client.get(url)
+                resp.raise_for_status()
+                return resp.json()
+            except Exception as e:
+                logger.debug("get_email_detail %s failed: %s", url, e)
+        return {}
+
+    async def mark_email_unread(self, email_id: str) -> Dict:
+        """POST /api/emails/{id}/mark-unread (falls back to integrations route)."""
+        for url in (
+            f"{self.base_url}/api/emails/{email_id}/mark-unread",
+            f"{self.base_url}/api/integrations/gmail/messages/{email_id}/mark-unread",
+        ):
+            try:
+                resp = await self.client.post(url)
+                resp.raise_for_status()
+                return resp.json()
+            except Exception as e:
+                logger.debug("mark_email_unread %s failed: %s", url, e)
+        return {}
+
+    async def mark_email_read(self, email_id: str) -> Dict:
+        """POST /api/emails/{id}/mark-read (falls back to integrations route)."""
+        for url in (
+            f"{self.base_url}/api/emails/{email_id}/mark-read",
+            f"{self.base_url}/api/integrations/gmail/messages/{email_id}/mark-read",
+        ):
+            try:
+                resp = await self.client.post(url)
+                resp.raise_for_status()
+                return resp.json()
+            except Exception as e:
+                logger.debug("mark_email_read %s failed: %s", url, e)
+        return {}
+
+    async def archive_email(self, email_id: str) -> Dict:
+        """POST /api/emails/{id}/archive (falls back to integrations route)."""
+        for url in (
+            f"{self.base_url}/api/emails/{email_id}/archive",
+            f"{self.base_url}/api/integrations/gmail/messages/{email_id}/archive",
+        ):
+            try:
+                resp = await self.client.post(url)
+                resp.raise_for_status()
+                return resp.json()
+            except Exception as e:
+                logger.debug("archive_email %s failed: %s", url, e)
+        return {}
 
     # ==================================================================
     # SYSTEM API
@@ -637,7 +1354,14 @@ class BackendClient:
         """
         while True:
             try:
-                async with websockets.connect(self.ws_url) as ws:
+                ws_connect_url = build_websocket_url(self.ws_url)
+                async with websockets.connect(
+                    ws_connect_url,
+                    open_timeout=12,
+                    ping_interval=20,
+                    ping_timeout=20,
+                    max_size=None,
+                ) as ws:
                     logger.info("WebSocket connected")
                     self._ws_reconnect_attempts = 0
                     self.ws_connection = ws
@@ -668,9 +1392,237 @@ class BackendClient:
         if self._ws_reconnect_attempts > WS_MAX_RECONNECT_ATTEMPTS:
             logger.error("Max WS reconnect attempts reached")
             raise ConnectionError("Failed to reconnect to backend WebSocket")
-        delay = min(WS_RECONNECT_DELAY * (2 ** self._ws_reconnect_attempts), 60)
+        exp = max(0, self._ws_reconnect_attempts - 1)
+        delay = min(WS_RECONNECT_DELAY * (2**exp), 30)
         logger.info(f"Reconnecting WS in {delay}s (attempt {self._ws_reconnect_attempts})")
         await asyncio.sleep(delay)
+
+    # ==================================================================
+    # NEW DEVICE SETTINGS ENDPOINTS
+    # ==================================================================
+
+    async def wifi_radio(self, enabled: bool) -> Dict:
+        """POST /api/device/wifi/radio — toggle WiFi radio on/off."""
+        try:
+            resp = await self.client.post(
+                f"{self.base_url}/api/device/wifi/radio",
+                json={"enabled": enabled},
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.error("wifi_radio failed: %s", e)
+            raise
+
+    async def wifi_saved(self) -> Dict:
+        """GET /api/device/wifi/saved — list saved WiFi connection names."""
+        try:
+            resp = await self.client.get(f"{self.base_url}/api/device/wifi/saved")
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.error("wifi_saved failed: %s", e)
+            raise
+
+    async def wifi_forget(self, connection_name: str) -> Dict:
+        """POST /api/device/wifi/forget — delete a saved WiFi profile by NM connection name."""
+        try:
+            resp = await self.client.post(
+                f"{self.base_url}/api/device/wifi/forget",
+                json={"connection_name": connection_name},
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.error("wifi_forget failed: %s", e)
+            raise
+
+    async def bluetooth_radio(self, enabled: bool) -> Dict:
+        """POST /api/device/bluetooth/radio — toggle Bluetooth on/off."""
+        try:
+            resp = await self.client.post(
+                f"{self.base_url}/api/device/bluetooth/radio",
+                json={"enabled": enabled},
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.error("bluetooth_radio failed: %s", e)
+            raise
+
+    async def bluetooth_devices(self) -> Dict:
+        """GET /api/device/bluetooth/devices — list paired Bluetooth devices."""
+        try:
+            resp = await self.client.get(f"{self.base_url}/api/device/bluetooth/devices")
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.error("bluetooth_devices failed: %s", e)
+            raise
+
+    async def bluetooth_pair(self, mac: str) -> Dict:
+        """POST /api/device/bluetooth/pair — pair a Bluetooth device by MAC."""
+        try:
+            resp = await self.client.post(
+                f"{self.base_url}/api/device/bluetooth/pair",
+                json={"mac": mac},
+                timeout=60.0,
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.error("bluetooth_pair failed: %s", e)
+            raise
+
+    async def set_timezone(self, tz: str) -> Dict:
+        """POST /api/device/system/timezone — set system timezone."""
+        try:
+            resp = await self.client.post(
+                f"{self.base_url}/api/device/system/timezone",
+                json={"timezone": tz},
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.error("set_timezone failed: %s", e)
+            raise
+
+    async def set_datetime(self, *, iso: str = "", ntp: Optional[bool] = None) -> Dict:
+        """POST /api/device/system/datetime — set date/time manually (iso_datetime field).
+        NTP toggle is handled separately via timedatectl on the device side; the backend
+        endpoint only accepts iso_datetime for a manual time set.
+        """
+        try:
+            if ntp is not None and not iso:
+                # NTP toggle only — not supported by the backend endpoint; handled locally
+                return {"ok": True, "ntp_only": True}
+            payload: Dict = {"iso_datetime": iso.strip()}
+            resp = await self.client.post(
+                f"{self.base_url}/api/device/system/datetime",
+                json=payload,
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.error("set_datetime failed: %s", e)
+            raise
+
+    async def storage_breakdown(self) -> Dict:
+        """GET /api/device/storage-breakdown — disk usage by category."""
+        try:
+            resp = await self.client.get(f"{self.base_url}/api/device/storage-breakdown")
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.error("storage_breakdown failed: %s", e)
+            raise
+
+    async def clear_cache(self) -> Dict:
+        """POST /api/device/clear-cache — delete temp/cache files."""
+        try:
+            resp = await self.client.post(f"{self.base_url}/api/device/clear-cache")
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.error("clear_cache failed: %s", e)
+            raise
+
+    async def clear_all_recordings(self) -> Dict:
+        """POST /api/device/recordings/clear-all — bulk delete all recordings."""
+        try:
+            resp = await self.client.post(
+                f"{self.base_url}/api/device/recordings/clear-all"
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.error("clear_all_recordings failed: %s", e)
+            raise
+
+    async def clear_all_transcripts(self) -> Dict:
+        """POST /api/device/transcripts/clear-all — bulk delete all transcript files."""
+        try:
+            resp = await self.client.post(
+                f"{self.base_url}/api/device/transcripts/clear-all"
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.error("clear_all_transcripts failed: %s", e)
+            raise
+
+    async def connectivity_check(self) -> Dict:
+        """GET /api/device/connectivity — HTTP probe to check backend + internet."""
+        try:
+            resp = await self.client.get(
+                f"{self.base_url}/api/device/connectivity",
+                timeout=20.0,
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.error("connectivity_check failed: %s", e)
+            raise
+
+    async def diagnostic_log(self, lines: int = 100) -> Dict:
+        """GET /api/device/diagnostic-log — recent journalctl lines."""
+        try:
+            resp = await self.client.get(
+                f"{self.base_url}/api/device/diagnostic-log",
+                params={"lines": int(lines)},
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.error("diagnostic_log failed: %s", e)
+            raise
+
+    async def send_diagnostic_report(self) -> Dict:
+        """POST /api/device/diagnostic-report — fetch last 200 log lines, then submit."""
+        try:
+            log_text = ""
+            try:
+                log_data = await self.diagnostic_log(lines=200)
+                log_text = (log_data.get("lines") or "")[:2000]
+            except Exception:
+                log_text = "(could not retrieve log lines)"
+            message = log_text or "(no log output)"
+            resp = await self.client.post(
+                f"{self.base_url}/api/device/diagnostic-report",
+                json={"message": message},
+                timeout=30.0,
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.error("send_diagnostic_report failed: %s", e)
+            raise
+
+    async def send_feedback(self, message: str) -> Dict:
+        """POST /api/device/feedback — submit user feedback."""
+        try:
+            resp = await self.client.post(
+                f"{self.base_url}/api/device/feedback",
+                json={"message": message},
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.error("send_feedback failed: %s", e)
+            raise
+
+    async def integration_sync(self, integration_id: str) -> Dict:
+        """POST /api/device/integrations/{id}/sync — request manual re-sync."""
+        try:
+            resp = await self.client.post(
+                f"{self.base_url}/api/device/integrations/{integration_id}/sync",
+                timeout=30.0,
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.error("integration_sync failed: %s", e)
+            raise
 
     # ==================================================================
     # HEALTH CHECK
@@ -678,14 +1630,44 @@ class BackendClient:
 
     async def health_check(self) -> bool:
         """
-        GET /health  (note: no /api prefix)
-        Returns True if backend is up.
+        Reachability probe: many deployments only reverse-proxy ``/api/*`` to FastAPI, so
+        ``GET {base}/health`` never hits the API (404) or returns SPA HTML (200 + wrong body).
+        Try ``/health`` first, then ``/api/system/status`` (usually proxied; optional auth off by default).
+
+        Uses a dedicated one-shot client so the probe is never blocked waiting for a connection
+        from the shared pool (which may be busy with concurrent startup requests or long-polls).
         """
-        try:
-            resp = await self.client.get(
-                f"{self.base_url}/health", timeout=5)
-            return resp.status_code == 200
-        except Exception as e:
-            logger.error(f"Health check failed: {e}")
-            return False
+        probes = (
+            f"{self.base_url}/health",
+            f"{self.base_url}/api/system/status",
+        )
+        last_err: Exception | None = None
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=12.0, read=15.0, write=8.0, pool=8.0),
+            follow_redirects=True,
+        ) as probe_client:
+            for url in probes:
+                for attempt in range(2):
+                    try:
+                        resp = await probe_client.get(url)
+                        if _response_ok_json_api(resp):
+                            return True
+                        logger.warning(
+                            "Health probe not OK: %s → HTTP %s (not JSON API)",
+                            url,
+                            resp.status_code,
+                        )
+                    except Exception as e:
+                        last_err = e
+                        logger.warning(
+                            "Health probe failed: %s (attempt %d/2) — %s",
+                            url,
+                            attempt + 1,
+                            e,
+                        )
+                        if attempt == 0:
+                            await asyncio.sleep(0.5)
+        if last_err is not None:
+            logger.error("All health probes failed (last error: %s)", last_err)
+        return False
 

@@ -1,656 +1,474 @@
-"""
-Report Review Screen -- Post-recording detailed report & actions
+"""Meeting Summary screen — Figma ``1036:254``
+(dvqlN0JtWQODt6jYbTrbDG, "Copy").
 
-Two tabs: Report | Actions
-- Report tab: full meeting report from transcript (detailed, not a short summary)
-- Actions tab: action items with checkboxes and Execute Selected button
+Minimal light-theme summary page drawn with Kivy primitives:
+
+  * a back button + purple "Meeting Name" title (top-left)
+  * a meta line — "Create time HH:MM AM  ·  32 min"
+  * one big white rounded card with a sparkle + "AI Summary" header and a single
+    scrollable region that shows the AI summary narrative only
+
+Meeting title, creation time, audio duration and the summary body all come from
+the backend meeting-detail response (``api_client.get_meeting_detail``), with
+the locally-passed ``summary_data`` used for the first paint.
+
+Public API preserved for ``main.py``:
+
+  * ``__init__``
+  * ``set_meeting_data(meeting_id, summary_data)``
+  * ``on_enter`` / ``on_leave``
 """
+
+from __future__ import annotations
 
 import logging
-from functools import partial
+import re
+from datetime import datetime, timedelta, timezone
+from typing import Optional
 
-from kivy.uix.boxlayout import BoxLayout
-from kivy.uix.gridlayout import GridLayout
-from kivy.uix.scrollview import ScrollView
-from kivy.uix.label import Label
-from kivy.uix.widget import Widget
-from kivy.uix.checkbox import CheckBox
-from kivy.graphics import Color, Rectangle, RoundedRectangle
 from kivy.clock import Clock
+from kivy.graphics import Color, Line, Mesh, RoundedRectangle
+from kivy.uix.anchorlayout import AnchorLayout
+from kivy.uix.behaviors import ButtonBehavior
+from kivy.uix.floatlayout import FloatLayout
+from kivy.uix.label import Label
+from kivy.uix.scrollview import ScrollView
+from kivy.uix.widget import Widget
 
-from screens.base_screen import BaseScreen
-from components.button import PrimaryButton, SecondaryButton
-from components.status_bar import StatusBar
-from components.modal_dialog import ModalDialog
-from config import COLORS, FONT_SIZES, SPACING, DASHBOARD_URL
 from async_helper import run_async
+from screens.base_screen import BaseScreen
+from summary_layout import (
+    AI_BODY_FS_RATIO,
+    AI_HEADER,
+    AI_HEADER_FS_RATIO,
+    AI_SCROLL,
+    AI_SPARKLE,
+    BACK_BTN,
+    BG_BOT,
+    BG_TOP,
+    CARD,
+    CARD_FILL,
+    CARD_RADIUS,
+    CARD_SHADOW,
+    COL_AI_HEADER,
+    COL_BODY,
+    COL_META,
+    COL_TITLE,
+    META,
+    META_FS_RATIO,
+    SPARKLE_FILL,
+    STATUS_BAR,
+    TITLE,
+    TITLE_FS_RATIO,
+    font_px,
+    kivy_hints,
+    scaled_canvas,
+)
+from ui_bg import attach_swirl_bg
 
 logger = logging.getLogger(__name__)
 
-# Horizontal space for checkbox + per-row Execute + spacing (must fit on screen)
-_ACTION_ROW_RESERVED = 28 + 96 + 20
-
-# Prefix for transcript-only body until the AI report row exists in DB.
-_TRANSCRIPT_ONLY_PREFIX = "[i]Transcript[/i]"
+_FONT = "42dot-Sans"
+_IST = timezone(timedelta(hours=5, minutes=30))
 
 
-class SummaryReviewScreen(BaseScreen):
-    """Post-recording screen with Report and Actions tabs."""
+# Section markers emitted by the backend report composer. The device only shows
+# the narrative overview, so trailing DETAILED ACCOUNT / OPEN QUESTIONS /
+# RISKS / CONCERNS sections are stripped. Mirrors the web parser.
+_DETAILED_SPLIT = re.compile(
+    r"(?:^|\r?\n(?:\r?\n)?)\*{0,2}DETAILED ACCOUNT\*{0,2}\s*\r?\n",
+    re.IGNORECASE,
+)
+_OPEN_MARKER = re.compile(
+    r"\r?\n\r?\n(?:---\r?\n)?\*{0,2}OPEN QUESTIONS\*{0,2}\s*\r?\n",
+    re.IGNORECASE,
+)
+_RISKS_MARKER = re.compile(
+    r"\r?\n\r?\n(?:---\r?\n)?\*{0,2}RISKS\s*/\s*CONCERNS\*{0,2}\s*\r?\n",
+    re.IGNORECASE,
+)
+
+
+def _split_on_last_marker(text: str, marker: re.Pattern) -> tuple[str, str]:
+    last = None
+    for m in marker.finditer(text):
+        last = m
+    if last is None:
+        return text, ""
+    return text[: last.start()], text[last.end():]
+
+
+def _summary_card_text(full_text: str) -> str:
+    """Return the narrative overview portion of a composed report."""
+    t = (full_text or "").strip()
+    if not t:
+        return ""
+    before_risks, _ = _split_on_last_marker(t, _RISKS_MARKER)
+    main_part, _ = _split_on_last_marker(before_risks, _OPEN_MARKER)
+    m = _DETAILED_SPLIT.search(main_part)
+    if m is None:
+        out = main_part.strip()
+    else:
+        overview = main_part[: m.start()].strip()
+        detailed = main_part[m.end():].strip()
+        out = overview or detailed
+    out = re.sub(r"\n{3,}", "\n\n", out)
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Widgets
+# ─────────────────────────────────────────────────────────────────────────
+
+
+class _BackChevronButton(ButtonBehavior, Widget):
+    """Circular back button with a chevron icon (existing device style)."""
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.meeting_id = None
-        self._summary_data = {}
-        self._actions_data = []
-        self._selected_actions = set()
-        self._auto_generate_attempted = False
-        self._current_tab = 'summary'
-        self._detail_loading = False
+        with self.canvas:
+            Color(1, 1, 1, 0.85)
+            self._bg = RoundedRectangle(pos=self.pos, size=self.size, radius=[999])
+            Color(53 / 255, 57 / 255, 59 / 255, 1)
+            self._chev = Line(points=[0, 0, 0, 0, 0, 0], width=2.4, cap="round", joint="round")
+        self.bind(pos=self._sync, size=self._sync)
+
+    def _sync(self, *_):
+        self._bg.pos = self.pos
+        self._bg.size = self.size
+        self._bg.radius = [min(self.width, self.height) / 2]
+        cx = self.x + self.width * 0.5
+        cy = self.y + self.height * 0.5
+        dx = self.width * 0.12
+        dy = self.height * 0.16
+        self._chev.points = [cx + dx, cy + dy, cx - dx, cy, cx + dx, cy - dy]
+
+
+class _Sparkle(Widget):
+    """A filled four-point star (the AI Summary glyph)."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        with self.canvas:
+            Color(*SPARKLE_FILL)
+            self._mesh = Mesh(mode="triangle_fan")
+        self.bind(pos=self._sync, size=self._sync)
+
+    def _sync(self, *_):
+        cx = self.x + self.width / 2.0
+        cy = self.y + self.height / 2.0
+        outer = min(self.width, self.height) / 2.0
+        inner = outer * 0.32
+        # Angular order: right, ne, up, nw, left, sw, down, se.
+        pts = [
+            (cx + outer, cy),
+            (cx + inner, cy + inner),
+            (cx, cy + outer),
+            (cx - inner, cy + inner),
+            (cx - outer, cy),
+            (cx - inner, cy - inner),
+            (cx, cy - outer),
+            (cx + inner, cy - inner),
+        ]
+        verts = [cx, cy, 0.0, 0.0]
+        for px, py in pts:
+            verts += [px, py, 0.0, 0.0]
+        verts += [pts[0][0], pts[0][1], 0.0, 0.0]
+        self._mesh.vertices = verts
+        self._mesh.indices = list(range(len(verts) // 4))
+
+
+class _Card(Widget):
+    """White rounded card with a soft drop shadow."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        with self.canvas:
+            Color(*CARD_SHADOW)
+            self._shadow = RoundedRectangle(pos=self.pos, size=self.size, radius=[CARD_RADIUS])
+            Color(*CARD_FILL)
+            self._rect = RoundedRectangle(pos=self.pos, size=self.size, radius=[CARD_RADIUS])
+        self.bind(pos=self._sync, size=self._sync)
+
+    def _sync(self, *_):
+        off = max(2.0, self.height * 0.01)
+        self._shadow.pos = (self.x, self.y - off)
+        self._shadow.size = self.size
+        self._shadow.radius = [CARD_RADIUS]
+        self._rect.pos = self.pos
+        self._rect.size = self.size
+        self._rect.radius = [CARD_RADIUS]
+
+
+class _MiniStatus(Widget):
+    """Compact top-right wifi + battery glyphs."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        with self.canvas:
+            Color(53 / 255, 57 / 255, 59 / 255, 1)
+            self._w1 = Line(width=2.0, cap="round")
+            self._w2 = Line(width=2.0, cap="round")
+            self._dot = RoundedRectangle(size=(0, 0), radius=[999])
+            self._batt = Line(width=2.0, joint="round")
+            Color(0.20, 0.78, 0.35, 1)
+            self._batt_fill = RoundedRectangle(size=(0, 0), radius=[2])
+        self.bind(pos=self._sync, size=self._sync)
+
+    def _sync(self, *_):
+        h = self.height
+        wifi_cx = self.x + h * 0.55
+        base_y = self.y + h * 0.30
+        # Upward-opening wifi arcs (0° = top, clockwise) + base dot.
+        self._w1.circle = (wifi_cx, base_y, h * 0.40, 305, 415)
+        self._w2.circle = (wifi_cx, base_y, h * 0.24, 305, 415)
+        d = h * 0.12
+        self._dot.pos = (wifi_cx - d / 2, base_y - d / 2)
+        self._dot.size = (d, d)
+        # Battery on the right.
+        bw = h * 1.2
+        bh = h * 0.48
+        bx = self.x + self.width - bw - h * 0.2
+        by = self.y + (h - bh) / 2.0
+        self._batt.rounded_rectangle = (bx, by, bw, bh, 3)
+        self._batt_fill.pos = (bx + 2, by + 2)
+        self._batt_fill.size = (max(0, bw * 0.7 - 2), bh - 4)
+
+
+class _ScrollText(ScrollView):
+    """Wrapping multi-line label inside a vertical ScrollView."""
+
+    def __init__(self, *, fs_ratio: float, color, font_name: str, **kwargs):
+        super().__init__(
+            do_scroll_x=False,
+            do_scroll_y=True,
+            bar_width=6,
+            bar_color=(0.42, 0.45, 0.52, 0.55),
+            bar_inactive_color=(0.42, 0.45, 0.52, 0.20),
+            scroll_type=["bars", "content"],
+            **kwargs,
+        )
+        self._label = Label(
+            text="",
+            font_name=font_name,
+            color=color,
+            halign="left",
+            valign="top",
+            markup=False,
+            size_hint=(1, None),
+        )
+        self._fs_ratio = fs_ratio
+        self._label._fs_ratio = fs_ratio  # noqa: SLF001
+        self.add_widget(self._label)
+        self.bind(size=self._sync_width)
+        self._label.bind(texture_size=self._sync_height)
+
+    def _sync_width(self, *_args):
+        self._label.text_size = (self.width, None)
+
+    def _sync_height(self, *_args):
+        self._label.height = max(self._label.texture_size[1], self.height)
+
+    @property
+    def text(self) -> str:
+        return self._label.text
+
+    @text.setter
+    def text(self, value: str) -> None:
+        self._label.text = value or ""
+
+    @property
+    def font_size(self):
+        return self._label.font_size
+
+    @font_size.setter
+    def font_size(self, value):
+        self._label.font_size = value
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Screen
+# ─────────────────────────────────────────────────────────────────────────
+
+
+class SummaryReviewScreen(BaseScreen):
+    """Minimal meeting-summary review page."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.meeting_id: Optional[str] = None
+        self._summary_data: dict = {}
+        self._meeting_title = "Meeting"
+        self._scaled_labels: list[tuple[Label, float]] = []
         self._build_ui()
 
+    # ------------------------------------------------------------------ UI
     def _build_ui(self):
-        self.root_layout = BoxLayout(orientation='vertical')
-        self.make_dark_bg(self.root_layout)
+        self._root = FloatLayout(size_hint=(1, 1))
+        attach_swirl_bg(self._root, BG_TOP, BG_BOT)
+        self._root.bind(size=self._on_root_resize)
 
-        self.status_bar = StatusBar(
-            status_text='MEETING REPORT',
-            status_color=COLORS['green'],
-            device_name='MeetingBox AI',
-            show_settings=False,
+        anchor = AnchorLayout(anchor_x="center", anchor_y="center", size_hint=(1, 1))
+        self._root.add_widget(anchor)
+        self._canvas = FloatLayout(size_hint=(None, None))
+        anchor.add_widget(self._canvas)
+
+        back_btn = _BackChevronButton(**kivy_hints(BACK_BTN))
+        back_btn.bind(on_release=lambda *_: self._on_back())
+        self._canvas.add_widget(back_btn)
+
+        self._canvas.add_widget(_MiniStatus(**kivy_hints(STATUS_BAR)))
+
+        self.title_label = self._add_label(
+            "Meeting Name", TITLE, TITLE_FS_RATIO, COL_TITLE, bold=True, halign="left",
         )
-        self.root_layout.add_widget(self.status_bar)
-
-        # Tab bar
-        tab_bar = BoxLayout(
-            orientation='horizontal',
-            size_hint=(1, None),
-            height=40,
-            padding=[SPACING['screen_padding'], 4],
-            spacing=8,
-        )
-
-        self.summary_tab_btn = SecondaryButton(
-            text='Report',
-            font_size=self.suf(FONT_SIZES['body']),
-            size_hint=(0.5, 1),
-        )
-        self.summary_tab_btn.bind(on_press=lambda _: self._switch_tab('summary'))
-        tab_bar.add_widget(self.summary_tab_btn)
-
-        self.actions_tab_btn = SecondaryButton(
-            text='Actions',
-            font_size=self.suf(FONT_SIZES['body']),
-            size_hint=(0.5, 1),
-        )
-        self.actions_tab_btn.bind(on_press=lambda _: self._switch_tab('actions'))
-        tab_bar.add_widget(self.actions_tab_btn)
-
-        self.root_layout.add_widget(tab_bar)
-
-        # Content area (swapped depending on tab)
-        self.content_area = BoxLayout(orientation='vertical', size_hint=(1, 1))
-        self.root_layout.add_widget(self.content_area)
-
-        # Bottom buttons
-        btn_row = BoxLayout(
-            orientation='horizontal',
-            size_hint=(1, None),
-            height=50,
-            padding=[SPACING['screen_padding'], 4],
-            spacing=8,
+        self.meta_label = self._add_label(
+            "Create time —", META, META_FS_RATIO, COL_META, halign="left",
         )
 
-        self.close_btn = SecondaryButton(
-            text='Close',
-            font_size=self.suf(FONT_SIZES['body']),
-            size_hint=(0.4, 1),
+        self._canvas.add_widget(_Card(**kivy_hints(CARD)))
+        self._canvas.add_widget(_Sparkle(**kivy_hints(AI_SPARKLE)))
+        self._add_label(
+            "AI Summary", AI_HEADER, AI_HEADER_FS_RATIO, COL_AI_HEADER, bold=True, halign="left",
         )
-        self.close_btn.bind(on_press=self._on_close)
-        btn_row.add_widget(self.close_btn)
 
-        self.execute_btn = PrimaryButton(
-            text='Execute Selected',
-            font_size=self.suf(FONT_SIZES['body']),
-            size_hint=(0.6, 1),
+        self.summary_scroll = _ScrollText(
+            fs_ratio=AI_BODY_FS_RATIO,
+            color=COL_BODY,
+            font_name=_FONT,
+            **kivy_hints(AI_SCROLL),
         )
-        self.execute_btn.bind(on_press=self._on_execute)
-        btn_row.add_widget(self.execute_btn)
+        self._scaled_labels.append((self.summary_scroll._label, AI_BODY_FS_RATIO))  # noqa: SLF001
+        self._canvas.add_widget(self.summary_scroll)
 
-        self.root_layout.add_widget(btn_row)
-        self.root_layout.add_widget(Widget(size_hint=(1, None), height=4))
+        self.add_widget(self._root)
+        Clock.schedule_once(lambda _dt: self._on_root_resize(self._root, self._root.size), 0)
 
-        self.add_widget(self.root_layout)
+    def _add_label(self, text, box, fs_ratio, color, *, bold=False, halign="center"):
+        lbl = Label(
+            text=text,
+            font_name=_FONT,
+            bold=bold,
+            color=color,
+            halign=halign,
+            valign="middle",
+            shorten=True,
+            shorten_from="right",
+            max_lines=1,
+            font_hinting="light",
+            font_kerning=True,
+            **kivy_hints(box),
+        )
+        lbl.bind(size=lbl.setter("text_size"))
+        self._scaled_labels.append((lbl, fs_ratio))
+        self._canvas.add_widget(lbl)
+        return lbl
 
+    def _on_root_resize(self, _root, size):
+        w, h = scaled_canvas(size[0], size[1])
+        self._canvas.size = (w, h)
+        for lbl, ratio in self._scaled_labels:
+            if lbl is None:
+                continue
+            try:
+                lbl.font_size = font_px(ratio, h)
+            except Exception:  # noqa: BLE001
+                pass
+
+    # ------------------------------------------------------------- lifecycle
     def set_meeting_data(self, meeting_id: str, summary_data: dict):
         self.meeting_id = meeting_id
-        self._summary_data = summary_data or {}
-        self._actions_data = []
-        self._selected_actions = set()
-        self._auto_generate_attempted = False
-        self._detail_loading = True
-        self._render_loading_tab()
-        self._fetch_and_merge_detail()
+        self._summary_data = dict(summary_data or {})
+        self._apply_local_data()
+        self._fetch_meeting_detail()
 
-    @staticmethod
-    def _segments_to_transcript_text(segments):
-        lines = []
-        for seg in segments or []:
-            if not isinstance(seg, dict):
-                continue
-            t = (seg.get("text") or "").strip()
-            if not t:
-                continue
-            st = float(seg.get("start_time") or 0.0)
-            mins, secs = divmod(int(st), 60)
-            spk = seg.get("speaker_id")
-            prefix = f"[{mins:02d}:{secs:02d}]"
-            if spk is not None and str(spk).strip() != "":
-                prefix += f" Speaker {spk}:"
-            lines.append(f"{prefix} {t}")
-        return "\n".join(lines)
+    def on_enter(self):
+        self._apply_local_data()
 
-    def _apply_meeting_detail(self, detail: dict):
-        """Merge GET /api/meetings/{id} into _summary_data; fall back to transcript."""
-        if not detail:
-            self._summary_data = {"summary": "Could not load this meeting."}
-            return
-        block = detail.get("summary")
-        if not isinstance(block, dict):
-            block = {}
-        segments = detail.get("segments") or []
-        report = (block.get("summary") or "").strip()
-        if not report and segments:
-            report = (
-                f"{_TRANSCRIPT_ONLY_PREFIX} — the full AI report will appear here when "
-                "analysis finishes. You can read the transcript below.\n\n"
-                + self._segments_to_transcript_text(segments)
-            )
-        elif not report:
-            report = "No report or transcript is available yet."
-        merged = {**block, "summary": report}
-        self._summary_data = merged
+    def on_leave(self):
+        pass
 
-    def _render_loading_tab(self):
-        self._current_tab = "summary"
-        self.content_area.clear_widgets()
-        self.execute_btn.opacity = 0
-        self.execute_btn.disabled = True
-        hold = BoxLayout(orientation="vertical", padding=[SPACING["screen_padding"], 24])
-        hold.add_widget(
-            Label(
-                text="Loading meeting…",
-                font_size=self.suf(FONT_SIZES["body"]),
-                color=COLORS["gray_400"],
-                halign="center",
-                valign="middle",
-                size_hint=(1, 1),
-            )
+    # --------------------------------------------------------------- data
+    def _apply_local_data(self):
+        data = self._summary_data or {}
+        title = (data.get("title") or self._meeting_title or "Meeting").strip() or "Meeting"
+        self._meeting_title = title
+        self.title_label.text = title
+        self.meta_label.text = self._format_meta_line(data)
+        self.summary_scroll.text = (
+            self._overview_summary_text()
+            or "Summary will appear here once processing finishes."
         )
-        self.content_area.add_widget(hold)
 
-    def _fetch_and_merge_detail(self):
+    def _overview_summary_text(self) -> str:
+        data = self._summary_data or {}
+        summary = data.get("summary")
+        if isinstance(summary, dict):
+            summary_text = (summary.get("summary") or "").strip()
+        else:
+            summary_text = (summary or "").strip()
+        return _summary_card_text(summary_text)
+
+    def _fetch_meeting_detail(self):
         if not self.meeting_id:
-            self._detail_loading = False
-            self._render_tab()
             return
 
         async def _run():
             try:
                 detail = await self.backend.get_meeting_detail(self.meeting_id)
-            except Exception as e:
-                logger.error("get_meeting_detail failed: %s", e)
-                detail = {}
-
-            def _done(_dt):
-                self._detail_loading = False
-                self._apply_meeting_detail(detail)
-                self._load_actions()
-                self._render_tab()
-
-            Clock.schedule_once(_done, 0)
-
-        run_async(_run())
-
-    def _load_actions(self):
-        if not self.meeting_id:
-            return
-
-        async def _fetch():
-            try:
-                actions = await self.backend.get_actions(self.meeting_id)
-
-                raw_s = (self._summary_data or {}).get("summary") or ""
-                tx_only = isinstance(raw_s, str) and raw_s.startswith(
-                    _TRANSCRIPT_ONLY_PREFIX
-                )
-                has_summary_content = bool(
-                    ((not tx_only) and str(raw_s).strip())
-                    or (self._summary_data or {}).get('action_items')
-                    or (self._summary_data or {}).get('decisions')
-                )
-                if (
-                    not actions
-                    and has_summary_content
-                    and not self._auto_generate_attempted
-                ):
-                    self._auto_generate_attempted = True
-                    try:
-                        actions = await self.backend.generate_actions(self.meeting_id)
-                    except Exception as gen_err:
-                        logger.error(f"Failed to auto-generate actions: {gen_err}")
-
-                def _update(_dt):
-                    self._actions_data = actions
-                    if self._current_tab == 'actions':
-                        self._render_actions_tab()
-                Clock.schedule_once(_update, 0)
-            except Exception as e:
-                logger.error(f"Failed to load actions: {e}")
-
-        run_async(_fetch())
-
-    @staticmethod
-    def _coerce_summary_action_items(raw):
-        out = []
-        for a in raw or []:
-            if isinstance(a, dict):
-                task = (a.get("task") or a.get("description") or "").strip()
-                if not task:
-                    task = str(a)
-                out.append({
-                    "task": task,
-                    "assignee": a.get("assignee"),
-                    "due_date": a.get("due_date"),
-                    "completed": bool(a.get("completed", False)),
-                })
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("get_meeting_detail failed: %s", exc)
+                return
+            if not isinstance(detail, dict):
+                return
+            block = detail.get("summary")
+            if isinstance(block, dict):
+                merged = {**(self._summary_data or {}), **block}
             else:
-                s = str(a).strip()
-                if s:
-                    out.append({
-                        "task": s,
-                        "assignee": None,
-                        "due_date": None,
-                        "completed": False,
-                    })
-        return out
+                merged = dict(self._summary_data or {})
+            for k in ("title", "duration", "started_at", "generated_at"):
+                if detail.get(k) is not None and merged.get(k) in (None, ""):
+                    merged[k] = detail[k]
+            self._summary_data = merged
+            Clock.schedule_once(lambda _dt: self._apply_local_data(), 0)
 
+        run_async(_run())
+
+    # ----------------------------------------------------------- formatting
     @staticmethod
-    def _effective_connector(action: dict) -> str:
-        """
-        gmail | calendar | '' — derive from connector_target and fall back to kind/type
-        so Execute still appears when the model returns mixed or alternate labels.
-        """
-        if not action:
-            return ''
-        ct = str(action.get('connector_target') or '').strip().lower()
-        if ct in ('gmail', 'calendar'):
-            return ct
-        if ct in ('google_calendar', 'gcal', 'google calendar'):
-            return 'calendar'
-        if ct in ('email', 'e-mail', 'mail'):
-            return 'gmail'
-        kind = str(action.get('kind') or '').strip().lower()
-        if kind == 'followup_email':
-            return 'gmail'
-        if kind == 'schedule_followup':
-            return 'calendar'
-        lt = str(action.get('type') or '').strip().lower()
-        if lt == 'email_draft':
-            return 'gmail'
-        if lt == 'calendar_invite':
-            return 'calendar'
-        return ''
+    def _to_ist_datetime(raw) -> datetime:
+        if isinstance(raw, (int, float)):
+            return datetime.fromtimestamp(float(raw), tz=timezone.utc).astimezone(_IST)
+        dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(_IST)
 
-    def _switch_tab(self, tab: str):
-        self._current_tab = tab
-        self._render_tab()
-
-    def _render_tab(self):
-        self.content_area.clear_widgets()
-        if self._current_tab == 'summary':
-            self._render_summary_tab()
-            self.execute_btn.opacity = 0
-            self.execute_btn.disabled = True
-        else:
-            self._render_actions_tab()
-
-    def _render_summary_tab(self):
-        scroll = ScrollView(size_hint=(1, 1))
-        content = BoxLayout(
-            orientation='vertical',
-            size_hint_y=None,
-            padding=[SPACING['screen_padding'], 8],
-            spacing=6,
-        )
-        content.bind(minimum_height=content.setter('height'))
-
-        summary_text = self._summary_data.get('summary', 'No report available.')
-        lbl = Label(
-            text=summary_text,
-            font_size=self.suf(FONT_SIZES['body']),
-            color=COLORS['white'],
-            halign='left',
-            valign='top',
-            size_hint_y=None,
-            markup=True,
-        )
-        lbl.bind(width=lambda w, val: setattr(w, 'text_size', (val, None)))
-        lbl.bind(texture_size=lambda w, ts: setattr(w, 'height', ts[1] + 8))
-        content.add_widget(lbl)
-
-        decisions = self._summary_data.get('decisions', [])
-        if decisions:
-            hdr = Label(
-                text='Decisions',
-                font_size=self.suf(FONT_SIZES['body']),
-                bold=True,
-                color=COLORS['blue'],
-                halign='left',
-                size_hint_y=None,
-                height=24,
-            )
-            hdr.bind(width=lambda w, val: setattr(w, 'text_size', (val, None)))
-            content.add_widget(hdr)
-            for d in decisions:
-                dl = Label(
-                    text=f"  - {d}",
-                    font_size=self.suf(FONT_SIZES['small']),
-                    color=COLORS['gray_300'],
-                    halign='left',
-                    valign='top',
-                    size_hint_y=None,
-                )
-                dl.bind(width=lambda w, val: setattr(w, 'text_size', (val, None)))
-                dl.bind(texture_size=lambda w, ts: setattr(w, 'height', ts[1] + 4))
-                content.add_widget(dl)
-
-        scroll.add_widget(content)
-        self.content_area.add_widget(scroll)
-
-    def _render_actions_tab(self):
-        self.content_area.clear_widgets()
-        scroll = ScrollView(size_hint=(1, 1))
-        content = BoxLayout(
-            orientation='vertical',
-            size_hint_y=None,
-            padding=[SPACING['screen_padding'], 8],
-            spacing=6,
-        )
-        content.bind(minimum_height=content.setter('height'))
-
-        self.execute_btn.opacity = 1
-
-        agentic = list(self._actions_data or [])
-        summary_items = self._coerce_summary_action_items(
-            (self._summary_data or {}).get("action_items", []),
-        )
-
-        if agentic:
-            hdr = Label(
-                text='AI actions — tap Execute on any row, or select multiple and use Execute Selected',
-                font_size=self.suf(FONT_SIZES['small']),
-                bold=True,
-                color=COLORS['blue'],
-                halign='left',
-                valign='middle',
-                size_hint_y=None,
-                height=22,
-            )
-            hdr.bind(width=lambda w, val: setattr(w, 'text_size', (val, None)))
-            content.add_widget(hdr)
-
-            for action in agentic:
-                aid = action.get('id')
-                if not aid:
-                    logger.warning('Skipping action row without id: %s', action.get('title'))
-                    continue
-
-                row = BoxLayout(
-                    orientation='horizontal',
-                    size_hint_y=None,
-                    size_hint_x=1,
-                    spacing=6,
-                    height=52,
-                )
-
-                cb = CheckBox(
-                    size_hint=(None, None),
-                    size=(28, 28),
-                    active=aid in self._selected_actions,
-                )
-                cb.bind(active=partial(self._on_action_toggle, aid))
-                row.add_widget(cb)
-
-                title = action.get('title', 'Untitled action')
-                assignee = action.get('assignee', '')
-                status = action.get('status', 'pending')
-                color = COLORS['white'] if status == 'pending' else COLORS['gray_500']
-
-                text = title
-                if assignee:
-                    text += f"  ({assignee})"
-                if status != 'pending':
-                    text += f"  [{status}]"
-
-                al = Label(
-                    text=text,
-                    font_size=self.suf(FONT_SIZES['small'] + 1),
-                    color=color,
-                    halign='left',
-                    valign='middle',
-                    size_hint=(1, 1),
-                )
-
-                def _sync_label_text_size(*_a, lbl=al, rw=row, res=_ACTION_ROW_RESERVED):
-                    w = rw.width
-                    if w and w > res:
-                        lbl.text_size = (w - res, None)
-
-                row.bind(width=_sync_label_text_size)
-                al.bind(
-                    texture_size=lambda _lbl, ts, rw=row: setattr(
-                        rw, 'height', max(52, ts[1] + 14),
-                    ),
-                )
-                row.add_widget(al)
-
-                eff = self._effective_connector(action)
-                if eff in ('calendar', 'gmail'):
-                    run_btn = SecondaryButton(
-                        text='Execute',
-                        font_size=self.suf(FONT_SIZES['small']),
-                        size_hint=(None, None),
-                        width=96,
-                        height=34,
-                    )
-                    is_pending = status == 'pending'
-                    run_btn.disabled = not is_pending
-                    run_btn.opacity = 1.0 if is_pending else 0.45
-                    run_btn.bind(on_press=partial(self._on_single_action_execute, action))
-                    row.add_widget(run_btn)
-
-                content.add_widget(row)
-                Clock.schedule_once(lambda dt, fn=_sync_label_text_size: fn(), 0)
-                Clock.schedule_once(lambda dt, fn=_sync_label_text_size: fn(), 0.2)
-
-            self.execute_btn.disabled = False
-            self.execute_btn.opacity = 1
-
-        elif summary_items:
-            hdr = Label(
-                text='Action items from report',
-                font_size=self.suf(FONT_SIZES['body']),
-                bold=True,
-                color=COLORS['blue'],
-                halign='left',
-                valign='middle',
-                size_hint_y=None,
-                height=24,
-            )
-            hdr.bind(width=lambda w, val: setattr(w, 'text_size', (val, None)))
-            content.add_widget(hdr)
-
-            note = Label(
-                text=(
-                    'These are checklist items from the report. Gmail/Calendar actions are created on the server '
-                    'with the report when you are signed in and integrations are connected. '
-                    'If the AI Actions list is still empty, connect accounts in the web app or reopen this screen.'
-                ),
-                font_size=self.suf(FONT_SIZES['small']),
-                color=COLORS['gray_500'],
-                halign='left',
-                valign='top',
-                size_hint_y=None,
-            )
-            note.bind(width=lambda w, val: setattr(w, 'text_size', (val, None)))
-            note.bind(texture_size=lambda w, ts: setattr(w, 'height', ts[1] + 4))
-            content.add_widget(note)
-
-            for item in summary_items:
-                meta_bits = []
-                if item.get('assignee'):
-                    meta_bits.append(str(item['assignee']))
-                if item.get('due_date'):
-                    meta_bits.append(str(item['due_date']))
-                meta = f" · {' · '.join(meta_bits)}" if meta_bits else ''
-                line = f"{'[x] ' if item.get('completed') else ''}{item['task']}{meta}"
-
-                al = Label(
-                    text=line,
-                    font_size=self.suf(FONT_SIZES['small'] + 1),
-                    color=COLORS['gray_300'],
-                    halign='left',
-                    valign='top',
-                    size_hint_y=None,
-                )
-                al.bind(width=lambda w, val: setattr(w, 'text_size', (val, None)))
-                al.bind(texture_size=lambda w, ts: setattr(w, 'height', ts[1] + 6))
-                content.add_widget(al)
-
-            self.execute_btn.disabled = True
-            self.execute_btn.opacity = 0.45
-
-        else:
-            empty = Label(
-                text='No action items found.',
-                font_size=self.suf(FONT_SIZES['body']),
-                color=COLORS['gray_500'],
-                halign='center',
-                size_hint_y=None,
-                height=40,
-            )
-            content.add_widget(empty)
-            self.execute_btn.disabled = True
-            self.execute_btn.opacity = 0.45
-
-        scroll.add_widget(content)
-        self.content_area.add_widget(scroll)
-
-    def _on_action_toggle(self, action_id, checkbox, value):
-        if value:
-            self._selected_actions.add(action_id)
-        else:
-            self._selected_actions.discard(action_id)
-
-    def _on_single_action_execute(self, action, _inst):
-        """Run one agentic action: calendar → create event; gmail → save draft only."""
-        action_id = action.get('id')
-        if not action_id:
-            return
-        eff = self._effective_connector(action)
-        if eff not in ('gmail', 'calendar'):
-            return
-        if (action.get('status') or 'pending') != 'pending':
-            return
-        create_draft = eff == 'gmail'
-
-        async def _run():
+    def _format_meta_line(self, data: dict) -> str:
+        created = ""
+        raw = data.get("generated_at") or data.get("started_at")
+        if raw:
             try:
-                await self.backend.execute_action(action_id, create_draft=create_draft)
-                msg = (
-                    'Calendar event was created. Check Google Calendar.'
-                    if not create_draft
-                    else 'Email draft was saved. Open Gmail → Drafts.'
-                )
+                dt = self._to_ist_datetime(raw)
+                created = dt.strftime("%I:%M %p").lstrip("0")
+            except Exception:  # noqa: BLE001
+                created = ""
+        created_part = f"Create time {created}" if created else "Create time —"
 
-                def _after_ok(_dt):
-                    self._load_actions()
-                    dlg = ModalDialog(
-                        title='Done',
-                        message=msg,
-                        confirm_text='OK',
-                        cancel_text='',
-                        on_confirm=lambda: None,
-                    )
-                    self.add_widget(dlg)
+        duration_part = ""
+        try:
+            seconds = max(0, int(float(data.get("duration") or 0)))
+        except (TypeError, ValueError):
+            seconds = 0
+        if seconds >= 60:
+            duration_part = f"{seconds // 60} min"
+        elif seconds > 0:
+            duration_part = f"{seconds} sec"
 
-                Clock.schedule_once(_after_ok, 0)
-            except Exception as e:
-                # Python 3.12+ deletes `e` after this block; capture text before scheduling UI.
-                err_text = (str(e) or 'Could not complete action. Try the web dashboard.')[:500]
-                logger.error("Single action execute failed %s: %s", action_id, err_text)
+        if duration_part:
+            return f"{created_part}    \u2022    {duration_part}"
+        return created_part
 
-                def _err(_dt):
-                    dlg = ModalDialog(
-                        title='Action failed',
-                        message=err_text,
-                        confirm_text='OK',
-                        cancel_text='',
-                        on_confirm=lambda: None,
-                    )
-                    self.add_widget(dlg)
-
-                Clock.schedule_once(_err, 0)
-
-        run_async(_run())
-
-    def _on_close(self, _inst):
-        self.goto('home', transition='fade')
-
-    def _on_execute(self, _inst):
-        if not self._selected_actions:
-            return
-
-        async def _run():
-            for action_id in list(self._selected_actions):
-                try:
-                    act = next(
-                        (a for a in (self._actions_data or []) if a.get('id') == action_id),
-                        None,
-                    )
-                    eff = self._effective_connector(act or {})
-                    if eff not in ('gmail', 'calendar'):
-                        continue
-                    await self.backend.execute_action(
-                        action_id,
-                        create_draft=(eff == 'gmail'),
-                    )
-                except Exception as e:
-                    logger.error(f"Failed to execute action {action_id}: {e}")
-
-        run_async(_run())
-
-        self._selected_actions.clear()
-        dialog = ModalDialog(
-            title='Actions Queued',
-            message=(
-                'Calendar selections create events. Gmail selections save drafts only '
-                '(not sent). Check your Gmail Drafts and the dashboard.\n'
-                f'Dashboard: {DASHBOARD_URL}'
-            ),
-            confirm_text='OK',
-            cancel_text='',
-            on_confirm=lambda: self.goto('home', transition='fade'),
-        )
-        self.add_widget(dialog)
-
-    def on_enter(self):
-        self._current_tab = 'summary'
-        if self._detail_loading:
-            return
-        if self.meeting_id:
-            self._detail_loading = True
-            self._render_loading_tab()
-            self._fetch_and_merge_detail()
-        else:
-            self._render_tab()
+    # ------------------------------------------------------------- handlers
+    def _on_back(self):
+        self.goto("home", transition="fade")

@@ -7,3 +7,25 @@ venv/
 .venv/
 *.egg-info
 README.md
+
+# Tests / dev-only — not needed inside the appliance image (shrinks build context & COPY layer)
+tests/
+**/tests/
+
+# Editor / tooling
+.idea/
+.vscode/
+.cursor/
+
+# Docs (optional — keeps tar-to-daemon smaller)
+*.md
+docs/
+
+# Common junk that sometimes lands in the folder
+dist/
+build/
+coverage/
+htmlcov/
+.tox/
+*.log
+Dockerfile.debug

@@ -7,7 +7,10 @@ WebSocket connections) to work alongside Kivy's synchronous event loop.
 """
 
 import asyncio
+import logging
 import threading
+
+logger = logging.getLogger(__name__)
 
 _async_loop = None
 _async_thread = None
@@ -43,7 +46,17 @@ def run_async(coro):
         concurrent.futures.Future that can be used to get the result
     """
     if _async_loop and _async_loop.is_running():
-        return asyncio.run_coroutine_threadsafe(coro, _async_loop)
+        fut = asyncio.run_coroutine_threadsafe(coro, _async_loop)
+
+        def _log_exc(f):
+            if not f.done() or f.cancelled():
+                return
+            exc = f.exception()
+            if exc is not None:
+                logger.error("Background async task failed", exc_info=exc)
+
+        fut.add_done_callback(_log_exc)
+        return fut
     return None
 
 

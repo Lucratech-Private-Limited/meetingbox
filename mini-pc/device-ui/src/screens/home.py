@@ -1,32 +1,43 @@
-"""Premium MeetingBox home screen — reference-style AI dashboard."""
+"""Home screen — pixel-perfect Figma 390:187 (yJqcY4KovVjJ11vjysW533).
+
+Figma frame: 1260 × 800 px (landscape).  Every coordinate, dimension, font
+size, and colour is taken directly from the Figma node data.  Live data
+(clock, weather, meetings, voice state) updates at runtime exactly as before.
+"""
 
 from __future__ import annotations
 
-from datetime import datetime
+import asyncio
+import logging
+import math
+import time
+from datetime import datetime, timedelta
 
+from kivy.animation import Animation
 from kivy.clock import Clock
-from kivy.graphics import Color, Ellipse, Line, Rectangle, RoundedRectangle
-from kivy.uix.boxlayout import BoxLayout
-from kivy.uix.button import Button
+from kivy.core.image import Image as CoreImage
+from kivy.graphics import (
+    Color, Ellipse, Line, PopMatrix, PushMatrix, Rectangle,
+    RoundedRectangle, Scale,
+)
+from kivy.properties import NumericProperty
+from kivy.uix.behaviors import ButtonBehavior
 from kivy.uix.floatlayout import FloatLayout
 from kivy.uix.image import Image
 from kivy.uix.label import Label
 from kivy.uix.widget import Widget
 
 from async_helper import run_async
-from components.button import PrimaryButton, SecondaryButton
+from api_client import _GMAIL_RECENT_DAYS, summarize_gmail_feed_for_home
 from components.modal_dialog import ModalDialog
 from components.text_input_dialog import TextInputDialog
 from config import (
     ASSETS_DIR,
     COLORS,
     DASHBOARD_URL,
+    DISPLAY_HEIGHT,
     DISPLAY_WIDTH,
-    FONT_SIZES,
-    SPACING,
     display_now,
-    home_layout_horizontal_scale,
-    home_layout_vertical_scale,
     to_display_local,
 )
 from local_network import get_primary_ipv4
@@ -34,606 +45,1846 @@ from network_util import linux_ethernet_ready
 from screens.base_screen import BaseScreen
 from weather_client import get_weather_client
 
-_FIGMA_DIR = ASSETS_DIR / 'home' / 'figma'
+# Lazy import of _categorize to avoid circulars — imported inside _load_tasks_count
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Figma design constants (frame 390:187, 1260 × 800 px)
+# ---------------------------------------------------------------------------
+_FW = 1260.0
+_FH = 800.0
+
+_FIGMA_DIR = ASSETS_DIR / "home" / "figma"
+
+# Colours from Figma
+_WHITE = (1.0, 1.0, 1.0, 1.0)
+_MUTED = (0.714, 0.729, 0.949, 1.0)   # #B6BAF2
+_BLUE  = (0.0, 0.420, 0.976, 1.0)     # #006BF9 / #006FFF
+_BLUE2 = (0.204, 0.506, 0.945, 1.0)   # #3481F1  next-up section
+_GREY  = (0.643, 0.643, 0.675, 1.0)   # #A4A4AC  section headers
+
+# Card backgrounds / borders (approximated from Figma gradients)
+_CARD_BG     = (0.004, 0.067, 0.216, 1.0)   # #011137 (top of gradient)
+_CARD_BORDER = (0.137, 0.161, 0.259, 1.0)   # #232942 — subtle dark navy, between Figma gradient stops
+_HERO_BG     = (0.004, 0.047, 0.145, 1.0)   # #010C25 (solid fill)
+_PILL_BG     = (0.0,   0.059, 0.200, 1.0)   # #000F33 (pill gradient start)
+_ROW_BG      = (0.004, 0.043, 0.149, 1.0)   # #010B26 (brief row bg)
+_ROW_BORDER  = (0.106, 0.137, 0.212, 1.0)   # #1B2336 (brief row border)
+
+# Font families registered in main.py via _register_asta_fonts()
+_FONT    = "42dot-Sans"   # Regular + Bold
+_FONT_SB = "42dot-SB"    # SemiBold
+_FONT_MD = "42dot-Med"   # Medium
 
 
-def _figma_png(filename: str) -> str:
-    """Return absolute path to PNG in assets/home/figma/ if it exists."""
-    p = _FIGMA_DIR / filename
-    return str(p) if p.is_file() else ''
+# ---------------------------------------------------------------------------
+# Coordinate helpers  (Figma absolute px → Kivy FloatLayout fractions)
+# ---------------------------------------------------------------------------
+
+def _x(px: float) -> float:
+    return px / _FW
 
 
-def _hero_background_path() -> str:
-    """Prefer full Figma hero art (figma/hero_background.png), else legacy single export."""
-    p = ASSETS_DIR / 'home' / 'figma' / 'hero_background.png'
-    if p.is_file():
-        return str(p)
-    p2 = ASSETS_DIR / 'home' / 'figma_home_hero.png'
-    return str(p2) if p2.is_file() else ''
+def _y(top: float, h: float) -> float:
+    return max(0.0, (_FH - top - h) / _FH)
 
 
-_NAVY_BG = (0.004, 0.030, 0.102, 1)       # #01081A
-_CARD_TOP = (0.004, 0.067, 0.216, 0.96)   # #011137
-_CARD_BOTTOM = (0.000, 0.039, 0.149, 0.98)
-_CARD_INNER = (0.004, 0.043, 0.149, 0.94)
-_FIGMA_BORDER = (0.247, 0.259, 0.325, 1)  # #3F4253
-_FIGMA_TEXT_MUTED = (0.714, 0.729, 0.949, 1)  # #B6BAF2
+def _sw(px: float) -> float:
+    return px / _FW
 
 
-def _hv(px):
-    return max(1, int(round(float(px) * home_layout_vertical_scale())))
+def _sh(px: float) -> float:
+    return px / _FH
 
 
-def _hh(px):
-    return max(1, int(round(float(px) * home_layout_horizontal_scale())))
+def _ff(fs: float) -> int:
+    scale = min(DISPLAY_WIDTH / _FW, DISPLAY_HEIGHT / _FH)
+    return max(6, round(fs * scale))
 
 
-def _hf(fs):
-    return max(6, int(round(float(fs) * home_layout_vertical_scale())))
+# ---------------------------------------------------------------------------
+# Asset helper
+# ---------------------------------------------------------------------------
+
+def _fp(name: str) -> str:
+    p = _FIGMA_DIR / name
+    return str(p) if p.is_file() else ""
 
 
-def _hmin(px: float) -> int:
-    """Design px scaled by min of home H/V factors so circular icons stay square."""
-    s = min(home_layout_horizontal_scale(), home_layout_vertical_scale())
-    return max(1, int(round(float(px) * s)))
+# ---------------------------------------------------------------------------
+# Gradient fill helper (creates a 1×2 texture → vertical gradient in Kivy)
+# ---------------------------------------------------------------------------
+
+_GRAD_CACHE: dict = {}
 
 
-def _format_home_next_meeting(next_meeting) -> tuple[str, str]:
-    if not next_meeting:
-        return 'No focus loaded', 'Ask Tony for a briefing'
-    title = (next_meeting.get('title') or 'Calendar event').strip() or 'Calendar event'
-    start = (next_meeting.get('start') or '').strip()
-    if not start:
-        return title, 'Time not set'
-    try:
-        if 'T' in start:
-            dt = datetime.fromisoformat(start.replace('Z', '+00:00'))
-            line = to_display_local(dt).strftime('%I:%M %p').lstrip('0')
-        else:
-            d = datetime.strptime(start[:10], '%Y-%m-%d')
-            line = d.strftime('%b %d · all day')
-        return title, line
-    except Exception:
-        return title, start
+def _grad(top: tuple, bot: tuple):
+    """Return a cached 1×2 Texture that produces a vertical gradient fill."""
+    from kivy.graphics.texture import Texture  # local import – Kivy not ready at module load
+    key = (top, bot)
+    if key not in _GRAD_CACHE:
+        tex = Texture.create(size=(1, 2), colorfmt="rgba")
+        def _b(c): return [min(255, max(0, int(x * 255))) for x in c]
+        # Kivy blit_buffer is bottom-up: first row = bottom of shape
+        tex.blit_buffer(bytes(_b(bot) + _b(top)), colorfmt="rgba", bufferfmt="ubyte")
+        tex.mag_filter = "linear"
+        tex.min_filter = "linear"
+        tex.wrap = "clamp_to_edge"
+        _GRAD_CACHE[key] = tex
+    return _GRAD_CACHE[key]
 
+
+# Gradient stop colours (all from Figma)
+_CARD_TOP = (0.00392, 0.06667, 0.21569, 1.0)   # #011137  card gradient top
+_CARD_BOT = (0.0,     0.03922, 0.14902, 1.0)   # #000A26  card gradient bottom
+_PILL_TOP = (0.0,     0.05882, 0.20000, 1.0)   # #000F33  pill top
+_PILL_BOT = (0.0,     0.03922, 0.14902, 1.0)   # #000A26  pill bottom
+_REC_TOP  = (0.0,     0.21961, 0.71373, 1.0)   # #0038B6  recording btn top
+_REC_BOT  = (0.0,     0.13725, 0.46275, 1.0)   # #002376  recording btn bottom
+
+
+# ---------------------------------------------------------------------------
+# Circular image widget (renders an image clipped to an ellipse)
+# ---------------------------------------------------------------------------
+
+class _CircularImg(Widget):
+    """Renders *source* as a circle/ellipse using canvas Ellipse + texture."""
+
+    def __init__(self, source: str, **kw):
+        super().__init__(**kw)
+        self._src = source
+        self._tex = None
+        self.bind(pos=self._draw, size=self._draw)
+        Clock.schedule_once(self._draw, 0)
+
+    def _draw(self, *_):
+        if not self._src:
+            return
+        self.canvas.clear()
+        with self.canvas:
+            try:
+                if self._tex is None:
+                    self._tex = CoreImage(self._src).texture
+                Color(1, 1, 1, 1)
+                Ellipse(pos=self.pos, size=self.size, texture=self._tex)
+            except Exception as exc:
+                logger.debug("_CircularImg load failed %s: %s", self._src, exc)
+
+
+# ---------------------------------------------------------------------------
+# Scalable image widget (canvas-transform scale, layout unchanged)
+# ---------------------------------------------------------------------------
+
+class _ScalableImage(Widget):
+    """Renders a PNG image and supports smooth CSS-style scale animation.
+
+    ``orb_scale`` drives a PushMatrix/Scale/PopMatrix canvas transform so the
+    visual size changes without affecting the FloatLayout positions of siblings.
+    """
+    orb_scale = NumericProperty(1.0)
+
+    def __init__(self, source: str, **kw):
+        super().__init__(**kw)
+        self._tex = None
+        try:
+            self._tex = CoreImage(source).texture
+        except Exception as exc:
+            logger.debug("_ScalableImage load %s: %s", source, exc)
+        with self.canvas:
+            PushMatrix()
+            self._sc = Scale(1, 1, 1)
+            Color(1, 1, 1, 1)
+            self._rect = Rectangle(pos=self.pos, size=self.size,
+                                   texture=self._tex)
+            PopMatrix()
+        self.bind(pos=self._sync, size=self._sync, orb_scale=self._sync_scale)
+        Clock.schedule_once(self._sync, 0)
+
+    def _sync_scale(self, *_):
+        cx, cy = self.center
+        self._sc.origin = (cx, cy, 0)
+        self._sc.x = self.orb_scale
+        self._sc.y = self.orb_scale
+
+    def _sync(self, *_):
+        self._rect.pos = self.pos
+        self._rect.size = self.size
+        self._sync_scale()
+
+
+
+
+# ---------------------------------------------------------------------------
+# Figma waveform widget — 7 animated bars matching SVG node 927:543 exactly
+# ---------------------------------------------------------------------------
+
+class _FigmaWaveform(Widget):
+    """Animated waveform that reproduces the exact 7-bar bi:soundwave SVG from Figma.
+
+    Bar x-centres, widths, and base heights are parsed directly from SVG node 927:543
+    (viewBox 0 0 46 46). Color is #006BF9 exactly as in Figma. Each bar oscillates
+    independently; ``update_bars(t, amplitude)`` is called at ~30 fps.
+    """
+
+    # (x_centre, base_height) in the 46×46 SVG viewBox — directly from Figma SVG paths
+    _BAR_DATA = [
+        (7.185,  8.625),   # outermost left
+        (12.935, 14.375),
+        (18.685, 22.999),
+        (24.435, 34.499),  # centre / tallest
+        (30.185, 22.999),
+        (35.935, 14.375),
+        (41.685, 8.625),   # outermost right
+    ]
+    _BAR_W  = 2.875    # bar width in viewBox units (= corner radius × 2 → fully-rounded ends)
+    _VB     = 46.0     # viewBox side length
+    _CY_VB  = 23.0     # y-centre of every bar in the viewBox
+    # Symmetric phase offsets so the wave appears to spread outward from the centre
+    _PHASES = [3.0, 2.2, 1.4, 0.0, 1.4, 2.2, 3.0]
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self._bar_rects: list = []
+        self._scale:     float = 1.0
+        self._bar_w_px:  float = 1.0
+        self._bar_cxy:   list  = []
+        self._setup_canvas()
+        self.bind(pos=self._on_resize, size=self._on_resize)
+        Clock.schedule_once(self._on_resize, 0)
+
+    def _setup_canvas(self):
+        with self.canvas:
+            self._color_inst = Color(0.0, 0.420, 0.976, 1.0)  # #006BF9
+            self._bar_rects = [
+                RoundedRectangle(pos=(0, 0), size=(1, 1), radius=[0.5])
+                for _ in self._BAR_DATA
+            ]
+
+    def _on_resize(self, *_):
+        w, h = self.size
+        px, py = self.pos
+        if w <= 0 or h <= 0:
+            return
+        s  = min(w / self._VB, h / self._VB)
+        ox = px + (w - self._VB * s) / 2
+        oy = py + (h - self._VB * s) / 2
+        self._scale    = s
+        self._bar_w_px = self._BAR_W * s
+        self._bar_cxy  = [
+            (ox + cx * s, oy + self._CY_VB * s)
+            for cx, _ in self._BAR_DATA
+        ]
+        # Render bars at their Figma baseline heights
+        r = self._bar_w_px / 2
+        for i, rect in enumerate(self._bar_rects):
+            cx_px, cy_px = self._bar_cxy[i]
+            bh_px = self._BAR_DATA[i][1] * s
+            rect.pos    = (cx_px - self._bar_w_px / 2, cy_px - bh_px / 2)
+            rect.size   = (self._bar_w_px, bh_px)
+            rect.radius = [r]
+
+    def update_bars(self, t: float, amplitude: float) -> None:
+        """Animate bar heights at ~30 fps.
+
+        Each bar breathes with a symmetric phase offset.  ``amplitude`` (0–1) scales
+        both the peak height *and* the oscillation speed so louder voice → taller +
+        faster movement, matching the original design intent.
+        """
+        if not self._bar_rects or not self._bar_cxy:
+            return
+        s   = self._scale
+        bwp = self._bar_w_px
+        r   = bwp / 2
+        amp = max(0.0, min(1.0, amplitude))
+
+        for i, rect in enumerate(self._bar_rects):
+            cx_px, cy_px = self._bar_cxy[i]
+            base_h_px    = self._BAR_DATA[i][1] * s
+            phase        = self._PHASES[i]
+
+            # Gentle idle oscillation (always visible even at zero amplitude)
+            idle = 1.0 + 0.10 * math.sin(t * 3.0 + phase)
+            # Voice-reactive: louder → taller, faster
+            vspeed = 5.0 + amp * 12.0
+            voice  = amp * 1.2 * abs(math.sin(t * vspeed + phase))
+
+            h_px = base_h_px * idle * (1.0 + voice)
+            rect.pos    = (cx_px - bwp / 2, cy_px - h_px / 2)
+            rect.size   = (bwp, h_px)
+            rect.radius = [r]
+
+
+# ---------------------------------------------------------------------------
+# Label factory
+# ---------------------------------------------------------------------------
+
+def _lbl(text, font, size, color, *, bold=False, halign="left", valign="top",
+         **kw) -> Label:
+    lbl = Label(text=text, font_name=font, font_size=size, bold=bold,
+                color=color, halign=halign, valign=valign, **kw)
+    lbl.bind(size=lbl.setter("text_size"))
+    return lbl
+
+
+# ---------------------------------------------------------------------------
+# Formatting helpers
+# ---------------------------------------------------------------------------
 
 def _greeting_name(name: str) -> str:
     hour = display_now().hour
-    greet = 'Good morning' if hour < 12 else 'Good afternoon' if hour < 17 else 'Good evening'
-    return f'{greet}, {name or "Stark"}'
+    greet = (
+        "Good morning" if hour < 12
+        else "Good afternoon" if hour < 17
+        else "Good evening"
+    )
+    return f"{greet}, {name or 'there'}"
 
 
-class _VoiceOrb(FloatLayout):
-    def __init__(self, **kwargs):
-        kwargs.setdefault('size_hint', (None, None))
-        super().__init__(**kwargs)
-        self._phase = 0.0
-        with self.canvas.before:
-            self._glow_color = Color(0.12, 0.42, 1.0, 0.24)
-            self._glow = Ellipse(pos=self.pos, size=self.size)
-            self._ring_color = Color(0.28, 0.60, 1.0, 0.70)
-            self._ring = Line(circle=(self.center_x, self.center_y, self.width / 2.2), width=2)
-            self._inner_color = Color(0.04, 0.10, 0.22, 1)
-            self._inner = Ellipse(pos=self.pos, size=self.size)
-        self.bind(pos=self._sync, size=self._sync)
-        Clock.schedule_interval(self._tick, 1 / 24)
-        src = _figma_png('icon_voice_orb_bar.png')
-        if src:
-            self.add_widget(
-                Image(
-                    source=src,
-                    fit_mode='contain',
-                    size_hint=(0.58, 0.58),
-                    pos_hint={'center_x': 0.5, 'center_y': 0.5},
+def _format_next_meeting(nm) -> tuple[str, str]:
+    if not nm:
+        return "", ""
+    title = (nm.get("title") or "Calendar event").strip() or "Calendar event"
+    tnorm = title.lower().replace("_", " ").strip()
+    if tnorm in ("schedule request", "schedule requested"):
+        return "", ""
+    start = (nm.get("start") or "").strip()
+    if not start:
+        return "", ""
+    try:
+        if "T" in start:
+            dt = datetime.fromisoformat(start.replace("Z", "+00:00"))
+            local_dt = to_display_local(dt)
+            if local_dt.date() != display_now().date():
+                return "", ""
+            line = local_dt.strftime("%I:%M %p").lstrip("0")
+        else:
+            d = datetime.strptime(start[:10], "%Y-%m-%d")
+            if d.date() != display_now().date():
+                return "", ""
+            line = d.strftime("%b %d · all day")
+        return title, line
+    except Exception:
+        return "", ""
+
+
+def _pick_next_today_meeting_from_week(week_payload: dict | None) -> dict | None:
+    """Pick the next meeting from today's calendar-week bucket."""
+    if not isinstance(week_payload, dict):
+        return None
+    days = week_payload.get("days")
+    if not isinstance(days, dict):
+        return None
+    today_key = display_now().date().isoformat()
+    rows = (days.get(today_key) or {}).get("meetings") or []
+    if not isinstance(rows, list) or not rows:
+        return None
+    now_local = display_now()
+    parsed: list[tuple[datetime, dict]] = []
+    for m in rows:
+        if not isinstance(m, dict):
+            continue
+        raw = (m.get("start") or m.get("start_time") or "").strip()
+        if not raw:
+            continue
+        try:
+            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            loc = to_display_local(dt)
+            parsed.append((loc, m))
+        except Exception:
+            continue
+    if not parsed:
+        return None
+    parsed.sort(key=lambda x: x[0])
+    for dt, row in parsed:
+        if dt >= now_local:
+            return row
+    # If all events are in the past, show today's latest one.
+    return parsed[-1][1]
+
+
+# ---------------------------------------------------------------------------
+# Card base widget (FloatLayout with rounded bg + border)
+# ---------------------------------------------------------------------------
+
+class _TappableCard(ButtonBehavior, FloatLayout):
+    """_Card variant that also acts as a button (on_release fires).
+
+    draw_bg=False skips the canvas background so callers can supply their own
+    PNG background (avoids double-stacked rounded rectangles).
+    """
+
+    def __init__(self, top=None, bot=None, border=None, radius=12, draw_bg=True, **kw):
+        _top = kw.pop("bg", top)
+        if _top is None:
+            _top = _CARD_TOP
+        if bot is None:
+            bot = _CARD_BOT
+        _brd = border if border is not None else _CARD_BORDER
+        super().__init__(**kw)
+        self._r = radius
+        if draw_bg:
+            with self.canvas.before:
+                Color(1, 1, 1, 1)
+                self._bg_rect = RoundedRectangle(
+                    pos=self.pos, size=self.size, radius=[radius],
+                    texture=_grad(_top, bot),
                 )
-            )
+            # Border on top of children so it shows over background images
+            with self.canvas.after:
+                Color(*_brd)
+                self._line = Line(
+                    rounded_rectangle=(self.x, self.y, self.width, self.height, radius),
+                    width=1.0,
+                )
+            self.bind(pos=self._sync, size=self._sync)
+        else:
+            self._bg_rect = None
+            self._line = None
 
-    def _sync(self, *_args):
-        pad = min(self.width, self.height) * 0.18
-        self._glow.pos = self.pos
-        self._glow.size = self.size
-        self._inner.pos = (self.x + pad, self.y + pad)
-        self._inner.size = (max(1, self.width - pad * 2), max(1, self.height - pad * 2))
-        self._ring.circle = (self.center_x, self.center_y, max(1, self.width / 2.35))
-
-    def _tick(self, dt):
-        self._phase = (self._phase + dt) % 2.0
-        pulse = 0.5 + 0.5 * abs(1.0 - self._phase)
-        self._glow_color.a = 0.15 + pulse * 0.20
-        self._ring_color.a = 0.45 + pulse * 0.30
+    def _sync(self, *_):
+        if self._bg_rect is None:
+            return
+        r = self._r
+        self._bg_rect.pos    = self.pos
+        self._bg_rect.size   = self.size
+        self._bg_rect.radius = [r]
+        self._line.rounded_rectangle = (self.x, self.y, self.width, self.height, r)
 
 
-class _GlassCard(BoxLayout):
-    def __init__(
-        self,
-        radius=24,
-        fill=None,
-        bg_image=None,
-        image_opacity=0.0,
-        **kwargs,
-    ):
-        super().__init__(**kwargs)
-        self._radius = radius
-        self._bg_image = str(bg_image) if bg_image else ''
+class _Card(FloatLayout):
+    def __init__(self, top=None, bot=None, border=None, radius=12, **kw):
+        _top = kw.pop("bg", top)
+        if _top is None:
+            _top = _CARD_TOP
+        if bot is None:
+            bot = _CARD_BOT
+        _brd = border if border is not None else _CARD_BORDER
+        super().__init__(**kw)
+        self._r = radius
         with self.canvas.before:
-            Color(0, 0, 0, 0.20)
-            self._shadow = RoundedRectangle(pos=(self.x + 1, self.y - 3), size=self.size, radius=[radius])
-            Color(*(fill or _CARD_BOTTOM))
-            self._bg_bottom = RoundedRectangle(pos=self.pos, size=self.size, radius=[radius])
-            Color(*_CARD_TOP)
-            self._bg_top = RoundedRectangle(pos=(self.x, self.y + self.height * 0.48), size=(self.width, self.height * 0.52), radius=[radius, radius, 0, 0])
-            if self._bg_image:
-                Color(1, 1, 1, image_opacity)
-                self._image = Rectangle(pos=self.pos, size=self.size, source=self._bg_image)
-                Color(0, 0, 0, 0.18)
-                self._image_scrim = RoundedRectangle(pos=self.pos, size=self.size, radius=[radius])
-            else:
-                self._image = None
-                self._image_scrim = None
-            Color(*_FIGMA_BORDER)
-            self._stroke = Line(rounded_rectangle=(self.x, self.y, self.width, self.height, radius), width=1)
+            Color(1, 1, 1, 1)
+            self._bg = RoundedRectangle(
+                pos=self.pos, size=self.size, radius=[radius],
+                texture=_grad(_top, bot),
+            )
+        # Border lives in canvas.after → renders on top of child widgets
+        # (e.g. the hero background image won't cover the border line).
+        with self.canvas.after:
+            Color(*_brd)
+            self._line = Line(
+                rounded_rectangle=(self.x, self.y, self.width, self.height, radius),
+                width=1.0,
+            )
         self.bind(pos=self._sync, size=self._sync)
 
-    def _sync(self, *_args):
-        self._shadow.pos = (self.x + 1, self.y - 3)
-        self._shadow.size = self.size
-        self._bg_bottom.pos = self.pos
-        self._bg_bottom.size = self.size
-        self._bg_top.pos = (self.x, self.y + self.height * 0.48)
-        self._bg_top.size = (self.width, self.height * 0.52)
-        if self._image is not None:
-            self._image.pos = self.pos
-            self._image.size = self.size
-        if self._image_scrim is not None:
-            self._image_scrim.pos = self.pos
-            self._image_scrim.size = self.size
-        self._stroke.rounded_rectangle = (self.x, self.y, self.width, self.height, self._radius)
+    def _sync(self, *_):
+        r = self._r
+        self._bg.pos    = self.pos
+        self._bg.size   = self.size
+        self._bg.radius = [r]
+        self._line.rounded_rectangle = (self.x, self.y, self.width, self.height, r)
 
+
+# ---------------------------------------------------------------------------
+# Morning-brief sub-row (dark card within the brief card)
+# ---------------------------------------------------------------------------
+
+class _BriefCardRow(_Card):
+    def __init__(self, **kw):
+        # Brief sub-rows use a solid dark bg (both gradient stops equal)
+        kw.setdefault("top",    _ROW_BG)
+        kw.setdefault("bot",    _ROW_BG)
+        kw.setdefault("border", _ROW_BORDER)
+        kw.setdefault("radius", _ff(16.82))
+        super().__init__(**kw)
+
+
+# ---------------------------------------------------------------------------
+# Data-holder structs (for backwards-compatible _load_home_summary references)
+# ---------------------------------------------------------------------------
+
+class _CardData:
+    """Gives .value_label / .text_label / ._more_label access to bottom chips."""
+    def __init__(self, value_label, text_label=None):
+        self.value_label  = value_label
+        self.text_label   = text_label
+        self._more_label  = None
+
+
+class _BriefRowData:
+    """Gives .title_label / .subtitle_label access to brief rows."""
+    def __init__(self, title: Label, sub: Label):
+        self.title_label    = title
+        self.subtitle_label = sub
+
+
+# ===========================================================================
+# HomeScreen
+# ===========================================================================
 
 class HomeScreen(BaseScreen):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self._clock_event = None
-        self._footer_ip_event = None
-        self._voice_state_event = None
-        self._footer_kwargs = {}
-        self._latest_meeting_id = None
-        # Set by _load_system_status — when True, weather updates do NOT
-        # overwrite the offline / backend-down message in the health label.
-        self._health_label_offline = False
+    """Main dashboard — Figma 390:187, 1260 × 800 px."""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+
+        # Public label refs (accessed by business-logic helpers)
+        self.greeting_label:      Label | None = None
+        self._big_clock_hm:       Label | None = None
+        self.date_label:          Label | None = None
+        self.health_label:        Label | None = None  # temperature / offline
+        self._wx_condition:       Label | None = None
+        self.next_time_label:     Label | None = None
+        self.next_title_label:    Label | None = None
+        self.more_label:          Label | None = None
+        self.voice_dot:           Label | None = None
+        self.voice_state_label:   Label | None = None
+        self.last_title_label:    Label | None = None
+        self.last_meta_label:     Label | None = None
+        self.last_actions_label:  Label | None = None
+        self.schedule_card:       _CardData | None = None
+        self.email_card:          _CardData | None = None
+        self.tasks_card:          _CardData | None = None
+        self.brief_calendar_label: _BriefRowData | None = None
+        self.brief_email_label:   _BriefRowData | None = None
+        self._brief_wx_title:     Label | None = None
+        self._brief_wx_sub:       Label | None = None
+        self._latest_meeting_id:  str | None = None
+        self._health_label_offline: bool = False
+        self._footer_kwargs:      dict | None = None
+
+        # Clock / event handles
+        self._clock_event:       object | None = None
+        self._footer_ip_event:   object | None = None
+        self._voice_state_event: object | None = None
+        self._summary_poll_event: object | None = None
+        self._home_cache_subscribed: bool = False
+
+        # "Meeting summary is ready" notification (polls the app-level
+        # processing-summary cache populated after a recording is summarised).
+        self._summary_ready_popup: FloatLayout | None = None
+        self._shown_summary_ids: set[str] = set()
+
+        # Status strip widget refs (Icon instances from components/icons.py)
+        self._sts_battery: object | None = None   # battery Icon
+        self._sts_bat_lbl: Label | None  = None   # "87%" label next to battery icon
+        self._sts_wifi:    object | None = None   # wifi Icon
+        self._sts_bt:      object | None = None   # bluetooth Icon
+
+        # Voice interaction widgets and state
+        self._listening_pill:    object | None = None  # the pill _Card
+        self._soundwave_wf:      _FigmaWaveform | None = None
+        self._voice_orb:         _ScalableImage | None = None
+        self._listening_active:  bool = False
+        self._current_amplitude: float = 0.0
+        self._soundwave_tick_ev: object | None = None
+
+        # Say-bar state machine
+        self._say_bar_active:    bool = False
+        self._say_bar_card:      FloatLayout | None = None  # the bar _Card
+        self._say_bar_prompts:   list = []                  # idle prompt widgets
+        self._orb_idle_ph:       dict = {}                  # orb pos_hint in idle
+        self._orb_active_ph:     dict = {}                  # orb pos_hint when active
+        self._orb_tap:           object | None = None       # tap target widget
+        self._say_bar_dot:       Label | None = None        # ● speaker dot
+        self._say_bar_label:     Label | None = None        # subtitle text
+        self._say_bar_reset_ev:  object | None = None       # pending idle-reset timer
+
         self._build_ui()
 
-    def _build_ui(self):
-        sv = _hv
-        sh = _hh
-        sf = _hf
-        # Major sections use ``size_hint_y`` weights matching Figma 390:187
-        # (header 54, top_row 263, bottom_cards 102, say 71). Kivy distributes
-        # whatever vertical space remains after padding/spacings/footer using
-        # those weights, so the home screen fills the panel at any size or
-        # HOME_CONTENT_SCALE — no flex spacer needed.
-        root = BoxLayout(
-            orientation='vertical',
-            padding=[sh(17), sv(15), sh(17), sv(8)],
-            spacing=sv(12),
-        )
+    # -----------------------------------------------------------------------
+    # UI construction
+    # -----------------------------------------------------------------------
+
+    def _build_ui(self) -> None:
+        root = FloatLayout(size_hint=(1, 1))
+        self._root = root
+
+        # Solid background #01081A
         with root.canvas.before:
-            Color(*_NAVY_BG)
-            self._bg = Rectangle(pos=root.pos, size=root.size)
-            Color(0.00, 0.18, 0.55, 0.22)
-            self._glow_a = Ellipse(pos=(-160, 160), size=(620, 620))
-            Color(0.00, 0.42, 1.00, 0.14)
-            self._glow_b = Ellipse(pos=(DISPLAY_WIDTH - 360, 40), size=(620, 420))
-        root.bind(pos=self._sync_bg, size=self._sync_bg)
+            Color(0.004, 0.031, 0.102, 1.0)
+            self._bg_rect = Rectangle(pos=root.pos, size=root.size)
+        root.bind(pos=lambda w, v: setattr(self._bg_rect, "pos", v),
+                  size=lambda w, v: setattr(self._bg_rect, "size", v))
 
-        header = BoxLayout(orientation='horizontal', size_hint=(1, 54), spacing=sh(14))
-        self.greeting_label = Label(
-            text='Good morning, Stark',
-            font_size=sf(30),
-            bold=True,
-            color=COLORS['white'],
-            halign='left',
-            valign='middle',
-            size_hint=(1, 1),
-        )
-        self.greeting_label.bind(size=self.greeting_label.setter('text_size'))
-        header.add_widget(self.greeting_label)
-        self.listening_pill = _GlassCard(
-            orientation='horizontal',
-            size_hint=(None, None),
-            width=sh(214),
-            height=sv(54),
-            padding=[sh(24), 0],
-            spacing=sh(10),
-            radius=sv(28),
-            fill=_CARD_INNER,
-        )
-        self.voice_dot = (
-            Image(source=p, size_hint=(None, 1), width=sh(22), fit_mode='contain', mipmap=False)
-            if (p := _figma_png('icon_listening_dot.png'))
-            else Label(text='●', font_size=sf(14), color=COLORS['gray_300'], size_hint=(None, 1), width=sh(22))
-        )
-        self.listening_pill.add_widget(self.voice_dot)
-        self.voice_state_label = Label(text='Listening', font_size=sf(20), bold=True, color=COLORS['white'], halign='left', valign='middle')
-        self.voice_state_label.bind(size=self.voice_state_label.setter('text_size'))
-        self.listening_pill.add_widget(self.voice_state_label)
-        sw = _figma_png('icon_soundwave.png')
-        if sw:
-            self.listening_pill.add_widget(
-                Image(source=sw, size_hint=(None, 1), width=sh(28), fit_mode='contain', mipmap=False)
-            )
-        else:
-            self.listening_pill.add_widget(Label(text='▥', font_size=sf(22), color=COLORS['blue'], size_hint=(None, 1), width=sh(30)))
-        # Tap on the listening pill toggles the wake-word assistant between
-        # paused and listening — privacy "kill switch" without opening Settings.
-        self.listening_pill.bind(
-            on_touch_up=lambda inst, touch: (
-                self._toggle_voice_listening() if inst.collide_point(*touch.pos) else None
-            )
-        )
-        header.add_widget(self.listening_pill)
-        sg = _figma_png('icon_settings.png')
-        if sg:
-            settings = Button(
-                background_normal=sg,
-                background_down=sg,
-                border=[0, 0, 0, 0],
-                size_hint=(None, None),
-                size=(sv(54), sv(54)),
-            )
-        else:
-            settings = SecondaryButton(text='Set', size_hint=(None, None), width=sv(54), height=sv(54), font_size=sf(18))
-        settings.bind(on_release=lambda *_: self.goto('settings', transition='slide_left'))
-        header.add_widget(settings)
-        root.add_widget(header)
+        self._build_header(root)
+        self._build_hero_card(root)
+        self._build_summary_card(root)
+        self._build_brief_card(root)
+        self._build_schedule_card(root)
+        self._build_email_card(root)
+        self._build_tasks_card(root)
+        self._build_say_bar(root)
 
-        top_row = BoxLayout(orientation='horizontal', size_hint=(1, 263), spacing=sh(7))
-
-        hp = _hero_background_path()
-        hero = _GlassCard(
-            orientation='vertical',
-            size_hint=(0.48, 1),
-            padding=[sh(20), sv(22), sh(20), sv(18)],
-            spacing=sv(4),
-            radius=sv(14),
-            fill=(0.000, 0.031, 0.086, 0.94),
-            bg_image=hp or None,
-            image_opacity=0.72,
-        )
-        time_row = BoxLayout(orientation='horizontal', size_hint=(1, None), height=sv(105))
-        clock_box = BoxLayout(orientation='vertical', size_hint=(1, 1), spacing=0)
-        clock_line = BoxLayout(orientation='horizontal', size_hint=(1, .72), spacing=sh(8))
-        self._big_clock_hm = Label(text='--:--', font_size=sf(46), bold=True, color=COLORS['white'], halign='left', valign='bottom', size_hint=(None, 1), width=sh(118))
-        self._big_clock_hm.bind(size=self._big_clock_hm.setter('text_size'))
-        clock_line.add_widget(self._big_clock_hm)
-        self._clock_ampm = Label(text='AM', font_size=sf(16), bold=True, color=_FIGMA_TEXT_MUTED, halign='left', valign='bottom', size_hint=(1, 1))
-        self._clock_ampm.bind(size=self._clock_ampm.setter('text_size'))
-        clock_line.add_widget(self._clock_ampm)
-        clock_box.add_widget(clock_line)
-        self.date_label = Label(text='', font_size=sf(14), bold=True, color=COLORS['white'], halign='left', valign='top', size_hint=(1, .28))
-        self.date_label.bind(size=self.date_label.setter('text_size'))
-        clock_box.add_widget(self.date_label)
-        time_row.add_widget(clock_box)
-        self.health_label = Label(text='—°C\nLoading…', font_size=sf(15), color=COLORS['white'], bold=True, halign='right', valign='middle', size_hint=(None, 1), width=sh(118))
-        self.health_label.bind(size=self.health_label.setter('text_size'))
-        time_row.add_widget(self.health_label)
-        # Tap on the weather block opens the same dialog the Settings screen
-        # uses so users can change the city without diving into Settings.
-        time_row.bind(
-            on_touch_up=lambda inst, touch: (
-                self._show_weather_location_dialog()
-                if self.health_label.collide_point(*touch.pos)
-                else None
-            )
-        )
-        hero.add_widget(time_row)
-
-        hero.add_widget(Widget(size_hint=(1, 1)))
-        next_label = Label(text='Next up', font_size=sf(13), color=COLORS['blue'], halign='left', valign='middle', size_hint=(1, None), height=sv(24))
-        next_label.bind(size=next_label.setter('text_size'))
-        hero.add_widget(next_label)
-        self.next_time_label = Label(text='▣  —', font_size=sf(13), color=COLORS['blue'], halign='left', valign='middle', size_hint=(1, None), height=sv(24))
-        self.next_time_label.bind(size=self.next_time_label.setter('text_size'))
-        hero.add_widget(self.next_time_label)
-        bottom_hero = BoxLayout(orientation='horizontal', size_hint=(1, None), height=sv(78), spacing=sh(8))
-        next_stack = BoxLayout(orientation='vertical', size_hint=(0.48, 1), spacing=sv(2))
-        self.next_title_label = Label(text='Now: No meeting selected', font_size=sf(15), bold=True, color=COLORS['white'], halign='left', valign='middle', size_hint=(1, .50), shorten=True)
-        self.next_title_label.bind(size=self.next_title_label.setter('text_size'))
-        next_stack.add_widget(self.next_title_label)
-        self.more_label = Label(text='+0 more', font_size=sf(13), bold=True, color=COLORS['blue'], halign='left', valign='top', size_hint=(1, .50))
-        self.more_label.bind(size=self.more_label.setter('text_size'))
-        # Tap "+N more" → open the meetings list (the natural drill-down).
-        next_stack.bind(
-            on_touch_up=lambda inst, touch: (
-                self.goto('meetings', transition='slide_left')
-                if self.more_label.collide_point(*touch.pos)
-                else None
-            )
-        )
-        next_stack.add_widget(self.more_label)
-        bottom_hero.add_widget(next_stack)
-        self.start_btn = PrimaryButton(
-            text='Start Recording\n[size=10]Tap or say "start recording"[/size]',
-            markup=True,
-            size_hint=(None, None),
-            width=sh(190),
-            height=sv(77),
-            font_size=sf(14),
-        )
-        self.start_btn.bind(on_release=self._on_start_recording)
-        bottom_hero.add_widget(self.start_btn)
-        hero.add_widget(bottom_hero)
-        top_row.add_widget(hero)
-
-        summary = _GlassCard(orientation='vertical', size_hint=(0.255, 1), padding=[sh(19), sv(35), sh(14), sv(18)], spacing=sv(8), radius=sv(12))
-        sum_head = BoxLayout(orientation='horizontal', size_hint=(1, None), height=sv(34), spacing=sh(8))
-        fd = _figma_png('icon_file_document.png')
-        if fd:
-            sum_head.add_widget(Image(source=fd, size_hint=(None, 1), width=sh(26), fit_mode='contain', mipmap=False))
-        sum_lbl = Label(
-            text='Last Meeting Summary',
-            font_size=sf(15),
-            color=COLORS['gray_400'],
-            bold=True,
-            halign='left',
-            valign='middle',
-            size_hint=(1, 1),
-        )
-        sum_lbl.bind(size=sum_lbl.setter('text_size'))
-        sum_head.add_widget(sum_lbl)
-        summary.add_widget(sum_head)
-        self.last_title_label = Label(text='Loading recent meeting...', font_size=sf(23), bold=True, color=COLORS['white'], halign='left', valign='middle', size_hint=(1, None), height=sv(42), shorten=True)
-        self.last_title_label.bind(size=self.last_title_label.setter('text_size'))
-        summary.add_widget(self.last_title_label)
-        self.last_meta_label = Label(text='Summaries, transcripts, decisions', font_size=sf(15), color=_FIGMA_TEXT_MUTED, halign='left', valign='top', size_hint=(1, None), height=sv(48))
-        self.last_meta_label.bind(size=self.last_meta_label.setter('text_size'))
-        summary.add_widget(self.last_meta_label)
-        summary.add_widget(Widget(size_hint=(1, 1)))
-        self.last_actions_label = Label(text='Open summary  ›', font_size=sf(15), color=COLORS['blue'], halign='left', valign='middle', size_hint=(1, None), height=sv(28))
-        self.last_actions_label.bind(size=self.last_actions_label.setter('text_size'))
-        summary.add_widget(self.last_actions_label)
-        summary.bind(on_touch_up=lambda inst, touch: self._open_latest_meeting() if inst.collide_point(*touch.pos) else None)
-        top_row.add_widget(summary)
-
-        brief = _GlassCard(orientation='vertical', size_hint=(0.255, 1), padding=[sh(10), sv(9), sh(10), sv(8)], spacing=sv(6), radius=sv(12))
-        br_h = BoxLayout(orientation='horizontal', size_hint=(1, None), height=sv(27), spacing=sh(6))
-        sun_p = _figma_png('icon_sun_morning_brief.png')
-        if sun_p:
-            br_h.add_widget(Image(source=sun_p, size_hint=(None, 1), width=sh(22), fit_mode='contain', mipmap=False))
-        br_title = Label(
-            text='Morning Brief',
-            font_size=sf(17),
-            color=COLORS['gray_400'],
-            bold=True,
-            halign='left',
-            valign='middle',
-            size_hint=(1, 1),
-        )
-        br_title.bind(size=br_title.setter('text_size'))
-        br_h.add_widget(br_title)
-        brief.add_widget(br_h)
-        self.brief_calendar_label = self._brief_item('3 meetings today', 'First at 11:00 AM', icon_file='icon_calendar_brief.png', fallback='▣')
-        brief.add_widget(self.brief_calendar_label)
-        self.brief_weather_label = self._brief_item('Weather: 32°C', 'Sunny', icon_file='icon_weather.png', fallback='☁')
-        brief.add_widget(self.brief_weather_label)
-        self.brief_email_label = self._brief_item('email:  From:', 'Connect Gmail for updates', icon_file='icon_email.png', fallback='✉')
-        # Tap → explain how to connect Gmail via the dashboard.
-        self.brief_email_label.bind(
-            on_touch_up=lambda inst, touch: (
-                self._show_gmail_dashboard_dialog() if inst.collide_point(*touch.pos) else None
-            )
-        )
-        brief.add_widget(self.brief_email_label)
-        view = SecondaryButton(text='View all   ›', size_hint=(1, None), height=sv(24), font_size=sf(11))
-        view.bind(on_release=lambda *_: self.goto('briefing', transition='slide_left'))
-        brief.add_widget(view)
-        top_row.add_widget(brief)
-        root.add_widget(top_row)
-
-        bottom_cards = BoxLayout(orientation='horizontal', size_hint=(1, 102), spacing=sh(7))
-        self.schedule_card = self._mini_card('—', 'Now: Loading', lambda *_: self.goto('meetings', transition='slide_left'), width_hint=0.43, icon_file='icon_calendar_schedule.png', fallback='▣')
-        bottom_cards.add_widget(self.schedule_card)
-        self.email_card = self._mini_card('—', 'New emails', lambda *_: self.goto('briefing', transition='slide_left'), width_hint=0.285, icon_file='icon_email_card.png', fallback='✉')
-        bottom_cards.add_widget(self.email_card)
-        self.tasks_card = self._mini_card('0', 'Tasks due', lambda *_: self.goto('briefing', transition='slide_left'), width_hint=0.285, icon_file='icon_task_check.png', fallback='✓')
-        bottom_cards.add_widget(self.tasks_card)
-        root.add_widget(bottom_cards)
-
-        say = _GlassCard(
-            orientation='horizontal',
-            size_hint=(1, 71),
-            padding=[sh(18), sv(10), sh(14), sv(10)],
-            spacing=sh(14),
-            radius=sv(21),
-            fill=_CARD_INNER,
-        )
-        spark_stack = BoxLayout(orientation='vertical', size_hint=(None, 1), width=sh(38), spacing=sv(2))
-        spk = _figma_png('icon_sparkle_layer.png')
-        if spk:
-            spark_stack.add_widget(Image(source=spk, size_hint=(1, 0.45), fit_mode='contain', mipmap=False))
-        plus_lbl = Label(
-            text='+',
-            font_size=sf(18),
-            bold=True,
-            color=COLORS['blue'],
-            halign='center',
-            valign='top',
-            size_hint=(1, 0.55),
-        )
-        plus_lbl.bind(size=plus_lbl.setter('text_size'))
-        spark_stack.add_widget(plus_lbl)
-        say.add_widget(spark_stack)
-        say_text = BoxLayout(orientation='vertical')
-        t1 = Label(text='Try saying', font_size=sf(19), bold=True, color=COLORS['blue'], halign='left', valign='bottom', size_hint=(1, .42))
-        t1.bind(size=t1.setter('text_size'))
-        say_text.add_widget(t1)
-        t2 = Label(text='"Schedule a meeting tomorrow at 4 PM"', font_size=sf(16), color=_FIGMA_TEXT_MUTED, halign='left', valign='top', size_hint=(1, .58))
-        t2.bind(size=t2.setter('text_size'))
-        say_text.add_widget(t2)
-        say.add_widget(say_text)
-        # Tapping the "Try saying" prompt opens the briefing screen — the
-        # closest in-app experience to the example voice command. (We can't
-        # synthetically inject a wake phrase into the voice pipeline.)
-        say.bind(
-            on_touch_up=lambda inst, touch: (
-                self.goto('briefing', transition='slide_left')
-                if inst.collide_point(*touch.pos)
-                else None
-            )
-        )
-        say.add_widget(_VoiceOrb(size=(sv(66), sv(66))))
-        kb_src = _figma_png('icon_keyboard.png')
-        if kb_src:
-            keyboard = Button(
-                background_normal=kb_src,
-                background_down=kb_src,
-                border=[0, 0, 0, 0],
-                size_hint=(None, None),
-                size=(sh(54), sv(48)),
-            )
-        else:
-            keyboard = SecondaryButton(text='Kb', size_hint=(None, None), width=sh(54), height=sv(48), font_size=sf(18))
-        keyboard.bind(on_release=lambda *_: self.goto('briefing', transition='slide_left'))
-        say.add_widget(keyboard)
-        root.add_widget(say)
-
-        root.add_widget(self.build_footer())
         self.add_widget(root)
 
-    def _mini_card(self, value, label, callback, width_hint=0.33, *, icon_file: str = '', fallback: str = '?'):
-        card = _GlassCard(
-            orientation='horizontal',
-            size_hint=(width_hint, 1),
-            padding=[_hh(30), _hv(16), _hh(15), _hv(16)],
-            spacing=_hh(16),
-            radius=_hv(16),
+    # -----------------------------------------------------------------------
+    # Header  (y = 21.19 … 97.47)
+    # -----------------------------------------------------------------------
+
+    def _build_header(self, root: FloatLayout) -> None:
+        # No back button — home is the root screen; nothing to go back to.
+
+        # Greeting  (24.01, 33.9)  — shifted left to fill the space left by the
+        # removed back badge. Figma original x=122.89 assumed a back-badge on the
+        # left; we start from x=24.01 now so the text uses the full left margin.
+        self.greeting_label = _lbl(
+            _greeting_name(None), _FONT_SB, _ff(42.38), _WHITE,
+            size_hint=(_sw(700), _sh(51)),
+            pos_hint={"x": _x(24.01), "y": _y(33.9, 51)},
         )
-        side = _hmin(48)
-        icon_box = _GlassCard(
-            orientation='vertical',
+        root.add_widget(self.greeting_label)
+
+        # Listening pill  (805.16, 21.19)  302.29 × 76.28
+        self._build_listening_pill(root)
+
+        # Settings badge  (1159.71, 21.19)  76.28 × 76.28  — tappable → settings screen
+        sg_src = _fp("email_icon_settings_badge.png") or _fp("icon_settings.png")
+        if sg_src:
+            sg_btn = _TappableCard(
+                draw_bg=False,
+                size_hint=(_sw(76.28), _sh(76.28)),
+                pos_hint={"x": _x(1159.71), "y": _y(21.19, 76.28)},
+            )
+            sg_btn.add_widget(Image(
+                source=sg_src,
+                size_hint=(1, 1),
+                pos_hint={"x": 0, "y": 0},
+                fit_mode="contain",
+            ))
+            sg_btn.bind(on_release=lambda *_: self.goto("settings"))
+            root.add_widget(sg_btn)
+
+        # Status strip (battery / WiFi / BT) — anchored to absolute top-right,
+        # above all other Figma elements.  Updates every 30 s.
+        self._build_status_strip(root)
+
+    def _build_status_strip(self, root: FloatLayout) -> None:
+        """Compact canvas-drawn status indicators at absolute top-right.
+
+        Three icons drawn via components/icons.py (no font dependency):
+          [battery rect + fill]  [87%]   [wifi arcs]  [bt symbol]
+        """
+        from kivy.uix.boxlayout import BoxLayout as _BL
+        from components.icons import Icon as _Icon
+
+        _strip_h = max(18, int(DISPLAY_HEIGHT * 0.032))
+        _icon_h  = max(10, int(_strip_h * 0.65))
+        _strip_w = int(DISPLAY_WIDTH * 0.22)
+        _fs      = max(7, int(_strip_h * 0.62))
+        _muted   = (0.55, 0.55, 0.60, 0.80)
+        _on_col  = (0.22, 0.53, 0.98, 0.92)
+        _spacing = max(4, int(_strip_w * 0.04))
+
+        strip = _BL(
+            orientation="horizontal",
             size_hint=(None, None),
-            width=side,
-            height=side,
-            radius=max(1, side // 2),
-            fill=_CARD_INNER,
+            width=_strip_w,
+            height=_strip_h,
+            padding=[0, 1, 8, 1],
+            spacing=_spacing,
+            pos_hint={"right": 1.0, "top": 1.0},
         )
-        src = _figma_png(icon_file) if icon_file else ''
-        if src:
-            icon_box.add_widget(
-                Image(
-                    source=src,
-                    size_hint=(1, 1),
-                    fit_mode='contain',
-                    mipmap=False,
-                )
-            )
-        else:
-            icon_box.add_widget(Label(text=fallback, font_size=_hf(31), color=COLORS['blue'], halign='center', valign='middle'))
-        card.add_widget(icon_box)
-        txt = BoxLayout(orientation='vertical')
-        v = Label(text=value, font_size=_hf(27), bold=True, color=COLORS['white'], halign='left', valign='bottom', size_hint=(1, .48))
-        v.bind(size=v.setter('text_size'))
-        setattr(card, 'value_label', v)
-        txt.add_widget(v)
-        l = Label(text=label, font_size=_hf(18), color=_FIGMA_TEXT_MUTED, halign='left', valign='top', size_hint=(1, .52), shorten=True)
-        l.bind(size=l.setter('text_size'))
-        setattr(card, 'text_label', l)
-        txt.add_widget(l)
-        card.add_widget(txt)
-        arr = _figma_png('icon_arrow_card.png')
-        if arr:
-            card.add_widget(
-                Image(
-                    source=arr,
-                    size_hint=(None, 1),
-                    width=_hh(22),
-                    fit_mode='contain',
-                    color=_FIGMA_TEXT_MUTED,
-                    mipmap=False,
-                )
-            )
-        else:
-            card.add_widget(Label(text='›', font_size=_hf(36), color=_FIGMA_TEXT_MUTED, size_hint=(None, 1), width=_hh(24)))
-        card.bind(on_touch_up=lambda inst, touch: callback() if inst.collide_point(*touch.pos) else None)
-        return card
 
-    def _brief_item(self, title, subtitle, *, icon_file: str = '', fallback: str = '?'):
-        row = _GlassCard(
-            orientation='horizontal',
-            size_hint=(1, None),
-            height=_hv(52),
-            padding=[_hh(10), _hv(6), _hh(8), _hv(6)],
-            spacing=_hh(9),
-            radius=_hv(12),
-            fill=_CARD_INNER,
+        # Battery icon — rectangle with fill level
+        bat_icon_w = max(20, int(_icon_h * 2.0))
+        self._sts_battery = _Icon(
+            "battery",
+            color=_muted,
+            level=1.0,
+            size_hint=(None, None),
+            size=(bat_icon_w, _icon_h),
+            pos_hint={"center_y": 0.5},
         )
-        src = _figma_png(icon_file) if icon_file else ''
-        iz = _hmin(22)
-        if src:
-            row.add_widget(
-                Image(
-                    source=src,
-                    size_hint=(None, None),
-                    width=iz,
-                    height=iz,
-                    fit_mode='contain',
-                    mipmap=False,
-                )
-            )
-        else:
-            row.add_widget(
-                Label(
-                    text=fallback,
-                    font_size=_hf(27),
-                    color=COLORS['blue'],
-                    halign='center',
-                    valign='middle',
-                    size_hint=(None, 1),
-                    width=_hh(38),
-                )
-            )
-        text = BoxLayout(orientation='vertical', spacing=0)
-        title_label = Label(text=title, font_size=_hf(15), bold=True, color=COLORS['gray_400'], halign='left', valign='bottom', size_hint=(1, .55), shorten=True)
-        title_label.bind(size=title_label.setter('text_size'))
-        subtitle_label = Label(text=subtitle, font_size=_hf(12), bold=True, color=_FIGMA_TEXT_MUTED, halign='left', valign='top', size_hint=(1, .45), shorten=True)
-        subtitle_label.bind(size=subtitle_label.setter('text_size'))
-        setattr(row, 'title_label', title_label)
-        setattr(row, 'subtitle_label', subtitle_label)
-        text.add_widget(title_label)
-        text.add_widget(subtitle_label)
-        row.add_widget(text)
-        return row
+        strip.add_widget(self._sts_battery)
 
-    def _sync_bg(self, widget, *_args):
-        self._bg.pos = widget.pos
-        self._bg.size = widget.size
-        self._glow_a.pos = (widget.x - 160, widget.y + widget.height - 460)
-        self._glow_b.pos = (widget.x + widget.width - 390, widget.y + 20)
+        # Percent label next to battery
+        self._sts_bat_lbl = Label(
+            text="--%",
+            font_size=_fs,
+            color=_muted,
+            halign="left",
+            valign="middle",
+            size_hint=(None, 1),
+            width=max(22, int(_strip_w * 0.22)),
+        )
+        self._sts_bat_lbl.bind(size=self._sts_bat_lbl.setter("text_size"))
+        strip.add_widget(self._sts_bat_lbl)
+
+        # WiFi icon
+        wifi_icon_w = max(14, int(_icon_h * 1.1))
+        self._sts_wifi = _Icon(
+            "wifi",
+            color=_muted,
+            size_hint=(None, None),
+            size=(wifi_icon_w, _icon_h),
+            pos_hint={"center_y": 0.5},
+        )
+        strip.add_widget(self._sts_wifi)
+
+        # Bluetooth icon
+        bt_icon_w = max(10, int(_icon_h * 0.75))
+        self._sts_bt = _Icon(
+            "bluetooth",
+            color=_muted,
+            size_hint=(None, None),
+            size=(bt_icon_w, _icon_h),
+            pos_hint={"center_y": 0.5},
+        )
+        strip.add_widget(self._sts_bt)
+
+        root.add_widget(strip)
+        self._status_strip_event: object | None = None
+
+    def _build_listening_pill(self, root: FloatLayout) -> None:
+        """Voice-state pill  (805.16, 21.19)  302.29 × 76.28.
+
+        Uses the exact Figma PNG (listening_pill_figma.png) as the pill background.
+        An animated _FigmaWaveform is overlaid at the soundwave position.
+        Hidden by default (opacity=0); shown via show_listening_state().
+        Display-only — not tappable.
+        """
+        PW, PH = 302.29, 76.28
+
+        # Outer container — no canvas bg; the PNG provides the visual
+        pill = FloatLayout(
+            size_hint=(_sw(PW), _sh(PH)),
+            pos_hint={"x": _x(805.16), "y": _y(21.19, PH)},
+        )
+        pill.opacity = 0.0  # hidden in idle state
+
+        # Figma pill PNG as the background (covers the full pill area)
+        pill_src = _fp("listening_pill_figma.png") or _fp("listening_pill.png")
+        if pill_src:
+            pill.add_widget(Image(
+                source=pill_src,
+                size_hint=(1, 1),
+                pos_hint={"x": 0, "y": 0},
+                fit_mode="fill",
+                allow_stretch=True,
+                keep_ratio=False,
+            ))
+
+        # Animated soundwave bars overlaid at the soundwave position (224.6, 15.54) 45.2×45.2
+        sw_wf = _FigmaWaveform(
+            size_hint=(45.2 / PW, 45.2 / PH),
+            pos_hint={"x": 224.6 / PW, "y": (PH - 15.54 - 45.2) / PH},
+        )
+        pill.add_widget(sw_wf)
+        self._soundwave_wf = sw_wf
+
+        # Keep label refs for any callers that update content
+        self.voice_dot = None
+        self.voice_state_label = None
+
+        self._listening_pill = pill
+        root.add_widget(pill)
+
+    # -----------------------------------------------------------------------
+    # Hero card  (24.01, 114.42)  579.15 × 372.03
+    # -----------------------------------------------------------------------
+
+    def _build_hero_card(self, root: FloatLayout) -> None:
+        CW, CH = 579.15, 372.03
+        # Hero card — Figma fill is solid #010C25; gradient runs only in the border.
+        card = _Card(top=_HERO_BG, bot=_HERO_BG, border=_CARD_BORDER,
+                     radius=_ff(19.48),
+                     size_hint=(_sw(CW), _sh(CH)),
+                     pos_hint={"x": _x(24.01), "y": _y(114.42, CH)})
+
+        # Background landscape image at (-10.39, -1.3) in card  599.92 × 375.28
+        hero_src = _fp("hero_bg.png") or _fp("hero_background.png")
+        if hero_src:
+            card.add_widget(Image(
+                source=hero_src,
+                size_hint=(599.92 / CW, 375.28 / CH),
+                pos_hint={"x": -10.39 / CW, "y": (CH - (-1.3) - 375.28) / CH},
+                fit_mode="fill",
+                allow_stretch=True,
+                keep_ratio=False,
+            ))
+
+        # Clock + AM/PM in one markup label so they always appear flush together.
+        # Figma: clock at (29.87, 34.07) 154×77 Bold 64.93px; AM at 202.58, 74.32.
+        # valign="top" so the text starts exactly at the container top (Figma y=34.07).
+        self._big_clock_hm = Label(
+            text=(
+                f"[b][size={_ff(64.93)}]--:--[/size][/b]"
+                f"[size={_ff(22.72)}][color=B6BAF2] --[/color][/size]"
+            ),
+            markup=True,
+            font_name=_FONT,
+            color=_WHITE,
+            halign="left",
+            valign="top",
+            size_hint=(250 / CW, 80 / CH),
+            pos_hint={"x": 29.87 / CW, "y": (CH - 34.07 - 80) / CH},
+        )
+        self._big_clock_hm.bind(size=self._big_clock_hm.setter("text_size"))
+        card.add_widget(self._big_clock_hm)
+
+        # Date  (0, 77.26) in group → abs (29.87, 111.33)  150 × 23  SemiBold 19.48px
+        self.date_label = _lbl(
+            "", _FONT_SB, _ff(19.48 * 1.2), _WHITE,
+            size_hint=(240 / CW, 28 / CH),
+            pos_hint={"x": 29.87 / CW, "y": (CH - 111.33 - 28) / CH},
+        )
+        card.add_widget(self.date_label)
+
+        # Weather group at (439.56, 44.46) in card
+        # Sun icon  (0, 0) in group → abs (439.56, 44.46)  58.7 × 58.7
+        sun_src = _fp("icon_sun_brief.png") or _fp("icon_sun.png")
+        if sun_src:
+            card.add_widget(Image(
+                source=sun_src,
+                size_hint=(58.7 / CW, 58.7 / CH),
+                pos_hint={"x": 439.56 / CW, "y": (CH - 44.46 - 58.7) / CH},
+                fit_mode="contain",
+            ))
+
+        # Temperature  (53.24, 7.14) in group → abs (492.80, 51.60)  53 × 27  Bold 22.72px
+        self.health_label = _lbl(
+            "--°C", _FONT, _ff(22.72), _WHITE, bold=True,
+            size_hint=(100 / CW, 27 / CH),
+            pos_hint={"x": 492.80 / CW, "y": (CH - 51.60 - 27) / CH},
+        )
+        card.add_widget(self.health_label)
+
+        # Condition  (53.24, 38.30) in group → abs (492.80, 82.76)  56 × 23  Medium 19.48px
+        self._wx_condition = _lbl(
+            "--", _FONT_MD, _ff(19.48), _MUTED,
+            size_hint=(100 / CW, 23 / CH),
+            pos_hint={"x": 492.80 / CW, "y": (CH - 82.76 - 23) / CH},
+        )
+        card.add_widget(self._wx_condition)
+
+        # Recording button (277.24, 235.68) in card  268.39 × 108.26
+        self._build_hero_rec_btn(card, CW, CH)
+
+        # Next-up group at (29.87, 216.2) in card
+        self._build_hero_next_up(card, CW, CH)
+
+        root.add_widget(card)
+
+    def _build_hero_rec_btn(self, card: FloatLayout, CW: float, CH: float) -> None:
+        BW, BH = 268.39, 108.26
+        BX, BY = 277.24, 235.68
+
+        # Use the exact Figma PNG if available — skip canvas gradient so we don't double-stack.
+        bg_src = _fp("recording_btn_bg.png")
+
+        btn_card = _TappableCard(
+            top=_REC_TOP, bot=_REC_BOT,
+            border=(0.012, 0.306, 0.886, 1.0),
+            radius=_ff(19.45),
+            draw_bg=(not bool(bg_src)),   # canvas bg only when no PNG
+            size_hint=(BW / CW, BH / CH),
+            pos_hint={"x": BX / CW, "y": (CH - BY - BH) / CH},
+        )
+        btn_card.bind(on_release=self._on_start_recording)
+        self._rec_btn = btn_card
+
+        if bg_src:
+            btn_card.add_widget(Image(
+                source=bg_src,
+                size_hint=(1, 1),
+                pos_hint={"x": 0, "y": 0},
+                fit_mode="fill",
+                allow_stretch=True,
+                keep_ratio=False,
+            ))
+
+        # Mic orb  (17.5, 20.74) in button  65.48 × 65.48
+        orb_src = _fp("mic_orb_mini.png")
+        if orb_src:
+            btn_card.add_widget(Image(
+                source=orb_src,
+                size_hint=(65.48 / BW, 65.48 / BH),
+                pos_hint={"x": 17.5 / BW, "y": (BH - 20.74 - 65.48) / BH},
+                fit_mode="contain",
+            ))
+
+        # "Start Recording"  (106.96, 31.76) in button  142 × 23  Bold 19.45px
+        btn_card.add_widget(_lbl(
+            "Start Recording", _FONT, _ff(19.45 * 1.2), _WHITE, bold=True,
+            size_hint=(200 / BW, 28 / BH),
+            pos_hint={"x": 106.96 / BW, "y": (BH - 31.76 - 28) / BH},
+        ))
+
+        # Subtitle  (95.94, 60.94) in button  164 × 15  SemiBold 12.97px
+        btn_card.add_widget(_lbl(
+            'Tap or say "start recording"', _FONT_SB, _ff(12.97 * 1.2), _WHITE,
+            size_hint=(200 / BW, 19 / BH),
+            pos_hint={"x": 95.94 / BW, "y": (BH - 60.94 - 19) / BH},
+        ))
+
+        card.add_widget(btn_card)
+
+    def _build_hero_next_up(self, card: FloatLayout, CW: float, CH: float) -> None:
+        # Group at (29.87, 216.2) in card  183 × 128.48
+        GX, GY = 29.87, 216.2
+
+        # "Next up"  (0, 0) in group  65 × 22  SemiBold 18.18px  #3481F1
+        card.add_widget(_lbl(
+            "Next up", _FONT_SB, _ff(18.18), _BLUE2,
+            size_hint=(100 / CW, 22 / CH),
+            pos_hint={"x": GX / CW, "y": (CH - GY - 22) / CH},
+        ))
+
+        # Calendar icon  (0, 38.96) in group → abs (29.87, 255.16)  31.18 × 30.82
+        cal_src = _fp("icon_calendar_row.png") or _fp("icon_calendar.png")
+        if cal_src:
+            card.add_widget(Image(
+                source=cal_src,
+                size_hint=(31.18 / CW, 30.82 / CH),
+                pos_hint={"x": GX / CW, "y": (CH - (GY + 38.96) - 30.82) / CH},
+                fit_mode="contain",
+            ))
+
+        # "11:00 AM"  (34.41, 40.25) in group → abs (64.28, 256.45)  78 × 22  SemiBold 18.18px
+        self.next_time_label = _lbl(
+            "--:-- --", _FONT_SB, _ff(18.18), _BLUE2,
+            size_hint=(160 / CW, 22 / CH),
+            pos_hint={"x": (GX + 34.41) / CW, "y": (CH - (GY + 40.25) - 22) / CH},
+        )
+        card.add_widget(self.next_time_label)
+
+        # "Now: Product Sync"  (0, 73.37) in group → abs (29.87, 289.57)  183 × 24  Bold 20.13px
+        self.next_title_label = _lbl(
+            "--", _FONT, _ff(20.13), _WHITE, bold=True,
+            size_hint=(240 / CW, 24 / CH),
+            pos_hint={"x": GX / CW, "y": (CH - (GY + 73.37) - 24) / CH},
+        )
+        card.add_widget(self.next_title_label)
+
+        # "+2 more"  (0, 106.48) in group → abs (29.87, 322.68)  70 × 22  Bold 18.18px
+        self.more_label = _lbl(
+            "", _FONT, _ff(18.18), _BLUE2, bold=True,
+            size_hint=(120 / CW, 22 / CH),
+            pos_hint={"x": GX / CW, "y": (CH - (GY + 106.48) - 22) / CH},
+        )
+        card.add_widget(self.more_label)
+
+        # Transparent tappable overlay covering the entire next-up group
+        # (calendar icon + time + title + "+N more" area → navigate to calendar)
+        tap = _TappableCard(
+            draw_bg=False,
+            size_hint=(260 / CW, 140 / CH),
+            pos_hint={"x": GX / CW, "y": (CH - GY - 140) / CH},
+        )
+        tap.bind(on_release=lambda *_: self.goto("calendar", transition="slide_left"))
+        card.add_widget(tap)
+
+    # -----------------------------------------------------------------------
+    # Meeting summary card  (611.64, 114.42)  307.94 × 371.5
+    # -----------------------------------------------------------------------
+
+    def _build_summary_card(self, root: FloatLayout) -> None:
+        CW, CH = 307.94, 371.5
+        card = _Card(radius=_ff(16.95),
+                     size_hint=(_sw(CW), _sh(CH)),
+                     pos_hint={"x": _x(611.64), "y": _y(114.42, CH)})
+        def _card_touch(w, t):
+            lx, ly = w.to_widget(t.x, t.y)
+            if w.collide_point(lx, ly):
+                self._open_latest_meeting()
+                return True
+            return False
+        card.bind(on_touch_up=_card_touch)
+
+        # File icon  (21.19, 50.85) abs in card  39.55 × 39.55
+        fi_src = _fp("icon_file.png")
+        if fi_src:
+            card.add_widget(Image(
+                source=fi_src,
+                size_hint=(39.55 / CW, 39.55 / CH),
+                pos_hint={"x": 21.19 / CW, "y": (CH - 50.85 - 39.55) / CH},
+                fit_mode="contain",
+            ))
+
+        # "Last Meeting Summary"  (62.15, 57.91) abs in card  224 × 25  SemiBold 21.19px  #A4A4AC
+        card.add_widget(_lbl(
+            "Last Meeting Summary", _FONT_SB, _ff(21.19 * 1.2), _GREY,
+            size_hint=(240 / CW, 30 / CH),
+            pos_hint={"x": 62.15 / CW, "y": (CH - 57.91 - 30) / CH},
+        ))
+
+        # Title group at (28.25, 104.53) in card
+        # "Product Sync"  200 × 39  SemiBold 32.49px  #FFF
+        self.last_title_label = _lbl(
+            "--", _FONT_SB, _ff(32.49 * 1.2), _WHITE,
+            size_hint=(240 / CW, 46 / CH),
+            pos_hint={"x": 28.25 / CW, "y": (CH - 104.53 - 46) / CH},
+        )
+        card.add_widget(self.last_title_label)
+
+        # "Today, 10:00 AM"  (28.25, 153.97)  164 × 25  SemiBold 21.19px  #B6BAF2
+        self.last_meta_label = _lbl(
+            "--", _FONT_SB, _ff(21.19 * 1.2), _MUTED,
+            size_hint=(260 / CW, 30 / CH),
+            pos_hint={"x": 28.25 / CW, "y": (CH - 153.97 - 30) / CH},
+        )
+        card.add_widget(self.last_meta_label)
+
+        # "Open summary"  (28.25, 238.72)  137 × 25  SemiBold 21.19px  #006FFF
+        self.last_actions_label = _lbl(
+            "Open summary", _FONT_SB, _ff(21.19 * 1.2), _BLUE,
+            size_hint=(180 / CW, 30 / CH),
+            pos_hint={"x": 28.25 / CW, "y": (CH - 238.72 - 30) / CH},
+        )
+        card.add_widget(self.last_actions_label)
+
+        # Arrow beside "Open summary"
+        _open_sum_arr = _fp("icon_arrow.png")
+        if _open_sum_arr:
+            card.add_widget(Image(
+                source=_open_sum_arr,
+                size_hint=(12 / CW, 22 / CH),
+                pos_hint={"x": (28.25 + 175) / CW, "y": (CH - 238.72 - 26) / CH},
+                fit_mode="contain",
+            ))
+
+        # Avatar 1  (28.25, 274.04)  46.19 × 46.04  — circular via Ellipse texture
+        av1_src = _fp("avatar_1.png") or _fp("avatar_photo_1.png")
+        if av1_src:
+            card.add_widget(_CircularImg(
+                source=av1_src,
+                size_hint=(46.19 / CW, 46.04 / CH),
+                pos_hint={"x": 28.25 / CW, "y": (CH - 274.04 - 46.04) / CH},
+            ))
+
+        # Avatar 2  (85.26, 274.99)  46.19 × 46.04  — circular
+        av2_src = _fp("avatar_2.png") or _fp("avatar_photo_2.png")
+        if av2_src:
+            card.add_widget(_CircularImg(
+                source=av2_src,
+                size_hint=(46.19 / CW, 46.04 / CH),
+                pos_hint={"x": 85.26 / CW, "y": (CH - 274.99 - 46.04) / CH},
+            ))
+
+        # "+2 badge"  (142.27, 274.04)  45.61 × 45.61
+        badge = _Card(bg=(0.004, 0.039, 0.106, 1.0),
+                      border=_CARD_BORDER,
+                      radius=_ff(23),
+                      size_hint=(45.61 / CW, 45.61 / CH),
+                      pos_hint={"x": 142.27 / CW, "y": (CH - 274.04 - 45.61) / CH})
+        badge.add_widget(_lbl(
+            "+2", _FONT_MD, _ff(21.17), _WHITE,
+            halign="center", valign="middle",
+            size_hint=(1, 1),
+            pos_hint={"x": 0, "y": 0},
+        ))
+        card.add_widget(badge)
+
+        root.add_widget(card)
+
+    # -----------------------------------------------------------------------
+    # Morning Brief card  (928.05, 114.42)  307.94 × 371.5
+    # -----------------------------------------------------------------------
+
+    def _build_brief_card(self, root: FloatLayout) -> None:
+        CW, CH = 307.94, 371.5
+        card = _Card(radius=_ff(16.95),
+                     size_hint=(_sw(CW), _sh(CH)),
+                     pos_hint={"x": _x(928.05), "y": _y(114.42, CH)})
+
+        # Header: sun icon (29.66, 14.13)  28.25 × 28.25  +  "Morning Brief" (72.04, 14.13)
+        msun_src = _fp("icon_sun_brief.png")
+        if msun_src:
+            card.add_widget(Image(
+                source=msun_src,
+                size_hint=(28.25 / CW, 28.25 / CH),
+                pos_hint={"x": 29.66 / CW, "y": (CH - 14.13 - 28.25) / CH},
+                fit_mode="contain",
+            ))
+        card.add_widget(_lbl(
+            "Morning Brief", _FONT_SB, _ff(24.01 * 1.2), _GREY,
+            size_hint=(200 / CW, 35 / CH),
+            pos_hint={"x": 72.04 / CW, "y": (CH - 14.13 - 35) / CH},
+        ))
+
+        # --- Calendar row (9.89, 57.91)  288.16 × 73.45 ---
+        RW, RH = 288.16, 73.45
+        cal_row = _BriefCardRow(
+            size_hint=(RW / CW, RH / CH),
+            pos_hint={"x": 9.89 / CW, "y": (CH - 57.91 - RH) / CH},
+        )
+        cal_icon_src = _fp("icon_calendar_row.png")
+        if cal_icon_src:
+            cal_row.add_widget(Image(
+                source=cal_icon_src,
+                size_hint=(47.46 / RW, 42.85 / RH),
+                pos_hint={"x": 20.34 / RW, "y": (RH - 15.3 - 42.85) / RH},
+                fit_mode="contain",
+            ))
+        brief_cal_title = _lbl(
+            "Briefing ready", _FONT, _ff(21.19 * 1.2), _GREY, bold=True,
+            size_hint=(210 / RW, 30 / RH),
+            pos_hint={"x": 81.37 / RW, "y": (RH - 13.77 - 30) / RH},
+        )
+        brief_cal_sub = _lbl(
+            "Ask Tony for a briefing", _FONT_SB, _ff(16.95 * 1.2), _MUTED,
+            size_hint=(180 / RW, 24 / RH),
+            pos_hint={"x": 81.37 / RW, "y": (RH - 41.32 - 24) / RH},
+        )
+        cal_row.add_widget(brief_cal_title)
+        cal_row.add_widget(brief_cal_sub)
+        card.add_widget(cal_row)
+        self.brief_calendar_label = _BriefRowData(brief_cal_title, brief_cal_sub)
+
+        # --- Weather row (9.89, 137.02)  288.16 × 73.45 ---
+        wx_row = _BriefCardRow(
+            size_hint=(RW / CW, RH / CH),
+            pos_hint={"x": 9.89 / CW, "y": (CH - 137.02 - RH) / CH},
+        )
+        wx_icon_src = _fp("icon_weather.png")
+        if wx_icon_src:
+            wx_row.add_widget(Image(
+                source=wx_icon_src,
+                size_hint=(36.8 / RW, 36.8 / RH),
+                pos_hint={"x": 13.76 / RW, "y": (RH - 10.7 - 36.8) / RH},
+                fit_mode="contain",
+            ))
+        self._brief_wx_title = _lbl(
+            "Weather: --°C", _FONT, _ff(21.19 * 1.2), _GREY, bold=True,
+            size_hint=(195 / RW, 28 / RH),
+            pos_hint={"x": 81.93 / RW, "y": (RH - 15.54 - 28) / RH},
+        )
+        self._brief_wx_sub = _lbl(
+            "--", _FONT_SB, _ff(16.95 * 1.2), _MUTED,
+            size_hint=(100 / RW, 24 / RH),
+            pos_hint={"x": 81.37 / RW, "y": (RH - 39.79 - 24) / RH},
+        )
+        wx_row.add_widget(self._brief_wx_title)
+        wx_row.add_widget(self._brief_wx_sub)
+        card.add_widget(wx_row)
+
+        # --- Email row (9.89, 216.12)  288.16 × 125.72 ---
+        ER, EH = 288.16, 125.72
+        em_row = _BriefCardRow(
+            size_hint=(ER / CW, EH / CH),
+            pos_hint={"x": 9.89 / CW, "y": (CH - 216.12 - EH) / CH},
+        )
+        em_icon_src = _fp("icon_email.png")
+        if em_icon_src:
+            em_row.add_widget(Image(
+                source=em_icon_src,
+                size_hint=(32.47 / ER, 32.47 / EH),
+                pos_hint={"x": 13.76 / ER, "y": (EH - 36.69 - 32.47) / EH},
+                fit_mode="contain",
+            ))
+        brief_em_title = _lbl(
+            "email:", _FONT, _ff(21.19 * 1.2), _WHITE, bold=True,
+            size_hint=(100 / ER, 30 / EH),
+            pos_hint={"x": 81.37 / ER, "y": (EH - 21.46 - 30) / EH},
+        )
+        brief_em_sub = _lbl(
+            "Connect Gmail for updates", _FONT_SB, _ff(16.95 * 1.2), _MUTED,
+            size_hint=(210 / ER, 24 / EH),
+            pos_hint={"x": 81.37 / ER, "y": (EH - 49.44 - 24) / EH},
+        )
+        em_row.add_widget(brief_em_title)
+        em_row.add_widget(brief_em_sub)
+        card.add_widget(em_row)
+        self.brief_email_label = _BriefRowData(brief_em_title, brief_em_sub)
+
+        # "View all"  (114.42, 346.08)  tappable → opens morning_brief screen
+        view_all_tap = _TappableCard(
+            size_hint=(90 / CW, 28 / CH),
+            pos_hint={"x": 107.0 / CW, "y": (CH - 344.0 - 28) / CH},
+        )
+        view_all_tap.add_widget(_lbl(
+            "View all", _FONT_SB, _ff(15.54 * 1.2), _BLUE,
+            size_hint=(1, 1), pos_hint={"x": 0, "y": 0},
+        ))
+        view_all_tap.bind(
+            on_release=lambda *_: self.goto("morning_brief", transition="slide_left"))
+        card.add_widget(view_all_tap)
+
+        # Arrow icon  (193.52, 344.66)  11.3 × 22.6
+        arr_src = _fp("icon_arrow.png")
+        if arr_src:
+            card.add_widget(Image(
+                source=arr_src,
+                size_hint=(11.3 / CW, 22.6 / CH),
+                pos_hint={"x": 193.52 / CW, "y": (CH - 344.66 - 22.6) / CH},
+                fit_mode="contain",
+            ))
+
+        root.add_widget(card)
+
+    # -----------------------------------------------------------------------
+    # Bottom chips
+    # -----------------------------------------------------------------------
+
+    def _build_bottom_chip(self, root, fig_x, fig_w, icon_src, icon_size,
+                           icon_abs_x, icon_abs_y,
+                           value_text, value_x, value_y,
+                           label_text, label_x, label_y,
+                           label_w=150, arrow_x=None, arrow_y=None,
+                           more_x=None, more_y=None, nextup_x=None, nextup_y=None,
+                           nextup_w=200, radius=22.6) -> _CardData:
+        """Generic bottom chip builder."""
+        CW, CH = fig_w, 144.08
+        FIG_Y  = 507.11
+
+        card = _Card(radius=_ff(radius),
+                     size_hint=(_sw(CW), _sh(CH)),
+                     pos_hint={"x": _x(fig_x), "y": _y(FIG_Y, CH)})
+
+        # Icon circle
+        if icon_src:
+            card.add_widget(Image(
+                source=icon_src,
+                size_hint=(icon_size / CW, icon_size / CH),
+                pos_hint={"x": icon_abs_x / CW, "y": (CH - icon_abs_y - icon_size) / CH},
+                fit_mode="contain",
+            ))
+
+        # Value (number)
+        val_lbl = _lbl(
+            value_text, _FONT_SB, _ff(38.14), _WHITE,
+            size_hint=(80 / CW, 45 / CH),
+            pos_hint={"x": value_x / CW, "y": (CH - value_y - 45) / CH},
+        )
+        card.add_widget(val_lbl)
+
+        # Label
+        txt_lbl = _lbl(
+            label_text, _FONT_SB, _ff(25.43), _MUTED,
+            size_hint=(label_w / CW, 30 / CH),
+            pos_hint={"x": label_x / CW, "y": (CH - label_y - 30) / CH},
+        )
+        card.add_widget(txt_lbl)
+
+        # Arrow
+        arr_src = _fp("icon_arrow.png")
+        if arr_src and arrow_x is not None:
+            card.add_widget(Image(
+                source=arr_src,
+                size_hint=(19.78 / CW, 39.55 / CH),
+                pos_hint={"x": arrow_x / CW, "y": (CH - arrow_y - 39.55) / CH},
+                fit_mode="contain",
+            ))
+
+        data = _CardData(val_lbl, txt_lbl)
+
+        # Optional "+N more" label (schedule card)
+        if more_x is not None:
+            more_lbl = _lbl(
+                "", _FONT_SB, _ff(21.19), _BLUE,
+                size_hint=(40 / CW, 25 / CH),
+                pos_hint={"x": more_x / CW, "y": (CH - more_y - 25) / CH},
+            )
+            card.add_widget(more_lbl)
+            data._more_label = more_lbl
+
+        # Optional secondary time label (schedule card: "Now: ...")
+        if nextup_x is not None:
+            next_lbl = _lbl(
+                "", _FONT_SB, _ff(22.6), _MUTED,
+                size_hint=(nextup_w / CW, 27 / CH),
+                pos_hint={"x": nextup_x / CW, "y": (CH - nextup_y - 27) / CH},
+            )
+            card.add_widget(next_lbl)
+            data.text_label = next_lbl
+
+        root.add_widget(card)
+        return data
+
+    def _build_schedule_card(self, root: FloatLayout) -> None:
+        # (24.01, 507.11)  509.93 × 144.08
+        # inner group at (40.96, 16.95): icon at (0, 9.89), value at (115.83, 0),
+        # subtitle at (115.83, 50.85), +2 at (115.83, 84.75)
+        CW, CH = 509.93, 144.08
+        FIG_Y  = 507.11
+        card = _Card(radius=_ff(22.6),
+                     size_hint=(_sw(CW), _sh(CH)),
+                     pos_hint={"x": _x(24.01), "y": _y(FIG_Y, CH)})
+
+        icon_src = _fp("icon_schedule_circle.png")
+        if icon_src:
+            card.add_widget(Image(
+                source=icon_src,
+                size_hint=(93.23 / CW, 93.23 / CH),
+                pos_hint={"x": 40.96 / CW, "y": (CH - 26.84 - 93.23) / CH},
+                fit_mode="contain",
+            ))
+
+        # Time value "11:00"
+        val_lbl = _lbl(
+            "--:--", _FONT_SB, _ff(38.14), _WHITE,
+            size_hint=(230 / CW, 45 / CH),
+            pos_hint={"x": (40.96 + 115.83) / CW,
+                      "y": (CH - 16.95 - 45) / CH},
+        )
+        card.add_widget(val_lbl)
+
+        # "+2 more" labels
+        plus_lbl = _lbl(
+            "", _FONT_SB, _ff(21.19), _BLUE,
+            size_hint=(30 / CW, 25 / CH),
+            pos_hint={"x": (40.96 + 115.83) / CW,
+                      "y": (CH - 16.95 - 84.75 - 25) / CH},
+        )
+        card.add_widget(plus_lbl)
+        more_lbl = _lbl(
+            "", _FONT_SB, _ff(21.19), _BLUE,
+            size_hint=(60 / CW, 25 / CH),
+            pos_hint={"x": (40.96 + 146.9) / CW,
+                      "y": (CH - 16.95 - 84.75 - 25) / CH},
+        )
+        card.add_widget(more_lbl)
+
+        # Subtitle "Now: Product Sync"
+        txt_lbl = _lbl(
+            "--", _FONT_SB, _ff(22.6 * 1.2), _MUTED,
+            size_hint=(240 / CW, 32 / CH),
+            pos_hint={"x": (40.96 + 115.83) / CW,
+                      "y": (CH - 16.95 - 50.85 - 32) / CH},
+        )
+        card.add_widget(txt_lbl)
+
+        # Arrow
+        arr_src = _fp("icon_arrow.png")
+        if arr_src:
+            card.add_widget(Image(
+                source=arr_src,
+                size_hint=(19.78 / CW, 39.55 / CH),
+                pos_hint={"x": (40.96 + 408.23) / CW,
+                          "y": (CH - 16.95 - 45.2 - 39.55) / CH},
+                fit_mode="contain",
+            ))
+
+        def _sched_touch(w, t):
+            lx, ly = w.to_widget(t.x, t.y)
+            if w.collide_point(lx, ly):
+                self.goto("calendar", transition="slide_left")
+                return True
+            return False
+        card.bind(on_touch_up=_sched_touch)
+
+        root.add_widget(card)
+
+        data = _CardData(val_lbl, txt_lbl)
+        data._more_label = more_lbl
+        self.schedule_card = data
+
+    def _build_email_card(self, root: FloatLayout) -> None:
+        # (542.42, 507.11)  334.78 × 144.08
+        CW, CH = 334.78, 144.08
+        FIG_Y  = 507.11
+        card = _Card(radius=_ff(22.6),
+                     size_hint=(_sw(CW), _sh(CH)),
+                     pos_hint={"x": _x(542.42), "y": _y(FIG_Y, CH)})
+
+        icon_src = _fp("icon_email_circle.png")
+        if icon_src:
+            card.add_widget(Image(
+                source=icon_src,
+                size_hint=(93.23 / CW, 93.23 / CH),
+                pos_hint={"x": 22.6 / CW, "y": (CH - 25.43 - 93.23) / CH},
+                fit_mode="contain",
+            ))
+
+        val_lbl = _lbl(
+            "—", _FONT_SB, _ff(38.14), _WHITE,
+            size_hint=(80 / CW, 45 / CH),
+            pos_hint={"x": (22.6 + 115.83) / CW,
+                      "y": (CH - 25.43 - 11.3 - 45) / CH},
+        )
+        card.add_widget(val_lbl)
+
+        txt_lbl = _lbl(
+            "New emails", _FONT_SB, _ff(25.43 * 1.2), _MUTED,
+            size_hint=(160 / CW, 36 / CH),
+            pos_hint={"x": (22.6 + 115.83) / CW,
+                      "y": (CH - 25.43 - 60.74 - 36) / CH},
+        )
+        card.add_widget(txt_lbl)
+
+        arr_src = _fp("icon_arrow.png")
+        if arr_src:
+            card.add_widget(Image(
+                source=arr_src,
+                size_hint=(19.78 / CW, 39.55 / CH),
+                pos_hint={"x": (22.6 + 269.8) / CW,
+                          "y": (CH - 25.43 - 31.08 - 39.55) / CH},
+                fit_mode="contain",
+            ))
+
+        def _email_touch(w, t):
+            lx, ly = w.to_widget(t.x, t.y)
+            if w.collide_point(lx, ly):
+                self.goto("emails", transition="slide_left")
+                return True
+            return False
+        card.bind(on_touch_up=_email_touch)
+        root.add_widget(card)
+        self.email_card = _CardData(val_lbl, txt_lbl)
+
+    def _build_tasks_card(self, root: FloatLayout) -> None:
+        # (885.67, 507.11)  350.31 × 144.08
+        CW, CH = 350.31, 144.08
+        FIG_Y  = 507.11
+        card = _Card(radius=_ff(22.6),
+                     size_hint=(_sw(CW), _sh(CH)),
+                     pos_hint={"x": _x(885.67), "y": _y(FIG_Y, CH)})
+
+        icon_src = _fp("icon_tasks_circle.png")
+        if icon_src:
+            card.add_widget(Image(
+                source=icon_src,
+                size_hint=(93.23 / CW, 93.23 / CH),
+                pos_hint={"x": 36.73 / CW, "y": (CH - 25.43 - 93.23) / CH},
+                fit_mode="contain",
+            ))
+
+        val_lbl = _lbl(
+            "—", _FONT_SB, _ff(38.14), _WHITE,
+            size_hint=(80 / CW, 45 / CH),
+            pos_hint={"x": (36.73 + 115.83) / CW,
+                      "y": (CH - 25.43 - 7.06 - 45) / CH},
+        )
+        card.add_widget(val_lbl)
+
+        txt_lbl = _lbl(
+            "Tasks due", _FONT_SB, _ff(25.43 * 1.2), _MUTED,
+            size_hint=(150 / CW, 36 / CH),
+            pos_hint={"x": (36.73 + 115.83) / CW,
+                      "y": (CH - 25.43 - 56.5 - 36) / CH},
+        )
+        card.add_widget(txt_lbl)
+
+        arr_src = _fp("icon_arrow.png")
+        if arr_src:
+            card.add_widget(Image(
+                source=arr_src,
+                size_hint=(19.78 / CW, 39.55 / CH),
+                pos_hint={"x": (36.73 + 257.09) / CW,
+                          "y": (CH - 25.43 - 21.19 - 39.55) / CH},
+                fit_mode="contain",
+            ))
+
+        def _tasks_touch(w, t):
+            lx, ly = w.to_widget(t.x, t.y)
+            if w.collide_point(lx, ly):
+                self.goto("tasks", transition="slide_left")
+                return True
+            return False
+        card.bind(on_touch_up=_tasks_touch)
+
+        root.add_widget(card)
+        self.tasks_card = _CardData(val_lbl, txt_lbl)
+
+    # -----------------------------------------------------------------------
+    # Say / transcription bar  (38.14, 672.38)  1183.72 × 100.29
+    #
+    # Idle state  : "Try saying" prompt visible, orb centred.
+    # Active state: prompt fades out, orb slides to right + pulses,
+    #               transcription subtitle fades in.
+    # -----------------------------------------------------------------------
+
+    def _build_say_bar(self, root: FloatLayout) -> None:
+        BW, BH = 1183.72, 100.29
+        bar = _Card(
+            radius=_ff(29.66),
+            size_hint=(_sw(BW), _sh(BH)),
+            pos_hint={"x": _x(38.14), "y": _y(672.38, BH)},
+        )
+        self._say_bar_card = bar
+
+        # -----------------------------------------------------------------
+        # IDLE prompt widgets (visible by default, fade out on activation)
+        # -----------------------------------------------------------------
+        idle_widgets: list = []
+
+        sp_src = _fp("icon_sparkle.png") or _fp("icon_sparkle_layer.png")
+        if sp_src:
+            sparkle = Image(
+                source=sp_src,
+                size_hint=(33.67 / BW, 33.66 / BH),
+                pos_hint={"x": 22.6 / BW, "y": (BH - 32.49 - 33.66) / BH},
+                fit_mode="contain",
+            )
+            bar.add_widget(sparkle)
+            idle_widgets.append(sparkle)
+
+        plus_lbl = _lbl(
+            "+", _FONT, _ff(22.6), (0.106, 0.463, 0.980, 1.0), bold=True,
+            size_hint=(20 / BW, 27 / BH),
+            pos_hint={"x": 46.49 / BW, "y": (BH - 50.73 - 27) / BH},
+        )
+        bar.add_widget(plus_lbl)
+        idle_widgets.append(plus_lbl)
+
+        try_lbl = _lbl(
+            "Try saying", _FONT_SB, _ff(26.84), _BLUE,
+            size_hint=(160 / BW, 32 / BH),
+            pos_hint={"x": 80.51 / BW, "y": (BH - 15.54 - 32) / BH},
+        )
+        bar.add_widget(try_lbl)
+        idle_widgets.append(try_lbl)
+
+        prompt_lbl = _lbl(
+            '"Schedule a meeting tomorrow at 4 PM"',
+            _FONT_SB, _ff(22.6 * 1.2), _MUTED,
+            size_hint=(500 / BW, 33 / BH),
+            pos_hint={"x": 80.51 / BW, "y": (BH - 56.50 - 33) / BH},
+        )
+        bar.add_widget(prompt_lbl)
+        idle_widgets.append(prompt_lbl)
+
+        # -----------------------------------------------------------------
+        # Mic orb — starts at IDLE (center) position
+        # Active position: right-aligned, 14 px from right edge
+        # -----------------------------------------------------------------
+        _ORB_W, _ORB_H = 91.82, 91.82
+        _ORB_IDLE_X = 591.86 / BW
+        _ORB_Y      = (BH - 4.24 - _ORB_H) / BH
+        _ORB_ACTIVE_X = (BW - _ORB_W - 14.0) / BW
+
+        self._orb_idle_ph   = {"x": _ORB_IDLE_X,   "y": _ORB_Y}
+        self._orb_active_ph = {"x": _ORB_ACTIVE_X,  "y": _ORB_Y}
+
+        orb_src = _fp("icon_voice_orb.png") or _fp("icon_voice_orb_bar.png")
+        if orb_src:
+            voice_orb = _ScalableImage(
+                source=orb_src,
+                size_hint=(_ORB_W / BW, _ORB_H / BH),
+                pos_hint=dict(self._orb_idle_ph),
+            )
+            bar.add_widget(voice_orb)
+            self._voice_orb = voice_orb
+
+        orb_tap = _TappableCard(
+            draw_bg=False,
+            size_hint=(_ORB_W / BW, _ORB_H / BH),
+            pos_hint=dict(self._orb_idle_ph),
+        )
+        orb_tap.bind(on_release=self._on_mic_orb_tapped)
+        bar.add_widget(orb_tap)
+        self._orb_tap = orb_tap
+
+        # Keyboard badge (idle, fades with the prompts)
+        kb_src = _fp("icon_keyboard.png")
+        if kb_src:
+            kb = Image(
+                source=kb_src,
+                size_hint=(76.28 / BW, 67.8 / BH),
+                pos_hint={"x": 1084.84 / BW, "y": (BH - 16.95 - 67.8) / BH},
+                fit_mode="contain",
+            )
+            bar.add_widget(kb)
+            idle_widgets.append(kb)
+
+        self._say_bar_prompts = idle_widgets
+
+        # -----------------------------------------------------------------
+        # ACTIVE transcription widgets (hidden by default)
+        # -----------------------------------------------------------------
+        _L_PAD   = 24.0
+        _DOT_W   = 22.0
+        _DOT_GAP = 10.0
+        _TX_X    = _L_PAD + _DOT_W + _DOT_GAP
+        _TX_W    = (BW - _ORB_W - 14.0) - _TX_X - 16.0
+
+        # Colored ● dot — white for user, blue for AI
+        self._say_bar_dot = _lbl(
+            "●", _FONT, _ff(16), _WHITE,
+            halign="center", valign="middle",
+            size_hint=(_DOT_W / BW, 0.4),
+            pos_hint={"x": _L_PAD / BW, "center_y": 0.5},
+            opacity=0.0,
+        )
+        bar.add_widget(self._say_bar_dot)
+
+        # Subtitle line (single line, 30 sp, shorten on overflow)
+        self._say_bar_label = Label(
+            text="",
+            font_name=_FONT,
+            font_size=_ff(30),
+            color=_WHITE,
+            halign="left",
+            valign="middle",
+            shorten=True,
+            shorten_from="right",
+            size_hint=(_TX_W / BW, 0.75),
+            pos_hint={"x": _TX_X / BW, "center_y": 0.5},
+            opacity=0.0,
+        )
+        self._say_bar_label.bind(
+            size=lambda w, _s: setattr(w, "text_size", (w.width, w.height))
+        )
+        bar.add_widget(self._say_bar_label)
+
+        root.add_widget(bar)
+
+    # -----------------------------------------------------------------------
+    # Say-bar transcription helpers
+    # -----------------------------------------------------------------------
+
+    @staticmethod
+    def _subtitle_tail(text: str, max_chars: int = 55) -> str:
+        """Return the last subtitle-sized window of *text*, trimmed to a word
+        boundary, so AI streaming feels like scrolling movie subtitles."""
+        text = text.strip()
+        if len(text) <= max_chars:
+            return text
+        tail = text[-max_chars:]
+        space = tail.find(' ')
+        return tail[space + 1:] if space >= 0 else tail
+
+    def update_say_bar_transcription(self, speaker: str, text: str) -> None:
+        """Show current transcript line.  speaker='You'|'AI'.
+
+        For AI text, only the most-recently-spoken words are shown so the
+        subtitle scrolls naturally in sync with the voice output.
+        """
+        if self._say_bar_dot is not None:
+            self._say_bar_dot.color = _WHITE if speaker == "You" else _BLUE
+        if self._say_bar_label is not None:
+            display = (
+                self._subtitle_tail(text) if speaker == "AI" else text
+            )
+            self._say_bar_label.text = display
+
+    def clear_say_bar_transcription(self) -> None:
+        """Clear transcription text (called at session start/end)."""
+        if self._say_bar_label is not None:
+            self._say_bar_label.text = ""
+        if self._say_bar_dot is not None:
+            self._say_bar_dot.color = _WHITE
+
+    # -----------------------------------------------------------------------
+    # Say-bar state machine  (idle ↔ active)
+    # -----------------------------------------------------------------------
+
+    def _orb_target_x(self, hint_x: float) -> float:
+        """Convert bar-fraction hint_x to absolute window x for orb animation."""
+        bar = self._say_bar_card
+        return (bar.x + hint_x * bar.width) if bar is not None else 0.0
+
+    def activate_say_bar(self) -> None:
+        """Transition say bar idle → active (one-shot; idempotent).
+
+        Fades out the "Try saying" prompts, slides the orb to the right
+        side, and fades in the transcription area.  The caller is
+        responsible for starting / managing the orb pulse animation.
+        """
+        if self._say_bar_reset_ev is not None:
+            self._say_bar_reset_ev.cancel()
+            self._say_bar_reset_ev = None
+
+        if self._say_bar_active:
+            return
+        self._say_bar_active = True
+
+        # Fade out idle prompts
+        for w in self._say_bar_prompts:
+            Animation.cancel_all(w, 'opacity')
+            Animation(opacity=0.0, duration=0.25, t='in_quad').start(w)
+
+        # Slide orb to the right (clear pos_hint so `x` can be animated)
+        target_x = self._orb_target_x(self._orb_active_ph['x'])
+        orb = self._voice_orb
+        if orb is not None:
+            Animation.cancel_all(orb, 'x')
+            orb.pos_hint = {}
+            Animation(x=target_x, duration=0.45, t='out_cubic').start(orb)
+
+        orb_tap = self._orb_tap
+        if orb_tap is not None:
+            Animation.cancel_all(orb_tap, 'x')
+            orb_tap.pos_hint = {}
+            Animation(x=target_x, duration=0.45, t='out_cubic').start(orb_tap)
+
+        # Fade in transcription dot + label
+        for w in (self._say_bar_dot, self._say_bar_label):
+            if w is not None:
+                Animation.cancel_all(w, 'opacity')
+                Animation(opacity=1.0, duration=0.35, t='out_quad').start(w)
+
+    def deactivate_say_bar(self) -> None:
+        """Schedule an idle reset 0.5 s after the session ends."""
+        if self._say_bar_reset_ev is not None:
+            self._say_bar_reset_ev.cancel()
+        self._say_bar_reset_ev = Clock.schedule_once(
+            lambda _dt: self._do_deactivate_say_bar(), 0.5
+        )
+
+    def _do_deactivate_say_bar(self) -> None:
+        """Animate say bar back to idle state."""
+        self._say_bar_reset_ev = None
+        self._say_bar_active = False
+
+        if self._say_bar_label is not None:
+            self._say_bar_label.text = ""
+
+        # Fade out transcription area
+        for w in (self._say_bar_dot, self._say_bar_label):
+            if w is not None:
+                Animation.cancel_all(w, 'opacity')
+                Animation(opacity=0.0, duration=0.25, t='in_quad').start(w)
+
+        # Slide orb back to idle position, then restore pos_hint
+        idle_x = self._orb_target_x(self._orb_idle_ph['x'])
+        orb = self._voice_orb
+        if orb is not None:
+            Animation.cancel_all(orb, 'x', 'orb_scale')
+
+            def _restore_orb_ph(*_):
+                orb.pos_hint = dict(self._orb_idle_ph)
+
+            slide = Animation(x=idle_x, duration=0.40, t='in_out_cubic')
+            slide.bind(on_complete=_restore_orb_ph)
+            slide.start(orb)
+            Animation(orb_scale=1.0, duration=0.40, t='out_sine').start(orb)
+
+        orb_tap = self._orb_tap
+        if orb_tap is not None:
+            Animation.cancel_all(orb_tap, 'x')
+
+            def _restore_tap_ph(*_):
+                orb_tap.pos_hint = dict(self._orb_idle_ph)
+
+            slide_tap = Animation(x=idle_x, duration=0.40, t='in_out_cubic')
+            slide_tap.bind(on_complete=_restore_tap_ph)
+            slide_tap.start(orb_tap)
+
+        # Fade idle prompts back in
+        for w in self._say_bar_prompts:
+            Animation.cancel_all(w, 'opacity')
+            Animation(opacity=1.0, duration=0.30, t='out_quad').start(w)
+
+    def _reset_say_bar_instant(self) -> None:
+        """Instantly reset say bar to idle — called on screen enter, no animation."""
+        if self._say_bar_reset_ev is not None:
+            self._say_bar_reset_ev.cancel()
+            self._say_bar_reset_ev = None
+        self._say_bar_active = False
+
+        for w in self._say_bar_prompts:
+            Animation.cancel_all(w, 'opacity')
+            w.opacity = 1.0
+
+        for w in (self._say_bar_dot, self._say_bar_label):
+            if w is not None:
+                Animation.cancel_all(w, 'opacity')
+                w.opacity = 0.0
+
+        if self._say_bar_label is not None:
+            self._say_bar_label.text = ""
+
+        orb = self._voice_orb
+        if orb is not None:
+            Animation.cancel_all(orb, 'x', 'orb_scale')
+            orb.orb_scale = 1.0
+            orb.pos_hint = dict(self._orb_idle_ph)
+
+        orb_tap = self._orb_tap
+        if orb_tap is not None:
+            Animation.cancel_all(orb_tap, 'x')
+            orb_tap.pos_hint = dict(self._orb_idle_ph)
+
+        bar = self._say_bar_card
+        if bar is not None:
+            bar.do_layout()
+
+    # -----------------------------------------------------------------------
+    # Lifecycle
+    # -----------------------------------------------------------------------
 
     def on_enter(self):
+        # Ensure listening state is reset to idle each time we arrive at home
+        self._listening_active = False
+        self._current_amplitude = 0.0
+        if self._soundwave_tick_ev is not None:
+            self._soundwave_tick_ev.cancel()
+            self._soundwave_tick_ev = None
+        if self._listening_pill is not None:
+            Animation.cancel_all(self._listening_pill, 'opacity')
+            self._listening_pill.opacity = 0.0
+        if self._soundwave_wf is not None:
+            self._soundwave_wf.update_bars(time.monotonic(), 0.0)
+        # Reset say bar and orb to idle position instantly
+        self._reset_say_bar_instant()
+
         self._update_clock_labels()
+        snap = get_weather_client().snapshot
+        if snap:
+            self._on_weather_snapshot(snap)
+        get_weather_client().subscribe(self._on_weather_snapshot)
+        self._refresh_voice_pill()
+        self._load_system_status()
+        if not self._home_cache_subscribed:
+            self.app.ui_cache_subscribe("home_summary_bundle", self._on_cached_home_summary)
+            self._home_cache_subscribed = True
+        cached_bundle = self.app.ui_cache_get("home_summary_bundle")
+        if isinstance(cached_bundle, dict):
+            self._apply_home_summary_bundle(cached_bundle)
+        if not self.app.ui_cache_is_fresh("home_summary_bundle"):
+            self._load_home_summary()
+
         if self._clock_event:
             self._clock_event.cancel()
-        self._clock_event = Clock.schedule_interval(lambda _dt: self._update_clock_labels(), 1.0)
+        self._clock_event = Clock.schedule_interval(
+            lambda _dt: self._update_clock_labels(), 1.0
+        )
         if self._footer_ip_event:
             self._footer_ip_event.cancel()
         self._footer_ip_event = Clock.schedule_interval(self._refresh_footer_ip, 30.0)
         Clock.schedule_once(lambda _dt: self._refresh_footer_ip(_dt), 3.0)
-        self._load_system_status()
-        self._load_home_summary()
-        self._refresh_voice_pill()
         if self._voice_state_event:
             self._voice_state_event.cancel()
-        self._voice_state_event = Clock.schedule_interval(lambda _dt: self._refresh_voice_pill(), 2.0)
-        # Subscribe to live weather; replays the cached snapshot immediately,
-        # then updates again whenever WeatherClient refreshes (every 15 min).
-        try:
-            wc = get_weather_client()
-            wc.subscribe(self._on_weather_snapshot)
-        except Exception:
-            pass
+        self._voice_state_event = Clock.schedule_interval(
+            lambda _dt: self._refresh_voice_pill(), 2.0
+        )
+        # Watch the app-level processing-summary cache so a "summary ready"
+        # notification can pop up while the user is back on the home screen.
+        if self._summary_poll_event:
+            self._summary_poll_event.cancel()
+            self._summary_poll_event = None
+        Clock.schedule_once(lambda _dt: self._check_summary_ready(), 0.5)
+        self._summary_poll_event = Clock.schedule_interval(
+            lambda _dt: self._check_summary_ready(), 1.5
+        )
+
+        # Status strip — initial load + 30-second refresh
+        if getattr(self, "_status_strip_event", None):
+            self._status_strip_event.cancel()
+        Clock.schedule_once(lambda _dt: self._refresh_status_strip(), 1.5)
+        self._status_strip_event = Clock.schedule_interval(
+            lambda _dt: self._refresh_status_strip(), 30.0
+        )
+
+        # Tasks count badge — fetch immediately, then refresh every 20 s so a
+        # boot-time empty fetch (backend not ready yet) self-heals without
+        # needing the user to leave and re-enter the home screen.
+        if getattr(self, "_tasks_count_event", None):
+            self._tasks_count_event.cancel()
+        Clock.schedule_once(lambda _dt: self._load_tasks_count(), 0)
+        self._tasks_count_event = Clock.schedule_interval(
+            lambda _dt: self._load_tasks_count(), 20.0
+        )
 
     def on_leave(self):
+        # Clean up listening state immediately when leaving home
+        self._listening_active = False
+        self._current_amplitude = 0.0
+        if self._soundwave_tick_ev is not None:
+            self._soundwave_tick_ev.cancel()
+            self._soundwave_tick_ev = None
+        if self._listening_pill is not None:
+            Animation.cancel_all(self._listening_pill, 'opacity')
+            self._listening_pill.opacity = 0.0
+        if self._voice_orb is not None:
+            Animation.cancel_all(self._voice_orb, 'orb_scale')
+            self._voice_orb.orb_scale = 1.0
+        if self._soundwave_wf is not None:
+            self._soundwave_wf.update_bars(time.monotonic(), 0.0)
+
         if self._clock_event:
             self._clock_event.cancel()
             self._clock_event = None
@@ -643,71 +1894,249 @@ class HomeScreen(BaseScreen):
         if self._voice_state_event:
             self._voice_state_event.cancel()
             self._voice_state_event = None
+        if self._summary_poll_event:
+            self._summary_poll_event.cancel()
+            self._summary_poll_event = None
+        # NOTE: deliberately do NOT dismiss the "summary ready" popup here.
+        # goto_screen() fires on_leave()+on_enter() even for redundant same-screen
+        # navigation (e.g. spurious "Nav → home" from voice events), which would
+        # otherwise remove+recreate the popup every cycle and make it blink /
+        # unclickable. The popup is parented to the home root (only visible on
+        # home) and is dismissed explicitly by its "View"/"Close" buttons.
+        if getattr(self, "_status_strip_event", None):
+            self._status_strip_event.cancel()
+            self._status_strip_event = None
+        if getattr(self, "_tasks_count_event", None):
+            self._tasks_count_event.cancel()
+            self._tasks_count_event = None
+        if self._home_cache_subscribed:
+            self.app.ui_cache_unsubscribe("home_summary_bundle", self._on_cached_home_summary)
+            self._home_cache_subscribed = False
         try:
             get_weather_client().unsubscribe(self._on_weather_snapshot)
         except Exception:
             pass
 
+    # -----------------------------------------------------------------------
+    # "Meeting summary is ready" notification
+    # -----------------------------------------------------------------------
+
+    def _check_summary_ready(self, *_):
+        """Show the summary-ready pill when the app cache has a fresh summary."""
+        if self._summary_ready_popup is not None:
+            return
+        cache = getattr(self.app, "_processing_summary_cache", None)
+        if not isinstance(cache, dict) or not cache:
+            return
+        for meeting_id, entry in list(cache.items()):
+            if not isinstance(entry, dict) or not entry.get("ok"):
+                continue
+            if meeting_id in self._shown_summary_ids:
+                continue
+            self._show_summary_ready_popup(meeting_id, entry.get("summary") or {})
+            break
+
+    def _show_summary_ready_popup(self, meeting_id: str, summary: dict) -> None:
+        self._dismiss_summary_popup()
+
+        title = ""
+        if isinstance(summary, dict):
+            for key in ("title", "meeting_title", "name"):
+                val = (summary.get(key) or "").strip()
+                if val:
+                    title = val
+                    break
+        title = title or "Your meeting"
+
+        # Long white pill with fully-rounded edges, centred near the top.
+        PW, PH, PT = 760.0, 88.0, 120.0
+        PX = (_FW - PW) / 2.0
+        popup = FloatLayout(
+            size_hint=(_sw(PW), _sh(PH)),
+            pos_hint={"x": _x(PX), "y": _y(PT, PH)},
+        )
+        bg = _Card(
+            top=_WHITE,
+            bot=_WHITE,
+            border=(0.88, 0.88, 0.91, 1.0),
+            radius=_ff(PH / 2.0),
+            size_hint=(1, 1),
+            pos_hint={"x": 0, "y": 0},
+        )
+        popup.add_widget(bg)
+
+        popup.add_widget(_lbl(
+            "Meeting summary is ready", _FONT_SB, _ff(22), (0.11, 0.11, 0.12, 1.0),
+            bold=True, halign="left", valign="middle",
+            size_hint=(0.56, 0.34),
+            pos_hint={"x": 0.045, "center_y": 0.63},
+        ))
+        popup.add_widget(_lbl(
+            title, _FONT_MD, _ff(17), (0.45, 0.45, 0.50, 1.0),
+            halign="left", valign="middle",
+            shorten=True, shorten_from="right", max_lines=1,
+            size_hint=(0.56, 0.30),
+            pos_hint={"x": 0.045, "center_y": 0.34},
+        ))
+
+        view_btn = _TappableCard(
+            top=_BLUE, bot=_BLUE, border=_BLUE, radius=_ff(26),
+            size_hint=(0.1447, 0.59),
+            pos_hint={"x": 0.687, "center_y": 0.5},
+        )
+        view_btn.add_widget(_lbl(
+            "View", _FONT_SB, _ff(20), _WHITE, bold=True,
+            halign="center", valign="middle",
+            size_hint=(1, 1), pos_hint={"x": 0, "y": 0},
+        ))
+        view_btn.bind(
+            on_release=lambda *_a, mid=meeting_id, sm=summary: self._on_view_summary(mid, sm)
+        )
+        popup.add_widget(view_btn)
+
+        close_btn = _TappableCard(
+            top=(0.93, 0.93, 0.95, 1.0), bot=(0.93, 0.93, 0.95, 1.0),
+            border=(0.86, 0.86, 0.89, 1.0), radius=_ff(26),
+            size_hint=(0.126, 0.59),
+            pos_hint={"x": 0.847, "center_y": 0.5},
+        )
+        close_btn.add_widget(_lbl(
+            "Close", _FONT_MD, _ff(18), (0.30, 0.30, 0.34, 1.0),
+            halign="center", valign="middle",
+            size_hint=(1, 1), pos_hint={"x": 0, "y": 0},
+        ))
+        close_btn.bind(
+            on_release=lambda *_a, mid=meeting_id: self._dismiss_summary_popup(mark=mid)
+        )
+        popup.add_widget(close_btn)
+
+        self._summary_ready_popup = popup
+        if getattr(self, "_root", None) is not None:
+            self._root.add_widget(popup)
+
+    def _on_view_summary(self, meeting_id: str, summary: dict) -> None:
+        self._shown_summary_ids.add(meeting_id)
+        self._dismiss_summary_popup()
+        try:
+            screen = self.app.screen_manager.get_screen("summary_review")
+            if hasattr(screen, "set_meeting_data"):
+                screen.set_meeting_data(meeting_id, summary or {})
+        except Exception:
+            logger.exception("Failed to open summary_review from home popup")
+        self.app.goto_screen("summary_review", "fade")
+
+    def _dismiss_summary_popup(self, mark: str | None = None) -> None:
+        if mark:
+            self._shown_summary_ids.add(mark)
+        popup = self._summary_ready_popup
+        self._summary_ready_popup = None
+        if popup is None:
+            return
+        try:
+            if popup.parent is not None:
+                popup.parent.remove_widget(popup)
+        except Exception:
+            pass
+
+    # -----------------------------------------------------------------------
+    # Helpers
+    # -----------------------------------------------------------------------
+
     def _refresh_footer_ip(self, _dt):
         if not self._footer_kwargs:
             return
         kw = self._footer_kwargs
-        self.update_footer(wifi_ok=kw['wifi_ok'], free_gb=kw['free_gb'], privacy_mode=kw['privacy_mode'], wired_lan_ok=kw['wired_lan_ok'], local_ip=get_primary_ipv4())
+        self.update_footer(
+            wifi_ok=kw["wifi_ok"],
+            free_gb=kw["free_gb"],
+            privacy_mode=kw["privacy_mode"],
+            wired_lan_ok=kw["wired_lan_ok"],
+            local_ip=get_primary_ipv4(),
+        )
 
     def _on_start_recording(self, _inst):
         self.app.start_recording()
 
     def _open_latest_meeting(self):
         if self._latest_meeting_id:
-            detail = self.app.screen_manager.get_screen('meeting_detail')
+            detail = self.app.screen_manager.get_screen("meeting_detail")
             detail.set_meeting_id(self._latest_meeting_id)
-            self.goto('meeting_detail', transition='slide_left')
+            self.goto("meeting_detail", transition="slide_left")
         else:
-            self.goto('meetings', transition='slide_left')
+            self.goto("meetings", transition="slide_left")
 
-    # ------------------------------------------------------------------
-    # Listening pill toggle
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------------
+    # Voice pill toggle (kept for backward-compat callers)
+    # -----------------------------------------------------------------------
+
     def _toggle_voice_listening(self):
-        """Flip the user-pause flag for the wake-word assistant.
-
-        ``user_voice_paused`` is also consulted by ``_voice_assistant_should_listen``
-        in main.py, so toggling it here is enough — _sync_voice_assistant_state
-        propagates the new value into the voice assistant + pill UI.
-        """
         app = self.app
-        if not getattr(app, 'voice_assistant', None) or not getattr(app.voice_assistant, 'available', False):
-            # No mic / wake word is unavailable — nothing meaningful to toggle.
+        if not getattr(app, "voice_assistant", None) or not getattr(
+            app.voice_assistant, "available", False
+        ):
             self.add_widget(ModalDialog(
-                title='Voice unavailable',
-                message=('No microphone is available, or the wake-word model is '
-                         'missing. Run a Microphone Test from Settings to debug.'),
-                confirm_text='OK',
-                cancel_text='',
+                title="Voice unavailable",
+                message=(
+                    "No microphone is available, or the wake-word model is "
+                    "missing. Run a Microphone Test from Settings to debug."
+                ),
+                confirm_text="OK",
+                cancel_text="",
             ))
             return
-        app.user_voice_paused = not getattr(app, 'user_voice_paused', False)
+        app.user_voice_paused = not getattr(app, "user_voice_paused", False)
         app._sync_voice_assistant_state()
         self._refresh_voice_pill()
 
-    # ------------------------------------------------------------------
-    # Weather location dialog (shared with Settings)
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------------
+    # Mic orb tap — activates listening same as wake word
+    # -----------------------------------------------------------------------
+
+    def _on_mic_orb_tapped(self, _inst) -> None:
+        """Tapping the mic orb triggers the listening state just like the wake word.
+
+        Puts the voice interpreter in command-listening mode and runs the
+        same animation/pill sequence as a real wake-phrase detection.
+        """
+        app = self.app
+        va  = getattr(app, 'voice_assistant', None)
+        if not va or not getattr(va, 'available', False):
+            self.add_widget(ModalDialog(
+                title="Voice unavailable",
+                message=(
+                    "No microphone is available, or the wake-word model is "
+                    "missing. Run a Microphone Test from Settings to debug."
+                ),
+                confirm_text="OK",
+                cancel_text="",
+            ))
+            return
+        # Open the voice interpreter's command window
+        va.simulate_wake()
+        # Reuse the exact same UI flow as real wake-word detection
+        app._handle_voice_wake_phrase("")
+
+    # -----------------------------------------------------------------------
+    # Weather location dialog
+    # -----------------------------------------------------------------------
+
     def _show_weather_location_dialog(self):
         wc = get_weather_client()
         cur = wc.location
-        cur_city = (cur and cur.get('city')) or ''
+        cur_city = (cur and cur.get("city")) or ""
         self.add_widget(TextInputDialog(
-            title='Weather Location',
-            message=('Enter a city name (e.g. "Bangalore" or "London, UK"). '
-                     'Leave blank to keep auto-detect.'),
+            title="Weather Location",
+            message=(
+                'Enter a city name (e.g. "Bangalore" or "London, UK"). '
+                "Leave blank to keep auto-detect."
+            ),
             initial_value=cur_city,
-            placeholder='City name',
+            placeholder="City name",
             on_confirm=self._apply_weather_location,
         ))
 
     def _apply_weather_location(self, value: str):
-        text = (value or '').strip()
+        text = (value or "").strip()
         if not text:
             return
         wc = get_weather_client()
@@ -717,143 +2146,540 @@ class HomeScreen(BaseScreen):
             if resolved is None:
                 Clock.schedule_once(
                     lambda _dt, t=text: self.add_widget(ModalDialog(
-                        title='City not found',
-                        message=(f'Could not find weather data for "{t}".\n\n'
-                                 'Try the city name in English, or include the '
-                                 'country (e.g. "Bengaluru, IN").'),
-                        confirm_text='OK',
-                        cancel_text='',
-                    )), 0)
-
+                        title="City not found",
+                        message=(
+                            f'Could not find weather data for "{t}".\n\n'
+                            "Try the city name in English, or include the "
+                            'country (e.g. "Bengaluru, IN").'
+                        ),
+                        confirm_text="OK",
+                        cancel_text="",
+                    )),
+                    0,
+                )
         run_async(_resolve())
 
-    # ------------------------------------------------------------------
-    # Gmail dashboard dialog
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------------
+    # Gmail dialog
+    # -----------------------------------------------------------------------
+
     def _show_gmail_dashboard_dialog(self):
         self.add_widget(ModalDialog(
-            title='Connect Gmail',
-            message=(f'To see unread email here, open\n{DASHBOARD_URL}\n'
-                     'on your phone or laptop and connect Gmail.'),
-            confirm_text='OK',
-            cancel_text='',
+            title="Connect Gmail",
+            message=(
+                f"To see unread email here, open\n{DASHBOARD_URL}\n"
+                "on your phone or laptop and connect Gmail."
+            ),
+            confirm_text="OK",
+            cancel_text="",
         ))
 
-    # ------------------------------------------------------------------
-    # Live weather update
-    # ------------------------------------------------------------------
+    # -----------------------------------------------------------------------
+    # Live weather
+    # -----------------------------------------------------------------------
+
     def _on_weather_snapshot(self, snap):
-        # Don't override the offline / backend-down state: those are
-        # higher-priority states that the user must be able to see.
-        if getattr(self, '_health_label_offline', False):
-            return
+        # Always show temperature — weather comes from open-meteo, not the backend.
+        # Even if backend is offline the temperature should display.
         try:
-            temp = float(snap.temp_c)
-            label = (snap.label or '--').strip()
-            self.health_label.text = f'{temp:.0f}°C\n{label}'
-            self.health_label.color = COLORS['white']
+            temp  = float(snap.temp_c)
+            label = (snap.label or "--").strip()
+            self.health_label.text       = f"{temp:.0f}°C"
+            # Keep red color when backend is offline so connectivity is still indicated,
+            # but show the temperature value (not the word "Backend").
+            if not self._health_label_offline:
+                self.health_label.color  = _WHITE
+            self._wx_condition.text      = label
+            self._brief_wx_title.text    = f"Weather: {temp:.0f}°C"
+            self._brief_wx_sub.text      = label
         except Exception:
             pass
 
+    # -----------------------------------------------------------------------
+    # Voice pill refresh (content only — visibility is event-driven)
+    # -----------------------------------------------------------------------
+
     def _refresh_voice_pill(self):
-        assistant = getattr(self.app, 'voice_assistant', None)
-        should_listen = getattr(self.app, '_voice_assistant_should_listen', lambda: False)()
-        if assistant and getattr(assistant, 'available', False) and should_listen:
-            self.voice_dot.color = COLORS['blue']
-            self.voice_state_label.text = 'Listening'
-        elif assistant and not getattr(assistant, 'available', False):
-            self.voice_dot.color = COLORS['gray_300']
-            self.voice_state_label.text = 'Voice offline'
+        """Update the pill's label/dot content without touching its opacity."""
+        # Pill only ever shows "Listening" — keep content locked to that state.
+        if self.voice_dot is not None:
+            self.voice_dot.color = COLORS["blue"]
+        if self.voice_state_label is not None:
+            self.voice_state_label.text = "Listening"
+
+    # -----------------------------------------------------------------------
+    # Wake-word voice interaction show / hide
+    # -----------------------------------------------------------------------
+
+    def show_listening_state(self) -> None:
+        """Called when the wake word is detected while on the home screen.
+
+        1. Activates say bar (slides orb right, fades prompt out/transcription in).
+        2. Simultaneously pulses the mic orb 1.3↔1.4x.
+        3. Fades the Listening pill in.
+        4. Starts the soundwave amplitude tick.
+        """
+        self._listening_active = True
+        self._current_amplitude = 0.0
+
+        # -- Say bar: slide orb to right + fade prompts (one-shot) ---------
+        self.activate_say_bar()
+
+        # Show an immediate "connecting…" hint so the user gets instant
+        # text feedback while the Realtime session is establishing.
+        # Real transcription will overwrite this as soon as it arrives.
+        if self._say_bar_label is not None and not self._say_bar_label.text:
+            self._say_bar_dot.color = _BLUE  # type: ignore[union-attr]
+            self._say_bar_label.text = "Listening…"
+
+        # -- Voice orb pulse (starts simultaneously with the slide) --------
+        if self._voice_orb is not None:
+            Animation.cancel_all(self._voice_orb, 'orb_scale')
+            pulse = (
+                Animation(orb_scale=1.3, duration=0.6, t='in_out_sine') +
+                Animation(orb_scale=1.4, duration=0.6, t='in_out_sine')
+            )
+            pulse.repeat = True
+            pulse.start(self._voice_orb)
+
+        # -- Listening pill fade in ----------------------------------------
+        if self._listening_pill is not None:
+            Animation.cancel_all(self._listening_pill, 'opacity')
+            Animation(opacity=1.0, duration=0.28, t='out_cubic').start(
+                self._listening_pill
+            )
+
+        # -- Start soundwave animation tick --------------------------------
+        if self._soundwave_tick_ev is None and self._soundwave_wf is not None:
+            self._soundwave_tick_ev = Clock.schedule_interval(
+                self._soundwave_tick, 1 / 30
+            )
+
+    def set_voice_session_state(self, state: str) -> None:
+        """Update home screen visuals for the current Realtime session state.
+
+        Called from the main app whenever the RealtimeVoiceSession emits a state
+        change (listening / thinking / speaking / idle).
+
+        - listening : orb pulses, pill fades in ("Listening")
+        - thinking  : orb keeps pulsing, pill fades out
+        - speaking  : orb keeps pulsing, pill fades out
+        - idle      : full hide (orb back to 1.0x, pill out, soundwave off)
+        """
+        if state == "listening":
+            # User can speak — show the listening pill and activate say bar
+            self._listening_active = True
+            self.activate_say_bar()
+            if self._listening_pill is not None:
+                Animation.cancel_all(self._listening_pill, 'opacity')
+                Animation(opacity=1.0, duration=0.22, t='out_cubic').start(
+                    self._listening_pill
+                )
+            # Keep orb pulsing (restart if stopped)
+            if self._voice_orb is not None:
+                Animation.cancel_all(self._voice_orb, 'orb_scale')
+                pulse = (
+                    Animation(orb_scale=1.3, duration=0.6, t='in_out_sine') +
+                    Animation(orb_scale=1.4, duration=0.6, t='in_out_sine')
+                )
+                pulse.repeat = True
+                pulse.start(self._voice_orb)
+            if self._soundwave_tick_ev is None and self._soundwave_wf is not None:
+                self._soundwave_tick_ev = Clock.schedule_interval(
+                    self._soundwave_tick, 1 / 30
+                )
+        elif state in ("thinking", "speaking"):
+            # Agent is busy — hide the pill but keep the orb animated
+            self._listening_active = False
+            self._current_amplitude = 0.0
+            if self._listening_pill is not None:
+                Animation.cancel_all(self._listening_pill, 'opacity')
+                Animation(opacity=0.0, duration=0.18, t='in_cubic').start(
+                    self._listening_pill
+                )
+            # Orb: slow gentle pulse so user knows session is alive
+            if self._voice_orb is not None:
+                Animation.cancel_all(self._voice_orb, 'orb_scale')
+                pulse = (
+                    Animation(orb_scale=1.15, duration=1.0, t='in_out_sine') +
+                    Animation(orb_scale=1.25, duration=1.0, t='in_out_sine')
+                )
+                pulse.repeat = True
+                pulse.start(self._voice_orb)
         else:
-            self.voice_dot.color = COLORS['gray_300']
-            self.voice_state_label.text = 'Voice paused'
+            # idle / unknown — full reset
+            self.hide_listening_state()
+
+    def hide_listening_state(self) -> None:
+        """End of voice interaction: scale orb back, fade out pill, stop soundwave,
+        and animate say bar back to idle."""
+        self._listening_active = False
+        self._current_amplitude = 0.0
+
+        # -- Stop soundwave tick and reset bars to baseline ----------------
+        if self._soundwave_tick_ev is not None:
+            self._soundwave_tick_ev.cancel()
+            self._soundwave_tick_ev = None
+        if self._soundwave_wf is not None:
+            self._soundwave_wf.update_bars(time.monotonic(), 0.0)
+
+        # -- Listening pill fade out ---------------------------------------
+        if self._listening_pill is not None:
+            Animation.cancel_all(self._listening_pill, 'opacity')
+            Animation(opacity=0.0, duration=0.28, t='in_cubic').start(
+                self._listening_pill
+            )
+
+        # -- Say bar: animate back to idle (handles orb scale too) --------
+        self.deactivate_say_bar()
+
+    def _soundwave_tick(self, _dt) -> None:
+        """30-fps tick: drive the _FigmaWaveform bar animation."""
+        if self._soundwave_wf is None:
+            return
+        self._soundwave_wf.update_bars(time.monotonic(), self._current_amplitude)
+
+    def update_amplitude(self, amp: float) -> None:
+        """Receive microphone amplitude (0-1); stored for the soundwave tick."""
+        if self._listening_active:
+            self._current_amplitude = amp
+
+    # -----------------------------------------------------------------------
+    # Status strip (battery / WiFi / BT icons at absolute top-right)
+    # -----------------------------------------------------------------------
+
+    def _refresh_status_strip(self):
+        """Fetch hardware status in a background thread and update the strip labels."""
+        import threading as _t
+        _t.Thread(target=self._fetch_status_strip, daemon=True).start()
+
+    def _fetch_status_strip(self):
+        try:
+            import hardware as _hw
+            import wifi_nmcli_local as _wifi
+            import bluetooth_local as _bt
+
+            batt    = _hw.get_battery_info()
+            wifi_on = _wifi.get_wifi_radio_enabled()
+            bt_on   = _bt.get_power_state()
+        except Exception:
+            return
+
+        def _apply(_dt):
+            if self._sts_battery is None:
+                return
+
+            pct      = batt.get("percent")
+            charging = batt.get("charging")
+            on_col   = (0.22, 0.53, 0.98, 0.92)   # blue — active
+            off_col  = (0.44, 0.44, 0.46, 0.65)   # gray — inactive
+
+            if pct is not None:
+                level = pct / 100.0
+                bat_col = (
+                    (0.22, 0.80, 0.35, 0.88) if level > 0.50 else
+                    (0.95, 0.65, 0.10, 0.88) if level > 0.20 else
+                    (0.95, 0.25, 0.20, 0.88)
+                )
+                self._sts_battery.set_color(bat_col)
+                self._sts_battery.set_level(level)
+                chg_sfx = "+" if charging else ""
+                self._sts_bat_lbl.text = f"{pct}%{chg_sfx}"
+                self._sts_bat_lbl.color = bat_col
+            else:
+                self._sts_battery.set_level(1.0)
+                self._sts_battery.set_color(off_col)
+                self._sts_bat_lbl.text = "AC"
+                self._sts_bat_lbl.color = off_col
+
+            self._sts_wifi.set_color(on_col if wifi_on else off_col)
+            self._sts_bt.set_color(on_col if bt_on else off_col)
+
+        Clock.schedule_once(_apply, 0)
+
+    # -----------------------------------------------------------------------
+    # Clock labels
+    # -----------------------------------------------------------------------
 
     def _update_clock_labels(self):
         now = display_now()
-        self.greeting_label.text = _greeting_name(getattr(self.app, 'user_name', '') or 'Stark')
-        self._big_clock_hm.text = now.strftime('%I:%M').lstrip('0')
-        self._clock_ampm.text = now.strftime('%p')
-        self.date_label.text = now.strftime('%A, %B ') + str(now.day)
+        self.greeting_label.text = _greeting_name(
+            getattr(self.app, "user_name", "") or ""
+        )
+        hm = now.strftime("%I:%M").lstrip("0") or "12:00"
+        ap = now.strftime("%p")
+        # Combined markup keeps time and AM/PM flush regardless of time width
+        self._big_clock_hm.text = (
+            f"[b][size={_ff(64.93)}]{hm}[/size][/b]"
+            f"[size={_ff(22.72)}][color=B6BAF2] {ap}[/color][/size]"
+        )
+        self.date_label.text = now.strftime("%A, %B ") + str(now.day)
+
+    # -----------------------------------------------------------------------
+    # System status
+    # -----------------------------------------------------------------------
 
     def _load_system_status(self):
         async def _fetch():
             try:
-                info = await self.backend.get_system_info()
-                free_gb = (info['storage_total'] - info['storage_used']) / (1024 ** 3)
-                wifi_ok = bool(info.get('wifi_ssid'))
+                info     = await self.backend.get_system_info()
+                free_gb  = (info["storage_total"] - info["storage_used"]) / (1024 ** 3)
+                wifi_ok  = bool(info.get("wifi_ssid"))
                 wired_ok = linux_ethernet_ready()
-                privacy = getattr(self.app, 'privacy_mode', False)
+                privacy  = getattr(self.app, "privacy_mode", False)
+
                 def _apply(_dt):
-                    online = wifi_ok or wired_ok
-                    self._health_label_offline = not online
-                    if not online:
-                        self.health_label.text = 'Offline\nNetwork'
-                        self.health_label.color = COLORS['red']
-                    else:
-                        # Online again — re-publish the latest weather snap (if any)
-                        # so the label restores to a real reading instead of staying
-                        # on the last offline message.
-                        snap = get_weather_client().snapshot
-                        if snap is not None:
-                            self._on_weather_snapshot(snap)
-                    self._footer_kwargs = {'wifi_ok': wifi_ok, 'free_gb': free_gb, 'privacy_mode': privacy, 'wired_lan_ok': wired_ok}
-                    self.update_footer(wifi_ok=wifi_ok, free_gb=free_gb, privacy_mode=privacy, wired_lan_ok=wired_ok, local_ip=get_primary_ipv4())
+                    # Backend reachability is determined by API success above.
+                    # Do not gate weather text on local NIC flags (WiFi metadata can be empty
+                    # even when backend + weather are available).
+                    self._health_label_offline = False
+                    snap = get_weather_client().snapshot
+                    if snap is not None:
+                        self._on_weather_snapshot(snap)
+                    self._footer_kwargs = {
+                        "wifi_ok":    wifi_ok,
+                        "free_gb":    free_gb,
+                        "privacy_mode": privacy,
+                        "wired_lan_ok": wired_ok,
+                    }
+                    self.update_footer(
+                        wifi_ok=wifi_ok, free_gb=free_gb,
+                        privacy_mode=privacy, wired_lan_ok=wired_ok,
+                        local_ip=get_primary_ipv4(),
+                    )
                 Clock.schedule_once(_apply, 0)
             except Exception:
                 def _backend_offline(_dt):
                     self._health_label_offline = True
-                    self.health_label.text = 'Backend\nOffline'
-                    self.health_label.color = COLORS['red']
+                    self.health_label.text  = "Backend"
+                    self.health_label.color = COLORS["red"]
+                    # Schedule a retry so temperature recovers automatically when
+                    # the backend comes back — without the user having to
+                    # navigate away and back.
+                    Clock.schedule_once(lambda _dt2: self._load_system_status(), 30.0)
                 Clock.schedule_once(_backend_offline, 0)
+
         run_async(_fetch())
+
+    # -----------------------------------------------------------------------
+    # Tasks count badge (independent fetch from /api/commitments)
+    # -----------------------------------------------------------------------
+
+    def _load_tasks_count(self) -> None:
+        """Fetch the number of tasks pending for today and update the Tasks chip.
+
+        Uses the exact same bucketing logic as the Tasks screen so the home
+        count always matches the "Today" tab badge there.
+        """
+        async def _fetch():
+            try:
+                from screens.tasks import _categorize  # noqa: PLC0415
+                # NOTE: the server caps limit at 100 (Query le=100); limit>100
+                # returns HTTP 422 which api_client swallows into an empty list,
+                # making the count always 0. Keep this at 100 (matches the
+                # Tasks screen's own fetch).
+                result = await self.backend.get_commitments(status="", limit=100)
+                rows: list = result.get("commitments") or []
+                breakdown = {"due_today": 0, "overdue": 0, "upcoming": 0,
+                             "unplanned": 0, "skipped": 0}
+                for r in rows:
+                    b = _categorize(r)
+                    breakdown[b if b in breakdown else "skipped"] += 1
+                count = breakdown["due_today"]
+                logger.info(
+                    "tasks chip: fetched %d rows -> today=%d overdue=%d "
+                    "upcoming=%d unplanned=%d skipped=%d",
+                    len(rows), breakdown["due_today"], breakdown["overdue"],
+                    breakdown["upcoming"], breakdown["unplanned"],
+                    breakdown["skipped"],
+                )
+            except Exception:
+                logger.exception("tasks chip: _load_tasks_count failed")
+                return
+
+            def _apply(_dt):
+                if self.tasks_card is not None:
+                    self.tasks_card.value_label.text = str(count)
+            Clock.schedule_once(_apply, 0)
+
+        run_async(_fetch())
+
+    # -----------------------------------------------------------------------
+    # Home summary (meetings, actions, email)
+    # -----------------------------------------------------------------------
 
     def _load_home_summary(self):
         async def _fetch():
+            if self.app.ui_cache_is_fresh("home_summary_bundle"):
+                self._apply_home_summary_bundle(self.app.ui_cache_get("home_summary_bundle") or {})
+                return
+            # Fetch Gmail, home summary, and latest meeting in parallel.
+            async def _gmail():
+                gf = getattr(self.backend, "fetch_gmail_recent", None)
+                if gf is None:
+                    return {}
+                return await gf(max_results=40, days=_GMAIL_RECENT_DAYS, q="")
+
+            async def _summary():
+                return await self.backend.get_home_summary()
+
+            async def _meetings():
+                return await self.backend.get_meetings(limit=1)
+
+            results = await asyncio.gather(
+                _gmail(), _summary(), _meetings(), return_exceptions=True
+            )
+            gfeed    = results[0] if not isinstance(results[0], BaseException) else {}
+            summary  = results[1] if not isinstance(results[1], BaseException) else None
+            meetings = results[2] if not isinstance(results[2], BaseException) else []
+
+            gsum = summarize_gmail_feed_for_home(gfeed)
             try:
-                data = await self.backend.get_home_summary()
-                meetings = []
-                try:
-                    meetings = await self.backend.get_meetings(limit=1)
-                except Exception:
-                    meetings = []
-                latest = meetings[0] if meetings else None
-                today_n = int(data.get('pending_actions_today') or 0)
-                total_n = int(data.get('pending_actions_total') or 0)
-                unread_n = data.get('unread_email_count')
-                next_title, next_time = _format_home_next_meeting(data.get('next_meeting'))
-                def _apply(_dt):
-                    self.next_time_label.text = f'▣  {next_time}'
-                    self.next_title_label.text = f'Now: {next_title}'
-                    self.more_label.text = f'+{max(0, today_n)} more'
-                    self.schedule_card.value_label.text = next_time.split(' ')[0] if next_time else '—'
-                    self.schedule_card.text_label.text = f'Now: {next_title}'
-                    if latest:
-                        self._latest_meeting_id = latest.get('id')
-                        self.last_title_label.text = latest.get('title') or 'Untitled meeting'
-                        try:
-                            raw = latest.get('start_time') or latest.get('created_at') or ''
-                            dt = datetime.fromisoformat(raw.replace('Z', '+00:00'))
-                            when = to_display_local(dt).strftime('%b %d · %I:%M %p').replace(' 0', ' ')
-                        except Exception:
-                            when = 'Recent meeting'
-                        dur = int(latest.get('duration') or 0) // 60
-                        self.last_meta_label.text = f'{when} · {dur} min' if dur else when
-                        pa = int(latest.get('pending_actions') or 0)
-                        self.last_actions_label.text = f'{pa} pending actions  ›' if pa else 'Open summary  ›'
-                    else:
-                        self._latest_meeting_id = None
-                        self.last_title_label.text = 'No saved meetings yet'
-                        self.last_meta_label.text = 'Start a recording to build memory'
-                        self.last_actions_label.text = 'Open meeting library  ›'
-                    self.email_card.value_label.text = str(unread_n) if unread_n is not None else '—'
-                    self.email_card.text_label.text = 'New emails'
-                    self.tasks_card.value_label.text = str(total_n)
-                    self.tasks_card.text_label.text = 'Tasks due'
-                    self.brief_calendar_label.title_label.text = f'{max(0, today_n)} actions today' if today_n else 'Briefing ready'
-                    self.brief_calendar_label.subtitle_label.text = f'First at {next_time}' if next_time and next_time != 'Time not set' else 'Ask Tony for focus'
-                    self.brief_email_label.title_label.text = 'email:  From:'
-                    self.brief_email_label.subtitle_label.text = 'Connect Gmail for updates' if unread_n is None else f'{unread_n} new messages'
-                Clock.schedule_once(_apply, 0)
+                data = summary or await self.backend.get_home_summary()
+                latest   = meetings[0] if meetings else None
+                today_n  = int(data.get("pending_actions_today") or 0)
+                total_n  = int(data.get("pending_actions_total") or 0)
+                next_title, next_time = _format_next_meeting(data.get("next_meeting"))
+                self.app.ui_cache_set(
+                    "home_summary_bundle",
+                    {
+                        "summary": dict(data or {}),
+                        "meetings": meetings if isinstance(meetings, list) else [],
+                        "gfeed": gfeed if isinstance(gfeed, dict) else {},
+                    },
+                )
+                Clock.schedule_once(
+                    lambda _dt: self._apply_home_summary_bundle(self.app.ui_cache_get("home_summary_bundle") or {}),
+                    0,
+                )
             except Exception:
-                Clock.schedule_once(lambda _dt: setattr(self.next_title_label, 'text', 'Now: Ask Tony for briefing'), 0)
+                Clock.schedule_once(
+                    lambda _dt: setattr(
+                        self.next_title_label, "text",
+                        "Now: Ask Tony for briefing"
+                    ),
+                    0,
+                )
+
         run_async(_fetch())
+
+    def _on_cached_home_summary(self, payload: dict) -> None:
+        Clock.schedule_once(lambda _dt: self._apply_home_summary_bundle(payload or {}), 0)
+
+    def _apply_home_summary_bundle(self, payload: dict) -> None:
+        if not isinstance(payload, dict):
+            return
+        if self.manager and self.manager.current != self.name:
+            return
+        data = payload.get("summary") if isinstance(payload.get("summary"), dict) else {}
+        meetings = payload.get("meetings") if isinstance(payload.get("meetings"), list) else []
+        gfeed = payload.get("gfeed") if isinstance(payload.get("gfeed"), dict) else {}
+        latest = meetings[0] if meetings else None
+        today_n = int(data.get("pending_actions_today") or 0)
+        total_n = int(data.get("pending_actions_total") or 0)
+        next_title, next_time = _format_next_meeting(data.get("next_meeting"))
+        if not (next_title and next_time):
+            today = display_now().date()
+            monday = today - timedelta(days=today.weekday())
+            wk = self.app.ui_cache_get(f"calendar_week:{monday.isoformat()}")
+            picked = _pick_next_today_meeting_from_week(wk if isinstance(wk, dict) else {})
+            if isinstance(picked, dict):
+                next_title, next_time = _format_next_meeting(
+                    {"title": picked.get("title"), "start": picked.get("start") or picked.get("start_time")}
+                )
+        gsum = summarize_gmail_feed_for_home(gfeed)
+        has_meeting = bool((next_title or "").strip()) and bool((next_time or "").strip())
+
+        if has_meeting:
+            self.next_time_label.text = next_time
+            self.next_title_label.text = f"Now: {next_title}"
+        else:
+            self.next_time_label.text = "Free today"
+            self.next_title_label.text = ""
+            # Vertically center "Free today" within schedule card while preserving
+            # existing font/color/size and horizontal alignment.
+            try:
+                lbl = self.schedule_card.value_label
+                lbl.pos_hint = {
+                    "x": (40.96 + 115.83) / 509.93,
+                    "y": (144.08 - 50.0 - 45) / 144.08,
+                }
+            except Exception:
+                pass
+        self.more_label.text = f"+{max(0, today_n)} more"
+
+        if has_meeting:
+            self.schedule_card.value_label.text = next_time.split(" ")[0] if next_time else "—"
+            self.schedule_card.text_label.text = f"Now: {next_title}"
+            try:
+                lbl = self.schedule_card.value_label
+                lbl.pos_hint = {
+                    "x": (40.96 + 115.83) / 509.93,
+                    "y": (144.08 - 16.95 - 45) / 144.08,
+                }
+            except Exception:
+                pass
+        else:
+            self.schedule_card.value_label.text = "Free today"
+            self.schedule_card.text_label.text = ""
+        if self.schedule_card._more_label is not None:
+            self.schedule_card._more_label.text = f"+{today_n}" if (today_n and has_meeting) else ""
+
+        if latest:
+            self._latest_meeting_id = latest.get("id")
+            self.last_title_label.text = latest.get("title") or "Untitled meeting"
+            try:
+                raw = (latest.get("start_time") or latest.get("created_at") or "")
+                dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+                when = (to_display_local(dt)
+                        .strftime("%b %d · %I:%M %p")
+                        .replace(" 0", " "))
+            except Exception:
+                when = "Recent meeting"
+            dur = int(latest.get("duration") or 0) // 60
+            self.last_meta_label.text = f"{when} · {dur} min" if dur else when
+            pa = int(latest.get("pending_actions") or 0)
+            self.last_actions_label.text = (
+                f"{pa} pending actions  ›" if pa else "Open summary  ›"
+            )
+        else:
+            self._latest_meeting_id = None
+            self.last_title_label.text = "No saved meetings yet"
+            self.last_meta_label.text = "Start a recording to build memory"
+            self.last_actions_label.text = "Open meeting library  ›"
+
+        if self.email_card is not None:
+            self.email_card.value_label.text = str(gsum.get("unread_count") or 0)
+        if self.brief_email_label is not None:
+            unread = int(gsum.get("unread_count") or 0)
+            self.brief_email_label.title_label.text = (
+                f"Email  •  {unread} unread" if unread else "Email"
+            )
+            self.brief_email_label.subtitle_label.text = str(
+                gsum.get("brief_subtitle") or "Connect Gmail for updates"
+            )
+
+        if self.brief_calendar_label is not None:
+            self.brief_calendar_label.title_label.text = (
+                f"{max(0, today_n)} actions today" if today_n else "Briefing ready"
+            )
+            self.brief_calendar_label.subtitle_label.text = (
+                f"First at {next_time}"
+                if next_time and next_time != "Time not set"
+                else "Ask Tony for focus"
+            )
+
+        # NOTE: do NOT set tasks_card from total_n (server pending_actions_total
+        # counts meeting action items, not commitments — it is usually 0 and
+        # would clobber the real count). The Tasks chip is driven exclusively by
+        # _load_tasks_count() which reads /api/commitments. Re-trigger it here so
+        # applying the home-summary bundle keeps the count fresh instead of
+        # overwriting it with a stale/zero value.
+        self._load_tasks_count()
+
+
+# ---------------------------------------------------------------------------
+# Compatibility alias (retained for brief card access in existing code)
+# ---------------------------------------------------------------------------
+
+_BriefRow = _BriefRowData

@@ -16,6 +16,8 @@ class AutoDeletePickerScreen(PickerBaseScreen):
         ('30', 'After 30 days'),
         ('60', 'After 60 days'),
         ('90', 'After 90 days'),
+        ('180', 'After 180 days'),
+        ('365', 'After 1 year'),
     ]
     _setting_key = 'auto_delete_days'
     _default = 'never'

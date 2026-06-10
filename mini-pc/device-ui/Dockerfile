@@ -1,5 +1,16 @@
 FROM python:3.11-slim
 
+# --- Build time (why `docker compose ... --build` can take 10–20+ minutes) ---
+# 1) The next RUN installs a large Debian stack (SDL2+Mesa+X11 *-dev*, build-essential,
+#    network-manager for nmcli, audio tools). That step downloads hundreds of MB — mostly
+#    network + mirror speed, not Python.
+# 2) Docker caches that layer until the RUN text or FROM base changes. The floating tag
+#    `python:3.11-slim` can move to a newer Debian release on Docker Hub; when it does,
+#    this entire apt layer is rebuilt from scratch (looks like "it used to be 2 minutes").
+# 3) Avoid `docker compose build --no-cache` and avoid `--pull` unless you intend to refresh
+#    the base image. After one successful build, only changing app files usually hits cache
+#    for apt and rebuilds pip/COPY only (~minutes → ~1–3 min typical).
+
 # System dependencies for Kivy GUI on Linux (X11/SDL2 backend):
 # SDL2, OpenGL/GLES, X11 client libs, touch input, build tools,
 # PortAudio for sounddevice (mic test).
@@ -25,6 +36,7 @@ RUN set -eux; \
             -o Acquire::Retries=5 \
             -o Acquire::http::Pipeline-Depth=0 \
         && apt_install \
+            ca-certificates \
             libsdl2-dev \
             libsdl2-image-dev \
             libsdl2-mixer-dev \
@@ -40,6 +52,10 @@ RUN set -eux; \
             libxrandr-dev \
             libmtdev1t64 \
             libportaudio2 \
+            portaudio19-dev \
+            libasound2-dev \
+            python3-dev \
+            libspeexdsp1 \
             build-essential \
             pkg-config \
             xdg-utils \
@@ -50,8 +66,13 @@ RUN set -eux; \
             util-linux \
             iproute2 \
             espeak-ng \
+            alsa-utils \
             network-manager \
             sudo \
+            bluez \
+            pulseaudio-utils \
+            pipewire \
+            wireplumber \
         ; then \
             success=1; \
             break; \
@@ -71,6 +92,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY . .
 
+# Pull mini-pc/audio/ into /app/audio so device-ui's audio_supervisor can spawn
+# audio_capture.py as a child process. ``audio`` is provided via Compose
+# ``additional_contexts`` (see ../docker-compose.yml device-ui service).
+COPY --from=audio . /app/audio/
+
 RUN chmod +x /app/docker-entrypoint.sh
 
 # Create non-root user with host-matching groups for device access
@@ -79,7 +105,7 @@ RUN groupadd -g 44 video 2>/dev/null || true \
     && groupadd -g 105 input 2>/dev/null || true \
     && useradd -m -u 1000 -s /bin/bash -G video,input,audio uiuser \
     && chown -R uiuser:uiuser /app \
-    && printf '%s\n' 'uiuser ALL=(root) NOPASSWD: /usr/local/bin/meetingbox-host-reboot, /usr/local/bin/meetingbox-host-poweroff, /bin/sh /usr/local/bin/meetingbox-host-reboot, /bin/sh /usr/local/bin/meetingbox-host-poweroff' > /etc/sudoers.d/meetingbox-host-power \
+    && printf '%s\n' 'uiuser ALL=(root) NOPASSWD: /usr/local/bin/meetingbox-host-reboot, /usr/local/bin/meetingbox-host-poweroff, /bin/sh /usr/local/bin/meetingbox-host-reboot, /bin/sh /usr/local/bin/meetingbox-host-poweroff, /bin/sh /usr/local/bin/meetingbox-bluetooth *, /bin/sh /usr/local/bin/meetingbox-timedatectl *, /usr/bin/tee /sys/class/backlight/*/brightness, /usr/bin/tee /sys/class/backlight/*/bl_power, /usr/bin/nmcli, /usr/bin/bluetoothctl, /usr/bin/rfkill, /usr/sbin/rfkill, /sbin/rfkill' > /etc/sudoers.d/meetingbox-host-power \
     && chmod 0440 /etc/sudoers.d/meetingbox-host-power \
     && visudo -cf /etc/sudoers.d/meetingbox-host-power
 

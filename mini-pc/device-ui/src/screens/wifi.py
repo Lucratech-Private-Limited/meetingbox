@@ -381,14 +381,8 @@ class WiFiScreen(BaseScreen):
             try:
                 if wifi_nmcli_local.has_nmcli():
                     result = wifi_nmcli_local.connect_wifi_network(ssid, password)
-                if result.get("status") != "connected":
-                    try:
-                        result = await self.backend.connect_wifi(
-                            ssid, password=password
-                        )
-                    except Exception as be:
-                        logger.warning("WiFi connect (backend): %s", be)
-                        result = {"status": "failed", "message": str(be)[:200]}
+                else:
+                    result = {"status": "failed", "message": "nmcli not available on this device"}
             except Exception as e:
                 logger.warning("WiFi connect: %s", e)
                 result = {"status": "failed", "message": str(e)[:200]}
