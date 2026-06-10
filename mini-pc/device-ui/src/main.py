@@ -2819,7 +2819,7 @@ class MeetingBoxApp(App):
                 and self._realtime_voice_session is not None):
             return
         if (self.screen_manager is not None
-                and self.screen_manager.current == 'home'):
+                and self.screen_manager.current in ('home', 'voice_session')):
             try:
                 home = self.screen_manager.get_screen('home')
                 home.hide_listening_state()
@@ -3026,8 +3026,8 @@ class MeetingBoxApp(App):
         )
         # Always compact — the full-screen overlay mode is no longer used.
         overlay.set_compact(True)
-        if name == 'home':
-            # Home screen uses the say bar for transcription — keep overlay hidden.
+        if name in ('home', 'voice_session'):
+            # Home + voice-session both handle transcription natively; keep overlay hidden.
             overlay.suppress_auto_show = True
             overlay.hide()
         else:
@@ -3410,10 +3410,10 @@ class MeetingBoxApp(App):
                 if self._transcript_overlay is not None:
                     self._transcript_overlay.clear_session()
                     self._sync_transcript_overlay_mode()
-                    # On home screen the say bar handles transcription; on
-                    # other screens show the compact overlay strip.
+                    # Home and voice_session both handle transcription natively;
+                    # on all other screens show the compact overlay strip.
                     if not (self.screen_manager
-                            and self.screen_manager.current == 'home'):
+                            and self.screen_manager.current in ('home', 'voice_session')):
                         self._transcript_overlay.show()
                 # Reset home say bar for the new session
                 self._clear_home_say_bar()
@@ -3425,7 +3425,7 @@ class MeetingBoxApp(App):
 
             def _update_home(_dt):
                 if (self.screen_manager is not None
-                        and self.screen_manager.current == 'home'):
+                        and self.screen_manager.current in ('home', 'voice_session')):
                     try:
                         home = self.screen_manager.get_screen('home')
                         home.set_voice_session_state(state)
@@ -3451,7 +3451,7 @@ class MeetingBoxApp(App):
             # Update home say bar with a placeholder immediately
             def _say_bar_placeholder(_dt):
                 if (self.screen_manager is not None
-                        and self.screen_manager.current == 'home'):
+                        and self.screen_manager.current in ('home', 'voice_session')):
                     try:
                         self.screen_manager.get_screen('home').update_say_bar_transcription("You", "…")
                     except Exception:
@@ -3482,10 +3482,10 @@ class MeetingBoxApp(App):
                 msg_id = overlay.add_user_message(text)
                 self._current_user_msg_id = msg_id
 
-            # Also update home say bar with user transcript
+            # Also update home say bar / voice-session transcript with user text
             def _say_bar_user(_dt, _t=text):
                 if (self.screen_manager is not None
-                        and self.screen_manager.current == 'home'):
+                        and self.screen_manager.current in ('home', 'voice_session')):
                     try:
                         self.screen_manager.get_screen('home').update_say_bar_transcription("You", _t)
                     except Exception:
@@ -3513,7 +3513,7 @@ class MeetingBoxApp(App):
                     )
                     def _say_bar_corrected(_dt, _c=corrected):
                         if (self.screen_manager is not None
-                                and self.screen_manager.current == 'home'):
+                                and self.screen_manager.current in ('home', 'voice_session')):
                             try:
                                 self.screen_manager.get_screen('home').update_say_bar_transcription("You", _c)
                             except Exception:
@@ -3540,10 +3540,10 @@ class MeetingBoxApp(App):
             if overlay is None:
                 return
             overlay.stream_ai_message(item_id, accumulated)
-            # Also update home say bar with streaming AI text
+            # Also update home say bar / voice-session transcript with AI text
             def _say_bar_ai(_dt, _t=accumulated):
                 if (self.screen_manager is not None
-                        and self.screen_manager.current == 'home'):
+                        and self.screen_manager.current in ('home', 'voice_session')):
                     try:
                         self.screen_manager.get_screen('home').update_say_bar_transcription("AI", _t)
                     except Exception:
