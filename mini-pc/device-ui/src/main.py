@@ -322,6 +322,7 @@ from screens.morning_brief import MorningBriefScreen
 from screens.emails import EmailsScreen
 from screens.tasks import TasksScreen
 from screens.email_draft import EmailDraftScreen
+from screens.voice_task_creation import VoiceTaskCreationScreen
 from components.quick_panel import QuickPanel
 
 # ------------------------------------------------------------------
@@ -773,6 +774,14 @@ class MeetingBoxApp(App):
         self.assistant_speech_volume = 85
         # Realtime may only start when _handle_voice_wake_phrase sets this True (one-shot).
         self._realtime_launch_permitted = False
+        # Number of consecutive auto-reconnects since the last user-triggered wake.
+        # Capped at 1 so a runaway reconnect loop doesn't block the wake listener.
+        self._realtime_reconnect_count = 0
+        # Which email field the current recipient picker is resolving ("to"/"cc"/"bcc").
+        self._picker_current_field = "to"
+        # Holds task data (title/description/due_date) between show_task_creation
+        # directive and the user tapping Confirm/Discard.
+        self._pending_task_data: dict = {}
         # Limits cloud NL replies per wake/mic activation (local wake listening unaffected).
         self._voice_cloud_qa_budget = 0
         # Serialises TTS calls — overlapping replies are dropped, not stacked
@@ -1063,6 +1072,12 @@ class MeetingBoxApp(App):
         self.screen_manager.add_widget(HomeScreen(name='home'))
         self.screen_manager.add_widget(VoiceSessionScreen(name='voice_session'))
         self.screen_manager.add_widget(EmailDraftScreen(name='email_draft'))
+        _vtc = VoiceTaskCreationScreen(
+            name='voice_task_creation',
+            on_confirm=self._on_task_creation_confirm_tapped,
+            on_discard=self._on_task_creation_discard_tapped,
+        )
+        self.screen_manager.add_widget(_vtc)
         self.screen_manager.add_widget(RecordingScreen(name='recording'))
         self.screen_manager.add_widget(ProcessingScreen(name='processing'))
         self.screen_manager.add_widget(CompleteScreen(name='complete'))
@@ -2656,6 +2671,7 @@ class MeetingBoxApp(App):
             and not WAKE_LOCAL_VOICE_ONLY
         ):
             self._realtime_launch_permitted = True
+            self._realtime_reconnect_count = 0  # fresh wake — reset reconnect budget
 
             def _kick_realtime(_dt):
                 self._show_home_listening_after_wake()
@@ -3003,11 +3019,89 @@ class MeetingBoxApp(App):
         except Exception:
             logger.exception("Failed to render email draft directive")
 
-    def _on_recipient_picker_directive(self, query: str, candidates: list) -> None:
+    def _on_task_creation_directive(self, task: dict) -> None:
+        """Navigate to the voice task creation screen with pre-filled data."""
+        if not isinstance(task, dict):
+            return
+        title       = str(task.get("title")       or "").strip()
+        description = str(task.get("description") or "").strip() or None
+        due_date    = str(task.get("due_date")    or "").strip() or None
+        if not title:
+            return
+        self._pending_task_data = {"title": title, "description": description, "due_date": due_date}
+        try:
+            sm = getattr(self, "screen_manager", None)
+            if sm is not None and sm.current != "voice_task_creation":
+                self.goto_screen("voice_task_creation")
+            screen = sm.get_screen("voice_task_creation") if sm else None
+            if screen is not None:
+                screen.set_task_data(title, description, due_date)
+        except Exception:
+            logger.exception("Failed to show voice task creation screen")
+
+    def _on_task_creation_confirm_tapped(self) -> None:
+        """User tapped Confirm — create the task and return to voice session."""
+        task = getattr(self, "_pending_task_data", None) or {}
+        title       = str(task.get("title")       or "").strip()
+        description = str(task.get("description") or "").strip() or None
+        due_date    = str(task.get("due_date")    or "").strip() or None
+        self._pending_task_data = {}
+
+        async def _create():
+            try:
+                result = await self.backend.create_commitment(
+                    title=title,
+                    due_date=due_date,
+                    description=description,
+                    confirm_duplicate=True,
+                    source="voice",
+                )
+                if result.get("error"):
+                    logger.warning("voice task creation failed: %s", result)
+                    msg = "Sorry, I couldn't save the task. Want to try again?"
+                else:
+                    logger.info("Voice task created: %s", result.get("id"))
+                    msg = "Task saved."
+            except Exception:
+                logger.exception("voice task creation API call failed")
+                msg = "Sorry, I couldn't save the task."
+            Clock.schedule_once(lambda _dt: self._inject_task_result(msg), 0)
+
+        run_async(_create())
+
+        try:
+            sm = getattr(self, "screen_manager", None)
+            if sm is not None:
+                self.goto_screen("voice_session")
+        except Exception:
+            logger.debug("task creation confirm: navigation failed", exc_info=True)
+
+    def _on_task_creation_discard_tapped(self) -> None:
+        """User tapped Discard — cancel and return to voice session."""
+        self._pending_task_data = {}
+        self._send_voice_user_text(
+            "[BUTTON:Discard] — the user cancelled task creation. Acknowledge briefly.",
+            interrupt=True,
+        )
+        try:
+            sm = getattr(self, "screen_manager", None)
+            if sm is not None:
+                self.goto_screen("voice_session")
+        except Exception:
+            logger.debug("task creation discard: navigation failed", exc_info=True)
+
+    def _inject_task_result(self, message: str) -> None:
+        """Inject the task-creation outcome as a voice turn into the live session."""
+        self._send_voice_user_text(message)
+
+    def _on_recipient_picker_directive(self, query: str, candidates: list, field: str = "to") -> None:
         """Show the recipient confirmation overlay from a show_recipient_picker directive."""
         overlay = getattr(self, "_recipient_overlay", None)
         if overlay is None:
             return
+        # Remember which email field this picker resolves — used by _on_recipient_selected
+        # to decide whether the confirmed contact goes into "to", "cc", or "bcc".
+        self._picker_current_field = field if field in ("to", "cc", "bcc") else "to"
         try:
             overlay.show_candidates(query, candidates or [])
         except Exception:
@@ -3031,17 +3125,20 @@ class MeetingBoxApp(App):
             sm = getattr(self, "screen_manager", None)
             if sm is not None and sm.current != "email_draft":
                 self.goto_screen("email_draft")
-            # Optimistic UI: reflect the picked recipient in the To field RIGHT
-            # NOW so the user sees their choice instantly, without waiting for the
-            # model's show_email_draft round-trip. The model's later directive is
-            # authoritative and will overwrite this if needed.
+            # Optimistic UI: reflect the picked recipient in the correct field
+            # (to/cc/bcc) RIGHT NOW so the user sees their choice instantly,
+            # without waiting for the model's show_email_draft round-trip.
+            # The model's later directive is authoritative and will overwrite.
+            field = getattr(self, "_picker_current_field", "to")
+            if field not in ("to", "cc", "bcc"):
+                field = "to"
             screen = sm.get_screen("email_draft") if sm is not None else None
             if screen is not None and hasattr(screen, "set_draft"):
-                cur = list((getattr(screen, "_fields", {}) or {}).get("to", []))
+                cur = list((getattr(screen, "_fields", {}) or {}).get(field, []))
                 disp = f"{name} <{email}>" if (name and name != email) else email
                 if not any(email in str(c) for c in cur):
                     cur.append(disp)
-                    screen.set_draft({"to": cur})
+                    screen.set_draft({field: cur})
         except Exception:
             logger.debug("optimistic recipient fill failed", exc_info=True)
         # interrupt=True: the AI may still be reading out the list of names;
@@ -3069,7 +3166,12 @@ class MeetingBoxApp(App):
         self._send_voice_user_text("Save it as a draft.")
 
     def _on_email_draft_discard_tapped(self) -> None:
-        self._send_voice_user_text("Discard the email.")
+        # Use an unambiguous signal so the model does NOT confuse this with a
+        # "navigate away" intent and save the draft first.  The persistence rule
+        # must NOT apply here — the user explicitly tapped the Discard button.
+        self._send_voice_user_text(
+            "[BUTTON:Discard] — delete this draft immediately, do NOT save it to Gmail drafts."
+        )
 
     def _sync_transcript_overlay_mode(self, screen_name: str | None = None) -> None:
         """Sync the transcript overlay mode for the current screen.
@@ -3439,21 +3541,36 @@ class MeetingBoxApp(App):
             def _after_end(_dt):
                 self._end_realtime_voice_session()
                 if unexpected:
-                    logger.info("Realtime session ended unexpectedly; auto-reconnecting.")
-                    # Re-arm the launch permission (normally set by the wake
-                    # word) so the reconnect bypasses the arming check.
-                    self._realtime_launch_permitted = True
+                    # Only auto-reconnect once per wake-word event.  If the
+                    # reconnect session also ends unexpectedly we fall back to
+                    # wake listening rather than looping forever and locking
+                    # the mic away from the wake listener.
+                    reconnect_count = getattr(self, "_realtime_reconnect_count", 0)
+                    if reconnect_count < 1:
+                        self._realtime_reconnect_count = reconnect_count + 1
+                        logger.info("Realtime session ended unexpectedly; auto-reconnecting (attempt %d).", reconnect_count + 1)
+                        # Re-arm the launch permission (normally set by the
+                        # wake word) so the reconnect bypasses the arming check.
+                        self._realtime_launch_permitted = True
 
-                    def _reconnect(_dt2):
-                        try:
-                            self._start_realtime_voice_session()
-                        except Exception:
-                            logger.exception("Realtime auto-reconnect failed")
+                        def _reconnect(_dt2):
+                            try:
+                                self._start_realtime_voice_session()
+                            except Exception:
+                                logger.exception("Realtime auto-reconnect failed")
 
-                    Clock.schedule_once(_reconnect, 0.3)
+                        Clock.schedule_once(_reconnect, 0.3)
+                    else:
+                        self._realtime_reconnect_count = 0
+                        logger.info(
+                            "Realtime session ended unexpectedly after reconnect attempt; "
+                            "returning to wake listening."
+                        )
+                        self._schedule_voice_prewarm(delay=1.0)
                 else:
                     # Clean end of a conversation — re-arm a warm standby
                     # session so the NEXT wake word is instant again.
+                    self._realtime_reconnect_count = 0
                     self._schedule_voice_prewarm(delay=1.0)
 
             Clock.schedule_once(_after_end, 0)
@@ -3508,6 +3625,11 @@ class MeetingBoxApp(App):
                 elif current == 'email_draft':
                     try:
                         self.screen_manager.get_screen('email_draft').set_voice_session_state(state)
+                    except Exception:
+                        pass
+                elif current == 'voice_task_creation':
+                    try:
+                        self.screen_manager.get_screen('voice_task_creation').set_voice_session_state(state)
                     except Exception:
                         pass
 
@@ -3651,6 +3773,7 @@ class MeetingBoxApp(App):
                 on_user_speech_stopped=_on_user_speech_stopped,
                 on_email_draft=self._on_email_draft_directive,
                 on_recipient_picker=self._on_recipient_picker_directive,
+                on_task_creation=self._on_task_creation_directive,
                 on_start_recording=self._realtime_handle_start_recording,
                 should_suppress_farewell=self._email_workflow_active,
                 prewarm=prewarm,

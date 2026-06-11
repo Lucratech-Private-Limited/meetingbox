@@ -374,6 +374,7 @@ class RealtimeVoiceSession:
         on_user_speech_started=None,
         on_email_draft=None,
         on_recipient_picker=None,
+        on_task_creation=None,
         on_start_recording=None,
         should_suppress_farewell=None,
         prewarm: bool = False,
@@ -404,6 +405,7 @@ class RealtimeVoiceSession:
         self._on_user_speech_started_cb = on_user_speech_started
         self._on_email_draft_cb = on_email_draft
         self._on_recipient_picker_cb = on_recipient_picker
+        self._on_task_creation_cb = on_task_creation
         self._on_start_recording_cb = on_start_recording
         # Optional predicate: when it returns True the aggressive keyword-based
         # client-side farewell close is skipped (e.g. while an email draft is
@@ -757,6 +759,36 @@ class RealtimeVoiceSession:
             return
         Clock.schedule_once(lambda _dt: self._safe_call(cb, draft), 0)
 
+    def _emit_task_creation(self, tool_output_json: str) -> None:
+        """Forward a show_task_creation directive payload to the UI."""
+        cb = self._on_task_creation_cb
+        if not cb:
+            return
+        try:
+            data = json.loads(tool_output_json)
+        except (json.JSONDecodeError, TypeError):
+            return
+        if not isinstance(data, dict) or not data.get("ok"):
+            return
+        task = data.get("device_task_creation")
+        if not isinstance(task, dict):
+            return
+        Clock.schedule_once(lambda _dt: self._safe_call(cb, task), 0)
+
+    def _redact_task_creation_for_model(self, tool_output_json: str) -> str:
+        """Strip the device-only task payload before feeding back to the model."""
+        try:
+            data = json.loads(tool_output_json)
+        except (json.JSONDecodeError, TypeError):
+            return tool_output_json
+        if not isinstance(data, dict) or "device_task_creation" not in data:
+            return tool_output_json
+        slim = {k: v for k, v in data.items() if k != "device_task_creation"}
+        try:
+            return json.dumps(slim)
+        except (TypeError, ValueError):
+            return tool_output_json
+
     def _redact_email_draft_for_model(self, tool_output_json: str) -> str:
         """Remove the device-only draft payload before the result is sent back to
         the model. The email draft popup (recipients / subject / body, including
@@ -797,8 +829,11 @@ class RealtimeVoiceSession:
         candidates = picker.get("candidates")
         if not isinstance(candidates, list):
             candidates = []
+        field = str(picker.get("field") or "to").strip().lower()
+        if field not in ("to", "cc", "bcc"):
+            field = "to"
         Clock.schedule_once(
-            lambda _dt: self._safe_call(cb, query, candidates), 0
+            lambda _dt: self._safe_call(cb, query, candidates, field), 0
         )
 
     def cancel_current_response(self) -> None:
@@ -1802,6 +1837,9 @@ class RealtimeVoiceSession:
                 # needs to know the popup updated; the real send always goes via
                 # the reply / reply-all tools, which compute recipients server-side.
                 model_out = self._redact_email_draft_for_model(out)
+            elif name == "show_task_creation":
+                self._emit_task_creation(out)
+                model_out = self._redact_task_creation_for_model(out)
             elif name == "show_recipient_picker":
                 self._emit_recipient_picker(out)
 

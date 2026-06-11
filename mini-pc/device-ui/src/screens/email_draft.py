@@ -298,12 +298,33 @@ class _PillButton(BoxLayout):
         super().__init__(**kw)
         self._on_tap = on_tap
         self._enabled = True
+        # Pill radius = half the button height (30px in Figma units on a 60px button).
+        # Using exactly height/2 guarantees a stadium/pill shape in Kivy — Kivy does
+        # not clamp oversized radii the way CSS does, so using _ff(50) on a 60px-tall
+        # button distorts the corners.
+        self._pill_r = _ff(30)
+        # Figma boxShadow: 0px 4px 4px rgba(0,0,0,0.25).
+        # Approximate a Gaussian blur using 6 concentric semi-transparent layers,
+        # each expanding outward by 1 raw px per step (NOT via _ff which clamps at 6).
+        # All layers share the same 4px y-offset so the shadow sits below the button,
+        # while the increasing expand radius creates a smooth falloff (like a blur halo).
+        _S = [
+            # (half_expand_raw_px, alpha) — innermost first
+            (0, 0.09),
+            (1, 0.07),
+            (2, 0.05),
+            (3, 0.04),
+            (4, 0.03),
+            (5, 0.02),
+        ]
         with self.canvas.before:
-            # shadow
-            Color(0, 0, 0, 0.25)
-            self._shad = RoundedRectangle(radius=[_ff(50)])
+            self._shadow_layers = []
+            for _, alpha in _S:
+                Color(0, 0, 0, alpha)
+                self._shadow_layers.append(RoundedRectangle(radius=[self._pill_r]))
             Color(*bg_color)
-            self._bg = RoundedRectangle(radius=[_ff(50)])
+            self._bg = RoundedRectangle(radius=[self._pill_r])
+        self._shadow_spec = _S
         self.bind(pos=self._sync, size=self._sync)
         lbl = Label(
             text=text,
@@ -318,12 +339,12 @@ class _PillButton(BoxLayout):
         self.add_widget(lbl)
 
     def _sync(self, *_):
-        # Figma: boxShadow 0px 4px 4px rgba(0,0,0,0.25) — no horizontal offset,
-        # 4px downward offset, same footprint as the button itself.
-        self._shad.pos  = (self.x, self.y - _ff(4))
-        self._shad.size = self.size
-        self._bg.pos    = self.pos
-        self._bg.size   = self.size
+        # Fixed 4px y-offset (Figma spec); half_e in raw pixels (no _ff — avoids min-6 clamp).
+        for layer, (half_e, _) in zip(self._shadow_layers, self._shadow_spec):
+            layer.pos  = (self.x - half_e, self.y - 4 - half_e)
+            layer.size = (self.width + 2 * half_e, self.height + 2 * half_e)
+        self._bg.pos  = self.pos
+        self._bg.size = self.size
 
     def set_enabled(self, enabled: bool):
         self._enabled = enabled
