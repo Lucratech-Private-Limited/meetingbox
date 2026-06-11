@@ -3090,6 +3090,19 @@ class MeetingBoxApp(App):
         except Exception:
             logger.debug("task creation discard: navigation failed", exc_info=True)
 
+    def _on_task_creation_dismiss_directive(self) -> None:
+        """Voice confirm/discard — server already saved (confirm) or cancelled
+        (discard) the task, so just clear pending state and return to the voice
+        transcription screen. No API call and no injected voice turn here: the
+        model speaks from the confirm_task_creation / discard_task_creation result."""
+        self._pending_task_data = {}
+        try:
+            sm = getattr(self, "screen_manager", None)
+            if sm is not None and sm.current == "voice_task_creation":
+                self.goto_screen("voice_session")
+        except Exception:
+            logger.debug("task creation voice dismiss: navigation failed", exc_info=True)
+
     def _inject_task_result(self, message: str) -> None:
         """Inject the task-creation outcome as a voice turn into the live session."""
         self._send_voice_user_text(message)
@@ -3774,6 +3787,7 @@ class MeetingBoxApp(App):
                 on_email_draft=self._on_email_draft_directive,
                 on_recipient_picker=self._on_recipient_picker_directive,
                 on_task_creation=self._on_task_creation_directive,
+                on_task_dismiss=self._on_task_creation_dismiss_directive,
                 on_start_recording=self._realtime_handle_start_recording,
                 should_suppress_farewell=self._email_workflow_active,
                 prewarm=prewarm,

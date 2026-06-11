@@ -837,8 +837,9 @@ REALTIME_VOICE_TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "description": (
             "Show the task-creation confirmation screen on the device. Call this — instead of "
             "create_task — whenever the user directly asks to create, add, or save a task/reminder. "
-            "The user reviews the pre-filled title and date on screen, then taps Confirm to save or "
-            "Discard to cancel. "
+            "The user reviews the pre-filled title and date on screen, then confirms (saves) or "
+            "discards (cancels) — EITHER by speaking ('confirm' / 'discard' / 'yes save it' / "
+            "'no cancel') OR by tapping the on-screen buttons. "
             "DATE RULES: "
             "(1) If the user mentioned a date ('tomorrow', 'Sunday', 'by the 15th'), resolve it to "
             "YYYY-MM-DD and pass as due_date. "
@@ -847,8 +848,10 @@ REALTIME_VOICE_TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "Wait for the reply, resolve the date if given, then call this tool — passing due_date "
             "only if explicitly provided. Omitting due_date places the task in Unplanned. "
             "TITLE RULE: ≤8-word paraphrase of what the user said — keep the verb and object. "
-            "After calling this tool, say: 'I've set it up — tap Confirm on screen to save, or "
-            "Discard to cancel.' Do NOT call create_task for direct user requests."
+            "After calling this tool, say exactly: 'I've set it up — say confirm to save it, "
+            "say discard to cancel, or tap the buttons on screen.' Then WAIT. The task is NOT "
+            "saved yet. When the user confirms, call confirm_task_creation. When they cancel, call "
+            "discard_task_creation. Do NOT call create_task for direct user requests."
         ),
         "parameters": {
             "type": "object",
@@ -877,6 +880,50 @@ REALTIME_VOICE_TOOL_DEFINITIONS: list[dict[str, Any]] = [
             },
             "required": ["title"],
         },
+    },
+    {
+        "type": "function",
+        "name": "confirm_task_creation",
+        "description": (
+            "Commit (save) the task that is currently shown on the task-creation screen. "
+            "Call this the moment the user verbally confirms after show_task_creation — e.g. "
+            "'confirm', 'yes', 'save it', 'go ahead', 'do it'. This actually writes the task to "
+            "the user's list and dismisses the screen on the device. Pass the SAME title, due_date "
+            "and description you used in show_task_creation (re-state them exactly — do not change "
+            "the wording or invent a date). After it returns success, confirm: 'Done — it's on "
+            "your list.' If it returns an error, apologise and offer to try again."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "title": {
+                    "type": "string",
+                    "description": "Same task title shown on screen (≤8-word paraphrase).",
+                },
+                "due_date": {
+                    "type": "string",
+                    "description": (
+                        "Same ISO date YYYY-MM-DD shown on screen, or omit if the task is Unplanned."
+                    ),
+                },
+                "description": {
+                    "type": "string",
+                    "description": "Same optional detail shown on screen, if any.",
+                },
+            },
+            "required": ["title"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "discard_task_creation",
+        "description": (
+            "Cancel the task that is currently shown on the task-creation screen WITHOUT saving it. "
+            "Call this when the user verbally declines after show_task_creation — e.g. 'discard', "
+            "'cancel', 'no', 'never mind', 'forget it'. This dismisses the screen on the device. "
+            "After it returns, acknowledge briefly: 'Okay, cancelled.'"
+        ),
+        "parameters": {"type": "object", "properties": {}},
     },
     {
         "type": "function",
@@ -1576,10 +1623,67 @@ def execute_realtime_voice_tool(
                     "due_date":    due_date,
                 },
                 "message": (
-                    "Task creation UI shown on device. "
-                    "User will tap Confirm to save or Discard to cancel."
+                    "Task creation UI shown on device. The user will confirm (save) or discard "
+                    "(cancel) by voice or by tapping. Wait for confirm_task_creation / "
+                    "discard_task_creation — do NOT claim the task is saved yet."
                 ),
             })
+
+        if name == "discard_task_creation":
+            return json.dumps({
+                "ok": True,
+                "device_task_dismiss": True,
+                "message": "Task discarded — screen dismissed. Acknowledge briefly: 'Okay, cancelled.'",
+            })
+
+        if name == "confirm_task_creation":
+            from services.tasks_service import (
+                voice_create_task,
+                TaskFidelityError,
+            )
+            title = str(args.get("title") or "").strip()
+            if not title:
+                return json.dumps({"ok": False, "error": "title_required"})
+            due_raw  = str(args.get("due_date") or args.get("due_at") or "").strip()
+            desc_raw = str(args.get("description") or args.get("detail") or "").strip()
+            try:
+                row = voice_create_task(
+                    user_id=user_id,
+                    title=title,
+                    due_date=due_raw or None,
+                    description=desc_raw or None,
+                    confirm_duplicate=True,
+                    source="voice",
+                )
+            except TaskFidelityError as exc:
+                return json.dumps({"ok": False, "error": "task_fidelity", "detail": str(exc)})
+            except Exception as exc:
+                logger.warning("confirm_task_creation failed: %s", exc)
+                return json.dumps({
+                    "ok": False,
+                    "device_task_dismiss": True,
+                    "error": "task_create_failed",
+                    "detail": str(exc),
+                    "message": "Saving failed. Apologise and offer to try again.",
+                })
+            return json.dumps(
+                {
+                    "ok": True,
+                    "device_task_dismiss": True,
+                    "task": {
+                        "id": row.get("id"),
+                        "title": row.get("title"),
+                        "due_at": row.get("due_at"),
+                        "status": row.get("status"),
+                    },
+                    "truth_status": {
+                        "writes_committed": True,
+                        "note": "Task saved to user_commitments.",
+                    },
+                    "message": "Task saved. Confirm to the user: 'Done — it's on your list.'",
+                },
+                default=str,
+            )
 
         if name == "create_task":
             from services.tasks_service import (

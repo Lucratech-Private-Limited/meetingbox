@@ -375,6 +375,7 @@ class RealtimeVoiceSession:
         on_email_draft=None,
         on_recipient_picker=None,
         on_task_creation=None,
+        on_task_dismiss=None,
         on_start_recording=None,
         should_suppress_farewell=None,
         prewarm: bool = False,
@@ -406,6 +407,7 @@ class RealtimeVoiceSession:
         self._on_email_draft_cb = on_email_draft
         self._on_recipient_picker_cb = on_recipient_picker
         self._on_task_creation_cb = on_task_creation
+        self._on_task_dismiss_cb = on_task_dismiss
         self._on_start_recording_cb = on_start_recording
         # Optional predicate: when it returns True the aggressive keyword-based
         # client-side farewell close is skipped (e.g. while an email draft is
@@ -784,6 +786,34 @@ class RealtimeVoiceSession:
         if not isinstance(data, dict) or "device_task_creation" not in data:
             return tool_output_json
         slim = {k: v for k, v in data.items() if k != "device_task_creation"}
+        try:
+            return json.dumps(slim)
+        except (TypeError, ValueError):
+            return tool_output_json
+
+    def _emit_task_dismiss(self, tool_output_json: str) -> None:
+        """Forward a confirm/discard_task_creation directive that dismisses the
+        task-creation screen (the actual save, if any, already happened server-side)."""
+        cb = self._on_task_dismiss_cb
+        if not cb:
+            return
+        try:
+            data = json.loads(tool_output_json)
+        except (json.JSONDecodeError, TypeError):
+            return
+        if not isinstance(data, dict) or not data.get("device_task_dismiss"):
+            return
+        Clock.schedule_once(lambda _dt: self._safe_call(cb), 0)
+
+    def _redact_task_dismiss_for_model(self, tool_output_json: str) -> str:
+        """Strip the device-only dismiss flag before feeding back to the model."""
+        try:
+            data = json.loads(tool_output_json)
+        except (json.JSONDecodeError, TypeError):
+            return tool_output_json
+        if not isinstance(data, dict) or "device_task_dismiss" not in data:
+            return tool_output_json
+        slim = {k: v for k, v in data.items() if k != "device_task_dismiss"}
         try:
             return json.dumps(slim)
         except (TypeError, ValueError):
@@ -1840,6 +1870,9 @@ class RealtimeVoiceSession:
             elif name == "show_task_creation":
                 self._emit_task_creation(out)
                 model_out = self._redact_task_creation_for_model(out)
+            elif name in ("confirm_task_creation", "discard_task_creation"):
+                self._emit_task_dismiss(out)
+                model_out = self._redact_task_dismiss_for_model(out)
             elif name == "show_recipient_picker":
                 self._emit_recipient_picker(out)
 
