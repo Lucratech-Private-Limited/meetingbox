@@ -2938,18 +2938,25 @@ class MeetingBoxApp(App):
             logger.exception("Realtime navigate to %s failed", name)
 
     # ── Voice-first email workflow: directives + touch feedback ───────────
-    def _send_voice_user_text(self, text: str) -> None:
+    def _send_voice_user_text(self, text: str, interrupt: bool = False) -> None:
         """Inject a spoken-equivalent user turn into the live Realtime session.
 
         Used so a screen tap (recipient card, Send / Save / Discard) is handled
         by the assistant exactly as if the user had said it, preserving the
         recipient-confirmation and send-approval workflow.
+
+        When ``interrupt=True`` the assistant's current speech is cancelled and
+        audio playback is stopped before the text is injected — use this for
+        taps that happen while the assistant is reading out options (e.g.
+        tapping a recipient card while the AI is still listing email addresses).
         """
         sess = getattr(self, "_realtime_voice_session", None)
         if sess is None:
             logger.debug("No active voice session for injected text: %r", text)
             return
         try:
+            if interrupt:
+                sess.cancel_current_response()
             sess.send_user_text(text)
         except Exception:
             logger.debug("send_user_text failed", exc_info=True)
@@ -3037,8 +3044,12 @@ class MeetingBoxApp(App):
                     screen.set_draft({"to": cur})
         except Exception:
             logger.debug("optimistic recipient fill failed", exc_info=True)
+        # interrupt=True: the AI may still be reading out the list of names;
+        # cancel that speech immediately so the user hears a crisp confirmation
+        # instead of the list continuing after they've already tapped.
         self._send_voice_user_text(
-            f"I picked {name} ({email}) on screen — use that address."
+            f"I picked {name} ({email}) on screen — use that address.",
+            interrupt=True,
         )
 
     def _on_recipient_dismissed(self) -> None:
@@ -3049,7 +3060,7 @@ class MeetingBoxApp(App):
     def _on_recipient_none(self) -> None:
         """User tapped 'None' in the recipient picker — inject voice turn."""
         # overlay already closed by RecipientConfirmOverlay._on_row_tap
-        self._send_voice_user_text("None of those.")
+        self._send_voice_user_text("None of those.", interrupt=True)
 
     def _on_email_draft_send_tapped(self) -> None:
         self._send_voice_user_text("Yes, send it.")

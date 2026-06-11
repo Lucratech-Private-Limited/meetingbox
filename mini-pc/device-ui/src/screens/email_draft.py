@@ -318,8 +318,10 @@ class _PillButton(BoxLayout):
         self.add_widget(lbl)
 
     def _sync(self, *_):
-        self._shad.pos  = (self.x + 1, self.y - 4)
-        self._shad.size = (self.width + 2, self.height + 5)
+        # Figma: boxShadow 0px 4px 4px rgba(0,0,0,0.25) — no horizontal offset,
+        # 4px downward offset, same footprint as the button itself.
+        self._shad.pos  = (self.x, self.y - _ff(4))
+        self._shad.size = self.size
         self._bg.pos    = self.pos
         self._bg.size   = self.size
 

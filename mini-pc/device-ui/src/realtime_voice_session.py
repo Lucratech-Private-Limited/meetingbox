@@ -801,6 +801,33 @@ class RealtimeVoiceSession:
             lambda _dt: self._safe_call(cb, query, candidates), 0
         )
 
+    def cancel_current_response(self) -> None:
+        """Interrupt any in-progress AI speech immediately (screen tap barge-in).
+
+        Sends ``response.cancel`` to stop the model mid-sentence, kills the
+        local aplay subprocess so the speaker goes quiet, and suppresses the
+        echo-tail audio briefly.  Safe to call from the Kivy main thread even
+        when no response is active (the API ignores a cancel when idle).
+        """
+        loop, ws = self._loop, self._ws
+        if loop is None or ws is None or loop.is_closed():
+            return
+
+        # Stop local audio playback immediately so the speaker goes quiet.
+        self._abort_aplay()
+        self._suppress_audio_until = time.monotonic() + _BARGE_IN_SUPPRESS_AUDIO_S
+
+        async def _cancel():
+            try:
+                await ws.send(json.dumps({"type": "response.cancel"}))
+            except Exception:
+                logger.debug("cancel_current_response ws.send failed", exc_info=True)
+
+        try:
+            asyncio.run_coroutine_threadsafe(_cancel(), loop)
+        except Exception:
+            logger.debug("cancel_current_response schedule failed", exc_info=True)
+
     def send_user_text(self, text: str) -> None:
         """Inject a user turn into the live session (e.g. from a screen tap).
 
