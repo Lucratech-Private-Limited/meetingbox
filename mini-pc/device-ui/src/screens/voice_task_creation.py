@@ -243,22 +243,40 @@ class VoiceTaskCreationScreen(BaseScreen):
         root.add_widget(card)
 
         # ── 4. Purple header bar  abs(27,82) 1206×87  #6D48CC ─────────────────
-        # Top corners match card radius; bottom corners are flat.
+        # Rounded at the top (matches card radius), flat at the bottom.
+        # Achieved by drawing a fully-rounded rect then a plain rect over the
+        # bottom `radius` pixels to square off the lower corners.
         hdr = Widget(
             size_hint=(_sw(1206), _sh(87)),
             pos_hint={"x": _x(27), "y": _y(82, 87)},
         )
         with hdr.canvas:
             Color(*_PURPLE)
-            self._hdr_bg = RoundedRectangle(
-                pos=hdr.pos, size=hdr.size,
-                radius=[_ff(38)],
-            )
-        hdr.bind(
-            pos=lambda w, _: setattr(self._hdr_bg, "pos",  w.pos),
-            size=lambda w, _: setattr(self._hdr_bg, "size", w.size),
-        )
+            self._hdr_round = RoundedRectangle(pos=hdr.pos, size=hdr.size, radius=[_ff(38)])
+            self._hdr_fill  = Rectangle()
+
+        def _sync_hdr(widget, *_):
+            r = _ff(38)
+            self._hdr_round.pos  = widget.pos
+            self._hdr_round.size = widget.size
+            self._hdr_fill.pos   = (widget.x, widget.y)
+            self._hdr_fill.size  = (widget.width, r)
+
+        hdr.bind(pos=_sync_hdr, size=_sync_hdr)
+        Clock.schedule_once(lambda _dt: _sync_hdr(hdr), 0)
         root.add_widget(hdr)
+
+        # ── 4b. Task icon  abs(55,103) 57×57 ─────────────────────────────────
+        task_icon_src = _fp("vc_task_icon.png")
+        if task_icon_src:
+            root.add_widget(Image(
+                source=task_icon_src,
+                size_hint=(_sw(57), _sh(57)),
+                pos_hint={"x": _x(55), "y": _y(103, 57)},
+                fit_mode="contain",
+                allow_stretch=True,
+                keep_ratio=True,
+            ))
 
         # ── 5. "Create Task" heading text  abs(127,113) 174×38 ────────────────
         root.add_widget(Label(
@@ -288,11 +306,11 @@ class VoiceTaskCreationScreen(BaseScreen):
         )
         root.add_widget(task_box)
 
-        # ── 6a. "Task" grey label pill  abs(40,209) 181×45  #9E9DA2 ──────────
-        # Extends slightly left of the task box (Figma: x=-15 relative to box).
+        # ── 6a. "Task" grey label pill  abs(55,209) 148×45  #9E9DA2 ──────────
+        # Starts at the left edge of the ECECEC container so it is fully contained.
         task_pill_bg = Widget(
-            size_hint=(_sw(181), _sh(45)),
-            pos_hint={"x": _x(40), "y": _y(209, 45)},
+            size_hint=(_sw(148), _sh(45)),
+            pos_hint={"x": _x(55), "y": _y(209, 45)},
         )
         with task_pill_bg.canvas:
             Color(*_LABEL_BG)
@@ -312,8 +330,8 @@ class VoiceTaskCreationScreen(BaseScreen):
             color=_WHITE,
             halign="center",
             valign="middle",
-            size_hint=(_sw(181), _sh(45)),
-            pos_hint={"x": _x(40), "y": _y(209, 45)},
+            size_hint=(_sw(148), _sh(45)),
+            pos_hint={"x": _x(55), "y": _y(209, 45)},
         ))
 
         # ── 6b. Scrollable task text  abs(120,265) 1022×114 ───────────────────
@@ -408,19 +426,20 @@ class VoiceTaskCreationScreen(BaseScreen):
         )
         root.add_widget(self._date_lbl)
 
-        # ── 8. Discard button  abs(363,702) 236×66  #ED5B77 ──────────────────
+        # ── 8. Discard button  abs(363,643) 236×66  #ED5B77 ──────────────────
+        # Vertically centred in the gap between card bottom (593) and screen (800).
         self._discard_btn = _PillButton(
             "Discard", _BTN_DISCARD, self._tap_discard,
             size_hint=(_sw(236), _sh(66)),
-            pos_hint={"x": _x(363), "y": _y(702, 66)},
+            pos_hint={"x": _x(363), "y": _y(643, 66)},
         )
         root.add_widget(self._discard_btn)
 
-        # ── 9. Confirm button  abs(661,702) 236×66  #10C76D ──────────────────
+        # ── 9. Confirm button  abs(661,643) 236×66  #10C76D ──────────────────
         self._confirm_btn = _PillButton(
             "Confirm", _BTN_CONFIRM, self._tap_confirm,
             size_hint=(_sw(236), _sh(66)),
-            pos_hint={"x": _x(661), "y": _y(702, 66)},
+            pos_hint={"x": _x(661), "y": _y(643, 66)},
         )
         root.add_widget(self._confirm_btn)
 

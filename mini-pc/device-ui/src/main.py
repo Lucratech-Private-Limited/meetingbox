@@ -3188,9 +3188,9 @@ class MeetingBoxApp(App):
         )
         # Always compact — the full-screen overlay mode is no longer used.
         overlay.set_compact(True)
-        if name in ('home', 'voice_session', 'email_draft'):
-            # Home + voice-session + email_draft all handle transcription natively;
-            # keep overlay hidden.
+        if name in ('home', 'voice_session', 'email_draft', 'voice_task_creation'):
+            # Home + voice-session + email_draft + voice_task_creation all handle
+            # transcription natively; keep overlay hidden.
             overlay.suppress_auto_show = True
             overlay.hide()
         else:
