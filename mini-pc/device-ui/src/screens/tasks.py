@@ -224,8 +224,12 @@ class _MoreButton(ButtonBehavior, Widget):
             e.pos  = (x0 + i * (d + gap), cy)
 
 
-class _PillBG(Widget):
-    """A solid rounded-rectangle background (used for the active tab pill)."""
+class _PillBG(FloatLayout):
+    """A solid rounded-rectangle background (used for the tab pill + count badge).
+
+    FloatLayout (not bare Widget) so a child label — e.g. the count number — is
+    laid out by size_hint/pos_hint instead of collapsing to the (0,0) corner.
+    """
 
     def __init__(self, color: tuple, radius: float, **kw):
         super().__init__(**kw)
@@ -713,12 +717,10 @@ class TasksScreen(BaseScreen):
         bar = _PillBG(_BAR_BG, _ff(38), **_ph(29.0, 170.0, 1202.0, 69.0))
         root.add_widget(bar)
 
-        # 5 cells of 234×69 at relative x 0,242,484,726,968 inside the 1202 bar
-        cell_w_hint = 234.0 / 1202.0
+        # 5 cells of 234×69 at Figma x 29 + {0,242,484,726,968}, y 170 (root-frame
+        # absolute coords — cells are children of *root*, not the bar widget).
         for i, (tab_id, text) in enumerate(_TABS):
-            rel_x = (i * 242.0) / 1202.0
-            cell = FloatLayout(size_hint=(cell_w_hint, 1.0),
-                               pos_hint={"x": rel_x, "y": 0.0})
+            cell = FloatLayout(**_ph(29.0 + i * 242.0, 170.0, 234.0, 69.0))
 
             pill = _PillBG((0, 0, 0, 0), _ff(34), size_hint=(1, 1),
                            pos_hint={"x": 0, "y": 0})
@@ -765,7 +767,8 @@ class TasksScreen(BaseScreen):
         # Card top is square, bottom rounded — drawn as rounded rect + a plain
         # rect over the top `r` px to square the upper corners.
         CARD_Y, CARD_H = 263.0, 800.0 - 263.0 - 21.0   # extend to near bottom
-        card = Widget(**_ph(29.0, CARD_Y, 1202.0, CARD_H))
+        # FloatLayout (not bare Widget) so the ScrollView child honours size_hint.
+        card = FloatLayout(**_ph(29.0, CARD_Y, 1202.0, CARD_H))
         r = _ff(38)
         with card.canvas.before:
             Color(*_CARD_BG)
