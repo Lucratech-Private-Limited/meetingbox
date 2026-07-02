@@ -19,10 +19,27 @@ vosk>=0.3.45
 # Real mic capture + VAD pipeline (formerly in mini-pc/audio/requirements.txt;
 # pulled in here so the merged device-ui image can also spawn audio_capture.py).
 pyaudio==0.2.14
-webrtcvad==2.0.10
+# WASAPI loopback capture for the AEC far-end reference (Windows only). Fork of
+# PyAudio that exposes render endpoints as loopback input devices; imported as
+# ``pyaudiowpatch`` and coexists with the stock ``pyaudio`` above.
+PyAudioWPatch>=0.2.12.7; sys_platform == "win32"
+# WebRTC AEC3 echo canceller (module ``pywebrtc_audio``, imported via
+# webrtc_apm.py) is NOT listed here on purpose: the PyPI wheel crashes on import
+# (pybind11 3.x ABI bug). We build/vendor a pinned wheel (pybind11<3) out of band
+# and bundle the .pyd in packaging. The AEC3 path is import-guarded, so if the
+# module is absent the session cleanly falls back to OS-AEC / Speex.
+# webrtcvad: the original sdist needs a C compiler. On Linux we keep the
+# canonical package; on Windows there is no prebuilt wheel for modern Python,
+# so use webrtcvad-wheels (a drop-in providing the same ``webrtcvad`` module).
+webrtcvad==2.0.10; sys_platform != "win32"
+webrtcvad-wheels>=2.0.14; sys_platform == "win32"
 pyyaml>=6.0.1
 # webrtcvad needs pkg_resources at runtime; bare slim Python 3.12+ images drop it.
 setuptools>=69.0.0
+
+# Windows-native text-to-speech fallback (SAPI5 via pyttsx3) used when the
+# Linux TTS engines (espeak-ng/piper/mimic3) are unavailable.
+pyttsx3>=2.90; sys_platform == "win32"
 
 # QR Code generation
 qrcode>=7.4.2
