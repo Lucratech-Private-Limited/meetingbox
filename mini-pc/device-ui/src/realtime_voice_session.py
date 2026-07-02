@@ -446,6 +446,45 @@ _WEBRTC_AEC_ENABLED = (
 )
 _AEC3_RATE = 48000
 
+# Residual-echo uplink gate for the AEC3 path. AEC3 delivers ~35 dB ERLE, not
+# infinite suppression: on loud consonants a little echo survives in the cleaned
+# near-end and can trip the *server* VAD (threshold ~0.85) into a phantom
+# speech_started -> a one-token transcript ("the", "."). While the assistant is
+# actually playing (far-end RMS above _AEC3_GATE_FAR_ACTIVE_RMS) we forward mic
+# frames only when the cleaned near-end RMS clearly exceeds the adaptive residual
+# floor (genuine double-talk); otherwise the frame is withheld so residual echo
+# never reaches the server VAD. When the assistant is silent the gate is fully
+# open, so normal user turns are never affected. A short preroll is flushed when
+# the gate opens so the first syllable of a real barge-in is not clipped, and a
+# hangover keeps it open through natural pauses. Disable via
+# REALTIME_AEC3_RESIDUAL_GATE=0.
+_AEC3_RESIDUAL_GATE_ENABLED = (
+    os.environ.get("REALTIME_AEC3_RESIDUAL_GATE", "1").strip().lower()
+    not in ("0", "false", "no", "off", "")
+)
+# Far-end RMS above which the assistant is considered "playing" (gate armed).
+_AEC3_GATE_FAR_ACTIVE_RMS = _env_float(
+    "REALTIME_AEC3_GATE_FAR_ACTIVE_RMS", 200.0, minimum=1.0
+)
+# Absolute near-end RMS floor a frame must clear to count as real speech while
+# the assistant is playing. Genuine speech is ~1500-5000; post-AEC echo residual
+# is far lower, so this cleanly separates them.
+_AEC3_GATE_MIN_RMS = _env_float(
+    "REALTIME_AEC3_GATE_MIN_RMS", 550.0 if IS_DESKTOP else 750.0, minimum=100.0
+)
+# A frame must also exceed the adaptive residual floor by this ratio.
+_AEC3_GATE_FLOOR_RATIO = _env_float(
+    "REALTIME_AEC3_GATE_FLOOR_RATIO", 3.0, minimum=1.2
+)
+# Keep the gate open this long after the last speech frame (natural pauses).
+_AEC3_GATE_HANGOVER_S = _env_float(
+    "REALTIME_AEC3_GATE_HANGOVER_S", 0.4, minimum=0.0, maximum=2.0
+)
+# Preroll flushed when the gate opens so a real barge-in's first syllable is kept.
+_AEC3_GATE_PREROLL_S = _env_float(
+    "REALTIME_AEC3_GATE_PREROLL_S", 0.15, minimum=0.0, maximum=0.5
+)
+
 # Live on-screen captions WHILE the user speaks. OpenAI's input transcription
 # only runs AFTER end-of-turn (post-commit), so it can't show words mid-speech.
 # To fill that gap we run the on-device Vosk model (the same one used for wake
@@ -1008,14 +1047,35 @@ class RealtimeVoiceSession:
         self._aec3_full_duplex = False
         self._aec3_in_resampler: _AntiAliasResampler | None = None   # mic -> 48k
         self._aec3_out_resampler: _AntiAliasResampler | None = None  # 48k -> 24k
+        # Residual-echo uplink gate state (AEC3 path).
+        self._aec3_gate_open_until = 0.0
+        self._aec3_residual_floor = 0.0
+        self._aec3_gate_preroll: deque[bytes] = deque()
+        self._aec3_gate_preroll_bytes = 0
+        self._aec3_gate_suppressed = 0
+        self._aec3_gate_last_log = 0.0
         self._webrtc_aec_available = False
         try:
-            if _WEBRTC_AEC_ENABLED and IS_DESKTOP:
+            if not (_WEBRTC_AEC_ENABLED and IS_DESKTOP):
+                logger.info(
+                    "Realtime AEC: WebRTC AEC3 disabled (REALTIME_WEBRTC_AEC=%s, desktop=%s)",
+                    _WEBRTC_AEC_ENABLED, IS_DESKTOP,
+                )
+            else:
                 import webrtc_apm
                 import aec_reference
-                if webrtc_apm.is_available() and (
-                    aec_reference._IS_WIN or aec_reference._IS_MAC
-                ):
+                if not webrtc_apm.is_available():
+                    logger.warning(
+                        "Realtime AEC: WebRTC AEC3 module not importable (%s) — "
+                        "falling back to OS DSP / Speex",
+                        getattr(webrtc_apm, "import_error", None),
+                    )
+                elif not (aec_reference._IS_WIN or aec_reference._IS_MAC):
+                    logger.info(
+                        "Realtime AEC: WebRTC AEC3 present but no OS far-end "
+                        "reference on this platform — falling back"
+                    )
+                else:
                     self._webrtc_aec_available = True
                     logger.info(
                         "Realtime AEC: WebRTC AEC3 engine available "
@@ -1025,7 +1085,7 @@ class RealtimeVoiceSession:
                     )
         except Exception:
             self._webrtc_aec_available = False
-            logger.debug("WebRTC AEC3 availability probe failed", exc_info=True)
+            logger.warning("WebRTC AEC3 availability probe failed", exc_info=True)
 
         # Live caption (on-device Vosk partials while the user speaks). Enabled
         # only when the feature flag is on AND a preloaded Vosk model was handed
@@ -2692,6 +2752,59 @@ class RealtimeVoiceSession:
         np.clip(s, -32768.0, 32767.0, out=s)
         return s.astype(np.int16).tobytes()
 
+    def _aec3_gate_should_send(self, near_pcm24: bytes, far_pcm48: bytes) -> bool:
+        """Residual-echo gate for the AEC3 uplink.
+
+        Returns True if the cleaned near-end frame should be forwarded to the
+        server. While the assistant is playing, frames that merely sit at the
+        post-AEC echo-residual floor are withheld so leftover echo cannot trip
+        the server VAD into a phantom turn; genuine double-talk (clearly louder
+        than the residual floor) passes through immediately. When the assistant
+        is silent the gate is fully open, so normal user turns are untouched.
+        """
+        if not _AEC3_RESIDUAL_GATE_ENABLED:
+            return True
+        far_rms = self._pcm_rms(far_pcm48)
+        # Assistant effectively silent -> no echo risk; keep the gate wide open.
+        if far_rms < _AEC3_GATE_FAR_ACTIVE_RMS:
+            self._aec3_gate_open_until = 0.0
+            self._aec3_residual_floor = 0.0
+            if self._aec3_gate_preroll:
+                self._aec3_gate_preroll.clear()
+                self._aec3_gate_preroll_bytes = 0
+            return True
+        near_rms = self._pcm_rms(near_pcm24)
+        floor = self._aec3_residual_floor
+        threshold = max(_AEC3_GATE_MIN_RMS, floor * _AEC3_GATE_FLOOR_RATIO)
+        now = time.monotonic()
+        if near_rms >= threshold:
+            self._aec3_gate_open_until = now + _AEC3_GATE_HANGOVER_S
+            return True
+        if now < self._aec3_gate_open_until:
+            return True
+        # Residual echo only: seed/adapt the floor from real residual frames and
+        # withhold the frame (never seed the floor from a speech-level sample).
+        self._aec3_residual_floor = (
+            near_rms if floor <= 0.0 else (floor * 0.95) + (near_rms * 0.05)
+        )
+        self._aec3_gate_preroll.append(near_pcm24)
+        self._aec3_gate_preroll_bytes += len(near_pcm24)
+        budget = int(_REALTIME_RATE * 2 * _AEC3_GATE_PREROLL_S)
+        while self._aec3_gate_preroll_bytes > budget and len(self._aec3_gate_preroll) > 1:
+            dropped = self._aec3_gate_preroll.popleft()
+            self._aec3_gate_preroll_bytes -= len(dropped)
+        self._aec3_gate_suppressed += 1
+        if now - self._aec3_gate_last_log >= 2.0:
+            self._aec3_gate_last_log = now
+            self._log_voice_event(
+                "aec3_residual_gated",
+                near_rms=round(near_rms, 1),
+                far_rms=round(far_rms, 1),
+                threshold=round(threshold, 1),
+                suppressed=self._aec3_gate_suppressed,
+            )
+        return False
+
     def _drain_far(self, nbytes: int) -> None:
         """Drop ``nbytes`` from the FRONT of the AEC far-end ring.
 
@@ -2756,7 +2869,17 @@ class RealtimeVoiceSession:
                         if self._aec3_out_resampler is not None else cleaned48
                     )
                     if cleaned24:
-                        await self._upload_resampled_audio(ws, cleaned24)
+                        # Residual-echo gate: withhold echo-only frames so AEC3
+                        # leftovers never trip the server VAD into a phantom
+                        # turn; pass genuine speech (+ preroll) straight through.
+                        if self._aec3_gate_should_send(cleaned24, far48):
+                            if self._aec3_gate_preroll:
+                                preroll = list(self._aec3_gate_preroll)
+                                self._aec3_gate_preroll.clear()
+                                self._aec3_gate_preroll_bytes = 0
+                                for pf in preroll:
+                                    await self._upload_resampled_audio(ws, pf)
+                            await self._upload_resampled_audio(ws, cleaned24)
                     continue
 
                 if resampler is not None:

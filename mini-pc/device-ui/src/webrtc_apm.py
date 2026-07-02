@@ -33,12 +33,17 @@ logger = logging.getLogger(__name__)
 _SUPPORTED_RATES = (16000, 32000, 48000)
 
 
+import_error: str | None = None
+
+
 def _import_apm():
+    global import_error
     try:
         import pywebrtc_audio  # noqa: F401
 
         return pywebrtc_audio
-    except Exception:
+    except Exception as e:
+        import_error = f"{type(e).__name__}: {e}"
         return None
 
 
