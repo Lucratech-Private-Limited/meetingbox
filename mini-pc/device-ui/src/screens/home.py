@@ -4,7 +4,7 @@ Complete rewrite matching the clean minimal Figma design:
   - Full-bleed abstract background image
   - Live 24-hour time (200 px SemiBold) + date (43 px SemiBold)
   - Mic orb button (tappable — activates voice agent)
-  - 'Say Hey Tony' frosted-glass prompt pill (always visible)
+  - 'Say Hey Pepper' frosted-glass prompt pill (always visible)
   - Voice-state pill (hidden at idle; shows Listening / Thinking / Talking
     during voice-agent sessions; includes animated speech waveform)
   - WiFi icon + real-battery indicator in top-right
@@ -30,7 +30,7 @@ from kivy.clock import Clock
 from kivy.core.image import Image as CoreImage
 from kivy.graphics import (
     Color, Ellipse, Line, PopMatrix, PushMatrix,
-    Rectangle, RoundedRectangle, Scale,
+    Rectangle, RoundedRectangle, Scale, Translate,
 )
 from kivy.properties import NumericProperty
 from kivy.uix.behaviors import ButtonBehavior
@@ -39,8 +39,10 @@ from kivy.uix.image import Image
 from kivy.uix.label import Label
 from kivy.uix.widget import Widget
 
+from components.live_wifi_icon import LiveWifiIcon
 from components.modal_dialog import ModalDialog
 from config import ASSETS_DIR, DISPLAY_HEIGHT, DISPLAY_WIDTH, display_now
+from page_swipe import PageSwipeController
 from screens.base_screen import BaseScreen
 
 logger = logging.getLogger(__name__)
@@ -55,8 +57,8 @@ _FIGMA_DIR = ASSETS_DIR / "home" / "figma"
 _TEXT        = (0.227, 0.231, 0.239, 1.0)   # #3A3B3D  body text / dark icons
 _PILL_BG     = (0.980, 0.980, 0.980, 1.0)   # #FAFAFA  voice-state pill fill
 _PURPLE      = (0.427, 0.282, 0.800, 1.0)   # #6D48CC  accent dot in pill
-_HEY_FILL    = (1.0,   1.0,   1.0,   0.5)   # Hey-Tony pill  rgba(255,255,255,0.5)
-_HEY_STROKE  = (1.0,   1.0,   1.0,   0.6)   # Hey-Tony border rgba(255,255,255,0.6)
+_HEY_FILL    = (1.0,   1.0,   1.0,   0.5)   # Hey-Pepper pill  rgba(255,255,255,0.5)
+_HEY_STROKE  = (1.0,   1.0,   1.0,   0.6)   # Hey-Pepper border rgba(255,255,255,0.6)
 _SHADOW      = (0.463, 0.506, 0.498, 0.18)  # rgba(118,129,127,0.18) — shadow approximation
 
 # Registered font names (loaded in main.py)
@@ -247,9 +249,10 @@ class _MicButton(ButtonBehavior, Widget):
 
     orb_scale = NumericProperty(1.0)
 
-    def __init__(self, source: str, on_tap=None, **kw):
+    def __init__(self, source: str, on_tap=None, suppress=None, **kw):
         super().__init__(**kw)
         self._on_tap = on_tap
+        self._suppress = suppress
         self._tex = None
         try:
             self._tex = CoreImage(source).texture
@@ -274,27 +277,28 @@ class _MicButton(ButtonBehavior, Widget):
         self._rect.size = self.size
         self._sync_scale()
 
-    def on_press(self):
+    def on_release(self):
+        # Fire on release (not press) so a horizontal page-swipe that begins on
+        # the orb cancels cleanly instead of triggering the voice agent.
+        if self._suppress is not None and self._suppress():
+            return
         if self._on_tap:
             self._on_tap(self)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 'Say Hey Tony' frosted-glass prompt pill  (node 1023:2042, 657 × 78 px)
+# 'Say Hey Pepper' frosted-glass prompt pill  (node 1023:2042, 657 × 78 px)
 # ─────────────────────────────────────────────────────────────────────────────
-class _HeyTonyPill(Widget):
+class _HeyPepperPill(Widget):
     """Frosted-glass pill drawn entirely in canvas.
 
-    Figma spec: fill rgba(255,255,255,0.5), stroke rgba(255,255,255,0.6),
-    borderRadius 40 px, shadow 0 11 19 rgba(118,129,127,0.7).
+    Figma spec (node 1023:2042): fill rgba(255,255,255,0.5),
+    stroke rgba(255,255,255,0.6) 2 px, borderRadius 40 px, no drop shadow.
     """
 
     def __init__(self, **kw):
         super().__init__(**kw)
         with self.canvas:
-            # Shadow approximation (Kivy has no blur; use layered semi-transparent rects)
-            self._shc  = Color(*_SHADOW)
-            self._shad = RoundedRectangle(pos=(0, 0), size=(1, 1), radius=[44])
             # Fill: rgba(255,255,255,0.5)
             self._fillc = Color(*_HEY_FILL)
             self._fillr = RoundedRectangle(pos=(0, 0), size=(1, 1), radius=[40])
@@ -309,9 +313,6 @@ class _HeyTonyPill(Widget):
         if w <= 0 or h <= 0:
             return
         r = _ff(40)
-        self._shad.pos    = (x + 2, y - 9)
-        self._shad.size   = (w + 2, h + 12)
-        self._shad.radius = [r + 5]
         self._fillr.pos    = (x, y)
         self._fillr.size   = (w, h)
         self._fillr.radius = [r]
@@ -403,6 +404,57 @@ class _VoiceStatePill(FloatLayout):
         self._waveform.update_bars(t, amp)
 
 
+class _SummaryPopupPill(FloatLayout):
+    """Rounded summary-ready notification container."""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        with self.canvas.before:
+            Color(*_SHADOW)
+            self._shadow = RoundedRectangle(pos=(0, 0), size=(1, 1), radius=[30])
+            Color(1.0, 1.0, 1.0, 0.96)
+            self._bg = RoundedRectangle(pos=(0, 0), size=(1, 1), radius=[28])
+            Color(1.0, 1.0, 1.0, 0.72)
+            self._border = Line(rounded_rectangle=(0, 0, 0, 0, 28), width=1.4)
+        self.bind(pos=self._draw, size=self._draw)
+
+    def _draw(self, *_):
+        x, y = self.pos
+        w, h = self.size
+        if w <= 0 or h <= 0:
+            return
+        r = min(w, h) / 2
+        self._shadow.pos = (x + 2, y - 8)
+        self._shadow.size = (w, h + 8)
+        self._shadow.radius = [r]
+        self._bg.pos = (x, y)
+        self._bg.size = (w, h)
+        self._bg.radius = [r]
+        self._border.rounded_rectangle = (x + 1, y + 1, w - 2, h - 2, max(2, r - 1))
+
+
+class _PopupButton(ButtonBehavior, FloatLayout):
+    """Small rounded button used inside the summary-ready popup."""
+
+    def __init__(self, fill, **kw):
+        super().__init__(**kw)
+        self._fill = fill
+        with self.canvas.before:
+            self._color = Color(*fill)
+            self._bg = RoundedRectangle(pos=(0, 0), size=(1, 1), radius=[22])
+        self.bind(pos=self._draw, size=self._draw)
+
+    def _draw(self, *_):
+        x, y = self.pos
+        w, h = self.size
+        if w <= 0 or h <= 0:
+            return
+        self._color.rgba = self._fill
+        self._bg.pos = (x, y)
+        self._bg.size = (w, h)
+        self._bg.radius = [min(w, h) / 2]
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # HomeScreen
 # ─────────────────────────────────────────────────────────────────────────────
@@ -417,20 +469,47 @@ class HomeScreen(BaseScreen):
         self._clock_ev:          object | None = None
         self._status_ev:         object | None = None
         self._voice_tick_ev:     object | None = None
+        self._summary_poll_ev:   object | None = None
         self._listening_active:  bool          = False
         self._current_amplitude: float         = 0.0
+        self._shown_summary_ids: set[str] = set()
         # Mutable widget refs (set in _build_ui)
+        self._root:       FloatLayout     | None = None
         self._battery:    _BatteryWidget  | None = None
         self._voice_pill: _VoiceStatePill | None = None
         self._mic_btn:    _MicButton      | None = None
         self._time_lbl:   Label           | None = None
         self._date_lbl:   Label           | None = None
+        self._summary_ready_popup: _SummaryPopupPill | None = None
+        self._page_tx = None
         self._build_ui()
+        # Left-to-right reveal of the Start-Recording (READY) page, dragged
+        # directly under the finger like an adjacent iOS Home-Screen page.
+        self._fwd_pager = PageSwipeController(
+            self,
+            "recording",
+            direction=1,
+            prepare_dest=self._prepare_recording_ready,
+            commit=self._commit_to_recording_ready,
+            can_start=self._can_start_swipe,
+        )
+        # Right-to-left reveal of the Calendar page. Calendar sits to the *right*
+        # of Home (mirroring Start-Recording on the left), and Tasks sits to the
+        # right of Calendar — one continuous chain of adjacent pages.
+        self._cal_pager = PageSwipeController(
+            self,
+            "calendar",
+            direction=-1,
+            prepare_dest=self._prepare_adjacent,
+            commit=self._commit_to_calendar,
+            can_start=self._can_start_swipe,
+        )
 
     # ── Build ─────────────────────────────────────────────────────────────────
 
     def _build_ui(self) -> None:
         root = FloatLayout()
+        self._root = root
 
         # 1 · Full-bleed background image  (0, 0)  1260 × 800 ──────────────
         bg_src = _fp("new_home_bg.png")
@@ -444,31 +523,11 @@ class HomeScreen(BaseScreen):
                 keep_ratio=False,
             ))
 
-        # 2 · WiFi icon  (1125, 31)  29 × 20 ─────────────────────────────
-        wifi_src = _fp("new_wifi_icon.png")
-        if wifi_src:
-            root.add_widget(Image(
-                source=wifi_src,
-                size_hint=(_sw(29), _sh(20)),
-                pos_hint={"x": _x(1125), "y": _y(31, 20)},
-                fit_mode="contain",
-                allow_stretch=True,
-                keep_ratio=True,
-            ))
-
-        # 3 · Battery indicator  (1191, 30)  47 × 21 ─────────────────────
-        self._battery = _BatteryWidget(
-            size_hint=(_sw(47), _sh(21)),
-            pos_hint={"x": _x(1191), "y": _y(30, 21)},
-        )
-        root.add_widget(self._battery)
-
-        # 4 · Voice-state pill  (867, 17)  222 × 47  (hidden by default) ─
-        self._voice_pill = _VoiceStatePill(
-            size_hint=(_sw(222), _sh(47)),
-            pos_hint={"x": _x(867), "y": _y(17, 47)},
-        )
-        root.add_widget(self._voice_pill)
+        # Voice-state pill: rendered exclusively by the global VoiceControlBar
+        # (see voice_control_bar.py) to keep size/position/font consistent
+        # across every screen. self._voice_pill stays None here on purpose;
+        # existing `if self._voice_pill:` guards below no-op safely.
+        # (WiFi + battery indicators removed — not relevant for the desktop app.)
 
         # 5 · Date label  (553, 126)  189 × 51  43 px SemiBold ───────────
         #     Figma text: "Tue Apr 2"  →  live: display_now()
@@ -500,24 +559,24 @@ class HomeScreen(BaseScreen):
         self._time_lbl.bind(size=self._time_lbl.setter("text_size"))
         root.add_widget(self._time_lbl)
 
-        # 7 · 'Say Hey Tony' pill  (302, 596)  657 × 78  40 px radius ────
-        hey_pill = _HeyTonyPill(
+        # 7 · 'Say Hey Pepper' pill  (302, 596)  657 × 78  40 px radius ────
+        hey_pill = _HeyPepperPill(
             size_hint=(_sw(657), _sh(78)),
             pos_hint={"x": _x(302), "y": _y(596, 78)},
         )
         root.add_widget(hey_pill)
 
-        # 8 · Hey-Tony text  (Figma: x+54 inside pill, 549 × 38, centred) ─
-        #     Figma: 32 px SemiBold, #3A3B3D, center
+        # 8 · Hey-Pepper text  (node 1023:2043) — 32 px SemiBold #3A3B3D,
+        #     centred on both axes inside the 657 × 78 pill.
         hey_lbl = Label(
-            text="Say 'Hey Tony' to start a conversation",
+            text="Say ‘Hey Pepper’ to start a conversation",
             font_name=_FONT_SB,
             font_size=_ff(32),
             color=_TEXT,
             halign="center",
             valign="middle",
-            size_hint=(_sw(549), _sh(38)),
-            pos_hint={"x": _x(302 + 54), "y": _y(596 + 19, 38)},
+            size_hint=(_sw(657), _sh(78)),
+            pos_hint={"x": _x(302), "y": _y(596, 78)},
         )
         hey_lbl.bind(size=hey_lbl.setter("text_size"))
         root.add_widget(hey_lbl)
@@ -527,6 +586,10 @@ class HomeScreen(BaseScreen):
         self._mic_btn = _MicButton(
             source=mic_src or "",
             on_tap=self._on_mic_tapped,
+            suppress=lambda: (
+                getattr(self, "_fwd_pager", None) is not None
+                and self._fwd_pager.is_engaged
+            ),
             size_hint=(_sw(122), _sh(122)),
             pos_hint={"x": _x(570), "y": _y(415, 122)},
         )
@@ -534,9 +597,104 @@ class HomeScreen(BaseScreen):
 
         self.add_widget(root)
 
+    # ── Interactive page swipe (Home → Start Recording) ───────────────────────
+
+    def _can_start_swipe(self) -> bool:
+        # Don't hijack touches while a voice session is animating or a modal
+        # dialog is on screen.
+        if self._listening_active:
+            return False
+        for child in self.children:
+            if isinstance(child, ModalDialog):
+                return False
+        return True
+
+    def _prepare_recording_ready(self, rec) -> None:
+        """Put the borrowed recording screen into its static READY look."""
+        try:
+            rec.show_ready_preview()
+        except Exception:
+            logger.exception("home: failed to prepare recording ready preview")
+
+    def _commit_to_recording_ready(self) -> None:
+        """Settle onto the real recording screen in its READY state."""
+        try:
+            rec = self.app.screen_manager.get_screen("recording")
+            rec.enter_ready_next = True
+        except Exception:
+            logger.exception("home: failed to flag recording ready entry")
+        self.app.goto_screen("recording", transition="none")
+
+    def _prepare_adjacent(self, dest) -> None:
+        """Prime an adjacent page (Calendar) with live content for the preview."""
+        try:
+            dest.prime_preview()
+        except Exception:
+            logger.exception("home: failed to prime adjacent page preview")
+
+    def _commit_to_calendar(self) -> None:
+        """Settle onto the Calendar page."""
+        self.app.goto_screen("calendar", transition="none")
+
+    def _ensure_page_translate(self) -> None:
+        if self._page_tx is not None:
+            return
+        with self.canvas.before:
+            PushMatrix()
+            self._page_tx = Translate(0, 0, 0)
+        with self.canvas.after:
+            PopMatrix()
+
+    def set_page_offset(self, dx: float) -> None:
+        self._ensure_page_translate()
+        self._page_tx.x = float(dx)
+
+    def prime_preview(self) -> None:
+        """Refresh transient content so the back-swipe preview looks live."""
+        self.set_page_offset(0.0)
+        try:
+            self._update_clock()
+        except Exception:
+            logger.debug("home: prime_preview clock refresh failed", exc_info=True)
+
+    def _pagers(self):
+        return (
+            getattr(self, "_fwd_pager", None),
+            getattr(self, "_cal_pager", None),
+        )
+
+    def on_touch_down(self, touch):
+        for pager in self._pagers():
+            if pager is not None and pager.on_touch_down(touch):
+                return True
+        return super().on_touch_down(touch)
+
+    def on_touch_move(self, touch):
+        for pager in self._pagers():
+            if pager is not None and pager.on_touch_move(touch):
+                return True
+        return super().on_touch_move(touch)
+
+    def on_touch_up(self, touch):
+        for pager in self._pagers():
+            if pager is not None and pager.on_touch_up(touch):
+                return True
+        return super().on_touch_up(touch)
+
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     def on_enter(self):
+        # Start the audio capture child lazily the first time home is reached
+        # (deferred from app startup so onboarding boots cleanly).
+        try:
+            self.app._ensure_audio_capture_started()
+        except Exception:
+            pass
+        # Reset any in-flight page swipe and the page translate.
+        for pager in self._pagers():
+            if pager is not None:
+                pager.cancel()
+        self.set_page_offset(0.0)
         # Reset voice state to idle
         self._listening_active  = False
         self._current_amplitude = 0.0
@@ -560,7 +718,17 @@ class HomeScreen(BaseScreen):
         Clock.schedule_once(lambda _dt: self._refresh_status(), 1.5)
         self._status_ev = Clock.schedule_interval(lambda _dt: self._refresh_status(), 30.0)
 
+        # Poll the app-level processing cache for newly completed summaries.
+        self._check_summary_ready()
+        if self._summary_poll_ev:
+            self._summary_poll_ev.cancel()
+        self._summary_poll_ev = Clock.schedule_interval(self._check_summary_ready, 1.5)
+
     def on_leave(self):
+        for pager in self._pagers():
+            if pager is not None:
+                pager.cancel()
+        self.set_page_offset(0.0)
         self._listening_active  = False
         self._current_amplitude = 0.0
         self._stop_waveform_tick()
@@ -576,6 +744,142 @@ class HomeScreen(BaseScreen):
         if self._status_ev:
             self._status_ev.cancel()
             self._status_ev = None
+        if self._summary_poll_ev:
+            self._summary_poll_ev.cancel()
+            self._summary_poll_ev = None
+
+    # ── Summary-ready popup ──────────────────────────────────────────────────
+
+    def _check_summary_ready(self, *_):
+        if self._summary_ready_popup is not None:
+            return
+        cache = getattr(self.app, "_processing_summary_cache", None)
+        if not isinstance(cache, dict) or not cache:
+            return
+        for meeting_id, entry in list(cache.items()):
+            if not isinstance(entry, dict) or not entry.get("ok"):
+                continue
+            if meeting_id in self._shown_summary_ids:
+                continue
+            self._show_summary_ready_popup(meeting_id, entry.get("summary") or {})
+            break
+
+    def _show_summary_ready_popup(self, meeting_id: str, summary: dict) -> None:
+        self._dismiss_summary_popup()
+        title = "Your meeting"
+        mode = "meeting"
+        if isinstance(summary, dict):
+            mode = str(summary.get("recording_mode") or summary.get("content_type") or "meeting").strip().lower()
+            for key in ("title", "report_title", "meeting_title", "name"):
+                value = str(summary.get(key) or "").strip()
+                if value:
+                    title = value
+                    break
+        is_note = mode in {"note", "notes"}
+        if is_note and title == "Your meeting":
+            title = "Notes"
+
+        popup = _SummaryPopupPill(
+            size_hint=(_sw(760), _sh(88)),
+            pos_hint={"x": _x((_FW - 760) / 2), "y": _y(96, 88)},
+        )
+
+        headline = Label(
+            text="Notes are ready" if is_note else "Meeting summary is ready",
+            font_name=_FONT_SB,
+            font_size=_ff(22),
+            color=_TEXT,
+            halign="left",
+            valign="middle",
+            size_hint=(0.56, 0.34),
+            pos_hint={"x": 0.045, "center_y": 0.63},
+        )
+        headline.bind(size=headline.setter("text_size"))
+        popup.add_widget(headline)
+
+        subtitle = Label(
+            text=title,
+            font_name=_FONT_SB,
+            font_size=_ff(17),
+            color=(0.45, 0.45, 0.50, 1.0),
+            halign="left",
+            valign="middle",
+            shorten=True,
+            shorten_from="right",
+            max_lines=1,
+            size_hint=(0.56, 0.30),
+            pos_hint={"x": 0.045, "center_y": 0.34},
+        )
+        subtitle.bind(size=subtitle.setter("text_size"))
+        popup.add_widget(subtitle)
+
+        view_btn = _PopupButton(
+            fill=_PURPLE,
+            size_hint=(0.1447, 0.59),
+            pos_hint={"x": 0.687, "center_y": 0.5},
+        )
+        view_label = Label(
+            text="View",
+            font_name=_FONT_SB,
+            font_size=_ff(20),
+            color=(1, 1, 1, 1),
+            halign="center",
+            valign="middle",
+            size_hint=(1, 1),
+            pos_hint={"x": 0, "y": 0},
+        )
+        view_label.bind(size=view_label.setter("text_size"))
+        view_btn.add_widget(view_label)
+        view_btn.bind(on_release=lambda *_a, mid=meeting_id, sm=summary: self._on_view_summary(mid, sm))
+        popup.add_widget(view_btn)
+
+        close_btn = _PopupButton(
+            fill=(0.93, 0.93, 0.95, 1.0),
+            size_hint=(0.126, 0.59),
+            pos_hint={"x": 0.847, "center_y": 0.5},
+        )
+        close_label = Label(
+            text="Close",
+            font_name=_FONT_SB,
+            font_size=_ff(18),
+            color=_TEXT,
+            halign="center",
+            valign="middle",
+            size_hint=(1, 1),
+            pos_hint={"x": 0, "y": 0},
+        )
+        close_label.bind(size=close_label.setter("text_size"))
+        close_btn.add_widget(close_label)
+        close_btn.bind(on_release=lambda *_a, mid=meeting_id: self._dismiss_summary_popup(mark=mid))
+        popup.add_widget(close_btn)
+
+        self._summary_ready_popup = popup
+        if self._root is not None:
+            self._root.add_widget(popup)
+
+    def _on_view_summary(self, meeting_id: str, summary: dict) -> None:
+        self._shown_summary_ids.add(meeting_id)
+        self._dismiss_summary_popup()
+        try:
+            screen = self.app.screen_manager.get_screen("summary_review")
+            if hasattr(screen, "set_meeting_data"):
+                screen.set_meeting_data(meeting_id, summary or {})
+        except Exception:
+            logger.exception("Failed to open summary_review from home popup")
+        self.app.goto_screen("summary_review", "fade")
+
+    def _dismiss_summary_popup(self, mark: str | None = None) -> None:
+        if mark:
+            self._shown_summary_ids.add(mark)
+        popup = self._summary_ready_popup
+        self._summary_ready_popup = None
+        if popup is None:
+            return
+        try:
+            if popup.parent is not None:
+                popup.parent.remove_widget(popup)
+        except Exception:
+            pass
 
     # ── Live clock ────────────────────────────────────────────────────────────
 
