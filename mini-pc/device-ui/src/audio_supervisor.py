@@ -39,24 +39,6 @@ def _truthy(value: Optional[str]) -> bool:
     return str(value).strip().lower() not in ("", "0", "false", "no", "off")
 
 
-def _resolve_frozen_audio_exe() -> Optional[Path]:
-    """In a PyInstaller build, return the sibling ``meetingbox-audio(.exe)``.
-
-    When frozen, ``sys.executable`` is the UI binary (not a Python interpreter),
-    so we cannot run ``audio_capture.py`` as a script. The installer ships a
-    second one-file binary next to the UI that runs the audio capture loop.
-    """
-    if not getattr(sys, "frozen", False):
-        return None
-    exe_dir = Path(sys.executable).resolve().parent
-    names = ["meetingbox-audio.exe", "meetingbox-audio"]
-    for n in names:
-        cand = exe_dir / n
-        if cand.is_file():
-            return cand
-    return None
-
-
 def _resolve_audio_script() -> Optional[Path]:
     """Return absolute path to ``audio_capture.py``, or None when not found."""
     env_path = os.environ.get("MEETINGBOX_AUDIO_SCRIPT", "").strip()
@@ -97,14 +79,12 @@ class AudioSupervisor:
 
     def __init__(
         self,
-        audio_script: Optional[Path],
+        audio_script: Path,
         python: str,
         on_event: Optional[Callable[[dict], None]] = None,
-        audio_exe: Optional[Path] = None,
     ) -> None:
         self._script = audio_script
         self._python = python
-        self._audio_exe = audio_exe
         self._on_event = on_event
         self._proc: Optional[subprocess.Popen] = None
         self._thread: Optional[threading.Thread] = None
@@ -158,12 +138,8 @@ class AudioSupervisor:
         env = os.environ.copy()
         env.setdefault("PYTHONUNBUFFERED", "1")
 
-        if self._audio_exe is not None:
-            cmd = [str(self._audio_exe)]
-            cwd = str(self._audio_exe.parent)
-        else:
-            cmd = [self._python, str(self._script)]
-            cwd = str(self._script.parent)
+        cmd = [self._python, str(self._script)]
+        cwd = str(self._script.parent)
         logger.info("spawning audio child: %s (cwd=%s)", " ".join(cmd), cwd)
         try:
             popen_kwargs: dict = {
@@ -176,14 +152,6 @@ class AudioSupervisor:
             }
             if sys.platform.startswith("linux"):
                 popen_kwargs["start_new_session"] = True
-            elif sys.platform == "win32":
-                # The audio child is a console-subsystem exe (so its stdout pipe
-                # works reliably). Without this flag Windows pops a black console
-                # window because the windowed UI has no console to inherit.
-                # CREATE_NO_WINDOW keeps the piped stdout but hides the window.
-                popen_kwargs["creationflags"] = getattr(
-                    subprocess, "CREATE_NO_WINDOW", 0x08000000
-                )
             self._proc = subprocess.Popen(cmd, **popen_kwargs)
         except FileNotFoundError as exc:
             logger.error("cannot launch audio child (missing executable): %s", exc)
@@ -263,17 +231,6 @@ def maybe_create_from_env(
     """Return a configured supervisor when enabled and runnable, else None."""
     if not _truthy(os.environ.get("MEETINGBOX_SPAWN_AUDIO")):
         return None
-
-    # Frozen (PyInstaller) build: run the sibling audio executable.
-    frozen_exe = _resolve_frozen_audio_exe()
-    if frozen_exe is not None:
-        return AudioSupervisor(
-            audio_script=None,
-            python=_resolve_python(),
-            on_event=on_event,
-            audio_exe=frozen_exe,
-        )
-
     script = _resolve_audio_script()
     if script is None:
         logger.error(

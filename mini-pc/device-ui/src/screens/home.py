@@ -42,6 +42,7 @@ from kivy.uix.widget import Widget
 from components.live_wifi_icon import LiveWifiIcon
 from components.modal_dialog import ModalDialog
 from config import ASSETS_DIR, DISPLAY_HEIGHT, DISPLAY_WIDTH, display_now
+from page_swipe import PageSwipeController
 from screens.base_screen import BaseScreen
 
 logger = logging.getLogger(__name__)
@@ -482,11 +483,27 @@ class HomeScreen(BaseScreen):
         self._summary_ready_popup: _SummaryPopupPill | None = None
         self._page_tx = None
         self._build_ui()
-        # Swipe page-navigation removed: the always-on-top Pepper dock is now the
-        # primary navigation surface, so Home no longer reveals adjacent pages.
-        # ``_pagers()`` reads these via ``getattr(..., None)``, so leaving them
-        # unset cleanly disables both the forward (Start-Recording) and reverse
-        # (Calendar/Tasks) reveals while the rest of the screen keeps working.
+        # Left-to-right reveal of the Start-Recording (READY) page, dragged
+        # directly under the finger like an adjacent iOS Home-Screen page.
+        self._fwd_pager = PageSwipeController(
+            self,
+            "recording",
+            direction=1,
+            prepare_dest=self._prepare_recording_ready,
+            commit=self._commit_to_recording_ready,
+            can_start=self._can_start_swipe,
+        )
+        # Right-to-left reveal of the Calendar page. Calendar sits to the *right*
+        # of Home (mirroring Start-Recording on the left), and Tasks sits to the
+        # right of Calendar — one continuous chain of adjacent pages.
+        self._cal_pager = PageSwipeController(
+            self,
+            "calendar",
+            direction=-1,
+            prepare_dest=self._prepare_adjacent,
+            commit=self._commit_to_calendar,
+            can_start=self._can_start_swipe,
+        )
 
     # ── Build ─────────────────────────────────────────────────────────────────
 

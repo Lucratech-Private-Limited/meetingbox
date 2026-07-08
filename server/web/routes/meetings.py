@@ -15,7 +15,6 @@ from pydantic import BaseModel, ConfigDict
 import redis
 import shutil
 import httpx
-import numpy as np
 
 from auth import get_current_user, get_optional_actor
 from database import get_connection
@@ -100,20 +99,6 @@ DEFAULT_TRANSCRIBE_PROMPT = (
   "Preserve names, numbers, dates, product names, English technical terms, and code-mixed phrases. "
   "Do not translate during transcription."
 )
-_PROMPT_ECHO_MARKERS = (
-  "transcribe all speech accurately in the language spoken",
-  "this is a multilingual meeting",
-  "preserve names numbers dates product names",
-  "do not translate during transcription",
-)
-
-# Silence/noise guard before Whisper to avoid hallucinating text from fan hum
-# or empty rooms. Tunable through env vars if field conditions vary.
-NO_SPEECH_MIN_SECONDS = max(1, _env_int("MEETINGBOX_NO_SPEECH_MIN_SECONDS", 6))
-NO_SPEECH_SPEECHLIKE_RMS = max(1, _env_int("MEETINGBOX_NO_SPEECH_SPEECHLIKE_RMS", 320))
-NO_SPEECH_SPEECHLIKE_PEAK = max(1, _env_int("MEETINGBOX_NO_SPEECH_SPEECHLIKE_PEAK", 1200))
-NO_SPEECH_MAX_GLOBAL_RMS = max(1, _env_int("MEETINGBOX_NO_SPEECH_MAX_GLOBAL_RMS", 180))
-NO_SPEECH_MAX_P95_PEAK = max(1, _env_int("MEETINGBOX_NO_SPEECH_MAX_P95_PEAK", 850))
 
 
 def _generate_session_id() -> str:
@@ -276,26 +261,27 @@ def _normalize_summary_data(data: dict) -> dict:
 
 def _resolve_user_id_for_post_summarize_actions(actor: Optional[dict]) -> Optional[str]:
   """
-  Logged-in web clients and device actors: use the actor's own user id.
-  Never fall back to an unrelated user's integrations — that would attribute
-  meeting memories to the wrong person on multi-user servers.
+  Logged-in web clients: use their user id.
+  Device UI calls summarize without JWT: if exactly one user has Gmail/Calendar connected,
+  use that user so agentic actions can be generated in the same response (typical home setup).
   """
   direct_user_id = _actor_user_id(actor)
   if direct_user_id:
     return str(direct_user_id)
-  # If the actor is a device but user resolution failed (edge case: device JWT
-  # with no owner_user_id), look the device up directly in the devices table.
-  device_id = _actor_device_id(actor)
-  if device_id:
-    conn = get_connection()
-    try:
-      cur = conn.cursor()
-      cur.execute("SELECT user_id FROM devices WHERE id = ?", (device_id,))
-      row = cur.fetchone()
-      if row and row[0]:
-        return str(row[0]).strip()
-    finally:
-      conn.close()
+  conn = get_connection()
+  try:
+    cur = conn.cursor()
+    cur.execute(
+      """
+      SELECT DISTINCT user_id FROM integrations
+      WHERE provider IN ('gmail', 'calendar') AND user_id IS NOT NULL AND TRIM(user_id) != ''
+      """,
+    )
+    ids = [str(r[0]).strip() for r in cur.fetchall() if r and r[0]]
+    if len(ids) == 1:
+      return ids[0]
+  finally:
+    conn.close()
   return None
 
 
@@ -309,12 +295,6 @@ class MeetingDetail(BaseModel):
 class RecordingControlRequest(BaseModel):
   device_id: Optional[str] = None
   target_device_id: Optional[str] = None
-  recording_mode: Optional[str] = None
-  # Rich context the user gave *before* recording starts (captured by the voice
-  # layer). Stored as searchable metadata so the recording is findable later
-  # even when these words never appear in the transcript. Free-form: any of
-  # session_intent / pre_context and entity arrays (referenced_people, …).
-  context: Optional[dict] = None
 
 
 def _app_setting_int(key: str, default: int) -> int:
@@ -448,12 +428,7 @@ def emit_audio_command(actor: dict, payload: dict, device_id: Optional[str] = No
   return target_device_id
 
 
-def _publish_recording_ws_event(
-  event_type: str,
-  session_id: Optional[str],
-  device_id: Optional[str] = None,
-  user_id: Optional[str] = None,
-) -> None:
+def _publish_recording_ws_event(event_type: str, session_id: Optional[str], device_id: Optional[str] = None) -> None:
   payload = {
     "type": event_type,
     "session_id": session_id,
@@ -461,73 +436,11 @@ def _publish_recording_ws_event(
   }
   if device_id:
     payload["device_id"] = device_id
-  if user_id:
-    payload["user_id"] = user_id
   _get_redis().publish("events", json.dumps(payload))
 
 
 def _session_owner_key(session_id: str) -> str:
   return f"meeting_session_owner:{session_id}"
-
-
-def _session_context_key(session_id: str) -> str:
-  return f"meeting_session_context:{session_id}"
-
-
-# Keys we accept in a pre-recording context payload (everything else ignored).
-_CONTEXT_TEXT_KEYS = ("session_intent", "pre_context")
-_CONTEXT_LIST_KEYS = (
-  "intent_tags",
-  "context_tags",
-  "referenced_people",
-  "referenced_projects",
-  "referenced_events",
-  "referenced_organizations",
-  "referenced_locations",
-  "referenced_topics",
-  "future_reference_tags",
-)
-
-
-def _sanitize_context_payload(raw: object) -> dict:
-  """Whitelist + coerce a caller-supplied context dict into storable fields."""
-  if not isinstance(raw, dict):
-    return {}
-  out: dict = {}
-  for k in _CONTEXT_TEXT_KEYS:
-    if raw.get(k) is not None:
-      val = str(raw.get(k) or "").strip()
-      if val:
-        out[k] = val[:2000]
-  for k in _CONTEXT_LIST_KEYS:
-    if raw.get(k) is not None:
-      out[k] = raw.get(k)
-  return out
-
-
-def _stage_session_context(session_id: str, context: object) -> None:
-  payload = _sanitize_context_payload(context)
-  if not session_id or not payload:
-    return
-  try:
-    _get_redis().setex(_session_context_key(session_id), 6 * 60 * 60, json.dumps(payload))
-  except Exception:
-    logger.debug("failed to stage session context for %s", session_id, exc_info=True)
-
-
-def _load_session_context(session_id: Optional[str]) -> dict:
-  if not session_id:
-    return {}
-  try:
-    raw = _get_redis().get(_session_context_key(session_id))
-  except Exception:
-    return {}
-  if not raw:
-    return {}
-  try:
-    return json.loads(raw)
-  except json.JSONDecodeError:
-    return {}
 
 
 def _store_session_owner(
@@ -571,35 +484,19 @@ def _require_actor(current_actor: Optional[dict]) -> dict:
 def _meeting_access_filter(actor: Optional[dict], alias: str = "meetings") -> tuple[str, list[object]]:
   """
   Scope meetings to the actor:
-  - device: rows explicitly owned by this user OR unclaimed rows recorded on this device
-  - user: rows owned by user_id OR unclaimed rows recorded on any device paired to that user
-
-  The device_id branch is intentionally a fallback (only when user_id IS NULL/empty) so that
-  a meeting's explicit user_id attribution always wins — preventing cross-user data leaks when
-  a device changes ownership.
+  - device: rows with matching device_id
+  - user: rows owned by user_id OR created on any device paired to that user
   """
   if not actor:
     return "", []
   if actor["type"] == "device":
-    uid = _actor_user_id(actor)
     did = _actor_device_id(actor)
-    # A meeting belongs to this device actor if:
-    #   1. Its user_id is already attributed to the device owner, OR
-    #   2. It has no user_id (orphaned device recording) AND matches this device_id.
-    pred = (
-      f"({alias}.user_id = ? OR "
-      f"(COALESCE(TRIM({alias}.user_id), '') = '' AND {alias}.device_id = ?))"
-    )
-    return pred, [uid, did]
+    return f"{alias}.device_id = ?", [did]
   uid = _actor_user_id(actor)
-  # A meeting belongs to this user if:
-  #   1. Its user_id matches, OR
-  #   2. It has no user_id (old recording) AND was recorded on a device paired to this user.
   pred = (
-    f"({alias}.user_id = ? OR "
-    f"(COALESCE(TRIM({alias}.user_id), '') = '' AND {alias}.device_id IN ("
+    f"({alias}.user_id = ? OR {alias}.device_id IN ("
     " SELECT id FROM devices WHERE user_id = ? "
-    " AND (status IS NULL OR TRIM(COALESCE(status, '')) = '' OR LOWER(TRIM(status)) = 'active')))"
+    " AND (status IS NULL OR TRIM(COALESCE(status, '')) = '' OR LOWER(TRIM(status)) = 'active'))"
     ")"
   )
   return pred, [uid, uid]
@@ -618,13 +515,10 @@ async def start_meeting(
   session_id = _generate_session_id()
   requested_device_id = (body.device_id or body.target_device_id) if body else None
   device_id = _resolve_recording_device_id(actor, requested_device_id)
-  mode = ((body.recording_mode if body else None) or "meeting").strip().lower()
-  if mode not in {"meeting", "note"}:
-    mode = "meeting"
 
   def _work(r):
     _store_session_owner(session_id, current_actor, device_id_override=device_id)
-    cmd = {"action": "start_recording", "session_id": session_id, "recording_mode": mode}
+    cmd = {"action": "start_recording", "session_id": session_id}
     if device_id:
       cmd["device_id"] = device_id
     r.publish("commands", json.dumps(cmd))
@@ -632,11 +526,7 @@ async def start_meeting(
     r.set(_recording_state_key(device_id), "recording")
 
   _recording_redis(_work)
-  # Stash any pre-recording context (mentioned people/topics/intent) so it can
-  # be persisted as searchable metadata when the audio is uploaded.
-  if body and body.context:
-    _stage_session_context(session_id, body.context)
-  return {"session_id": session_id, "status": "recording_started", "recording_mode": mode}
+  return {"session_id": session_id, "status": "recording_started"}
 
 
 @router.post("/stop")
@@ -876,104 +766,7 @@ def _ensure_16k_mono_wav(source: Path, dest: Path) -> None:
   )
 
 
-def _no_speech_active_ratio_default() -> float:
-  raw = (os.getenv("MEETINGBOX_NO_SPEECH_MIN_ACTIVE_RATIO") or "").strip()
-  if not raw:
-    return 0.02
-  try:
-    val = float(raw)
-  except (TypeError, ValueError):
-    return 0.02
-  return max(0.0, min(1.0, val))
-
-
-NO_SPEECH_MIN_ACTIVE_RATIO = _no_speech_active_ratio_default()
-
-
-def _detect_no_speech_audio(audio_path: Path) -> tuple[bool, dict]:
-  """Detect fan/noise-only WAVs before Whisper transcription."""
-  frame_ms = 30
-  try:
-    with wave.open(str(audio_path), "rb") as wf:
-      sample_rate = int(wf.getframerate() or 16000)
-      channels = int(wf.getnchannels() or 1)
-      frame_width = max(1, int(sample_rate * frame_ms / 1000))
-      all_frames: list[np.ndarray] = []
-      while True:
-        raw = wf.readframes(frame_width)
-        if not raw:
-          break
-        arr = np.frombuffer(raw, dtype=np.int16)
-        if arr.size == 0:
-          continue
-        if channels > 1:
-          arr = arr.reshape(-1, channels).mean(axis=1).astype(np.int16)
-        all_frames.append(arr)
-  except Exception:
-    logger.debug("No-speech detector failed to read wav: %s", audio_path, exc_info=True)
-    return False, {}
-
-  if not all_frames:
-    return True, {"reason": "empty_audio"}
-
-  rms_values: list[float] = []
-  peak_values: list[int] = []
-  active_frames = 0
-  for arr in all_frames:
-    f = arr.astype(np.float64)
-    rms = float(np.sqrt(np.mean(np.square(f))))
-    peak = int(np.max(np.abs(arr)))
-    rms_values.append(rms)
-    peak_values.append(peak)
-    if rms >= NO_SPEECH_SPEECHLIKE_RMS or peak >= NO_SPEECH_SPEECHLIKE_PEAK:
-      active_frames += 1
-
-  duration_s = sum(frame.size for frame in all_frames) / float(sample_rate)
-  global_rms = float(np.sqrt(np.mean(np.square(np.concatenate(all_frames).astype(np.float64)))))
-  p95_peak = int(np.percentile(np.array(peak_values, dtype=np.float64), 95)) if peak_values else 0
-  active_ratio = active_frames / float(len(all_frames))
-
-  is_no_speech = (
-    duration_s >= NO_SPEECH_MIN_SECONDS
-    and active_ratio < NO_SPEECH_MIN_ACTIVE_RATIO
-    and global_rms <= NO_SPEECH_MAX_GLOBAL_RMS
-    and p95_peak <= NO_SPEECH_MAX_P95_PEAK
-  )
-  stats = {
-    "duration_s": round(duration_s, 2),
-    "active_ratio": round(active_ratio, 4),
-    "global_rms": round(global_rms, 2),
-    "p95_peak": p95_peak,
-  }
-  return is_no_speech, stats
-
-
-def _normalize_prompt_echo_text(text: str) -> str:
-  return " ".join(
-    "".join(ch.lower() if ch.isalnum() else " " for ch in (text or "")).split()
-  )
-
-
-def _looks_like_transcription_prompt_echo(text: str) -> bool:
-  """Whisper sometimes echoes the prompt when audio is clipped/unintelligible."""
-  norm = _normalize_prompt_echo_text(text)
-  if not norm:
-    return False
-  markers_found = sum(1 for marker in _PROMPT_ECHO_MARKERS if marker in norm)
-  repeated_core = norm.count(_PROMPT_ECHO_MARKERS[0]) >= 2
-  prompt = _normalize_prompt_echo_text(
-    (os.getenv("OPENAI_TRANSCRIBE_PROMPT") or DEFAULT_TRANSCRIBE_PROMPT).strip()
-  )
-  prompt_words = set(prompt.split())
-  words = norm.split()
-  prompt_word_ratio = (
-    sum(1 for word in words if word in prompt_words) / float(len(words))
-    if words and prompt_words else 0.0
-  )
-  return repeated_core or (markers_found >= 2 and prompt_word_ratio >= 0.75)
-
-
-def _transcribe_audio_file_once(client, model: str, audio_path: Path, *, use_prompt: bool = True) -> str:
+def _transcribe_audio_file_once(client, model: str, audio_path: Path) -> str:
   with open(audio_path, "rb") as audio_fp:
     kwargs = {
       "model": model,
@@ -981,32 +774,12 @@ def _transcribe_audio_file_once(client, model: str, audio_path: Path, *, use_pro
     }
     prompt = (os.getenv("OPENAI_TRANSCRIBE_PROMPT") or DEFAULT_TRANSCRIBE_PROMPT).strip()
     language = os.getenv("OPENAI_TRANSCRIBE_LANGUAGE", "").strip()
-    if prompt and use_prompt:
+    if prompt:
       kwargs["prompt"] = prompt
     if language:
       kwargs["language"] = language
     tr = client.audio.transcriptions.create(**kwargs)
   return (getattr(tr, "text", None) or "").strip()
-
-
-def _transcribe_audio_file(client, model: str, audio_path: Path) -> str:
-  transcript = _transcribe_audio_file_once(client, model, audio_path, use_prompt=True)
-  if not _looks_like_transcription_prompt_echo(transcript):
-    return transcript
-  logger.warning(
-    "Whisper returned transcription prompt echo for %s; retrying once without prompt",
-    audio_path.name,
-  )
-  retry = _transcribe_audio_file_once(client, model, audio_path, use_prompt=False)
-  if retry and not _looks_like_transcription_prompt_echo(retry):
-    return retry
-  raise HTTPException(
-    status_code=422,
-    detail=(
-      "Transcription failed because Whisper returned only the transcription prompt. "
-      "The audio was likely clipped, too noisy, or otherwise unintelligible."
-    ),
-  )
 
 
 def _split_wav_for_transcription(audio_path: Path) -> list[Path]:
@@ -1049,14 +822,6 @@ def _split_wav_for_transcription(audio_path: Path) -> list[Path]:
 
 def _transcribe_audio_with_openai(audio_path: Path) -> str:
   """Transcribe meeting WAV via OpenAI Audio API, chunking long recordings."""
-  no_speech, stats = _detect_no_speech_audio(audio_path)
-  if no_speech:
-    logger.info(
-      "Skipping Whisper for %s: no clear speech detected (%s)",
-      audio_path.name,
-      stats,
-    )
-    return ""
   client = _get_openai_client()
   if not client:
     raise HTTPException(status_code=400, detail="OPENAI_API_KEY is not configured on the server.")
@@ -1064,7 +829,7 @@ def _transcribe_audio_with_openai(audio_path: Path) -> str:
   logger.info("Transcribing %s with OpenAI (%s)", audio_path.name, model)
   try:
     if audio_path.stat().st_size <= OPENAI_TRANSCRIBE_MAX_BYTES:
-      transcript = _transcribe_audio_file(client, model, audio_path)
+      transcript = _transcribe_audio_file_once(client, model, audio_path)
     else:
       chunks = _split_wav_for_transcription(audio_path)
       try:
@@ -1073,18 +838,18 @@ def _transcribe_audio_with_openai(audio_path: Path) -> str:
         logger.info("Transcribing %s in %d chunks", audio_path.name, total)
         for idx, chunk_path in enumerate(chunks, start=1):
           logger.info("Transcribing chunk %d/%d for %s", idx, total, audio_path.name)
-          part = _transcribe_audio_file(client, model, chunk_path)
+          part = _transcribe_audio_file_once(client, model, chunk_path)
           if part:
             parts.append(part)
         transcript = "\n\n".join(parts).strip()
       finally:
         for chunk_path in chunks:
           chunk_path.unlink(missing_ok=True)
-  except HTTPException:
-    raise
   except Exception as exc:
     logger.exception("OpenAI transcription failed: %s", exc)
     raise HTTPException(status_code=502, detail=f"OpenAI transcription failed: {exc}") from exc
+  if not transcript:
+    raise HTTPException(status_code=500, detail="OpenAI transcription returned empty text.")
   return transcript
 
 
@@ -1094,8 +859,6 @@ async def upload_audio(
   request: Request,
   file: UploadFile = File(...),
   session_id: Optional[str] = Form(default=None),
-  recording_mode: Optional[str] = Form(default="meeting"),
-  context_json: Optional[str] = Form(default=None),
   current_actor: Optional[dict] = Depends(get_optional_actor),
 ):
   """
@@ -1109,10 +872,6 @@ async def upload_audio(
   if ext not in UPLOAD_AUDIO_EXTENSIONS:
     ext = ".webm"
   session_id = session_id or _generate_session_id()
-  mode = (recording_mode or "meeting").strip().lower()
-  if mode not in {"meeting", "note"}:
-    mode = "meeting"
-  title_prefix = "Notes" if mode == "note" else "Meeting"
   dest_wav = RECORDINGS_DIR / f"{session_id}.wav"
 
   with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
@@ -1167,9 +926,7 @@ async def upload_audio(
       "type": "processing_started",
       "meeting_id": session_id,
       "device_id": owner_device_id,
-      "user_id": owner_user_id,
-      "title": f"{title_prefix} {session_id}",
-      "recording_mode": mode,
+      "title": f"Meeting {session_id}",
       "duration": duration_seconds,
       "timestamp": now_iso,
     }),
@@ -1180,41 +937,28 @@ async def upload_audio(
   conn.row_factory = lambda cursor, row: {col[0]: row[idx] for idx, col in enumerate(cursor.description)}
   try:
     cur = conn.cursor()
-    cur.execute("SELECT id, user_id, device_id FROM meetings WHERE id = ?", (session_id,))
+    cur.execute("SELECT id FROM meetings WHERE id = ?", (session_id,))
     exists = cur.fetchone()
     if not exists:
       cur.execute(
         """
-        INSERT INTO meetings (id, user_id, device_id, title, start_time, end_time, duration, audio_path, status, created_at, recording_mode)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO meetings (id, user_id, device_id, title, start_time, end_time, duration, audio_path, status, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
           session_id,
           owner_user_id,
           owner_device_id,
-          f"{title_prefix} {session_id}",
+          f"Meeting {session_id}",
           now_iso,
           None,
           None,
           str(dest_wav),
           "transcribing",
           now_iso,
-          mode,
         ),
       )
     else:
-      # Verify ownership before updating an existing meeting row.
-      # A meeting belongs to this actor if its user_id or device_id matches,
-      # or if both are empty (orphaned device recording being claimed).
-      row_user = (exists["user_id"] or "").strip()
-      row_device = (exists["device_id"] or "").strip()
-      actor_owns = (
-        (owner_user_id and row_user == str(owner_user_id))
-        or (owner_device_id and row_device == str(owner_device_id))
-        or (not row_user and not row_device)
-      )
-      if not actor_owns:
-        raise HTTPException(status_code=403, detail="You do not have permission to update this meeting.")
       cur.execute(
         """
         UPDATE meetings
@@ -1222,35 +966,14 @@ async def upload_audio(
             device_id = COALESCE(device_id, ?),
             audio_path = ?,
             status = ?,
-            start_time = COALESCE(start_time, ?),
-            recording_mode = ?
+            start_time = COALESCE(start_time, ?)
         WHERE id = ?
         """,
-        (owner_user_id, owner_device_id, str(dest_wav), "transcribing", now_iso, mode, session_id),
+        (owner_user_id, owner_device_id, str(dest_wav), "transcribing", now_iso, session_id),
       )
     conn.commit()
   finally:
     conn.close()
-
-  # Persist captured context (pre-recording staged at /start + anything sent
-  # with this upload, e.g. post-recording comments) as searchable metadata
-  # BEFORE the pipeline runs, so entity extraction can use it.
-  try:
-    staged = _load_session_context(session_id)
-    uploaded: dict = {}
-    if context_json:
-      try:
-        uploaded = _sanitize_context_payload(json.loads(context_json))
-      except json.JSONDecodeError:
-        uploaded = {}
-    merged_ctx = {**staged, **uploaded}
-    if merged_ctx or mode:
-      from services.recording_store import save_recording_context
-
-      save_recording_context(session_id, session_type=mode, merge=True, **merged_ctx)
-    _get_redis().delete(_session_context_key(session_id))
-  except Exception:
-    logger.debug("failed to persist recording context meeting_id=%s", session_id, exc_info=True)
 
   try:
     await run_meeting_agent_pipeline(
@@ -1259,13 +982,12 @@ async def upload_audio(
       dest_wav,
       duration_seconds,
       current_actor,
-      recording_mode=mode,
     )
 
     _get_redis().set(_recording_state_key(owner_device_id), "idle")
     _get_redis().delete(_current_meeting_key(owner_device_id))
     _get_redis().delete(_session_owner_key(session_id))
-    return {"session_id": session_id, "path": str(dest_wav), "status": "completed", "recording_mode": mode}
+    return {"session_id": session_id, "path": str(dest_wav), "status": "completed"}
   except HTTPException as exc:
     _get_redis().set(_recording_state_key(owner_device_id), "idle")
     _get_redis().delete(_current_meeting_key(owner_device_id))
@@ -1333,10 +1055,6 @@ async def list_meetings(limit: int = 50, offset: int = 0, status: Optional[str] 
     if status:
       filters.append("m.status = ?")
       params.append(status)
-    # Exclude note recordings — those are surfaced via the Notes page / voice
-    # agent (user_notes), not the Meetings list. NULL-safe so legacy rows
-    # (created before the recording_mode column existed) still appear.
-    filters.append("(m.recording_mode IS NULL OR m.recording_mode != 'note')")
     if filters:
       query += " WHERE " + " AND ".join(filters)
     query += " ORDER BY m.created_at DESC LIMIT ? OFFSET ?"
@@ -1640,12 +1358,6 @@ async def summarize_meeting(meeting_id: str, force: bool = False, current_actor:
       try:
         from services.analysis_service import run_post_meeting_analysis
         run_post_meeting_analysis(uid_mem, meeting_id)
-      except Exception:
-        pass
-      # Trigger background user profile build (fire-and-forget, guarded by cooldown).
-      try:
-        from services.user_profiler import trigger_profile_build_bg
-        trigger_profile_build_bg(uid_mem)
       except Exception:
         pass
   except Exception:

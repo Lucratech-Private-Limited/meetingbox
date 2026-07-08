@@ -110,9 +110,6 @@ hiddenimports += [
     "net_status",
     "tts_windows",
     "audio_output",
-    # Always-on-top Pepper navigation dock (Windows desktop companion).
-    "dock_win_overlay",
-    "windows_autostart",
     # OS-grade AEC via the Windows Voice Capture DSP (lazy-imported inside
     # RealtimeVoiceSession; drives comtypes COM/DMO directly).
     "windows_aec",

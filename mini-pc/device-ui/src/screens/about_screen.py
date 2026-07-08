@@ -10,12 +10,9 @@ from kivy.uix.scrollview import ScrollView
 
 from components.status_bar import StatusBar
 from config import COLORS, FONT_SIZES, SPACING, DASHBOARD_URL
-from platform_compat import IS_DESKTOP
 from screens.base_screen import BaseScreen
 
 _FIRMWARE = os.getenv("FIRMWARE_VERSION", "1.0.0")
-# Desktop builds are an app, not appliance firmware.
-_VERSION_LABEL = ("Version" if IS_DESKTOP else "Firmware")
 
 _LICENSES = """
 MeetingBox Device UI
@@ -76,8 +73,8 @@ class AboutScreen(BaseScreen):
             l.bind(width=lambda w, v: setattr(w, "text_size", (v, None)))
             return l
 
-        body.add_widget(lbl("Pepper AI", bold=True, size=FONT_SIZES.get("large", 18)))
-        body.add_widget(lbl(f"{_VERSION_LABEL} {_FIRMWARE}", color=COLORS["gray_300"]))
+        body.add_widget(lbl("MeetingBox", bold=True, size=FONT_SIZES.get("large", 18)))
+        body.add_widget(lbl(f"Firmware {_FIRMWARE}", color=COLORS["gray_300"]))
         body.add_widget(lbl(f"Dashboard: {DASHBOARD_URL}", color=COLORS["gray_400"]))
         body.add_widget(lbl("Support: support.meetingbox.com", color=COLORS["gray_400"]))
         body.add_widget(lbl(""))

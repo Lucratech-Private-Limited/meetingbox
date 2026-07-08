@@ -18,12 +18,7 @@ export function useWebSocket() {
     const connect = () => {
       if (unmounted.current) return
 
-      let wsUrl = getWebSocketUrl()
-      const authToken = localStorage.getItem('auth_token')
-      if (authToken) {
-        const sep = wsUrl.includes('?') ? '&' : '?'
-        wsUrl = `${wsUrl}${sep}access_token=${encodeURIComponent(authToken)}`
-      }
+      const wsUrl = getWebSocketUrl()
       ws.current = new WebSocket(wsUrl)
 
       ws.current.onopen = () => {

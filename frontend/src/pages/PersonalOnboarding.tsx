@@ -69,7 +69,7 @@ export default function PersonalOnboarding() {
   }
 
   return (
-    <div className="min-h-screen bg-app-page flex items-center justify-center p-4">
+    <div className="min-h-screen bg-gray-50 flex items-center justify-center p-4">
       <div className="max-w-2xl w-full mx-auto">
 
         <div className="mb-8">
@@ -78,29 +78,29 @@ export default function PersonalOnboarding() {
               <div
                 key={step.id}
                 className={`flex-1 h-1 mx-1 rounded transition-colors ${
-                  step.id <= currentStep ? 'bg-primary-600' : 'bg-app-border'
+                  step.id <= currentStep ? 'bg-primary-600' : 'bg-gray-200'
                 }`}
               />
             ))}
           </div>
-          <p className="text-sm text-app-ink-subtle text-center">
+          <p className="text-sm text-gray-500 text-center">
             Step {currentStep} of {steps.length}
           </p>
         </div>
 
-        <div className="bg-app-surface rounded-lg shadow-lg p-8">
+        <div className="bg-white rounded-lg shadow-lg p-8">
 
           {currentStep === 1 && (
             <div className="text-center">
-              <div className="w-20 h-20 bg-primary-900/40 rounded-full flex items-center justify-center mx-auto mb-6">
+              <div className="w-20 h-20 bg-primary-100 rounded-full flex items-center justify-center mx-auto mb-6">
                 <svg className="w-10 h-10 text-primary-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" />
                 </svg>
               </div>
-              <h1 className="text-3xl font-bold text-app-ink mb-4">
+              <h1 className="text-3xl font-bold text-gray-900 mb-4">
                 Welcome, {user?.display_name || user?.username || 'there'}!
               </h1>
-              <p className="text-lg text-app-ink-muted mb-8">
+              <p className="text-lg text-gray-600 mb-8">
                 Let&apos;s personalize your MeetingBox experience. This will only take a moment.
               </p>
             </div>
@@ -108,8 +108,8 @@ export default function PersonalOnboarding() {
 
           {currentStep === 2 && (
             <div>
-              <h2 className="text-2xl font-bold text-app-ink mb-4">Connect Your Tools (Optional)</h2>
-              <p className="text-app-ink-muted mb-6">
+              <h2 className="text-2xl font-bold text-gray-900 mb-4">Connect Your Tools (Optional)</h2>
+              <p className="text-gray-600 mb-6">
                 Connect Gmail and Calendar to enable AI-powered actions like drafting emails and scheduling follow-ups.
                 You can skip this and set up later in Settings.
               </p>
@@ -124,7 +124,7 @@ export default function PersonalOnboarding() {
                   const connected = integrationsList.find(i => i.id === item.id)?.connected ?? false
                   const email = integrationsList.find(i => i.id === item.id)?.email
                   return (
-                    <div key={item.id} className="border border-app-border rounded-lg p-4 hover:border-primary-500 transition-colors">
+                    <div key={item.id} className="border border-gray-200 rounded-lg p-4 hover:border-primary-500 transition-colors">
                       <div className="flex items-center justify-between">
                         <div className="flex items-center space-x-3">
                           <div className={`w-10 h-10 ${item.bgColor} rounded-lg flex items-center justify-center`}>
@@ -133,8 +133,8 @@ export default function PersonalOnboarding() {
                             </svg>
                           </div>
                           <div>
-                            <h3 className="font-medium text-app-ink">{item.name}</h3>
-                            <p className="text-sm text-app-ink-subtle">{item.desc}</p>
+                            <h3 className="font-medium text-gray-900">{item.name}</h3>
+                            <p className="text-sm text-gray-500">{item.desc}</p>
                             {connected && email && (
                               <p className="text-xs text-green-600">{email}</p>
                             )}
@@ -148,7 +148,7 @@ export default function PersonalOnboarding() {
                           <button
                             onClick={() => handleConnect(item.id)}
                             disabled={connecting !== null}
-                            className="px-4 py-2 text-sm font-medium text-primary-200 bg-primary-900/45 rounded-lg hover:bg-primary-800/55 disabled:opacity-50"
+                            className="px-4 py-2 text-sm font-medium text-primary-700 bg-primary-50 rounded-lg hover:bg-primary-100 disabled:opacity-50"
                           >
                             {connecting === item.id ? 'Redirecting...' : 'Connect'}
                           </button>
@@ -168,16 +168,16 @@ export default function PersonalOnboarding() {
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
                 </svg>
               </div>
-              <h2 className="text-2xl font-bold text-app-ink mb-4">You&apos;re All Set!</h2>
-              <p className="text-app-ink-muted mb-8">
+              <h2 className="text-2xl font-bold text-gray-900 mb-4">You&apos;re All Set!</h2>
+              <p className="text-gray-600 mb-8">
                 Your account is ready. View meetings, manage actions, and connect integrations anytime from your dashboard.
               </p>
             </div>
           )}
 
-          <div className="flex items-center justify-between mt-8 pt-6 border-t border-app-border">
+          <div className="flex items-center justify-between mt-8 pt-6 border-t border-gray-200">
             {currentStep > 1 && currentStep < steps.length ? (
-              <button onClick={handleSkip} className="text-sm text-app-ink-subtle hover:text-app-ink-muted">
+              <button onClick={handleSkip} className="text-sm text-gray-500 hover:text-gray-700">
                 Skip for now
               </button>
             ) : (
@@ -187,7 +187,7 @@ export default function PersonalOnboarding() {
               {currentStep > 1 && currentStep < steps.length && (
                 <button
                   onClick={() => setCurrentStep(currentStep - 1)}
-                  className="px-4 py-2 text-sm font-medium text-app-ink-muted bg-app-surface border border-app-border-light rounded-lg hover:bg-app-page"
+                  className="px-4 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-lg hover:bg-gray-50"
                 >
                   Back
                 </button>

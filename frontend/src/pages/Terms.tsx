@@ -4,21 +4,21 @@ const LAST_UPDATED = 'April 17, 2026'
 
 export default function Terms() {
   return (
-    <div className="min-h-screen bg-app-page text-app-ink-muted">
-      <header className="border-b border-app-border-light px-4 py-4">
+    <div className="min-h-screen bg-gray-950 text-gray-200">
+      <header className="border-b border-gray-800 px-4 py-4">
         <div className="mx-auto max-w-3xl flex items-center justify-between gap-4">
           <Link to="/login" className="text-sm font-medium text-blue-400 hover:text-blue-300">
             ← Back to sign in
           </Link>
-          <span className="text-sm text-app-ink-subtle">MeetingBox AI</span>
+          <span className="text-sm text-gray-500">MeetingBox AI</span>
         </div>
       </header>
 
       <main className="mx-auto max-w-3xl px-4 py-10 pb-16">
         <h1 className="text-3xl font-bold text-white tracking-tight mb-2">Terms of Service</h1>
-        <p className="text-sm text-app-ink-subtle mb-8">Last updated: {LAST_UPDATED}</p>
+        <p className="text-sm text-gray-500 mb-8">Last updated: {LAST_UPDATED}</p>
 
-        <div className="space-y-6 text-sm leading-relaxed text-app-ink-muted">
+        <div className="space-y-6 text-sm leading-relaxed text-gray-300">
           <p className="rounded-lg border border-amber-900/50 bg-amber-950/30 px-4 py-3 text-amber-200/90">
             These terms are a practical template for OAuth listings and early customers. They are not
             legal advice. Have qualified counsel review and adapt them for your jurisdiction and
@@ -29,7 +29,7 @@ export default function Terms() {
             <h2 className="text-lg font-semibold text-white mb-2">1. Agreement</h2>
             <p>
               By accessing or using MeetingBox AI operated by{' '}
-              <strong className="text-app-ink">Lucra Tech Solutions</strong> (&quot;we&quot;,
+              <strong className="text-gray-100">Lucra Tech Solutions</strong> (&quot;we&quot;,
               &quot;us&quot;), you agree to these Terms of Service. If you do not agree, do not use
               the service.
             </p>
@@ -144,7 +144,7 @@ export default function Terms() {
             </p>
           </section>
 
-          <p className="pt-4 text-app-ink-subtle">
+          <p className="pt-4 text-gray-500">
             See also our{' '}
             <Link to="/privacy" className="text-blue-400 hover:text-blue-300 underline">
               Privacy Policy

@@ -15,7 +15,6 @@ from components.button import PrimaryButton
 from components.settings_item import SettingsItem
 from components.status_bar import StatusBar
 from config import COLORS, FONT_SIZES, SPACING
-from platform_compat import TAP_OR_CLICK
 from screens.base_screen import BaseScreen
 
 logger = logging.getLogger(__name__)
@@ -46,7 +45,7 @@ class ConnectivityCheckScreen(BaseScreen):
         )
 
         self.status_lbl = Label(
-            text=f"{TAP_OR_CLICK} CHECK to run a connectivity test.",
+            text="Tap CHECK to run a connectivity test.",
             font_size=self.suf(FONT_SIZES["small"]),
             color=COLORS["gray_400"],
             halign="left",

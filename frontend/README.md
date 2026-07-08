@@ -21,11 +21,7 @@ npm ci
 npm run build
 ```
 
-Output: `dist/` (verified by `scripts/verify-dist.mjs` after each build). The server stack mounts **that directory** — see `DEPLOY.md` if you see **403 Forbidden** after deploy.
-
-## WebSocket (live recording / captions)
-
-`useWebSocket` connects to `VITE_WS_URL` or same-origin `/ws`. When the user is logged in, **`access_token`** is appended from `localStorage` (`auth_token`) so the API can enforce **`MEETINGBOX_WS_REQUIRE_AUTH`**. If the API uses **only** `MEETINGBOX_WS_SHARED_SECRET`, set `VITE_WS_URL` to include `?token=...` (or protect `/ws` at the reverse proxy).
+Output: `dist/`. The server stack mounts this directory (see `FRONTEND_DIST` in `server/.env.example`).
 
 ## Splitting into its own git repository
 

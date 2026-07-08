@@ -9,14 +9,6 @@ import { actionsApi } from '../api/actions'
 import type { MeetingDetail as MeetingDetailType } from '../types/meeting'
 import type { AgenticAction } from '../types/action'
 import LoadingSpinner from '../components/ui/LoadingSpinner'
-import DashboardNavShell from '../components/dashboard/DashboardNavShell'
-import Modal from '../components/ui/Modal'
-import Button from '../components/ui/Button'
-import TranscriptView from '../components/meeting/TranscriptView'
-import SummaryCard from '../components/meeting/SummaryCard'
-import ActionCard from '../components/actions/ActionCard'
-import CreateManualActions from '../components/actions/CreateManualActions'
-import toast from 'react-hot-toast'
 
 /** Pending Gmail/Calendar actions that count toward dashboard alerts (matches device home-summary). */
 function isExecutablePendingAction(a: AgenticAction): boolean {
@@ -24,6 +16,13 @@ function isExecutablePendingAction(a: AgenticAction): boolean {
   const t = String(a.connector_target || '').toLowerCase()
   return t === 'gmail' || t === 'calendar'
 }
+import Modal from '../components/ui/Modal'
+import Button from '../components/ui/Button'
+import TranscriptView from '../components/meeting/TranscriptView'
+import SummaryCard from '../components/meeting/SummaryCard'
+import ActionCard from '../components/actions/ActionCard'
+import CreateManualActions from '../components/actions/CreateManualActions'
+import toast from 'react-hot-toast'
 
 type Tab = 'summary' | 'transcript' | 'actions' | 'recording'
 
@@ -144,7 +143,7 @@ export default function MeetingDetailPage() {
     if (!id) return
     setSummarizing(true)
     try {
-      await meetingsApi.summarize(id, true)
+      await meetingsApi.summarize(id)
       await loadMeetingData()
       toast.success('Summary generated!')
     } catch (err: unknown) {
@@ -206,45 +205,40 @@ export default function MeetingDetailPage() {
     if (e.key === 'Escape') setIsEditingTitle(false)
   }
 
-  const pendingDashboardCount = actions.filter(isExecutablePendingAction).length
   if (loading) {
     return (
-      <DashboardNavShell>
-        <div className="flex items-center justify-center min-h-[60vh]">
-          <LoadingSpinner size="large" />
-        </div>
-      </DashboardNavShell>
+      <div className="flex items-center justify-center min-h-[60vh]">
+        <LoadingSpinner size="large" />
+      </div>
     )
   }
 
   if (!meeting) {
     return (
-      <DashboardNavShell>
-        <div className="max-w-7xl mx-auto px-4 py-16 text-center">
-          <h2 className="text-2xl font-bold text-app-ink mb-2">Meeting not found</h2>
-          <p className="text-app-ink-muted mb-6">This meeting may have been deleted or doesn&apos;t exist.</p>
-          <button
-            onClick={() => navigate('/dashboard')}
-            className="px-4 py-2 bg-primary-600 text-white rounded-lg hover:bg-primary-700"
-          >
-            Back to Dashboard
-          </button>
-        </div>
-      </DashboardNavShell>
+      <div className="max-w-7xl mx-auto px-4 py-16 text-center">
+        <h2 className="text-2xl font-bold text-gray-900 mb-2">Meeting not found</h2>
+        <p className="text-gray-600 mb-6">This meeting may have been deleted or doesn&apos;t exist.</p>
+        <button
+          onClick={() => navigate('/dashboard')}
+          className="px-4 py-2 bg-primary-600 text-white rounded-lg hover:bg-primary-700"
+        >
+          Back to Dashboard
+        </button>
+      </div>
     )
   }
 
   const hasTranscript = meeting.segments && meeting.segments.length > 0
   const hasSummary = !!meeting.summary
+  const pendingDashboardCount = actions.filter(isExecutablePendingAction).length
 
   return (
-    <DashboardNavShell>
     <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
 
       {/* Back link */}
       <button
         onClick={() => navigate('/dashboard')}
-        className="flex items-center text-sm text-app-ink-muted hover:text-app-ink mb-4"
+        className="flex items-center text-sm text-gray-600 hover:text-gray-900 mb-4"
       >
         <svg className="w-5 h-5 mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor">
           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
@@ -263,7 +257,7 @@ export default function MeetingDetailPage() {
                 onChange={(e) => setEditTitle(e.target.value)}
                 onKeyDown={handleRenameKeyDown}
                 autoFocus
-                className="text-2xl font-bold text-app-ink border border-app-border-light rounded-lg px-3 py-1 focus:ring-2 focus:ring-primary-500 focus:border-transparent"
+                className="text-2xl font-bold text-gray-900 border border-gray-300 rounded-lg px-3 py-1 focus:ring-2 focus:ring-primary-500 focus:border-transparent"
               />
               <button
                 onClick={handleSaveRename}
@@ -273,18 +267,18 @@ export default function MeetingDetailPage() {
               </button>
               <button
                 onClick={() => setIsEditingTitle(false)}
-                className="px-3 py-1.5 text-sm font-medium text-app-ink-muted bg-app-surface border border-app-border-light rounded-lg hover:bg-app-page"
+                className="px-3 py-1.5 text-sm font-medium text-gray-600 bg-white border border-gray-300 rounded-lg hover:bg-gray-50"
               >
                 Cancel
               </button>
             </div>
           ) : (
             <div className="flex items-center gap-2 mb-2 group">
-              <h1 className="text-3xl font-bold text-app-ink">{meeting.title}</h1>
+              <h1 className="text-3xl font-bold text-gray-900">{meeting.title}</h1>
               <button
                 onClick={handleStartRename}
                 title="Rename meeting"
-                className="opacity-0 group-hover:opacity-100 transition-opacity p-1.5 rounded-lg text-app-ink-faint hover:text-primary-400 hover:bg-primary-900/40"
+                className="opacity-0 group-hover:opacity-100 transition-opacity p-1.5 rounded-lg text-gray-400 hover:text-primary-600 hover:bg-primary-50"
               >
                 <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
@@ -292,7 +286,7 @@ export default function MeetingDetailPage() {
               </button>
             </div>
           )}
-          <div className="flex items-center space-x-4 text-sm text-app-ink-muted">
+          <div className="flex items-center space-x-4 text-sm text-gray-600">
             <span>{format(parseUTC(meeting.start_time), 'PPpp')}</span>
             {meeting.duration != null && (
               <>
@@ -306,37 +300,43 @@ export default function MeetingDetailPage() {
         <div className="flex flex-wrap items-center gap-2" data-tutorial="meeting-toolbar">
           <Link
             to={`/assistant?meeting=${encodeURIComponent(id || '')}`}
-            className="px-4 py-2 text-sm font-medium text-primary-200 bg-primary-900/45 border border-primary-600/50 rounded-lg hover:bg-primary-800/55"
+            className="px-4 py-2 text-sm font-medium text-primary-800 bg-primary-50 border border-primary-200 rounded-lg hover:bg-primary-100"
           >
             Assistant
           </Link>
           <button
-            onClick={handleSummarize}
-            disabled={summarizing}
-            className="px-4 py-2 bg-indigo-600 text-white text-sm font-medium rounded-lg hover:bg-indigo-700 disabled:opacity-50"
-          >
-            {summarizing ? 'Generating Summary...' : 'Generate Summary'}
-          </button>
-          <button
             onClick={() => handleExport('pdf')}
-            className="px-4 py-2 text-sm font-medium text-app-ink-muted bg-app-surface border border-app-border-light rounded-lg hover:bg-app-page"
+            className="px-4 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-lg hover:bg-gray-50"
           >
             Export PDF
           </button>
           <button
             onClick={() => handleExport('txt')}
-            className="px-4 py-2 text-sm font-medium text-app-ink-muted bg-app-surface border border-app-border-light rounded-lg hover:bg-app-page"
+            className="px-4 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-lg hover:bg-gray-50"
           >
             Export TXT
           </button>
           <button
             onClick={() => setShowDeleteConfirm(true)}
-            className="px-4 py-2 text-sm font-medium text-red-700 bg-app-surface border border-red-300 rounded-lg hover:bg-red-50"
+            className="px-4 py-2 text-sm font-medium text-red-700 bg-white border border-red-300 rounded-lg hover:bg-red-50"
           >
             Delete
           </button>
         </div>
       </div>
+
+      {/* Summarize button — only when transcript exists and no API summary yet */}
+      {hasTranscript && !hasSummary && (
+        <div className="mb-6 bg-white rounded-lg border border-gray-200 p-4 flex flex-wrap items-center gap-3">
+          <button
+            onClick={handleSummarize}
+            disabled={summarizing}
+            className="px-4 py-2 bg-indigo-600 text-white text-sm font-medium rounded-lg hover:bg-indigo-700 disabled:opacity-50"
+          >
+            {summarizing ? 'Summarizing...' : 'Summarize with API'}
+          </button>
+        </div>
+      )}
 
       {/* Pending actions alert */}
       {pendingDashboardCount > 0 && (
@@ -358,7 +358,7 @@ export default function MeetingDetailPage() {
       )}
 
       {/* Tabs */}
-      <div className="border-b border-app-border mb-6" data-tutorial="meeting-tabs">
+      <div className="border-b border-gray-200 mb-6" data-tutorial="meeting-tabs">
         <nav className="flex space-x-8">
           {(['summary', 'transcript', 'actions', 'recording'] as const).map((tab) => (
             <button
@@ -367,7 +367,7 @@ export default function MeetingDetailPage() {
               className={`py-4 px-1 border-b-2 font-medium text-sm ${
                 activeTab === tab
                   ? 'border-primary-500 text-primary-600'
-                  : 'border-transparent text-app-ink-subtle hover:text-app-ink-muted hover:border-app-border-light'
+                  : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300'
               }`}
             >
               {tab.charAt(0).toUpperCase() + tab.slice(1)}
@@ -393,10 +393,10 @@ export default function MeetingDetailPage() {
 
         {activeTab === 'actions' && (
           <div className="space-y-4">
-            <div className="flex flex-col gap-4 rounded-2xl border border-app-border bg-app-surface px-5 py-4 sm:flex-row sm:items-start sm:justify-between">
+            <div className="flex flex-col gap-4 rounded-2xl border border-gray-200 bg-white px-5 py-4 sm:flex-row sm:items-start sm:justify-between">
               <div className="min-w-0 flex-1">
-                <h3 className="text-sm font-semibold text-app-ink">Calendar &amp; email</h3>
-                <p className="text-sm text-app-ink-muted">
+                <h3 className="text-sm font-semibold text-gray-900">Calendar &amp; email</h3>
+                <p className="text-sm text-gray-600">
                   Suggested follow-ups load automatically when this meeting has a summary or transcript and your
                   accounts are connected. Use Refresh when you want new suggestions; connect accounts under Settings →
                   Integrations. You can also add your own calendar event or Gmail message below.
@@ -407,19 +407,19 @@ export default function MeetingDetailPage() {
                 <button
                   onClick={() => void handleGenerateActions()}
                   disabled={isGeneratingActions}
-                  className="rounded-lg border border-primary-600/45 bg-primary-900/40 px-4 py-2 text-sm font-medium text-primary-200 hover:bg-primary-800/50 disabled:opacity-50"
+                  className="rounded-lg border border-primary-200 bg-primary-50 px-4 py-2 text-sm font-medium text-primary-700 hover:bg-primary-100 disabled:opacity-50"
                 >
                   {isGeneratingActions ? 'Refreshing...' : 'Refresh Suggestions'}
                 </button>
               </div>
             </div>
             {actions.length === 0 ? (
-              <div className="text-center py-12 bg-app-surface rounded-lg border border-app-border">
-                <svg className="mx-auto h-12 w-12 text-app-ink-faint" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <div className="text-center py-12 bg-white rounded-lg border border-gray-200">
+                <svg className="mx-auto h-12 w-12 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
                 </svg>
-                <h3 className="mt-2 text-sm font-medium text-app-ink">No calendar or email actions yet</h3>
-                <p className="mt-1 text-sm text-app-ink-subtle">
+                <h3 className="mt-2 text-sm font-medium text-gray-900">No calendar or email actions yet</h3>
+                <p className="mt-1 text-sm text-gray-500">
                   Connect Gmail and/or Calendar under Settings, ensure this meeting has a summary or transcript, then open
                   this tab again or click <span className="font-medium">Refresh Suggestions</span>.
                 </p>
@@ -437,14 +437,14 @@ export default function MeetingDetailPage() {
         )}
 
         {activeTab === 'recording' && (
-          <div className="bg-app-surface rounded-lg border border-app-border p-6">
+          <div className="bg-white rounded-lg border border-gray-200 p-6">
             {meeting.audio_path ? (
               <div className="space-y-4">
                 <div className="flex items-center gap-3 mb-2">
                   <svg className="h-6 w-6 text-primary-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.536 8.464a5 5 0 010 7.072M12 6v12m-3.536-2.464a5 5 0 010-7.072M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
                   </svg>
-                  <h3 className="text-lg font-semibold text-app-ink">Audio Recording</h3>
+                  <h3 className="text-lg font-semibold text-gray-900">Audio Recording</h3>
                 </div>
                 <audio
                   controls
@@ -454,7 +454,7 @@ export default function MeetingDetailPage() {
                 >
                   Your browser does not support the audio element.
                 </audio>
-                <p className="text-sm text-app-ink-subtle">
+                <p className="text-sm text-gray-500">
                   {meeting.duration != null
                     ? `Duration: ${Math.floor(meeting.duration / 60)}m ${meeting.duration % 60}s`
                     : 'Duration unknown'}
@@ -462,11 +462,11 @@ export default function MeetingDetailPage() {
               </div>
             ) : (
               <div className="text-center py-12">
-                <svg className="mx-auto h-12 w-12 text-app-ink-faint" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <svg className="mx-auto h-12 w-12 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" />
                 </svg>
-                <h3 className="mt-2 text-sm font-medium text-app-ink">No recording available</h3>
-                <p className="mt-1 text-sm text-app-ink-subtle">
+                <h3 className="mt-2 text-sm font-medium text-gray-900">No recording available</h3>
+                <p className="mt-1 text-sm text-gray-500">
                   The audio recording for this meeting is not available.
                 </p>
               </div>
@@ -481,10 +481,10 @@ export default function MeetingDetailPage() {
         onClose={() => setShowDeleteConfirm(false)}
         title="Delete Meeting"
       >
-        <p className="text-sm text-app-ink-muted mb-2">
+        <p className="text-sm text-gray-600 mb-2">
           Are you sure you want to delete <strong>{meeting.title}</strong>?
         </p>
-        <p className="text-sm text-app-ink-subtle mb-6">
+        <p className="text-sm text-gray-500 mb-6">
           This will permanently remove the recording, transcript, summary, and all associated actions. This cannot be undone.
         </p>
         <div className="flex justify-end gap-3">
@@ -505,7 +505,6 @@ export default function MeetingDetailPage() {
         </div>
       </Modal>
     </div>
-    </DashboardNavShell>
   )
 }
 

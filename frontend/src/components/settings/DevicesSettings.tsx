@@ -57,11 +57,11 @@ export default function DevicesSettings() {
 
   return (
     <div className="space-y-6">
-      <div className="bg-app-surface rounded-lg border border-app-border p-6">
+      <div className="bg-white rounded-lg border border-gray-200 p-6">
         <div className="flex items-start justify-between gap-4">
           <div>
-            <h2 className="text-lg font-semibold text-app-ink">Pair a new device</h2>
-            <p className="mt-1 text-sm text-app-ink-muted">
+            <h2 className="text-lg font-semibold text-gray-900">Pair a new device</h2>
+            <p className="mt-1 text-sm text-gray-600">
               Generate a short-lived code, then enter it on the mini PC to link that device to this account.
             </p>
           </div>
@@ -75,11 +75,11 @@ export default function DevicesSettings() {
         </div>
 
         {pairingCode && (
-          <div className="mt-6 rounded-lg border border-primary-600/40 bg-primary-900/35 p-5">
-            <p className="text-sm text-primary-200">Enter this code on the device within 15 minutes.</p>
-            <p className="mt-3 text-3xl font-bold tracking-[0.35em] text-primary-100">{pairingCode}</p>
+          <div className="mt-6 rounded-lg border border-primary-200 bg-primary-50 p-5">
+            <p className="text-sm text-primary-700">Enter this code on the device within 15 minutes.</p>
+            <p className="mt-3 text-3xl font-bold tracking-[0.35em] text-primary-900">{pairingCode}</p>
             {pairingExpiresAt && (
-              <p className="mt-2 text-xs text-primary-300">
+              <p className="mt-2 text-xs text-primary-700">
                 Expires at {new Date(pairingExpiresAt).toLocaleString()}
               </p>
             )}
@@ -87,23 +87,23 @@ export default function DevicesSettings() {
         )}
       </div>
 
-      <div className="bg-app-surface rounded-lg border border-app-border p-6">
-        <h2 className="text-lg font-semibold text-app-ink">Your devices</h2>
-        <p className="mt-1 text-sm text-app-ink-muted">
+      <div className="bg-white rounded-lg border border-gray-200 p-6">
+        <h2 className="text-lg font-semibold text-gray-900">Your devices</h2>
+        <p className="mt-1 text-sm text-gray-600">
           Meetings recorded by these devices will be linked to this account.
         </p>
 
         {loading ? (
-          <div className="py-8 text-center text-app-ink-subtle">Loading devices...</div>
+          <div className="py-8 text-center text-gray-500">Loading devices...</div>
         ) : devices.length === 0 ? (
-          <div className="py-8 text-center text-app-ink-subtle">No devices paired yet.</div>
+          <div className="py-8 text-center text-gray-500">No devices paired yet.</div>
         ) : (
           <div className="mt-6 space-y-4">
             {devices.map((device) => (
-              <div key={device.id} className="flex items-center justify-between rounded-lg border border-app-border p-4">
+              <div key={device.id} className="flex items-center justify-between rounded-lg border border-gray-200 p-4">
                 <div>
-                  <div className="text-sm font-medium text-app-ink">{device.device_name || 'MeetingBox'}</div>
-                  <div className="mt-1 text-xs text-app-ink-subtle">
+                  <div className="text-sm font-medium text-gray-900">{device.device_name || 'MeetingBox'}</div>
+                  <div className="mt-1 text-xs text-gray-500">
                     Status: {device.status}
                     {device.serial_number ? ` · Serial: ${device.serial_number}` : ''}
                     {device.last_seen_at ? ` · Last seen: ${new Date(device.last_seen_at).toLocaleString()}` : ''}

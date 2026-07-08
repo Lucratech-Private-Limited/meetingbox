@@ -164,7 +164,7 @@ export default function CreateManualActions({ meetingId, onCreated }: CreateManu
             resetCalForm()
             setCalOpen(true)
           }}
-          className="rounded-lg border border-app-border-light bg-app-surface px-3 py-2 text-sm font-medium text-app-ink-muted hover:bg-app-page"
+          className="rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50"
         >
           Add calendar event
         </button>
@@ -174,7 +174,7 @@ export default function CreateManualActions({ meetingId, onCreated }: CreateManu
             resetMailForm()
             setMailOpen(true)
           }}
-          className="rounded-lg border border-app-border-light bg-app-surface px-3 py-2 text-sm font-medium text-app-ink-muted hover:bg-app-page"
+          className="rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50"
         >
           Add Gmail message
         </button>
@@ -182,31 +182,31 @@ export default function CreateManualActions({ meetingId, onCreated }: CreateManu
 
       <Modal isOpen={calOpen} onClose={() => !calSaving && setCalOpen(false)} title="New calendar event">
         <div className="space-y-3 text-sm max-w-md">
-          <p className="text-app-ink-muted">
+          <p className="text-gray-600">
             Creates a pending action for this meeting. Connect Google Calendar under Settings if you have not already.
           </p>
           <label className="block">
-            <span className="text-app-ink-muted font-medium">Card title</span>
+            <span className="text-gray-700 font-medium">Card title</span>
             <input
-              className="mt-1 w-full rounded-md border border-app-border-light px-3 py-2"
+              className="mt-1 w-full rounded-md border border-gray-300 px-3 py-2"
               value={calCardTitle}
               onChange={(e) => setCalCardTitle(e.target.value)}
               placeholder="Shown in the actions list"
             />
           </label>
           <label className="block">
-            <span className="text-app-ink-muted font-medium">Event title (optional)</span>
+            <span className="text-gray-700 font-medium">Event title (optional)</span>
             <input
-              className="mt-1 w-full rounded-md border border-app-border-light px-3 py-2"
+              className="mt-1 w-full rounded-md border border-gray-300 px-3 py-2"
               value={calEventTitle}
               onChange={(e) => setCalEventTitle(e.target.value)}
               placeholder="Defaults to card title if empty"
             />
           </label>
           <label className="block">
-            <span className="text-app-ink-muted font-medium">Description (optional)</span>
+            <span className="text-gray-700 font-medium">Description (optional)</span>
             <textarea
-              className="mt-1 w-full rounded-md border border-app-border-light px-3 py-2"
+              className="mt-1 w-full rounded-md border border-gray-300 px-3 py-2"
               rows={2}
               value={calDescription}
               onChange={(e) => setCalDescription(e.target.value)}
@@ -214,19 +214,19 @@ export default function CreateManualActions({ meetingId, onCreated }: CreateManu
           </label>
           <div className="grid grid-cols-2 gap-2">
             <label className="block">
-              <span className="text-app-ink-muted font-medium">Date</span>
+              <span className="text-gray-700 font-medium">Date</span>
               <input
                 type="date"
-                className="mt-1 w-full rounded-md border border-app-border-light px-3 py-2"
+                className="mt-1 w-full rounded-md border border-gray-300 px-3 py-2"
                 value={calDate}
                 onChange={(e) => setCalDate(e.target.value)}
               />
             </label>
             <label className="block">
-              <span className="text-app-ink-muted font-medium">Time</span>
+              <span className="text-gray-700 font-medium">Time</span>
               <input
                 type="time"
-                className="mt-1 w-full rounded-md border border-app-border-light px-3 py-2"
+                className="mt-1 w-full rounded-md border border-gray-300 px-3 py-2"
                 value={calTime}
                 onChange={(e) => setCalTime(e.target.value)}
               />
@@ -234,19 +234,19 @@ export default function CreateManualActions({ meetingId, onCreated }: CreateManu
           </div>
           <div className="grid grid-cols-2 gap-2">
             <label className="block">
-              <span className="text-app-ink-muted font-medium">Duration (minutes)</span>
+              <span className="text-gray-700 font-medium">Duration (minutes)</span>
               <input
                 type="number"
                 min={1}
-                className="mt-1 w-full rounded-md border border-app-border-light px-3 py-2"
+                className="mt-1 w-full rounded-md border border-gray-300 px-3 py-2"
                 value={calDuration}
                 onChange={(e) => setCalDuration(Number(e.target.value) || 30)}
               />
             </label>
             <label className="block">
-              <span className="text-app-ink-muted font-medium">Timezone</span>
+              <span className="text-gray-700 font-medium">Timezone</span>
               <select
-                className="mt-1 w-full rounded-md border border-app-border-light px-3 py-2"
+                className="mt-1 w-full rounded-md border border-gray-300 px-3 py-2"
                 value={calTz}
                 onChange={(e) => setCalTz(e.target.value)}
               >
@@ -259,9 +259,9 @@ export default function CreateManualActions({ meetingId, onCreated }: CreateManu
             </label>
           </div>
           <label className="block">
-            <span className="text-app-ink-muted font-medium">Attendees (optional)</span>
+            <span className="text-gray-700 font-medium">Attendees (optional)</span>
             <input
-              className="mt-1 w-full rounded-md border border-app-border-light px-3 py-2"
+              className="mt-1 w-full rounded-md border border-gray-300 px-3 py-2"
               value={calAttendees}
               onChange={(e) => setCalAttendees(e.target.value)}
               placeholder="email1@example.com, email2@example.com"
@@ -280,55 +280,55 @@ export default function CreateManualActions({ meetingId, onCreated }: CreateManu
 
       <Modal isOpen={mailOpen} onClose={() => !mailSaving && setMailOpen(false)} title="New Gmail message">
         <div className="space-y-3 text-sm max-w-md">
-          <p className="text-app-ink-muted">
+          <p className="text-gray-600">
             Creates a pending email action for this meeting. Connect Gmail under Settings if you have not already.
           </p>
           <label className="block">
-            <span className="text-app-ink-muted font-medium">Card title</span>
+            <span className="text-gray-700 font-medium">Card title</span>
             <input
-              className="mt-1 w-full rounded-md border border-app-border-light px-3 py-2"
+              className="mt-1 w-full rounded-md border border-gray-300 px-3 py-2"
               value={mailCardTitle}
               onChange={(e) => setMailCardTitle(e.target.value)}
             />
           </label>
           <label className="block">
-            <span className="text-app-ink-muted font-medium">Note (optional)</span>
+            <span className="text-gray-700 font-medium">Note (optional)</span>
             <textarea
-              className="mt-1 w-full rounded-md border border-app-border-light px-3 py-2"
+              className="mt-1 w-full rounded-md border border-gray-300 px-3 py-2"
               rows={2}
               value={mailDescription}
               onChange={(e) => setMailDescription(e.target.value)}
             />
           </label>
           <label className="block">
-            <span className="text-app-ink-muted font-medium">To</span>
+            <span className="text-gray-700 font-medium">To</span>
             <input
-              className="mt-1 w-full rounded-md border border-app-border-light px-3 py-2"
+              className="mt-1 w-full rounded-md border border-gray-300 px-3 py-2"
               value={mailTo}
               onChange={(e) => setMailTo(e.target.value)}
               placeholder="comma-separated email addresses"
             />
           </label>
           <label className="block">
-            <span className="text-app-ink-muted font-medium">Cc (optional)</span>
+            <span className="text-gray-700 font-medium">Cc (optional)</span>
             <input
-              className="mt-1 w-full rounded-md border border-app-border-light px-3 py-2"
+              className="mt-1 w-full rounded-md border border-gray-300 px-3 py-2"
               value={mailCc}
               onChange={(e) => setMailCc(e.target.value)}
             />
           </label>
           <label className="block">
-            <span className="text-app-ink-muted font-medium">Subject</span>
+            <span className="text-gray-700 font-medium">Subject</span>
             <input
-              className="mt-1 w-full rounded-md border border-app-border-light px-3 py-2"
+              className="mt-1 w-full rounded-md border border-gray-300 px-3 py-2"
               value={mailSubject}
               onChange={(e) => setMailSubject(e.target.value)}
             />
           </label>
           <label className="block">
-            <span className="text-app-ink-muted font-medium">Message</span>
+            <span className="text-gray-700 font-medium">Message</span>
             <textarea
-              className="mt-1 w-full rounded-md border border-app-border-light px-3 py-2"
+              className="mt-1 w-full rounded-md border border-gray-300 px-3 py-2"
               rows={6}
               value={mailBody}
               onChange={(e) => setMailBody(e.target.value)}

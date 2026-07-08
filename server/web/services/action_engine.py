@@ -140,30 +140,13 @@ def _normalize_action_record(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def get_meeting_context(meeting_id: str, user_id: str | None = None) -> dict[str, Any]:
+def get_meeting_context(meeting_id: str) -> dict[str, Any]:
     conn = get_connection()
     conn.row_factory = _row_factory
     try:
         cur = conn.cursor()
-        # Verify ownership when user_id is supplied so callers cannot read
-        # another user's meeting content by passing an arbitrary meeting_id.
-        if user_id:
-            cur.execute(
-                """
-                SELECT id, title, start_time FROM meetings
-                WHERE id = ? AND (
-                    user_id = ?
-                    OR device_id IN (SELECT id FROM devices WHERE user_id = ?)
-                )
-                """,
-                (meeting_id, user_id, user_id),
-            )
-        else:
-            cur.execute("SELECT id, title, start_time FROM meetings WHERE id = ?", (meeting_id,))
+        cur.execute("SELECT id, title, start_time FROM meetings WHERE id = ?", (meeting_id,))
         meeting = cur.fetchone()
-        if not meeting:
-            # Return empty context rather than raising — lets the caller handle the 404.
-            return {"meeting": {}, "summary": "", "decisions": [], "topics": [], "action_items": [], "transcript": ""}
         cur.execute("SELECT * FROM summaries WHERE meeting_id = ?", (meeting_id,))
         summary = cur.fetchone()
         cur.execute("SELECT * FROM local_summaries WHERE meeting_id = ?", (meeting_id,))
@@ -387,9 +370,7 @@ def _is_valid_generated_action(action: dict[str, Any]) -> bool:
 
 
 def generate_actions_for_meeting(meeting_id: str, user_id: str | None) -> list[dict[str, Any]]:
-    context = get_meeting_context(meeting_id, user_id=user_id)
-    if not context.get("meeting"):
-        raise HTTPException(status_code=404, detail="Meeting not found.")
+    context = get_meeting_context(meeting_id)
     if not context["summary"] and not context["transcript"]:
         raise HTTPException(status_code=400, detail="No meeting summary or transcript available to generate actions.")
 
@@ -773,9 +754,7 @@ def execute_action_record(
             "result": normalized["payload"],
         }
 
-    context = get_meeting_context(normalized["meeting_id"], user_id=user_id)
-    if not context.get("meeting"):
-        raise HTTPException(status_code=404, detail="Meeting not found.")
+    context = get_meeting_context(normalized["meeting_id"])
     connector_target = normalized["connector_target"]
     result_payload: dict[str, Any]
     artifact: dict[str, Any] | None = None

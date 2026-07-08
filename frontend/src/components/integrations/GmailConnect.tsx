@@ -29,7 +29,7 @@ export default function GmailConnect({ connected, onStatusChange }: GmailConnect
   }
 
   return (
-    <div className="border border-app-border rounded-lg p-4 hover:border-primary-500 transition-colors">
+    <div className="border border-gray-200 rounded-lg p-4 hover:border-primary-500 transition-colors">
       <div className="flex items-center justify-between">
         <div className="flex items-center space-x-3">
           <div className="w-10 h-10 bg-red-100 rounded-lg flex items-center justify-center">
@@ -39,8 +39,8 @@ export default function GmailConnect({ connected, onStatusChange }: GmailConnect
             </svg>
           </div>
           <div>
-            <h3 className="font-medium text-app-ink">Gmail</h3>
-            <p className="text-sm text-app-ink-subtle">Send AI-drafted emails</p>
+            <h3 className="font-medium text-gray-900">Gmail</h3>
+            <p className="text-sm text-gray-500">Send AI-drafted emails</p>
           </div>
         </div>
         {connected ? (
@@ -53,7 +53,7 @@ export default function GmailConnect({ connected, onStatusChange }: GmailConnect
         ) : (
           <button
             onClick={handleConnect}
-            className="px-4 py-2 text-sm font-medium text-primary-200 bg-primary-900/45 rounded-lg hover:bg-primary-800/55"
+            className="px-4 py-2 text-sm font-medium text-primary-700 bg-primary-50 rounded-lg hover:bg-primary-100"
           >
             Connect
           </button>

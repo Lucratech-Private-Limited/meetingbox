@@ -3,7 +3,6 @@ import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
 import { Toaster } from 'react-hot-toast'
 import { useAuthStore } from './store/authStore'
 import Layout from './components/layout/Layout'
-import DashboardLayout from './components/layout/DashboardLayout'
 import ErrorBoundary from './components/ErrorBoundary'
 import PersonalOnboarding from './pages/PersonalOnboarding'
 import Login from './pages/Login'
@@ -15,10 +14,6 @@ import LiveRecording from './pages/LiveRecording'
 import Settings from './pages/Settings'
 import SystemStatus from './pages/SystemStatus'
 import AssistantChat from './pages/AssistantChat'
-import Calendar from './pages/Calendar'
-import Meetings from './pages/Meetings'
-import Emails from './pages/Emails'
-import Tasks from './pages/Tasks'
 import Privacy from './pages/Privacy'
 import Terms from './pages/Terms'
 import KioskIdle from './pages/KioskIdle'
@@ -30,8 +25,8 @@ function AuthGate({ children }: { children: React.ReactNode }) {
 
   if (loading) {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-app-page">
-        <div className="animate-pulse text-app-ink-faint">Loading...</div>
+      <div className="min-h-screen flex items-center justify-center bg-gray-950">
+        <div className="animate-pulse text-gray-400">Loading...</div>
       </div>
     )
   }
@@ -59,8 +54,8 @@ export default function App() {
 
   if (loading) {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-app-page">
-        <div className="animate-pulse text-app-ink-faint">Loading...</div>
+      <div className="min-h-screen flex items-center justify-center bg-gray-950">
+        <div className="animate-pulse text-gray-400">Loading...</div>
       </div>
     )
   }
@@ -70,13 +65,7 @@ export default function App() {
   return (
     <ErrorBoundary>
       <BrowserRouter>
-        <Toaster
-          position="top-right"
-          toastOptions={{
-            className: '!bg-app-surface !text-app-ink !border !border-app-border',
-            duration: 4000,
-          }}
-        />
+        <Toaster position="top-right" />
 
         <Routes>
           <Route path="/setup" element={<Navigate to="/login" replace />} />
@@ -112,21 +101,17 @@ export default function App() {
             }
           />
 
-          {/* Protected app routes — full-screen dashboard shell (no global Navbar) */}
+          {/* Protected app routes */}
           <Route
             path="/"
             element={
               <AuthGate>
-                <DashboardLayout />
+                <Layout />
               </AuthGate>
             }
           >
             <Route index element={<Navigate to="/dashboard" />} />
             <Route path="dashboard" element={<Dashboard />} />
-            <Route path="meetings" element={<Meetings />} />
-            <Route path="emails" element={<Emails />} />
-            <Route path="tasks" element={<Tasks />} />
-            <Route path="calendar" element={<Calendar />} />
             <Route path="meeting/:id" element={<MeetingDetail />} />
             <Route path="live" element={<LiveRecording />} />
             <Route path="settings" element={<Settings />} />

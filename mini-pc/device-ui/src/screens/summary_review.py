@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import logging
 import re
-import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -33,16 +32,12 @@ from kivy.graphics import Color, Line, Mesh, RoundedRectangle
 from kivy.uix.anchorlayout import AnchorLayout
 from kivy.uix.behaviors import ButtonBehavior
 from kivy.uix.floatlayout import FloatLayout
-from kivy.uix.image import Image
 from kivy.uix.label import Label
 from kivy.uix.scrollview import ScrollView
 from kivy.uix.widget import Widget
 
 from async_helper import run_async
-from components.device_status_bar import DeviceStatusBar
-from config import ASSETS_DIR
 from screens.base_screen import BaseScreen
-from screens.home import _VoiceStatePill  # noqa: PLC2701
 from summary_layout import (
     AI_BODY_FS_RATIO,
     AI_HEADER,
@@ -76,7 +71,6 @@ logger = logging.getLogger(__name__)
 
 _FONT = "42dot-Sans"
 _IST = timezone(timedelta(hours=5, minutes=30))
-_SPARKLE_ICON = str(ASSETS_DIR / "home" / "figma" / "icon_sparkle.png")
 
 
 # Section markers emitted by the backend report composer. The device only shows
@@ -316,11 +310,6 @@ class SummaryReviewScreen(BaseScreen):
         self._summary_data: dict = {}
         self._meeting_title = "Meeting"
         self._scaled_labels: list[tuple[Label, float]] = []
-        # Voice-agent listening pill (auto-activated when the summary opens).
-        self._voice_pill: Optional[_VoiceStatePill] = None
-        self._listening = False
-        self._amplitude = 0.0
-        self._voice_tick_ev = None
         self._build_ui()
 
     # ------------------------------------------------------------------ UI
@@ -338,10 +327,7 @@ class SummaryReviewScreen(BaseScreen):
         back_btn.bind(on_release=lambda *_: self._on_back())
         self._canvas.add_widget(back_btn)
 
-        self._canvas.add_widget(DeviceStatusBar(
-            debug_location="summary_review.py:DeviceStatusBar",
-            **kivy_hints(STATUS_BAR),
-        ))
+        self._canvas.add_widget(_MiniStatus(**kivy_hints(STATUS_BAR)))
 
         self.title_label = self._add_label(
             "Meeting Name", TITLE, TITLE_FS_RATIO, COL_TITLE, bold=True, halign="left",
@@ -351,18 +337,8 @@ class SummaryReviewScreen(BaseScreen):
         )
 
         self._canvas.add_widget(_Card(**kivy_hints(CARD)))
-        sparkle_src = _SPARKLE_ICON if (ASSETS_DIR / "home" / "figma" / "icon_sparkle.png").is_file() else ""
-        if sparkle_src:
-            self._canvas.add_widget(Image(
-                source=sparkle_src,
-                fit_mode="contain",
-                allow_stretch=True,
-                keep_ratio=True,
-                **kivy_hints(AI_SPARKLE),
-            ))
-        else:
-            self._canvas.add_widget(_Sparkle(**kivy_hints(AI_SPARKLE)))
-        self.header_label = self._add_label(
+        self._canvas.add_widget(_Sparkle(**kivy_hints(AI_SPARKLE)))
+        self._add_label(
             "AI Summary", AI_HEADER, AI_HEADER_FS_RATIO, COL_AI_HEADER, bold=True, halign="left",
         )
 
@@ -374,11 +350,6 @@ class SummaryReviewScreen(BaseScreen):
         )
         self._scaled_labels.append((self.summary_scroll._label, AI_BODY_FS_RATIO))  # noqa: SLF001
         self._canvas.add_widget(self.summary_scroll)
-
-        # Voice-state pill: rendered exclusively by the global VoiceControlBar
-        # (see voice_control_bar.py) for consistent size/position/font.
-        # self._voice_pill stays None here on purpose; existing
-        # `if self._voice_pill:` guards below no-op safely.
 
         self.add_widget(self._root)
         Clock.schedule_once(lambda _dt: self._on_root_resize(self._root, self._root.size), 0)
@@ -456,81 +427,20 @@ class SummaryReviewScreen(BaseScreen):
         self._apply_local_data()
         Clock.schedule_once(lambda _dt: self._on_root_resize(self._root, self._root.size), 0)
         Clock.schedule_once(lambda _dt: self._on_root_resize(self._root, self._root.size), 0.05)
-        # Auto-activate the voice agent grounded on this summary (no wake word).
-        if self.meeting_id:
-            self.show_listening_state()
-            try:
-                self.app.start_summary_context_session(self.meeting_id, self._summary_data)
-            except Exception:
-                logger.debug("start_summary_context_session failed", exc_info=True)
 
     def on_leave(self):
-        # Stop the listening-pill animation, but do NOT tear down the voice
-        # context here: opening the email-draft / task / calendar action screen
-        # navigates away from this screen as part of acting ON the summary. The
-        # app clears the context only when the user truly leaves the summary
-        # workflow (see MeetingBoxApp.goto_screen) or the session ends.
-        self.hide_listening_state()
-
-    # ------------------------------------------------------- voice listening UI
-    def show_listening_state(self) -> None:
-        self._listening = True
-        self._amplitude = 0.0
-        if self._voice_pill:
-            self._voice_pill.set_state_text("Listening")
-            self._voice_pill.opacity = 1.0
-        self._start_voice_tick()
-
-    def hide_listening_state(self) -> None:
-        self._listening = False
-        self._stop_voice_tick()
-        if self._voice_pill:
-            self._voice_pill.opacity = 0.0
-
-    def set_voice_session_state(self, state: str) -> None:
-        lbl = {"listening": "Listening", "thinking": "Thinking", "speaking": "Talking"}.get(state)
-        if lbl and self._voice_pill:
-            self._voice_pill.set_state_text(lbl)
-            self._voice_pill.opacity = 1.0
-        if state == "listening":
-            self._listening = True
-            self._start_voice_tick()
-        else:
-            self._listening = False
-            self._stop_voice_tick()
-
-    def update_amplitude(self, amp: float) -> None:
-        if self._listening:
-            self._amplitude = amp
-
-    def _start_voice_tick(self) -> None:
-        if self._voice_tick_ev is None:
-            self._voice_tick_ev = Clock.schedule_interval(self._voice_tick, 1 / 30)
-
-    def _stop_voice_tick(self) -> None:
-        if self._voice_tick_ev:
-            self._voice_tick_ev.cancel()
-            self._voice_tick_ev = None
-
-    def _voice_tick(self, _dt: float) -> None:
-        if self._voice_pill:
-            self._voice_pill.update_bars(time.monotonic(), self._amplitude)
+        pass
 
     # --------------------------------------------------------------- data
     def _apply_local_data(self):
         data = self._summary_data or {}
-        is_note = self._is_note_data(data)
-        title_default = "Notes" if is_note else "Meeting"
-        title = (data.get("title") or self._meeting_title or title_default).strip() or title_default
-        if is_note:
-            title = "Notes"
+        title = (data.get("title") or self._meeting_title or "Meeting").strip() or "Meeting"
         self._meeting_title = title
         self.title_label.text = title
-        self.header_label.text = "Notes" if is_note else "AI Summary"
         self.meta_label.text = self._format_meta_line(data)
         self.summary_scroll.text = (
             self._overview_summary_text()
-            or ("Notes will appear here once processing finishes." if is_note else "Summary will appear here once processing finishes.")
+            or "Summary will appear here once processing finishes."
         )
 
     def _overview_summary_text(self) -> str:
@@ -540,14 +450,7 @@ class SummaryReviewScreen(BaseScreen):
             summary_text = (summary.get("summary") or "").strip()
         else:
             summary_text = (summary or "").strip()
-        if self._is_note_data(data):
-            return summary_text
         return _summary_card_text(summary_text)
-
-    @staticmethod
-    def _is_note_data(data: dict) -> bool:
-        mode = str((data or {}).get("recording_mode") or (data or {}).get("content_type") or "").strip().lower()
-        return mode in {"note", "notes"}
 
     def _fetch_meeting_detail(self):
         if not self.meeting_id:
@@ -571,19 +474,8 @@ class SummaryReviewScreen(BaseScreen):
                     merged[k] = detail[k]
             self._summary_data = merged
             Clock.schedule_once(lambda _dt: self._apply_local_data(), 0)
-            # Enrich the voice agent's grounded context with the fuller detail
-            # (action items / decisions) now that it has loaded.
-            Clock.schedule_once(lambda _dt: self._refresh_voice_context(), 0)
 
         run_async(_run())
-
-    def _refresh_voice_context(self) -> None:
-        if not self.meeting_id:
-            return
-        try:
-            self.app.update_summary_context(self.meeting_id, self._summary_data)
-        except Exception:
-            logger.debug("update_summary_context failed", exc_info=True)
 
     # ----------------------------------------------------------- formatting
     @staticmethod

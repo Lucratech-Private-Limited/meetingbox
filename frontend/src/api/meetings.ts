@@ -1,6 +1,6 @@
 // Meetings API endpoints
 
-import client, { LONG_REQUEST_TIMEOUT_MS } from './client'
+import client from './client'
 import type { Meeting, MeetingDetail } from '../types/meeting'
 
 export const meetingsApi = {
@@ -52,7 +52,6 @@ export const meetingsApi = {
     form.append('file', blob, 'recording.webm')
     await client.post('/api/meetings/upload-audio', form, {
       headers: { 'Content-Type': 'multipart/form-data' },
-      timeout: LONG_REQUEST_TIMEOUT_MS,
     })
   },
 
@@ -68,11 +67,8 @@ export const meetingsApi = {
   },
 
   // Summarize with API (Claude)
-  summarize: async (id: string, force = false): Promise<void> => {
-    await client.post(`/api/meetings/${id}/summarize`, undefined, {
-      params: force ? { force: true } : undefined,
-      timeout: LONG_REQUEST_TIMEOUT_MS,
-    })
+  summarize: async (id: string): Promise<void> => {
+    await client.post(`/api/meetings/${id}/summarize`)
   },
 
   // Get audio recording URL for a meeting

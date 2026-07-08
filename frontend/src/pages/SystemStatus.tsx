@@ -6,7 +6,6 @@ import LoadingSpinner from '../components/ui/LoadingSpinner'
 import Modal from '../components/ui/Modal'
 import Button from '../components/ui/Button'
 import toast from 'react-hot-toast'
-import DashboardNavShell from '../components/dashboard/DashboardNavShell'
 
 export default function SystemStatus() {
   const [info, setInfo] = useState<SystemInfo | null>(null)
@@ -61,30 +60,26 @@ export default function SystemStatus() {
 
   if (loading) {
     return (
-      <DashboardNavShell>
-        <div className="flex items-center justify-center min-h-[60vh]">
-          <LoadingSpinner size="large" />
-        </div>
-      </DashboardNavShell>
+      <div className="flex items-center justify-center min-h-[60vh]">
+        <LoadingSpinner size="large" />
+      </div>
     )
   }
 
   if (error) {
     return (
-      <DashboardNavShell>
-        <div className="max-w-4xl mx-auto px-4 py-8">
-          <h1 className="text-3xl font-bold text-app-ink mb-4">System Status</h1>
-          <div className="bg-red-50 border border-red-200 rounded-lg p-4 text-red-800">
-            <p>{error}</p>
-            <button
-              onClick={() => { setLoading(true); load() }}
-              className="mt-3 px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 text-sm"
-            >
-              Retry
-            </button>
-          </div>
+      <div className="max-w-4xl mx-auto px-4 py-8">
+        <h1 className="text-3xl font-bold text-gray-900 mb-4">System Status</h1>
+        <div className="bg-red-50 border border-red-200 rounded-lg p-4 text-red-800">
+          <p>{error}</p>
+          <button
+            onClick={() => { setLoading(true); load() }}
+            className="mt-3 px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 text-sm"
+          >
+            Retry
+          </button>
         </div>
-      </DashboardNavShell>
+      </div>
     )
   }
 
@@ -112,13 +107,12 @@ export default function SystemStatus() {
     : []
 
   return (
-    <DashboardNavShell>
     <div className="max-w-4xl mx-auto px-4 py-8" data-tutorial="tutorial-system">
-      <h1 className="text-3xl font-bold text-app-ink mb-2">System Status</h1>
-      <p className="text-sm text-app-ink-muted mb-4">
+      <h1 className="text-3xl font-bold text-gray-900 mb-2">System Status</h1>
+      <p className="text-sm text-gray-600 mb-4">
         Metrics reflect your <strong>paired MeetingBox device</strong> (mini PC), not this web server.
         {pairedDeviceName ? (
-          <span className="block mt-1 text-app-ink">Device: {pairedDeviceName}</span>
+          <span className="block mt-1 text-gray-800">Device: {pairedDeviceName}</span>
         ) : null}
       </p>
 
@@ -131,14 +125,14 @@ export default function SystemStatus() {
       {stats.length > 0 ? (
       <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
         {stats.map((stat) => (
-          <div key={stat.label} className="bg-app-surface rounded-lg border border-app-border p-6">
+          <div key={stat.label} className="bg-white rounded-lg border border-gray-200 p-6">
             <div className="flex items-center justify-between mb-2">
-              <h3 className="text-sm font-medium text-app-ink-subtle uppercase tracking-wide">
+              <h3 className="text-sm font-medium text-gray-500 uppercase tracking-wide">
                 {stat.label}
               </h3>
             </div>
-            <p className="text-lg font-semibold text-app-ink mb-3">{stat.value}</p>
-            <div className="w-full bg-app-border rounded-full h-2">
+            <p className="text-lg font-semibold text-gray-900 mb-3">{stat.value}</p>
+            <div className="w-full bg-gray-200 rounded-full h-2">
               <div
                 className={`h-2 rounded-full transition-all ${stat.color}`}
                 style={{ width: `${Math.min(stat.percent, 100)}%` }}
@@ -148,18 +142,18 @@ export default function SystemStatus() {
         ))}
       </div>
       ) : !applianceNote ? (
-        <p className="text-app-ink-muted text-sm mb-6">No metrics to display yet.</p>
+        <p className="text-gray-600 text-sm mb-6">No metrics to display yet.</p>
       ) : null}
 
       {info?.updated_at ? (
-        <p className="mt-3 text-xs text-app-ink-subtle">
+        <p className="mt-3 text-xs text-gray-500">
           Last updated from device: {new Date(info.updated_at).toLocaleString()}
         </p>
       ) : null}
 
       {/* Free up Space */}
       <div className="mt-8">
-        <h2 className="text-xl font-bold text-app-ink mb-4">Storage</h2>
+        <h2 className="text-xl font-bold text-gray-900 mb-4">Storage</h2>
         {info && info.disk_percent > 80 && (
           <div className="mb-4 bg-red-50 border border-red-200 rounded-lg p-4 flex items-start">
             <svg className="h-5 w-5 text-red-400 flex-shrink-0 mt-0.5" fill="currentColor" viewBox="0 0 20 20">
@@ -173,8 +167,8 @@ export default function SystemStatus() {
             </div>
           </div>
         )}
-        <div className="bg-app-surface rounded-lg border border-app-border p-6">
-          <p className="text-sm text-app-ink-muted mb-4">
+        <div className="bg-white rounded-lg border border-gray-200 p-6">
+          <p className="text-sm text-gray-600 mb-4">
             Delete old meeting recordings, transcripts, and summaries to reclaim disk space on the server
             (your account). This does not change the appliance display above.
           </p>
@@ -191,24 +185,24 @@ export default function SystemStatus() {
 
       {/* Cleanup modal */}
       <Modal isOpen={showCleanup} onClose={() => setShowCleanup(false)} title="Free up Space">
-        <p className="text-sm text-app-ink-muted mb-4">
+        <p className="text-sm text-gray-600 mb-4">
           Choose how to free up disk space. Deleted meetings cannot be recovered.
         </p>
         <div className="space-y-4">
-          <div className="bg-app-page rounded-lg p-4">
-            <h4 className="text-sm font-medium text-app-ink mb-2">Delete oldest meetings first</h4>
-            <p className="text-sm text-app-ink-subtle mb-3">
+          <div className="bg-gray-50 rounded-lg p-4">
+            <h4 className="text-sm font-medium text-gray-900 mb-2">Delete oldest meetings first</h4>
+            <p className="text-sm text-gray-500 mb-3">
               Remove the oldest recordings to make room for new ones.
             </p>
             <div className="flex items-center gap-3">
-              <label htmlFor="cleanup-count" className="text-sm text-app-ink-muted">
+              <label htmlFor="cleanup-count" className="text-sm text-gray-700">
                 Number to delete:
               </label>
               <select
                 id="cleanup-count"
                 value={cleanupCount}
                 onChange={(e) => setCleanupCount(Number(e.target.value))}
-                className="px-3 py-1.5 border border-app-border-light rounded-lg text-sm bg-app-surface text-app-ink focus:ring-2 focus:ring-primary-500"
+                className="px-3 py-1.5 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-primary-500"
               >
                 {[5, 10, 20, 50].map((n) => (
                   <option key={n} value={n}>{n} meetings</option>
@@ -223,9 +217,9 @@ export default function SystemStatus() {
               </Button>
             </div>
           </div>
-          <div className="bg-app-page rounded-lg p-4">
-            <h4 className="text-sm font-medium text-app-ink mb-2">Delete manually</h4>
-            <p className="text-sm text-app-ink-subtle">
+          <div className="bg-gray-50 rounded-lg p-4">
+            <h4 className="text-sm font-medium text-gray-900 mb-2">Delete manually</h4>
+            <p className="text-sm text-gray-500">
               Go to the Dashboard and delete individual meetings by hovering over them and clicking the trash icon.
             </p>
           </div>
@@ -237,6 +231,5 @@ export default function SystemStatus() {
         </div>
       </Modal>
     </div>
-    </DashboardNavShell>
   )
 }

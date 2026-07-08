@@ -24,14 +24,14 @@ Badge colour cycling by 1-based row index (colours loop every 4):
   index % 4 == 3 → #FCA862 (orange)
   index % 4 == 0 → #F155F4 (pink/magenta)
 
-"None of these" is appended as the last row, taking the next colour in sequence.
+"None" is appended as the last row, taking the next colour in sequence.
 
 Scrolling: the rows area scrolls when total rows (contacts + None) exceed 4.
 
 Tap-to-confirm:
   - Tapping a contact highlights the row background to #BDDDF2 for 400 ms,
     then fires on_select(index, contact).
-  - Tapping "None of these" fires on_none() (or injects "None of these." voice turn).
+  - Tapping "None" fires on_none() (or injects "None of those." voice turn).
   - Tapping ✕ close fires on_dismiss() with no voice injection.
 
 Public API (unchanged from previous version):
@@ -39,7 +39,7 @@ Public API (unchanged from previous version):
     close()                              — hide + clear
     on_select(index, contact)           — card tapped (1-based index)
     on_dismiss()                        — ✕ tapped
-    on_none()                           — "None of these" tapped  (NEW)
+    on_none()                           — "None" tapped  (NEW)
 """
 
 from __future__ import annotations
@@ -213,8 +213,6 @@ class RecipientConfirmOverlay(FloatLayout):
 
         self._visible     = False
         self._candidates: list[dict] = []
-        self._rows_by_index: dict[int, _ContactRow] = {}
-        self._selection_completed = False
         self.opacity = 0.0
         self._build_ui()
 
@@ -335,8 +333,6 @@ class RecipientConfirmOverlay(FloatLayout):
     def show_candidates(self, query: str, candidates: list[dict]) -> None:
         """Build and reveal the picker from a list of candidate contacts."""
         self._candidates = [c for c in (candidates or []) if c.get("email")]
-        self._rows_by_index = {}
-        self._selection_completed = False
         self._rows_box.clear_widgets()
 
         n = len(self._candidates)
@@ -350,7 +346,6 @@ class RecipientConfirmOverlay(FloatLayout):
                 index=i, label_text=label, badge_color=color,
                 on_tap=self._on_row_tap, is_none=False,
             )
-            self._rows_by_index[i] = row
             self._rows_box.add_widget(row)
             if i < n or True:  # always add separator (incl. before None)
                 self._rows_box.add_widget(self._make_sep())
@@ -359,10 +354,9 @@ class RecipientConfirmOverlay(FloatLayout):
         none_idx   = n + 1
         none_color = _BADGE_COLOURS[(none_idx - 1) % 4]
         none_row   = _ContactRow(
-            index=none_idx, label_text="None of these", badge_color=none_color,
+            index=none_idx, label_text="None", badge_color=none_color,
             on_tap=self._on_row_tap, is_none=True,
         )
-        self._rows_by_index[none_idx] = none_row
         self._rows_box.add_widget(none_row)
 
         # Enable / disable scroll: scroll only when total rows > 4
@@ -388,22 +382,12 @@ class RecipientConfirmOverlay(FloatLayout):
         Animation.cancel_all(self)
         Animation(opacity=1, duration=0.18, t="out_quad").start(self)
 
-    def close(self, cancel_pending: bool = True) -> None:
+    def close(self) -> None:
         if not self._visible:
             return
-        if cancel_pending:
-            self._selection_completed = True
         self._visible = False
         Animation.cancel_all(self)
         Animation(opacity=0, duration=0.15, t="in_quad").start(self)
-
-    def select_index(self, index: int) -> bool:
-        """Programmatically select a row (used for voice choices)."""
-        row = self._rows_by_index.get(int(index))
-        if row is None or not self._visible or self._selection_completed:
-            return False
-        row.flash_and_tap()
-        return True
 
     @property
     def visible(self) -> bool:
@@ -413,10 +397,7 @@ class RecipientConfirmOverlay(FloatLayout):
 
     def _on_row_tap(self, index: int, is_none: bool) -> None:
         """Called by _ContactRow.flash_and_tap() after the 400 ms highlight."""
-        if self._selection_completed:
-            return
-        self._selection_completed = True
-        self.close(cancel_pending=False)
+        self.close()
         if is_none:
             if self.on_none:
                 self.on_none()
@@ -445,7 +426,6 @@ class RecipientConfirmOverlay(FloatLayout):
             return False
         # Dismiss if touch is outside the card
         if self._card and not self._card.collide_point(*touch.pos):
-            self._selection_completed = True
             if self.on_dismiss:
                 self.on_dismiss()
             else:

@@ -28,7 +28,6 @@ from kivy.uix.label import Label
 from kivy.uix.scrollview import ScrollView
 from kivy.uix.widget import Widget
 
-from components.live_wifi_icon import LiveWifiIcon as _WifiIcon
 from config import ASSETS_DIR, DISPLAY_HEIGHT, DISPLAY_WIDTH
 from screens.base_screen import BaseScreen
 # Re-use the shared pill and battery widget from the home screen.
@@ -73,6 +72,46 @@ def _fp(name: str) -> str:
     p = _FIGMA_DIR / name
     return str(p) if p.is_file() else ""
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Programmatic WiFi icon  (Figma fill #000000, 29 × 20 px)
+# ──────────────────────────────────────────────────────────────────────────────
+class _WifiIcon(Widget):
+    """Three concentric arcs + centre dot drawn in canvas — true vector, no PNG."""
+
+    _COL = (0.0, 0.0, 0.0, 1.0)   # Figma fill: #000000
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        with self.canvas:
+            self._c    = Color(*self._COL)
+            self._arc1 = Line(width=1.4)   # innermost (smallest)
+            self._arc2 = Line(width=1.4)
+            self._arc3 = Line(width=1.4)   # outermost
+            self._dotc = Color(*self._COL)
+            self._dot  = Ellipse()
+        self.bind(pos=self._redraw, size=self._redraw)
+        Clock.schedule_once(self._redraw, 0)
+
+    def _redraw(self, *_) -> None:
+        w, h = self.size
+        if w <= 1 or h <= 1:
+            return
+        # Arc pivot: bottom-centre of the icon
+        cx = self.x + w / 2
+        cy = self.y + h * 0.08
+
+        # Three arc radii as fractions of icon height
+        for arc, frac in [(self._arc1, 0.30), (self._arc2, 0.58), (self._arc3, 0.86)]:
+            r = h * frac
+            # Kivy arc angles: 0° = 3 o'clock, counterclockwise.
+            # 45°–135° gives an upward-opening fan.
+            arc.ellipse = (cx - r, cy - r, 2 * r, 2 * r, 45, 135)
+
+        # Dot
+        dr = h * 0.09
+        self._dot.pos  = (cx - dr, cy - dr)
+        self._dot.size = (dr * 2, dr * 2)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -451,27 +490,36 @@ class VoiceSessionScreen(BaseScreen):
         )
         root.add_widget(self._transcript)
 
-        # Voice-state pill: rendered exclusively by the global VoiceControlBar
-        # (see voice_control_bar.py) to keep size/position/font consistent
-        # across every screen and avoid a duplicate pill flashing before the
-        # global bar takes over. self._voice_pill stays None here on purpose;
-        # existing `if self._voice_pill:` guards below no-op safely.
+        # 6 · Voice-state pill  (910, 17)  222 × 47  (always visible here) ──
+        self._voice_pill = _VoiceStatePill(
+            size_hint=(_sw(222), _sh(47)),
+            pos_hint={"x": _x(910), "y": _y(17, 47)},
+        )
+        self._voice_pill.opacity = 1.0   # override home-screen default of 0
+        root.add_widget(self._voice_pill)
 
-        # (WiFi + battery indicators removed — not relevant for the desktop app.)
+        # 7 · WiFi icon  (1147, 31)  29 × 20  — drawn as canvas vectors ────────
+        root.add_widget(_WifiIcon(
+            size_hint=(_sw(29), _sh(20)),
+            pos_hint={"x": _x(1147), "y": _y(31, 20)},
+        ))
+
+        # 8 · Battery indicator  (1191, 30)  47 × 21 ─────────────────────────
+        self._battery = _BatteryWidget(
+            size_hint=(_sw(47), _sh(21)),
+            pos_hint={"x": _x(1191), "y": _y(30, 21)},
+        )
+        root.add_widget(self._battery)
 
         # 9 · Back button  (top-left, same row as pill) ───────────────────────
-        # Omitted in the floating-dock companion: the dock is the only navigation
-        # surface there (tap the active icon / click away to dismiss).
-        from config import dock_companion_enabled
-        if not dock_companion_enabled():
-            back = _BackButton(
-                on_tap=self._on_back,
-                size_hint=(_sw(140), _sh(47)),
-                pos_hint={"x": _x(20), "y": _y(17, 47)},
-            )
-            root.add_widget(back)
-            # The _BackButton widget renders via a child label that must be added:
-            root.add_widget(back._lbl)
+        back = _BackButton(
+            on_tap=self._on_back,
+            size_hint=(_sw(140), _sh(47)),
+            pos_hint={"x": _x(20), "y": _y(17, 47)},
+        )
+        root.add_widget(back)
+        # The _BackButton widget renders via a child label that must be added:
+        root.add_widget(back._lbl)
 
         self.add_widget(root)
 

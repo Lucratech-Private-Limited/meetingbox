@@ -4,7 +4,6 @@ import { integrationsApi } from '../../api/integrations'
 import type { Integration } from '../../types/user'
 import LoadingSpinner from '../ui/LoadingSpinner'
 import toast from 'react-hot-toast'
-import PendingAssistantQueue from './PendingAssistantQueue'
 
 export default function IntegrationsSettings() {
   const [integrations, setIntegrations] = useState<Integration[]>([])
@@ -87,8 +86,8 @@ export default function IntegrationsSettings() {
   return (
     <div className="space-y-4">
       {integrations.length === 0 ? (
-        <div className="bg-app-surface rounded-lg border border-app-border p-6 text-center">
-          <p className="text-app-ink-subtle">
+        <div className="bg-white rounded-lg border border-gray-200 p-6 text-center">
+          <p className="text-gray-500">
             No integrations available. Ensure the backend is running and Google OAuth credentials are configured.
           </p>
         </div>
@@ -96,11 +95,11 @@ export default function IntegrationsSettings() {
         integrations.map((integration) => (
           <div
             key={integration.id}
-            className="bg-app-surface rounded-lg border border-app-border p-6"
+            className="bg-white rounded-lg border border-gray-200 p-6"
           >
             <div className="flex items-center justify-between">
               <div className="flex items-center space-x-4">
-                <div className="w-12 h-12 rounded-lg bg-app-raised flex items-center justify-center text-2xl">
+                <div className="w-12 h-12 rounded-lg bg-gray-100 flex items-center justify-center text-2xl">
                   {integration.id === 'gmail' ? (
                     <svg className="w-7 h-7 text-red-500" fill="currentColor" viewBox="0 0 20 20">
                       <path d="M2.003 5.884L10 9.882l7.997-3.998A2 2 0 0016 4H4a2 2 0 00-1.997 1.884z" />
@@ -113,8 +112,8 @@ export default function IntegrationsSettings() {
                   )}
                 </div>
                 <div>
-                  <h3 className="text-lg font-semibold text-app-ink">{integration.name}</h3>
-                  <p className="text-sm text-app-ink-muted">{integration.description}</p>
+                  <h3 className="text-lg font-semibold text-gray-900">{integration.name}</h3>
+                  <p className="text-sm text-gray-600">{integration.description}</p>
                   {integration.connected && integration.email && (
                     <p className="text-xs text-green-600 mt-1">Connected as {integration.email}</p>
                   )}
@@ -146,7 +145,6 @@ export default function IntegrationsSettings() {
           </div>
         ))
       )}
-      <PendingAssistantQueue />
     </div>
   )
 }

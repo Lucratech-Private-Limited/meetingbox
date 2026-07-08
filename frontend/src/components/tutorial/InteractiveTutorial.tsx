@@ -158,7 +158,7 @@ export default function InteractiveTutorial() {
   return (
     <div className="fixed inset-0 z-[10000] pointer-events-none" aria-live="polite">
       <div
-        className={`absolute inset-0 pointer-events-auto ${showSpotlight ? 'bg-transparent' : 'bg-app-deep/75'}`}
+        className={`absolute inset-0 pointer-events-auto ${showSpotlight ? 'bg-transparent' : 'bg-slate-900/60'}`}
         onClick={(e) => e.stopPropagation()}
         aria-hidden
       />
@@ -176,27 +176,27 @@ export default function InteractiveTutorial() {
       )}
 
       <div
-        className="pointer-events-auto rounded-xl border border-app-border bg-app-surface p-4 shadow-xl"
+        className="pointer-events-auto rounded-xl border border-gray-200 bg-white p-4 shadow-xl"
         style={tooltipStyle}
         role="dialog"
         aria-labelledby="tutorial-title"
         aria-describedby="tutorial-body"
       >
-        <p id="tutorial-title" className="text-sm font-semibold text-app-ink">
+        <p id="tutorial-title" className="text-sm font-semibold text-gray-900">
           {step.title}
         </p>
-        <p id="tutorial-body" className="mt-2 text-sm text-app-ink-muted leading-relaxed">
+        <p id="tutorial-body" className="mt-2 text-sm text-gray-600 leading-relaxed">
           {step.body}
         </p>
         <div className="mt-4 flex flex-wrap items-center justify-between gap-2">
-          <span className="text-xs text-app-ink-faint">
+          <span className="text-xs text-gray-400">
             {index + 1} / {tutorialSteps.length}
           </span>
           <div className="flex flex-wrap gap-2">
             <button
               type="button"
               onClick={skip}
-              className="px-3 py-1.5 text-xs font-medium text-app-ink-muted hover:text-app-ink"
+              className="px-3 py-1.5 text-xs font-medium text-gray-600 hover:text-gray-900"
             >
               Skip tour
             </button>
@@ -204,7 +204,7 @@ export default function InteractiveTutorial() {
               type="button"
               onClick={back}
               disabled={index === 0}
-              className="px-3 py-1.5 text-xs font-medium rounded-lg border border-app-border-light text-app-ink-muted hover:bg-app-page disabled:opacity-40"
+              className="px-3 py-1.5 text-xs font-medium rounded-lg border border-gray-300 text-gray-700 hover:bg-gray-50 disabled:opacity-40"
             >
               Back
             </button>
@@ -217,7 +217,7 @@ export default function InteractiveTutorial() {
             </button>
           </div>
         </div>
-        <p className="mt-2 text-[10px] text-app-ink-faint">Press Esc to exit</p>
+        <p className="mt-2 text-[10px] text-gray-400">Press Esc to exit</p>
       </div>
     </div>
   )

@@ -148,15 +148,6 @@ class WebRtcAEC:
                 out.extend(near_frame)
         return bytes(out)
 
-    def clear_far(self) -> None:
-        """Drop buffered far-end bytes (e.g. after a barge-in abort).
-
-        Keeps the APM's converged filter state — only the not-yet-consumed
-        reference audio is discarded so stale (never-played) reference can't
-        misalign against the mic after playback is flushed.
-        """
-        self._far_buf.clear()
-
     def reset(self) -> None:
         try:
             self._ap.reset()

@@ -40,7 +40,6 @@ from routes.actions import router as actions_router
 from routes.integrations import router as integrations_router
 from routes.emails import router as emails_router
 from routes.commitments import router as commitments_router
-from routes.notes import router as notes_router
 from routes.briefing import router as briefing_router
 from routes.admin_memory import router as admin_memory_router
 from routes.memory import router as memory_router
@@ -54,8 +53,6 @@ from rate_limit import limiter
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
 logger = logging.getLogger("meetingbox.web")
-
-
 
 
 def _startup_strict_env() -> None:
@@ -100,87 +97,27 @@ REDIS_HOST = os.getenv("REDIS_HOST", "redis")
 STATIC_DIR = Path(os.getenv("STATIC_DIR", "/app/static"))
 
 
-import dataclasses as _dataclasses
-
-
-@_dataclasses.dataclass
-class _WsClient:
-  ws: WebSocket
-  user_id: str | None          # None → unauthenticated open-connect
-  device_ids: frozenset[str]   # own device + all devices owned by this user
-
-
-def _resolve_ws_scope(actor: dict | None) -> tuple[str | None, frozenset[str]]:
-  """Resolve (user_id, owned_device_ids) for a WebSocket actor at connect time."""
-  if not actor:
-    return None, frozenset()
-  user_id = str(((actor.get("user") or {}).get("id")) or "").strip() or None
-  own_device = str(((actor.get("device") or {}).get("id")) or "").strip()
-  device_ids: set[str] = {own_device} if own_device else set()
-  if user_id:
-    try:
-      conn = get_connection()
-      try:
-        cur = conn.cursor()
-        cur.execute("SELECT id FROM devices WHERE user_id = ?", (user_id,))
-        for row in cur.fetchall():
-          did = (row[0] if isinstance(row, (list, tuple)) else (row or {}).get("id") or "")
-          if did:
-            device_ids.add(str(did))
-      finally:
-        conn.close()
-    except Exception:
-      logger.debug("ws: could not load device_ids for user=%s", user_id, exc_info=True)
-  return user_id, frozenset(device_ids)
-
-
-def _ws_client_should_receive(client: _WsClient, ev_user: str, ev_device: str) -> bool:
-  """True if this client should receive an event with the given user/device scope."""
-  # Unscoped events (no user_id and no device_id) are broadcast to all connections.
-  if not ev_user and not ev_device:
-    return True
-  # Unauthenticated open-connect clients only receive unscoped events.
-  if client.user_id is None and not client.device_ids:
-    return False
-  # Direct user match.
-  if ev_user and client.user_id == ev_user:
-    return True
-  # Device match — covers both the device itself and its owner's web browser.
-  if ev_device and ev_device in client.device_ids:
-    return True
-  return False
-
-
 class ConnectionManager:
   def __init__(self) -> None:
-    self._clients: list[_WsClient] = []
+    self.active_connections: list[WebSocket] = []
 
-  async def connect(self, websocket: WebSocket, actor: dict | None = None) -> None:
+  async def connect(self, websocket: WebSocket) -> None:
     await websocket.accept()
-    user_id, device_ids = _resolve_ws_scope(actor)
-    self._clients.append(_WsClient(ws=websocket, user_id=user_id, device_ids=device_ids))
-    logger.info(
-      "WebSocket client connected user=%s devices=%d total_conn=%d",
-      user_id, len(device_ids), len(self._clients),
-    )
+    self.active_connections.append(websocket)
+    logger.info("WebSocket client connected (%d total)", len(self.active_connections))
 
   def disconnect(self, websocket: WebSocket) -> None:
-    before = len(self._clients)
-    self._clients = [c for c in self._clients if c.ws is not websocket]
-    if len(self._clients) < before:
-      logger.info("WebSocket client disconnected (%d total)", len(self._clients))
+    if websocket in self.active_connections:
+      self.active_connections.remove(websocket)
+      logger.info("WebSocket client disconnected (%d total)", len(self.active_connections))
 
   async def broadcast(self, message: dict) -> None:
-    ev_user = str(message.get("user_id") or "").strip()
-    ev_device = str(message.get("device_id") or "").strip()
     dead: list[WebSocket] = []
-    for client in list(self._clients):
-      if not _ws_client_should_receive(client, ev_user, ev_device):
-        continue
+    for ws in self.active_connections:
       try:
-        await client.ws.send_json(message)
+        await ws.send_json(message)
       except Exception:
-        dead.append(client.ws)
+        dead.append(ws)
     for ws in dead:
       self.disconnect(ws)
 
@@ -319,57 +256,33 @@ def _check_mem0_startup() -> None:
 
 
 def _start_analysis_scheduler() -> object | None:
-  """Start APScheduler background jobs for daily meeting analysis and user profiling.
+  """Start APScheduler background job for daily meeting analysis.
 
-  Analysis digest: only active when MEETINGBOX_ANALYSIS_ENABLED=1.
-  User profiler:   only active when MEETINGBOX_USER_PROFILER_ENABLED=1.
-  Returns the scheduler instance so it can be shut down cleanly in lifespan teardown.
+  Only active when MEETINGBOX_ANALYSIS_ENABLED=1. Returns the scheduler
+  instance so it can be shut down cleanly in the lifespan teardown.
   Safe to call even when APScheduler is not installed — returns None.
   """
-  analysis_on = os.getenv("MEETINGBOX_ANALYSIS_ENABLED", "").strip() in ("1", "true", "yes", "on")
-  from services.user_profiler import profiler_enabled
-  profiler_on = profiler_enabled()
-
-  if not analysis_on and not profiler_on:
-    logger.info("Analysis scheduler: disabled (neither MEETINGBOX_ANALYSIS_ENABLED nor MEETINGBOX_USER_PROFILER_ENABLED set)")
+  if os.getenv("MEETINGBOX_ANALYSIS_ENABLED", "").strip() not in ("1", "true", "yes", "on"):
+    logger.info("Analysis scheduler: disabled (MEETINGBOX_ANALYSIS_ENABLED not set)")
     return None
   try:
     from apscheduler.schedulers.background import BackgroundScheduler
+    from services.analysis_service import run_daily_digest_all_users
 
     scheduler = BackgroundScheduler(timezone="UTC", daemon=True)
-
-    if analysis_on:
-      from services.analysis_service import run_daily_digest_all_users
-      # Run daily at 02:00 UTC — low-traffic window.
-      scheduler.add_job(
-        run_daily_digest_all_users,
-        trigger="cron",
-        hour=2,
-        minute=0,
-        id="daily_digest",
-        replace_existing=True,
-        max_instances=1,
-        coalesce=True,
-      )
-      logger.info("Analysis scheduler: daily digest registered at 02:00 UTC")
-
-    if profiler_on:
-      from services.user_profiler import run_profiler_all_users
-      # Run daily at 03:00 UTC — after the meeting digest, low-traffic window.
-      scheduler.add_job(
-        run_profiler_all_users,
-        trigger="cron",
-        hour=3,
-        minute=0,
-        id="user_profiler",
-        replace_existing=True,
-        max_instances=1,
-        coalesce=True,
-      )
-      logger.info("Analysis scheduler: user profiler registered at 03:00 UTC")
-
+    # Run daily at 02:00 UTC — low-traffic window.
+    scheduler.add_job(
+      run_daily_digest_all_users,
+      trigger="cron",
+      hour=2,
+      minute=0,
+      id="daily_digest",
+      replace_existing=True,
+      max_instances=1,
+      coalesce=True,
+    )
     scheduler.start()
-    logger.info("Analysis scheduler: started")
+    logger.info("Analysis scheduler: started — daily digest at 02:00 UTC")
     return scheduler
   except ImportError:
     logger.warning(
@@ -385,21 +298,6 @@ def _start_analysis_scheduler() -> object | None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):  # type: ignore[override]
   _check_mem0_startup()
-  # Warm the Mem0 search/get_all path in the background so the first voice
-  # session doesn't pay the ~3 s cold-start (embedding model + DB connect).
-  try:
-    from services.mem0_service import warm_search_path
-    threading.Thread(target=warm_search_path, name="mem0-warm", daemon=True).start()
-  except Exception:
-    logger.debug("mem0 warm thread failed to start", exc_info=True)
-  # Backfill the recording search index for any legacy recordings (cheap:
-  # FTS + metadata only, no LLM/embedding calls). Runs in the background so it
-  # never blocks startup.
-  try:
-    from services.recording_store import backfill_fts_index
-    threading.Thread(target=backfill_fts_index, name="recording-index-backfill", daemon=True).start()
-  except Exception:
-    logger.debug("recording index backfill thread failed to start", exc_info=True)
   scheduler = _start_analysis_scheduler()
   loop = asyncio.get_running_loop()
   queue: asyncio.Queue = asyncio.Queue()
@@ -454,7 +352,6 @@ app.include_router(actions_router, prefix="/api", tags=["actions"])
 app.include_router(integrations_router, prefix="/api", tags=["integrations"])
 app.include_router(emails_router, prefix="/api", tags=["emails"])
 app.include_router(commitments_router, prefix="/api", tags=["commitments"])
-app.include_router(notes_router, prefix="/api", tags=["notes"])
 app.include_router(briefing_router, prefix="/api")
 app.include_router(admin_memory_router, prefix="/api")
 app.include_router(memory_router, prefix="/api")
@@ -492,14 +389,12 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
   secret = (os.getenv("MEETINGBOX_WS_SHARED_SECRET", "") or "").strip()
   require_auth = os.getenv("MEETINGBOX_WS_REQUIRE_AUTH", "").strip() == "1"
   secret_ok = bool(secret) and (websocket.query_params.get("token") or "").strip() == secret
-  # Resolve actor once — used for both auth gating and per-user event filtering.
-  token = _ws_bearer_from_request(websocket)
-  actor: dict | None = resolve_actor_from_access_token(token) if token else None
+  actor_ok = bool(resolve_actor_from_access_token(_ws_bearer_from_request(websocket)))
 
   if not secret and not require_auth:
     pass  # backward compatible: open connect
   elif not secret and require_auth:
-    if not actor:
+    if not actor_ok:
       await websocket.close(code=1008)
       return
   elif secret and not require_auth:
@@ -507,11 +402,11 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
       await websocket.close(code=1008)
       return
   else:
-    if not (secret_ok or actor):
+    if not (secret_ok or actor_ok):
       await websocket.close(code=1008)
       return
 
-  await manager.connect(websocket, actor)
+  await manager.connect(websocket)
   try:
     while True:
       msg = await websocket.receive_text()

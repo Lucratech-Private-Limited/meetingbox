@@ -21,7 +21,7 @@ export const useMeetingStore = create<MeetingState>((set, get) => ({
   fetchMeetings: async () => {
     set({ loading: true, error: null })
     try {
-      const meetings = await meetingsApi.list({ limit: 500, offset: 0 })
+      const meetings = await meetingsApi.list()
       set({ meetings, loading: false })
     } catch {
       set({ error: 'Failed to fetch meetings', loading: false })

@@ -34,8 +34,8 @@ export default function AuthCallback() {
   }, [consumeGoogleCallback, navigate, searchParams])
 
   return (
-    <div className="min-h-screen flex items-center justify-center bg-app-page px-4">
-      <div className="text-sm text-app-ink-faint">Signing you in...</div>
+    <div className="min-h-screen flex items-center justify-center bg-gray-950 px-4">
+      <div className="text-sm text-gray-400">Signing you in...</div>
     </div>
   )
 }

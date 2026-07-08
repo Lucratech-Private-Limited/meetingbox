@@ -19,7 +19,7 @@ export default function MeetingCard({ meeting, onDelete }: MeetingCardProps) {
   const [isDeleting, setIsDeleting] = useState(false)
 
   const statusInfo = MEETING_STATUSES[meeting.status as keyof typeof MEETING_STATUSES] ?? {
-    color: 'bg-app-raised text-app-ink',
+    color: 'bg-gray-100 text-gray-800',
     text: meeting.status,
   }
 
@@ -48,12 +48,12 @@ export default function MeetingCard({ meeting, onDelete }: MeetingCardProps) {
     <>
       <Link
         to={`/meeting/${meeting.id}`}
-        className="group flex h-full flex-col bg-app-surface rounded-lg border border-app-border hover:border-primary-500 hover:shadow-md transition-all relative"
+        className="group flex h-full flex-col bg-white rounded-lg border border-gray-200 hover:border-primary-500 hover:shadow-md transition-all relative"
       >
         <div className="flex flex-col flex-1 p-6">
           {/* Title and status */}
           <div className="flex items-center justify-between mb-3">
-            <h3 className="text-lg font-semibold text-app-ink truncate flex-1 mr-2">
+            <h3 className="text-lg font-semibold text-gray-900 truncate flex-1 mr-2">
               {meeting.title}
             </h3>
             <div className="flex items-center gap-2">
@@ -66,7 +66,7 @@ export default function MeetingCard({ meeting, onDelete }: MeetingCardProps) {
                 <button
                   onClick={handleDeleteClick}
                   title="Delete meeting"
-                  className="opacity-0 group-hover:opacity-100 transition-opacity p-1.5 rounded-lg text-app-ink-faint hover:text-red-600 hover:bg-red-50"
+                  className="opacity-0 group-hover:opacity-100 transition-opacity p-1.5 rounded-lg text-gray-400 hover:text-red-600 hover:bg-red-50"
                 >
                   <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
@@ -77,9 +77,9 @@ export default function MeetingCard({ meeting, onDelete }: MeetingCardProps) {
           </div>
 
           {/* Meta info */}
-          <div className="space-y-2 text-sm text-app-ink-muted">
+          <div className="space-y-2 text-sm text-gray-600">
             <div className="flex items-center">
-              <svg className="w-4 h-4 mr-2 text-app-ink-faint" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <svg className="w-4 h-4 mr-2 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
               </svg>
               {formatDistanceToNow(parseUTC(meeting.start_time), { addSuffix: true })}
@@ -87,7 +87,7 @@ export default function MeetingCard({ meeting, onDelete }: MeetingCardProps) {
 
             {meeting.duration != null && (
               <div className="flex items-center">
-                <svg className="w-4 h-4 mr-2 text-app-ink-faint" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <svg className="w-4 h-4 mr-2 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
                 </svg>
                 {Math.floor(meeting.duration / 60)} minutes
@@ -98,7 +98,7 @@ export default function MeetingCard({ meeting, onDelete }: MeetingCardProps) {
           {/* Agentic actions: bottom-right style row */}
           <div className="mt-auto pt-4 flex justify-end items-center gap-3 text-xs">
             <span
-              className={`inline-flex items-center gap-1 ${pendingN > 0 ? 'text-amber-600' : 'text-app-ink-faint'}`}
+              className={`inline-flex items-center gap-1 ${pendingN > 0 ? 'text-amber-600' : 'text-gray-400'}`}
               title={`${pendingN} pending Gmail/Calendar action${pendingN !== 1 ? 's' : ''}`}
             >
               <svg className="w-4 h-4 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden>
@@ -112,7 +112,7 @@ export default function MeetingCard({ meeting, onDelete }: MeetingCardProps) {
               <span className="tabular-nums font-medium">{pendingN}</span>
             </span>
             <span
-              className={`inline-flex items-center gap-1 ${executedN > 0 ? 'text-emerald-600' : 'text-app-ink-faint'}`}
+              className={`inline-flex items-center gap-1 ${executedN > 0 ? 'text-emerald-600' : 'text-gray-400'}`}
               title={`${executedN} executed Gmail/Calendar action${executedN !== 1 ? 's' : ''}`}
             >
               <svg className="w-4 h-4 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden>
@@ -135,10 +135,10 @@ export default function MeetingCard({ meeting, onDelete }: MeetingCardProps) {
         onClose={() => setShowConfirm(false)}
         title="Delete Meeting"
       >
-        <p className="text-sm text-app-ink-muted mb-2">
+        <p className="text-sm text-gray-600 mb-2">
           Are you sure you want to delete <strong>{meeting.title}</strong>?
         </p>
-        <p className="text-sm text-app-ink-subtle mb-6">
+        <p className="text-sm text-gray-500 mb-6">
           This will permanently remove the recording, transcript, summary, and all associated actions. This cannot be undone.
         </p>
         <div className="flex justify-end gap-3">

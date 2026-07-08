@@ -22,72 +22,38 @@ if [[ "${MEETINGBOX_SKIP_PANEL_XRANDR:-0}" == "1" ]]; then
   exit 0
 fi
 
-# Default OUT to "auto" so a wrong hardcoded name never silently fails — the logic
-# below verifies the result and walks every connected output until landscape lands.
-OUT="${MEETINGBOX_PANEL_OUTPUT:-auto}"
+OUT="${MEETINGBOX_PANEL_OUTPUT:-DSI-1}"
 MODE="${MEETINGBOX_PANEL_MODE:-800x1280}"
 ROT="${MEETINGBOX_PANEL_ROTATE:-left}"
 
-# True when the X framebuffer is currently landscape (width > height).
-_screen_is_landscape() {
-  local cur w h
-  cur=$(xrandr 2>/dev/null | grep -oE 'current [0-9]+ x [0-9]+' | head -1)
-  w=$(awk '{print $2}' <<<"$cur")
-  h=$(awk '{print $4}' <<<"$cur")
-  [[ -n "$w" && -n "$h" ]] || return 1
-  [[ "$w" -gt "$h" ]]
-}
-
-# Connected output names, e.g. DSI-1 HDMI-1 eDP-1.
-_connected_outputs() {
-  xrandr 2>/dev/null | awk '/ connected/{print $1}'
-}
-
-# Apply one rotation to one output (try with mode, then without, then --auto).
-_set_rotation() {
-  local out="$1" rot="$2"
-  [[ -z "$out" ]] && return 1
-  xrandr --output "$out" --mode "$MODE" --rotate "$rot" 2>/dev/null && return 0
-  xrandr --output "$out" --rotate "$rot" 2>/dev/null && return 0
-  xrandr --output "$out" --auto --rotate "$rot" 2>/dev/null && return 0
-  return 1
-}
-
-# Force landscape and VERIFY the framebuffer actually became landscape. If the
-# configured output is wrong, walk every connected output; if the configured
-# rotation does not yield landscape (e.g. normal/inverted on a portrait panel),
-# fall back to left/right — both rotate a portrait panel to landscape — so the
-# screen is GUARANTEED to never stay portrait. On success, OUT/ROT are updated to
-# the values that worked (OUT is reused for touch mapping below).
-_apply_landscape_lock() {
-  local candidates=() rotations=() c r
-  if [[ "${OUT,,}" != "auto" ]]; then
-    candidates+=("$OUT")
+# Try several xrandr forms; return 0 if one succeeds.
+_xrandr_try_once() {
+  if xrandr --output "$OUT" --mode "$MODE" --rotate "$ROT" 2>/dev/null; then
+    return 0
   fi
-  while IFS= read -r c; do
-    [[ -n "$c" && "$c" != "$OUT" ]] && candidates+=("$c")
-  done < <(_connected_outputs)
-
-  rotations+=("$ROT")
-  [[ "$ROT" != "left" ]] && rotations+=("left")
-  [[ "$ROT" != "right" ]] && rotations+=("right")
-
-  for c in "${candidates[@]}"; do
-    for r in "${rotations[@]}"; do
-      _set_rotation "$c" "$r" || continue
-      if _screen_is_landscape; then
-        OUT="$c"
-        ROT="$r"
-        logger -t meetingbox-kiosk "orientation: landscape locked on $OUT (--rotate $ROT)"
-        return 0
-      fi
-    done
-  done
+  if xrandr --output "$OUT" --rotate "$ROT" 2>/dev/null; then
+    return 0
+  fi
+  # Current mode may be wrong name in .env; keep rotation.
+  if xrandr --output "$OUT" --auto --rotate "$ROT" 2>/dev/null; then
+    return 0
+  fi
   return 1
 }
 
 XR_OK=0
 if command -v xrandr >/dev/null 2>&1; then
+  # Optional: pick first connected output from `xrandr` when OUT is wrong (e.g. HDMI-1 vs DSI-1).
+  if [[ "${OUT}" == "auto" ]] || [[ "${OUT}" == "AUTO" ]]; then
+    picked=$(xrandr 2>/dev/null | awk '/ connected / { print $1; exit }')
+    if [[ -n "${picked}" ]]; then
+      OUT="$picked"
+      logger -t meetingbox-kiosk "xrandr: MEETINGBOX_PANEL_OUTPUT=auto -> using OUT=$OUT"
+    else
+      logger -t meetingbox-kiosk "xrandr: MEETINGBOX_PANEL_OUTPUT=auto but no connected output yet"
+    fi
+  fi
+
   # GDM runs this very early; the X output sometimes appears a few seconds later — retry.
   init_delay="${MEETINGBOX_XRANDR_INITIAL_DELAY:-0}"
   if [[ "${init_delay}" =~ ^[0-9]+$ ]] && [[ "$init_delay" -gt 0 ]]; then
@@ -96,18 +62,20 @@ if command -v xrandr >/dev/null 2>&1; then
   attempts="${MEETINGBOX_XRANDR_ATTEMPTS:-30}"
   delay="${MEETINGBOX_XRANDR_RETRY_DELAY:-1}"
   for ((i = 1; i <= attempts; i++)); do
-    if _apply_landscape_lock; then
+    if _xrandr_try_once; then
+      logger -t meetingbox-kiosk "xrandr ok: --output $OUT --mode $MODE --rotate $ROT (attempt $i/$attempts)"
       XR_OK=1
       break
     fi
     if [[ "$i" -eq 1 ]] || [[ "$i" -eq "$attempts" ]]; then
-      logger -t meetingbox-kiosk "orientation: not landscape yet (attempt $i/$attempts); connected: $(_connected_outputs | tr '\n' ' ')"
+      err=$(xrandr --output "$OUT" --mode "$MODE" --rotate "$ROT" 2>&1 | head -c 400)
+      logger -t meetingbox-kiosk "xrandr failed (attempt $i/$attempts) OUT=$OUT: ${err//$'\n'/ }"
     fi
     [[ "$i" -lt "$attempts" ]] && sleep "$delay"
   done
 
   if [[ "$XR_OK" -ne 1 ]]; then
-    logger -t meetingbox-kiosk "orientation: FAILED to lock landscape after $attempts attempts — run 'DISPLAY=:0 xrandr' on the panel and set MEETINGBOX_PANEL_OUTPUT in $ENV_FILE."
+    logger -t meetingbox-kiosk "xrandr: rotation not applied after $attempts attempts — fix MEETINGBOX_PANEL_OUTPUT / MEETINGBOX_PANEL_MODE in $ENV_FILE (run: xrandr on the panel). Touch mapping will still run."
     while IFS= read -r line; do
       logger -t meetingbox-kiosk "xrandr: $line"
     done < <(xrandr 2>/dev/null | head -25)
@@ -253,31 +221,6 @@ _map_touch_to_output() {
 # Run touch alignment whenever enabled — not only when xrandr succeeded (xrandr can fail while X + touch still need calibration).
 if [[ "${MEETINGBOX_MAP_TOUCH_TO_OUTPUT:-1}" == "1" ]]; then
   _map_touch_to_output
-fi
-
-# ── Permanently disable auto-rotation at the source (no reactive fighting) ────
-# iio-sensor-proxy reads the accelerometer and is what flips the display when the
-# device is moved. We do NOT want to react to rotation after it happens (that
-# causes a visible flip then a correction). Instead, stop + mask the daemon so no
-# rotation event is ever generated — xrandr above set landscape once and it stays.
-# (install-gdm-kiosk-session.sh masks it persistently as root; this is a runtime
-# best-effort fallback in case the daemon got re-enabled.)
-if systemctl is-active --quiet iio-sensor-proxy.service 2>/dev/null; then
-  systemctl stop iio-sensor-proxy.service 2>/dev/null \
-    && logger -t meetingbox-kiosk "orientation: stopped iio-sensor-proxy" \
-    || logger -t meetingbox-kiosk "orientation: could not stop iio-sensor-proxy (need root mask at install)"
-fi
-if ! systemctl is-enabled iio-sensor-proxy.service 2>/dev/null | grep -q masked; then
-  systemctl mask iio-sensor-proxy.service 2>/dev/null \
-    && logger -t meetingbox-kiosk "orientation: masked iio-sensor-proxy" \
-    || true
-fi
-
-# Lock GNOME orientation if gsettings is available (covers gnome-settings-daemon auto-rotation).
-if command -v gsettings >/dev/null 2>&1; then
-  gsettings set org.gnome.settings-daemon.peripherals.touchscreen orientation-lock true 2>/dev/null \
-    && logger -t meetingbox-kiosk "orientation: set gsettings orientation-lock=true" \
-    || true
 fi
 
 exit 0

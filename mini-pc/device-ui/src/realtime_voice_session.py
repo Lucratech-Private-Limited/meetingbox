@@ -6,16 +6,11 @@ Minimal, low-latency rebuild.
 Design:
 - Connect to wss://api.openai.com/v1/realtime with the ephemeral
   client_secret minted by the MeetingBox server.
-- Server VAD segments turns; the CLIENT decides what happens to them
-  (client-authority turn-taking). The session runs with
-  `create_response: false` and `interrupt_response: false`: at
-  input_audio_buffer.committed the client checks the turn's acoustic
-  evidence and either sends response.create (genuine speech) or
-  conversation.item.delete (phantom — echo/noise the server VAD
-  mis-segmented). A phantom therefore never creates a response, never
-  paints a bubble, and never pollutes the model's context. Latency cost
-  is one WS message (~no dead air); the evidence is already computed by
-  the time the commit event arrives.
+- Trust the server's semantic_vad for turn detection — server runs with
+  `create_response: true` and `interrupt_response: true`, so end-of-turn
+  and barge-in are handled at the source instead of being gated on a
+  second model hop (transcription + manual response.create on the
+  client). This removes ~0.5–1.5 s of dead air per turn.
 - Send ONE small session.update: nudge eagerness to "high" and enable
   user-audio transcription (used only for farewell detection). The
   server's full instructions, tools, voice, and audio format are left
@@ -23,31 +18,13 @@ Design:
 - Stream PCM16 mic audio at 24 kHz to input_audio_buffer.append.
 - Play model audio deltas through aplay; pipe writes run on a dedicated
   single-thread executor so they never block the WebSocket heartbeat.
-- On user speech_started with local speech evidence: hard-kill aplay so
-  the user hears themselves, not the assistant, and send response.cancel
-  (the client owns interruption — interrupt_response is off so a VAD
-  false-positive can never truncate a genuine answer).
+- On user speech_started: hard-kill aplay so the user hears themselves,
+  not the assistant. The server will cancel the in-flight response on
+  its own via interrupt_response.
 - On user transcript completion: if the text is a farewell, close the
   session. Otherwise the server creates the next response automatically.
 - On function-call output in response.done: invoke the backend tool via
   HTTP, post the result back, send response.create to continue.
-
-Turn speech-evidence layer (engine-agnostic, all paths):
-- Every frame sent up the wire is scored by a local VAD (adaptive noise
-  floor + WebRTC APM speech probability when AEC3 is live) at the single
-  uplink choke point. Final transcripts are accepted only when the turn's
-  audio actually carried speech — otherwise they are ASR hallucinations
-  ("it" / "hello" / ".") from a noise-committed turn and are dropped, with
-  the auto-created response cancelled. The same evidence gates barge-in: a
-  server speech_started only stops playback when the uplink recently
-  carried locally-verified speech. See _UplinkSpeechMonitor.
-- Echo-aware scoring: while assistant audio plays (plus a decay hangover)
-  the AEC's residual echo is both energetic and voice-like, so RMS vs the
-  ambient floor cannot arbitrate. Playback-time frames must instead reach
-  an absolute barge-in level AND dominate a learned residual-echo envelope
-  (the double-talk principle) before they count as speech evidence. This
-  stops the assistant's own leaked voice from validating phantom turns
-  ("The" / "Hi") or authorizing false self-interruptions.
 
 Echo / self-hearing handling depends on the resolved audio hardware:
 - Echo-isolated combined external mic+speaker puck (AudioDevicePair
@@ -74,7 +51,6 @@ import subprocess
 import sys
 import threading
 import time
-import wave
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
@@ -149,44 +125,6 @@ def _env_int(name: str, default: int, *, minimum: int | None = None, maximum: in
 _REALTIME_WS_HOST = "api.openai.com"
 _REALTIME_RATE = 24000
 
-# --- Uplink codec (mic -> server bandwidth) -------------------------------
-# The mic/AEC pipeline runs at 24 kHz PCM16 internally, but that is ~512 kbps
-# on the wire (base64'd), which is more sustained UPSTREAM than many real
-# connections can carry. When the uplink can't keep up, mic frames back up,
-# the server hears silence, and it closes the session on a keepalive timeout
-# (observed repeatedly during continuous email dictation on a ~0.4-1.1 Mbps
-# link). G.711 mu-law at 8 kHz is ~64 kbps (~6x smaller after base64) — the
-# standard low-bandwidth voice codec (telephone quality) — and fits in even a
-# marginal upstream with headroom. The DOWNLINK (assistant voice) is
-# unaffected and stays full quality. Only the mic->server leg is transcoded,
-# and only at the final wire step: AEC, live captions and the speech-evidence
-# monitor all still see the full 24 kHz audio.
-#   REALTIME_UPLINK_CODEC=g711_ulaw  # g711_ulaw (default) | pcm16
-# Deployments with guaranteed bandwidth can set pcm16 for pristine uplink.
-_REALTIME_UPLINK_CODEC = (
-    os.environ.get("REALTIME_UPLINK_CODEC", "g711_ulaw") or "g711_ulaw"
-).strip().lower()
-_G711_RATE = 8000
-
-# G.711 encoding uses the stdlib ``audioop`` (present in CPython 3.11; the
-# drop-in ``audioop-lts`` package restores it on 3.13+). We deliberately do NOT
-# hand-roll a mu-law encoder: it must be bit-exact with what the server's
-# decoder expects or speech comes through garbled, and matching audioop's
-# 16->14-bit handling exactly is error-prone. When audioop is unavailable we
-# simply keep the PCM16 uplink (correct, just higher bandwidth) rather than
-# risk sending mis-encoded audio.
-try:
-    import audioop as _audioop  # type: ignore
-except Exception:  # pragma: no cover - only on 3.13+ without audioop-lts
-    _audioop = None
-
-
-def _pcm16_to_ulaw(pcm16: bytes) -> bytes:
-    """Encode 16-bit mono PCM to G.711 mu-law bytes (1 byte/sample)."""
-    if not pcm16 or _audioop is None:
-        return b""
-    return _audioop.lin2ulaw(pcm16, 2)
-
 # Mic chunk duration. Smaller chunks help the server VAD see speech edges
 # sooner, but 5 ms (200 callbacks/s at 48 kHz capture) overwhelms the
 # asyncio executor on this hardware and produces persistent PortAudio
@@ -209,71 +147,9 @@ _APLAY_BUFFER_TIME_US = "70000"
 # response.created event arrives so we never silence a fresh response.
 _BARGE_IN_SUPPRESS_AUDIO_S = 0.4
 
-# A barge-in only means something while the assistant is ACTUALLY speaking.
-# In OS-AEC full-duplex we trust the server VAD, but the server re-fires
-# speech_started on the user's own trailing speech / residual-echo tail right
-# after each pause — with no audio playing. Forcing an interrupt for that
-# cancels the freshly-requested reply before it can speak, which is what makes
-# long dictation crawl (each pause commits a turn, the next syllable kills the
-# response). Require this much queued assistant audio before a server VAD blip
-# is allowed to force-cancel; below it there is nothing to barge into.
-_BARGE_IN_MIN_PLAYBACK_S = _env_float(
-    "REALTIME_BARGE_IN_MIN_PLAYBACK_S", 0.25, minimum=0.0, maximum=2.0
-)
-
-# After WE send response.create, the server takes up to ~1-2 s to acknowledge
-# with response.created (which is what sets _response_in_progress). During that
-# gap the response IS in flight but no flag reflects it yet, so a stray server
-# speech_started would be mis-read as "nothing to protect" and cancel the reply
-# before it ever speaks. Treat a freshly-requested response as protected for
-# this window; the assistant isn't audible yet, so a genuine barge-in loses
-# nothing (it re-interrupts once real audio starts).
-_RESPONSE_CREATE_PROTECT_S = 2.5
-
-# A response can stop streaming without ever sending response.done (e.g. the
-# realtime stream degrades / the proxy socket flaps mid-turn). _state then
-# stays "speaking" forever, which (a) keeps the AEC3 residual gate armed so
-# every mic frame is suppressed (the user is never heard) and (b) freezes the
-# UI pill on "talking". If assistant audio has fully drained and nothing has
-# extended it for this long while still "speaking", treat the turn as finished
-# so the mic reopens and the pill recovers. Comfortably longer than any natural
-# inter-sentence gap (audio playback keeps _assistant_audio_play_until ahead).
-_RESPONSE_STALL_RECOVERY_S = 4.0
-
 # Close the session if the user is silent (and we're not speaking) for
 # this many seconds. Matches the previous behavior.
 _SESSION_IDLE_CLOSE_S = 40.0
-
-# --- Dead-link (half-open connection) detection ---------------------------
-# A flaky uplink can lose its INBOUND half while the outbound half stays up:
-# TCP keeps ACKing our audio (frames flow, sends are fast) but OpenAI's events
-# never arrive. The WS ping/pong CANNOT catch this quickly — OpenAI legitimately
-# delays protocol pongs 5-15 s+ while generating, which is why ping_timeout had
-# to be raised to 120 s (a shorter timeout false-closed healthy mid-response
-# sessions). So a dead inbound link previously sat undetected for ~60 s until the
-# network itself reaped the zombie socket, stranding the user mid-conversation.
-#
-# The correct liveness signal is INBOUND DATA FLOW, not pings: a live-but-busy
-# server streams audio/transcription deltas continuously (sub-second), so
-# "time since the last server event" stays fresh; only a truly dead link goes
-# fully silent. We flag the link dead when we have been actively streaming mic
-# audio (so the server owes us SOMETHING — at minimum a speech_started) yet have
-# received nothing for this long. Guarded so a legitimate long dictation (server
-# already acked speech_started; a single utterance emits no further events until
-# speech_stopped) is never mistaken for a dead link — except past the hard cap,
-# which catches a link that dies mid-utterance so speech_stopped never comes.
-_DEAD_LINK_RECV_SILENCE_S = max(
-    3.0, float(os.environ.get("REALTIME_DEAD_LINK_S", "8") or "8")
-)
-_DEAD_LINK_HARD_S = max(_DEAD_LINK_RECV_SILENCE_S + 5.0, 30.0)
-# Inbound silence alone is NOT proof of a dead link: a silent user produces the
-# exact same signature (uplink trickling frames, server with nothing to say).
-# So when a silence threshold trips, VERIFY with a protocol ping before killing
-# the session — a healthy idle link pongs in well under a second; only a truly
-# dead link stays mute. Generous timeout because OpenAI can delay pongs several
-# seconds under load (though mid-generation the deltas keep recv_silence fresh,
-# so we rarely probe then).
-_DEAD_LINK_PING_TIMEOUT_S = 10.0
 
 # ── Device-driven morning-brief carousel walkthrough ───────────────────────
 # The Realtime model batches its navigate_device_ui calls (all three at once)
@@ -540,59 +416,32 @@ _LOCAL_BARGE_IN_SPIKE_ECHO_MAX_REF_RATIO = _env_float(
 _LOCAL_BARGE_IN_MIN_FRAMES = _env_int("REALTIME_BARGE_IN_MIN_FRAMES", 2, minimum=1, maximum=10)
 _LOCAL_BARGE_IN_PREROLL_S = _env_float("REALTIME_BARGE_IN_PREROLL_S", 0.18, minimum=0.0, maximum=0.5)
 
-# --- OS-grade acoustic echo cancellation (Windows Voice Capture DSP) ----------
+# --- OS-grade acoustic echo cancellation (the single Windows solution) --------
 # Drive the Windows "Voice Capture DSP" (CWMAudioAEC). It captures the mic AND
 # references the system render itself, returning a clean, echo-cancelled 16 kHz
-# mono stream. When live it becomes the mic SOURCE (source mode) instead of our
-# own PortAudio input stream.
-#
-# OFF by default (opt-in via REALTIME_OS_AEC=1). Source mode only emits mic
-# frames while the OS render clock ticks — we keep it clocking with a silent
-# "keep-alive" render stream — but under the playback start/stop churn of a real
-# session that clock stalls and the DSP stops delivering frames, so the mic goes
-# permanently deaf (observed: peak_rms collapses to ~48, then 60 s+ of zero
-# frames, then the realtime socket closes on a 90 s server-silence timeout).
-# The shipping EXE never used this path; it captured with a normal PortAudio
-# input stream (below), which delivers frames continuously regardless of
-# playback. Keep the DSP available for opt-in only.
+# mono stream — the desktop equivalent of the hardware AEC phone assistants use.
+# When live it becomes the mic source and we run true FULL-DUPLEX barge-in:
+# stream the cancelled mic continuously and let the server VAD +
+# interrupt_response handle interruption. Windows-only; on the Linux appliance
+# (and any box where the DSP is unavailable) the Speex + local barge-in path
+# below is used instead.
 _OS_AEC_ENABLED = (
-    os.environ.get("REALTIME_OS_AEC", "0").strip().lower()
-    not in ("0", "false", "no", "off", "")
-)
-
-# Engine ordering on Windows: WebRTC AEC3 + WASAPI loopback FIRST, OS Voice
-# Capture DSP as fallback. This is the architecture ChatGPT/Gemini/Meet
-# actually ship: the echo canceller is PURE SOFTWARE (the same AEC3 code
-# Chrome runs), so its behavior is deterministic and identical on every
-# machine regardless of the audio chip or vendor driver. The OS DSP
-# (CWMAudioAEC) delegates cancellation quality to whatever DSP the driver
-# provides — measured on real hardware it leaks residual echo bursts of
-# RMS 400-2000 that defeat any downstream gate, and it exposes no internal
-# state (no speech probability, no ERLE) so the client is blind to what it
-# did. AEC3's known trade-offs (loopback onset blind window, FIFO drift)
-# are handled explicitly by the reference-blind gate and the residual gate,
-# and — unlike driver behavior — they are the same on every device.
-# Set REALTIME_PREFER_OS_AEC=1 to restore OS-DSP-first without a rebuild.
-_PREFER_OS_AEC = (
-    os.environ.get("REALTIME_PREFER_OS_AEC", "0").strip().lower()
+    os.environ.get("REALTIME_OS_AEC", "1").strip().lower()
     not in ("0", "false", "no", "off", "")
 )
 
 # Genuine WebRTC AEC3 (the echo canceller Chrome/Meet/Discord use) driven off a
 # real playback reference: WASAPI loopback on Windows, the app's own PCM on
-# macOS (see aec_reference.py). AEC3 only accepts 16/32/48 kHz; we run it at
-# 48 kHz (loopback's native rate) and downsample the cleaned near-end to the
-# 24 kHz uplink.
-#
-# OFF by default on desktop (opt-in via REALTIME_WEBRTC_AEC=1). The shipping
-# EXE — the fast, interactive build the product baselines against — used the
-# plain PortAudio mic + Speex AEC + local barge-in path below, NOT AEC3. Making
-# AEC3 the default engine (commit 457929e) raised the barge-in evidence bar so
-# normal-volume speech over a coupled laptop speaker/mic no longer interrupted,
-# which is the regression this restores. AEC3 remains available for opt-in
-# experiments but is no longer the default mic-processing engine.
+# macOS (see aec_reference.py). This is the PREFERRED desktop echo path — it is
+# device- and volume-agnostic (loopback is the post-mix speaker signal) and its
+# nonlinear residual suppressor gives full-duplex barge-in without muting or
+# energy heuristics. When live it becomes the mic-processing engine and we run
+# true full-duplex, superseding the OS DSP and Speex paths. Disable via
+# REALTIME_WEBRTC_AEC=0. AEC3 only accepts 16/32/48 kHz; we run it at 48 kHz
+# (loopback's native rate) and downsample the cleaned near-end to the 24 kHz
+# uplink.
 _WEBRTC_AEC_ENABLED = (
-    os.environ.get("REALTIME_WEBRTC_AEC", "0").strip().lower()
+    os.environ.get("REALTIME_WEBRTC_AEC", "1").strip().lower()
     not in ("0", "false", "no", "off", "")
 )
 _AEC3_RATE = 48000
@@ -617,22 +466,6 @@ _AEC3_RESIDUAL_GATE_ENABLED = (
 _AEC3_GATE_FAR_ACTIVE_RMS = _env_float(
     "REALTIME_AEC3_GATE_FAR_ACTIVE_RMS", 200.0, minimum=1.0
 )
-# Keep "assistant is still effectively playing" armed briefly after far-end RMS
-# dips below the active threshold. This avoids flicker around the tail and
-# blocks residual echo bursts that otherwise sneak through as one-token turns.
-_AEC3_GATE_FAR_ACTIVE_HANGOVER_S = _env_float(
-    "REALTIME_AEC3_GATE_FAR_ACTIVE_HANGOVER_S", 0.45, minimum=0.0, maximum=2.0
-)
-# Post-playback echo-suppression cooldown, driven by our own (reliable) render
-# clock rather than loopback RMS. Room resonance / decaying echo of the last
-# words keeps arriving at the mic for ~1-1.5 s after playback ends, well above
-# the VAD floor — this is the exact tail that leaks phantom end-of-turn words
-# (e.g. "glad"). Production native voice apps (and Google's Gemini guidance)
-# hold mic suppression for this long after the assistant stops. Real, clearly
-# dominant user speech still barges in via the elevated double-talk threshold.
-_AEC3_GATE_COOLDOWN_S = _env_float(
-    "REALTIME_AEC3_GATE_COOLDOWN_S", 1.2, minimum=0.3, maximum=3.0
-)
 # Absolute near-end RMS floor a frame must clear to count as real speech while
 # the assistant is playing. Genuine speech is ~1500-5000; post-AEC echo residual
 # is far lower, so this cleanly separates them.
@@ -643,16 +476,6 @@ _AEC3_GATE_MIN_RMS = _env_float(
 _AEC3_GATE_FLOOR_RATIO = _env_float(
     "REALTIME_AEC3_GATE_FLOOR_RATIO", 3.0, minimum=1.2
 )
-# ERLE-aware term: post-AEC residual echo scales with the far-end (playback)
-# level, and spikes higher while AEC3 is re-converging (which happens on every
-# playback abort/restart). So the double-talk threshold must scale with the
-# current far-end RMS, not stay fixed -- otherwise loud-playback residual bursts
-# clear a fixed floor and leak one-token phantoms ("it"/"the"). A frame must
-# exceed this fraction of the far-end RMS to count as genuine near-end speech.
-# Set to 0 to disable the far-proportional term.
-_AEC3_GATE_FAR_LEAK_RATIO = _env_float(
-    "REALTIME_AEC3_GATE_FAR_LEAK_RATIO", 0.12, minimum=0.0, maximum=1.0
-)
 # Keep the gate open this long after the last speech frame (natural pauses).
 _AEC3_GATE_HANGOVER_S = _env_float(
     "REALTIME_AEC3_GATE_HANGOVER_S", 0.4, minimum=0.0, maximum=2.0
@@ -660,85 +483,6 @@ _AEC3_GATE_HANGOVER_S = _env_float(
 # Preroll flushed when the gate opens so a real barge-in's first syllable is kept.
 _AEC3_GATE_PREROLL_S = _env_float(
     "REALTIME_AEC3_GATE_PREROLL_S", 0.15, minimum=0.0, maximum=0.5
-)
-# A single post-AEC frame can spike above the threshold from a transient
-# residual-echo burst. Real speech sustains for many consecutive frames, so
-# require this many above-threshold frames in a row before opening the gate.
-# The held onset frames sit in the preroll and are flushed intact on confirm,
-# so genuine barge-in loses no audio (only ~this-many-frames of latency).
-_AEC3_GATE_CONSEC_FRAMES = _env_int(
-    "REALTIME_AEC3_GATE_CONSEC_FRAMES", 3, minimum=1, maximum=20
-)
-# If a tiny transcript slips through while assistant audio is still playing
-# (or in the immediate playback tail), treat it as likely echo-phantom and drop
-# it client-side before it can trigger a bogus assistant reply.
-_AEC3_PHANTOM_TRANSCRIPT_TAIL_S = _env_float(
-    "REALTIME_AEC3_PHANTOM_TRANSCRIPT_TAIL_S", 1.0, minimum=0.0, maximum=3.0
-)
-# Recent local near-end evidence window. Server VAD can still false-trigger on
-# residual echo at playback onset on some laptop paths; only trust instantaneous
-# speech_started interruptions when we have local near-end evidence above this
-# adaptive floor in the immediate past.
-_AEC3_SPEECH_EVIDENCE_WINDOW_S = _env_float(
-    "REALTIME_AEC3_SPEECH_EVIDENCE_WINDOW_S", 1.2, minimum=0.2, maximum=4.0
-)
-_AEC3_SPEECH_EVIDENCE_RATIO = _env_float(
-    "REALTIME_AEC3_SPEECH_EVIDENCE_RATIO", 0.55, minimum=0.2, maximum=1.0
-)
-_AEC3_SPEECH_EVIDENCE_MIN_RMS = _env_float(
-    "REALTIME_AEC3_SPEECH_EVIDENCE_MIN_RMS",
-    220.0 if IS_DESKTOP else 320.0,
-    minimum=80.0,
-)
-
-# --- Residual-echo uplink gate for the Windows OS Voice Capture DSP path ------
-# The OS DSP (CWMAudioAEC) cancels the assistant's echo at the source, but like
-# every canceller it leaves ~30-40 dB ERLE, so a little residual survives on
-# loud playback. The OS-DSP path streams the mic to OpenAI CONTINUOUSLY, so that
-# residual reaches the server VAD and gets hallucinated into a stray one-word
-# "turn" ("Hello"/"Sure"/"the") mid-playback. This gate closes that hole using
-# the SAME double-talk logic as the AEC3 gate, but driven by our own RELIABLE
-# render clock (audio_playback_remaining_s) instead of a loopback far-reference —
-# so it has none of the loopback onset-blind-window / clock-drift problems that
-# made the AEC3 gate fragile. While the assistant is playing, a mic frame is
-# forwarded only when its RMS clearly exceeds the adaptive residual-echo floor
-# (genuine double-talk / real barge-in); otherwise it is withheld so residual
-# echo can never reach the server. When the assistant is silent the gate is
-# fully open — normal user turns are never touched. Disable via
-# REALTIME_OS_DSP_RESIDUAL_GATE=0.
-_OS_DSP_GATE_ENABLED = (
-    os.environ.get("REALTIME_OS_DSP_RESIDUAL_GATE", "1").strip().lower()
-    not in ("0", "false", "no", "off", "")
-)
-# Absolute near-end RMS floor a frame must clear to count as real speech while
-# the assistant is playing (safety net for when the residual floor is ~0).
-_OS_DSP_GATE_MIN_RMS = _env_float(
-    "REALTIME_OS_DSP_GATE_MIN_RMS", 300.0, minimum=80.0
-)
-# A frame must also exceed the adaptive residual-echo floor by this ratio. The
-# adaptive floor is what makes the gate device-agnostic: it tracks whatever the
-# real residual level is on this machine, and genuine speech is many times louder.
-_OS_DSP_GATE_FLOOR_RATIO = _env_float(
-    "REALTIME_OS_DSP_GATE_FLOOR_RATIO", 3.0, minimum=1.2
-)
-# Require this many consecutive above-threshold frames before opening, so a
-# single transient residual spike can never open the gate. Held onset frames sit
-# in the preroll and flush intact on confirm, so no real audio is lost.
-_OS_DSP_GATE_CONSEC_FRAMES = _env_int(
-    "REALTIME_OS_DSP_GATE_CONSEC_FRAMES", 2, minimum=1, maximum=20
-)
-# Keep the gate open this long after the last speech frame (natural pauses).
-_OS_DSP_GATE_HANGOVER_S = _env_float(
-    "REALTIME_OS_DSP_GATE_HANGOVER_S", 0.8, minimum=0.0, maximum=3.0
-)
-# Hold the suppression window this long after the render clock goes idle, to
-# absorb the short decaying echo tail of the assistant's final words.
-_OS_DSP_GATE_COOLDOWN_S = _env_float(
-    "REALTIME_OS_DSP_GATE_COOLDOWN_S", 0.35, minimum=0.0, maximum=2.0
-)
-# Preroll flushed when the gate opens so a real barge-in's first syllable is kept.
-_OS_DSP_GATE_PREROLL_S = _env_float(
-    "REALTIME_OS_DSP_GATE_PREROLL_S", 0.3, minimum=0.0, maximum=0.6
 )
 
 # Live on-screen captions WHILE the user speaks. OpenAI's input transcription
@@ -752,112 +496,6 @@ _REALTIME_LIVE_CAPTION = (
     os.environ.get("REALTIME_LIVE_CAPTION", "1").strip().lower()
     not in ("0", "false", "no", "off", "")
 )
-
-# --- Turn speech-evidence layer (transcript validation + interrupt gating) ----
-# Structural fix for phantom transcripts: the transcription model (a Whisper
-# family model) HALLUCINATES short tokens ("it" / "hello" / ".") when the
-# server VAD commits a turn that contained no real speech — residual echo,
-# room noise, a breath. No amount of per-engine gate tuning can fully prevent
-# such commits, so we attach acoustic ground truth to every turn instead:
-# every frame actually sent up the wire is scored by a local VAD (adaptive
-# noise floor + the WebRTC APM's spectral speech probability when the AEC3
-# engine is live), and per-turn speech evidence is accumulated. A final
-# transcript is accepted ONLY when the turn's audio actually carried
-# speech-like energy; otherwise it is dropped as an ASR hallucination and the
-# auto-created response is cancelled. The same evidence stream gates
-# interruptions: a server speech_started only stops playback when the uplink
-# recently carried speech-like audio. This layer is engine-agnostic — it
-# observes the single uplink choke point, so it protects the OS-DSP, AEC3,
-# Speex and raw-mic paths identically, while the assistant is speaking AND
-# while it is idle. Disable via REALTIME_TURN_EVIDENCE=0.
-#
-# DESKTOP DEFAULT: OFF. The shipping Windows EXE — the fast, interactive
-# baseline the product is measured against — ran the server-driven model
-# (semantic_vad with create_response AND interrupt_response both true): the
-# server detected end-of-turn and generated the reply automatically. The
-# client-authority evidence layer (a manual response.create per turn plus
-# phantom excision) was added after the EXE and regressed responsiveness — when
-# the per-turn response.create stalls, the model never replies, the uplink goes
-# quiet, and the server closes the socket on a silence timeout mid-task
-# (observed: draft an email, ask for a change, then 75 s of dead air and a
-# server close). Half-duplex mic-muting during playback + Speex AEC already
-# suppress the echo phantoms this layer was built to catch, so on desktop we
-# default back to the EXE's server-driven turn-taking. The appliance (far-field
-# USB array, no chassis coupling) keeps the evidence layer on. Opt back in on
-# desktop with REALTIME_TURN_EVIDENCE=1.
-_TURN_EVIDENCE_ENABLED = (
-    os.environ.get("REALTIME_TURN_EVIDENCE", "0" if IS_DESKTOP else "1").strip().lower()
-    not in ("0", "false", "no", "off", "")
-)
-# Absolute RMS a frame must reach to ever count as speech. Deliberately LOW
-# (well under the residual gates' floors) so quiet-but-genuine speech still
-# registers as evidence — the adaptive floor ratio does the heavy lifting.
-_EVIDENCE_MIN_RMS = _env_float(
-    "REALTIME_EVIDENCE_MIN_RMS", 180.0 if IS_DESKTOP else 260.0, minimum=50.0
-)
-# A frame must also exceed the adaptive ambient-noise floor by this ratio.
-_EVIDENCE_FLOOR_RATIO = _env_float(
-    "REALTIME_EVIDENCE_FLOOR_RATIO", 2.5, minimum=1.2
-)
-# WebRTC APM spectral speech-probability bands (AEC3 path only): >= hi
-# upgrades a frame to speech even at modest energy; <= lo vetoes a
-# borderline-energy frame (residual echo bursts score near zero).
-_EVIDENCE_PROB_HI = _env_float("REALTIME_EVIDENCE_PROB_HI", 0.70, minimum=0.5, maximum=1.0)
-_EVIDENCE_PROB_LO = _env_float("REALTIME_EVIDENCE_PROB_LO", 0.20, minimum=0.0, maximum=0.5)
-# A turn whose uploaded audio carried less than this much speech-like signal
-# cannot have produced ANY genuine transcript — drop whatever text came back.
-_EVIDENCE_HARD_MIN_SPEECH_MS = _env_float(
-    "REALTIME_EVIDENCE_HARD_MIN_SPEECH_MS", 60.0, minimum=0.0, maximum=1000.0
-)
-# Short fragments (<= _EVIDENCE_SHORT_MAX_WORDS words) are the classic
-# hallucination shape; they additionally require this much speech evidence.
-# A genuinely spoken one-word answer ("yes", "confirm") carries 300+ ms of
-# voiced audio; acoustic transients (keyboard clacks, coughs, echo bursts)
-# that the ASR mislabels as words sit well under 200 ms.
-_EVIDENCE_SHORT_MIN_SPEECH_MS = _env_float(
-    "REALTIME_EVIDENCE_SHORT_MIN_SPEECH_MS", 250.0, minimum=0.0, maximum=2000.0
-)
-_EVIDENCE_SHORT_MAX_WORDS = _env_int(
-    "REALTIME_EVIDENCE_SHORT_MAX_WORDS", 2, minimum=1, maximum=6
-)
-# While the assistant's own audio is playing (or just stopped), uplink frames
-# ride on residual echo the AEC could not fully remove — RMS alone cannot
-# distinguish the assistant's leaked voice from the user's. Such frames only
-# count as speech evidence when they clearly DOMINATE the echo: at or above
-# this absolute RMS AND above the learned residual-echo envelope by the ratio
-# below. Genuine barge-in (the user talking over the assistant) passes both;
-# echo bursts leaking through the AEC do not.
-_EVIDENCE_PLAYBACK_MIN_RMS = _env_float(
-    "REALTIME_EVIDENCE_PLAYBACK_MIN_RMS", 1500.0, minimum=200.0
-)
-_EVIDENCE_PLAYBACK_FLOOR_RATIO = _env_float(
-    "REALTIME_EVIDENCE_PLAYBACK_FLOOR_RATIO", 2.5, minimum=1.2
-)
-# Echo-risk hangover after playback stops: covers the acoustic decay tail and
-# playback-clock skew (the clock can read zero a moment before the speaker
-# actually goes quiet). Frames inside this window still face the playback bar.
-_EVIDENCE_PLAYBACK_HANGOVER_S = _env_float(
-    "REALTIME_EVIDENCE_PLAYBACK_HANGOVER_S", 1.0, minimum=0.0, maximum=5.0
-)
-# While assistant audio is playing, a server speech_started only hard-stops
-# playback when the uplink carried speech evidence within this window.
-_EVIDENCE_INTERRUPT_WINDOW_S = _env_float(
-    "REALTIME_EVIDENCE_INTERRUPT_WINDOW_S", 1.5, minimum=0.3, maximum=5.0
-)
-# How far before the server's speech_started timestamp the evidence window
-# starts (covers VAD prefix padding + event network latency).
-_EVIDENCE_TURN_LOOKBACK_S = _env_float(
-    "REALTIME_EVIDENCE_TURN_LOOKBACK_S", 1.0, minimum=0.0, maximum=5.0
-)
-
-# --- Audio pipeline debug taps -------------------------------------------------
-# When REALTIME_AUDIO_DEBUG_DIR is set, the session records two WAV files per
-# session: the raw mic capture (pre-resample, at the native rate) and the
-# exact 24 kHz uplink audio sent to OpenAI (post-AEC, post-gates). Combined
-# with the VOICE_EVENT turn audits this makes "why did it transcribe X?"
-# measurable offline instead of subjective. Capped to keep disk bounded.
-_AUDIO_DEBUG_DIR = os.environ.get("REALTIME_AUDIO_DEBUG_DIR", "").strip()
-_AUDIO_DEBUG_MAX_S = _env_float("REALTIME_AUDIO_DEBUG_MAX_S", 300.0, minimum=10.0)
 
 
 # ---------------------------------------------------------------------------
@@ -1148,250 +786,6 @@ class _AntiAliasResampler:
         return (np.clip(out, -1.0, 1.0) * 32767.0).astype(np.int16).tobytes()
 
 
-class _UplinkSpeechMonitor:
-    """Acoustic speech-evidence tracker for the audio actually sent to the server.
-
-    Observes every frame at the uplink choke point (post-AEC, post-gates) and
-    scores it against an adaptive ambient-noise floor, optionally refined by
-    the WebRTC APM's spectral speech probability. The per-frame decisions are
-    retained in a short rolling window so the session can ask two questions
-    with real acoustic ground truth:
-
-      * ``stats_since(ts)`` — how much speech-like audio did the current turn
-        actually carry? Used to validate final transcripts: a committed turn
-        with (near-)zero speech evidence cannot have produced a genuine
-        transcript, so whatever text the ASR returned is a hallucination.
-      * ``recent_speech(window)`` — did the uplink carry speech-like audio in
-        the immediate past? Used to gate interruptions: a server
-        ``speech_started`` that no locally-observed speech can explain is an
-        echo/noise artifact and must not stop playback.
-
-    Echo awareness: RMS against the ambient floor is meaningless while the
-    assistant's own audio is playing — residual echo that survives the AEC is
-    energetic AND spectrally speech-like (it IS a voice: the assistant's).
-    Frames observed during playback (plus a decay hangover) therefore face a
-    dedicated bar: they must reach an absolute barge-in level and dominate a
-    separately-learned residual-echo envelope. This is the double-talk
-    principle: only near-end audio that overpowers the echo path counts.
-
-    Engine-agnostic by design: identical behavior on the OS-DSP, AEC3, Speex
-    and raw-mic paths, while the assistant is speaking and while it is idle.
-    Single-threaded (asyncio loop) — no locking needed.
-    """
-
-    def __init__(
-        self,
-        *,
-        rate: int = _REALTIME_RATE,
-        min_rms: float = _EVIDENCE_MIN_RMS,
-        floor_ratio: float = _EVIDENCE_FLOOR_RATIO,
-        prob_hi: float = _EVIDENCE_PROB_HI,
-        prob_lo: float = _EVIDENCE_PROB_LO,
-        playback_min_rms: float = _EVIDENCE_PLAYBACK_MIN_RMS,
-        playback_floor_ratio: float = _EVIDENCE_PLAYBACK_FLOOR_RATIO,
-        retain_s: float = 12.0,
-    ) -> None:
-        self._rate = int(rate)
-        self._min_rms = float(min_rms)
-        self._floor_ratio = float(floor_ratio)
-        self._prob_hi = float(prob_hi)
-        self._prob_lo = float(prob_lo)
-        self._playback_min_rms = float(playback_min_rms)
-        self._playback_floor_ratio = float(playback_floor_ratio)
-        self._retain_s = float(retain_s)
-        self._noise_floor = 0.0
-        # Envelope of residual echo observed while the assistant plays: a
-        # decaying peak-tracker, learned only from playback-time frames that
-        # did NOT qualify as speech. Genuine barge-in must beat it.
-        self._echo_env = 0.0
-        self._last_speech_at = 0.0
-        # (monotonic_ts, duration_ms, rms, is_speech, echo_risk) per frame.
-        self._frames: deque[tuple[float, float, float, bool, bool]] = deque()
-
-    @property
-    def noise_floor(self) -> float:
-        return self._noise_floor
-
-    @property
-    def echo_env(self) -> float:
-        return self._echo_env
-
-    @property
-    def last_speech_at(self) -> float:
-        return self._last_speech_at
-
-    def observe(
-        self,
-        pcm16: bytes,
-        *,
-        speech_prob: float | None = None,
-        echo_risk: bool = False,
-        echo_active: bool = False,
-        now: float | None = None,
-    ) -> bool:
-        """Score one uplink frame; returns True when it looks like speech.
-
-        ``echo_risk`` marks frames captured while the assistant's audio was
-        playing (or within its decay hangover): they must clear the stricter
-        playback bar before counting as speech evidence.
-
-        ``echo_active`` marks frames captured while the speaker is ACTUALLY
-        emitting audio right now (playback clock / loopback says so). Only
-        these frames may teach the residual-echo envelope: during the
-        post-playback hangover there is no echo source, so any energy is
-        ambient or the user — learning it into the envelope would teach the
-        envelope the user's own voice and lock them out.
-        """
-        if not pcm16:
-            return False
-        echo_risk = echo_risk or echo_active
-        samples = np.frombuffer(pcm16, dtype=np.int16)
-        if samples.size == 0:
-            return False
-        rms = float(np.sqrt(np.mean(samples.astype(np.float32) ** 2)))
-        dur_ms = (len(pcm16) / 2.0) / self._rate * 1000.0
-        floor = self._noise_floor
-        threshold = max(self._min_rms, floor * self._floor_ratio)
-        if echo_risk:
-            # Double-talk bar: absolute barge-in level AND dominance over the
-            # learned residual-echo envelope. Residual echo tracks its own
-            # envelope by definition, so it can never dominate it.
-            threshold = max(
-                threshold,
-                self._playback_min_rms,
-                self._echo_env * self._playback_floor_ratio,
-            )
-        is_speech = rms >= threshold
-        if speech_prob is not None and not echo_risk:
-            # Spectral refinement (AEC3 path), idle only: confident speech
-            # upgrades a modest-energy frame; confident non-speech vetoes a
-            # borderline energy spike. During playback the residual echo is
-            # itself a voice, so the spectral score cannot arbitrate and the
-            # energy dominance test above stands alone.
-            if speech_prob >= self._prob_hi and rms >= (self._min_rms * 0.5):
-                is_speech = True
-            elif speech_prob <= self._prob_lo and rms < (threshold * 2.0):
-                is_speech = False
-        ts = time.monotonic() if now is None else now
-        if is_speech:
-            self._last_speech_at = ts
-        elif echo_active:
-            # Learn the residual-echo envelope ONLY from frames captured while
-            # the speaker is truly emitting: fast attack (echo bursts raise it
-            # immediately), slow release (it outlasts gaps between TTS words).
-            if rms > self._echo_env:
-                self._echo_env = rms
-            else:
-                self._echo_env = (self._echo_env * 0.98) + (rms * 0.02)
-        elif echo_risk:
-            # Hangover tail: the strict bar still applies, but there is no
-            # echo source anymore — do not learn this energy into the echo
-            # envelope or the ambient floor (it may be the user starting to
-            # talk, or echo decay; neither is a stable reference).
-            self._echo_env *= 0.95
-        else:
-            # Adapt the ambient floor only from idle non-speech frames. Seed
-            # conservatively (never above the absolute minimum) so a session
-            # that opens mid-speech cannot poison the floor upward.
-            if floor <= 0.0:
-                self._noise_floor = min(rms, self._min_rms)
-            else:
-                self._noise_floor = (floor * 0.95) + (rms * 0.05)
-            # The echo envelope decays toward ambience while the assistant
-            # is silent so stale playback peaks don't gate the next turn.
-            self._echo_env *= 0.95
-        self._frames.append((ts, dur_ms, rms, is_speech, echo_risk))
-        cutoff = ts - self._retain_s
-        frames = self._frames
-        while frames and frames[0][0] < cutoff:
-            frames.popleft()
-        return is_speech
-
-    def stats_since(self, since_ts: float) -> dict:
-        """Aggregate evidence for frames observed at/after ``since_ts``."""
-        speech_ms = 0.0
-        total_ms = 0.0
-        peak_rms = 0.0
-        echo_risk_ms = 0.0
-        for ts, dur_ms, rms, is_speech, echo_risk in self._frames:
-            if ts < since_ts:
-                continue
-            total_ms += dur_ms
-            if is_speech:
-                speech_ms += dur_ms
-            if echo_risk:
-                echo_risk_ms += dur_ms
-            if rms > peak_rms:
-                peak_rms = rms
-        return {
-            "speech_ms": round(speech_ms, 1),
-            "total_ms": round(total_ms, 1),
-            "peak_rms": round(peak_rms, 1),
-            "noise_floor": round(self._noise_floor, 1),
-            "echo_risk_ms": round(echo_risk_ms, 1),
-            "echo_env": round(self._echo_env, 1),
-        }
-
-    def recent_speech(self, window_s: float, *, now: float | None = None) -> bool:
-        """True when speech-like audio was observed within ``window_s``."""
-        if self._last_speech_at <= 0.0:
-            return False
-        ts = time.monotonic() if now is None else now
-        return (ts - self._last_speech_at) <= window_s
-
-    def reset(self) -> None:
-        self._frames.clear()
-        self._noise_floor = 0.0
-        self._echo_env = 0.0
-        self._last_speech_at = 0.0
-
-
-class _DebugWavTap:
-    """Env-gated WAV recorder for offline pipeline debugging.
-
-    Bounded (``_AUDIO_DEBUG_MAX_S``) so a long session can never fill the
-    disk; failures degrade to a no-op and never touch the audio path.
-    """
-
-    def __init__(self, path: str, rate: int, max_seconds: float = _AUDIO_DEBUG_MAX_S) -> None:
-        self._rate = int(rate)
-        self._max_bytes = int(rate * 2 * max_seconds)
-        self._written = 0
-        self._wf = None
-        try:
-            parent = os.path.dirname(path)
-            if parent:
-                os.makedirs(parent, exist_ok=True)
-            wf = wave.open(path, "wb")
-            wf.setnchannels(1)
-            wf.setsampwidth(2)
-            wf.setframerate(self._rate)
-            self._wf = wf
-            logger.info("Realtime audio debug tap: recording %s", path)
-        except Exception:
-            logger.debug("debug wav tap open failed: %s", path, exc_info=True)
-            self._wf = None
-
-    def write(self, pcm16: bytes) -> None:
-        wf = self._wf
-        if wf is None or not pcm16 or self._written >= self._max_bytes:
-            return
-        try:
-            wf.writeframes(pcm16)
-            self._written += len(pcm16)
-        except Exception:
-            self._wf = None
-
-    def close(self) -> None:
-        wf = self._wf
-        self._wf = None
-        if wf is not None:
-            try:
-                wf.close()
-            except Exception:
-                pass
-
-
 # ---------------------------------------------------------------------------
 # RealtimeVoiceSession
 # ---------------------------------------------------------------------------
@@ -1431,7 +825,6 @@ class RealtimeVoiceSession:
         on_ai_transcript_delta=None,
         on_user_speech_stopped=None,
         on_user_speech_started=None,
-        on_user_transcript_rejected=None,
         on_email_draft=None,
         on_email_view=None,
         on_recipient_picker=None,
@@ -1468,7 +861,6 @@ class RealtimeVoiceSession:
         self._on_ai_transcript_delta_cb = on_ai_transcript_delta
         self._on_user_speech_stopped_cb = on_user_speech_stopped
         self._on_user_speech_started_cb = on_user_speech_started
-        self._on_user_transcript_rejected_cb = on_user_transcript_rejected
         self._on_email_draft_cb = on_email_draft
         self._on_email_view_cb  = on_email_view
         self._on_recipient_picker_cb = on_recipient_picker
@@ -1559,31 +951,10 @@ class RealtimeVoiceSession:
         self._connected_fired = False
         self._user_ended = False
 
-        # Mic input.
-        # Buffer only ~2 s of mic audio (drop-oldest when full — see
-        # _mic_callback). A deeper buffer (the old 8 s) is actively harmful for
-        # a realtime stream: when the uplink briefly can't keep up it lets the
-        # backlog snowball into a multi-second STALE burst that never catches
-        # up, so the server hears a growing gap and closes the session. Keeping
-        # the queue shallow means a slow link drops the oldest frames and we
-        # always send near-live audio.
-        self._audio_q: queue.Queue[bytes | None] = queue.Queue(maxsize=100)
+        # Mic input
+        self._audio_q: queue.Queue[bytes | None] = queue.Queue(maxsize=400)
         self._mic_stream = None
         self._mic_native_sr = _REALTIME_RATE
-        # Uplink transcode (24 kHz PCM16 internal -> G.711 mu-law 8 kHz on the
-        # wire) when REALTIME_UPLINK_CODEC=g711_ulaw. Stateful anti-alias
-        # downsampler, created once per session; None when sending raw PCM16.
-        _g711_requested = _REALTIME_UPLINK_CODEC in ("g711_ulaw", "g711", "pcmu", "ulaw")
-        self._uplink_g711 = _g711_requested and _audioop is not None
-        if _g711_requested and _audioop is None:
-            logger.warning(
-                "Realtime uplink: g711_ulaw requested but 'audioop' is "
-                "unavailable (Python 3.13+ without audioop-lts) — falling back "
-                "to PCM16 uplink (higher bandwidth)."
-            )
-        self._uplink_resampler: _AntiAliasResampler | None = (
-            _AntiAliasResampler(_REALTIME_RATE, _G711_RATE) if self._uplink_g711 else None
-        )
         # Anti-aliased desktop downsampler (built lazily in _pump_mic once the
         # actual capture rate is known). None on the appliance / when no
         # resampling is needed.
@@ -1673,31 +1044,16 @@ class RealtimeVoiceSession:
         # the mic pump downsamples the cleaned output to the 24 kHz uplink.
         self._aec3 = None
         self._far_ref = None
-        # True when the render tap in PcmStreamPlayer feeds the far reference
-        # (device-paced ground truth); _play_delta must then not double-feed.
-        self._far_ref_via_player = False
         self._aec3_full_duplex = False
         self._aec3_in_resampler: _AntiAliasResampler | None = None   # mic -> 48k
         self._aec3_out_resampler: _AntiAliasResampler | None = None  # 48k -> 24k
         # Residual-echo uplink gate state (AEC3 path).
         self._aec3_gate_open_until = 0.0
-        self._aec3_far_active_until = 0.0
         self._aec3_residual_floor = 0.0
-        self._aec3_recent_speech_evidence_until = 0.0
-        self._aec3_gate_consecutive = 0
         self._aec3_gate_preroll: deque[bytes] = deque()
         self._aec3_gate_preroll_bytes = 0
         self._aec3_gate_suppressed = 0
         self._aec3_gate_last_log = 0.0
-        # Residual-echo uplink gate state (Windows OS Voice Capture DSP path).
-        self._os_dsp_gate_open_until = 0.0
-        self._os_dsp_gate_active_until = 0.0
-        self._os_dsp_gate_floor = 0.0
-        self._os_dsp_gate_consecutive = 0
-        self._os_dsp_gate_preroll: deque[bytes] = deque()
-        self._os_dsp_gate_preroll_bytes = 0
-        self._os_dsp_gate_suppressed = 0
-        self._os_dsp_gate_last_log = 0.0
         self._webrtc_aec_available = False
         try:
             if not (_WEBRTC_AEC_ENABLED and IS_DESKTOP):
@@ -1723,46 +1079,13 @@ class RealtimeVoiceSession:
                     self._webrtc_aec_available = True
                     logger.info(
                         "Realtime AEC: WebRTC AEC3 engine available "
-                        "(will use AEC3 + app render-feed far-end reference, "
-                        "full-duplex)"
+                        "(will use AEC3 + %s far-end reference, full-duplex)",
+                        "WASAPI loopback" if aec_reference._IS_WIN
+                        else "app-playback",
                     )
         except Exception:
             self._webrtc_aec_available = False
             logger.warning("WebRTC AEC3 availability probe failed", exc_info=True)
-
-        # Unified per-turn speech-evidence tracker (see _UplinkSpeechMonitor).
-        # Observes every uploaded frame; validates transcripts and gates
-        # interruptions with real acoustic evidence on every engine path.
-        self._speech_monitor: _UplinkSpeechMonitor | None = (
-            _UplinkSpeechMonitor() if _TURN_EVIDENCE_ENABLED else None
-        )
-        # Monotonic timestamp of the most recent server speech_started event —
-        # anchors the evidence window for the turn's transcript validation.
-        # Also keyed per item_id so back-to-back turns cannot cross-contaminate
-        # each other's evidence windows.
-        self._turn_started_at = 0.0
-        self._turn_started_by_item: dict[str, float] = {}
-        # Evidence snapshot frozen at input_audio_buffer.committed, keyed by
-        # item_id. Transcription completes 0.5-1.5 s AFTER the commit; if the
-        # user has already begun their next utterance by then, a live
-        # recomputation would count that new speech as evidence for the OLD
-        # turn and accept a phantom. The commit-time snapshot is the turn's
-        # true acoustic record — nothing after the commit belongs to it.
-        self._turn_commit_stats: dict[str, dict] = {}
-        # When the previous turn was committed: the current turn's evidence
-        # window must never reach back past it (the lookback padding would
-        # otherwise swallow the tail of the previous utterance).
-        self._last_turn_commit_at = 0.0
-        # Echo-risk hangover clock: uplink frames until this monotonic time
-        # face the stricter playback evidence bar (see _uplink_echo_risk).
-        self._playback_echo_risk_until = 0.0
-        # Conversation items excised as phantoms (deleted server-side). Any
-        # late transcription events for these items are dropped outright.
-        self._phantom_items: set[str] = set()
-        # Optional WAV debug taps (REALTIME_AUDIO_DEBUG_DIR); built in _pump_mic
-        # once the native capture rate is known.
-        self._debug_raw_tap: _DebugWavTap | None = None
-        self._debug_uplink_tap: _DebugWavTap | None = None
 
         # Live caption (on-device Vosk partials while the user speaks). Enabled
         # only when the feature flag is on AND a preloaded Vosk model was handed
@@ -1810,38 +1133,6 @@ class RealtimeVoiceSession:
         # State exposed to the UI / idle watchdog
         self._state = "idle"            # idle | listening | thinking | speaking
         self._response_in_progress = False
-        # True while a server-side tool call's HTTP round-trip is in flight
-        # (_handle_response_done -> invoke_realtime_tool_sync). During that
-        # window the OpenAI server legitimately sends NOTHING (it is waiting
-        # for our function_call_output), the recv loop is blocked awaiting the
-        # tool result (so _last_server_event_at freezes), and pongs are known
-        # to be slow — the dead-link watchdog must not treat this as a dead
-        # socket (a 30s+ assistant_intent email send would be killed mid-write).
-        self._tool_roundtrip_active = False
-        # response.done handling (which includes the tool HTTP round-trip) runs
-        # as a background task, NOT inline in _recv_loop: a slow tool call
-        # (36s assistant_intent email send) would otherwise block frame
-        # consumption, fill the websocket read buffer, pause the library's
-        # reader, leave the server's keepalive pings unanswered and get the
-        # connection killed BY OPENAI mid-send. The lock serializes handlers
-        # so tool outputs are still delivered in response order.
-        self._response_done_tasks: set = set()
-        self._response_done_lock = asyncio.Lock()
-        # Monotonic time we last sent response.create (see
-        # _RESPONSE_CREATE_PROTECT_S). Guards the create->created ack gap.
-        self._response_requested_at = 0.0
-        # Monotonic time we last received ANY frame from the realtime WS.
-        # Used to quantify mid-session stalls (loop starvation vs a truly
-        # silent server) in the close-reason log and the loop-lag heartbeat.
-        self._last_server_event_at = time.monotonic()
-        # --- Uplink-health diagnostics (see _loop_lag_monitor heartbeat) ------
-        # Distinguish the three stall classes we cannot tell apart from the
-        # existing logs: (a) event loop blocked, (b) outbound WS send stalled
-        # (network/backpressure — frames pile up in _audio_q, pongs can't go
-        # out -> server ping-timeout), (c) mic callback died (queue goes dry).
-        self._frames_sent = 0
-        self._last_frame_sent_at = time.monotonic()
-        self._max_send_dt = 0.0
         self._active_audio_item_id: str | None = None
         self._active_audio_content_index = 0
         self._last_activity_monotonic = time.monotonic()
@@ -1936,13 +1227,11 @@ class RealtimeVoiceSession:
         if cb:
             Clock.schedule_once(lambda _dt: self._safe_call(cb, state), 0)
 
-    def _emit_user_transcript(
-        self, text: str, is_final: bool = True, item_id: str = ""
-    ) -> None:
+    def _emit_user_transcript(self, text: str, is_final: bool = True) -> None:
         cb = self._on_user_transcript_cb
         if cb and text:
             Clock.schedule_once(
-                lambda _dt: self._safe_call(cb, text, is_final, item_id), 0
+                lambda _dt: self._safe_call(cb, text, is_final), 0
             )
 
     def _emit_ai_transcript(self, text: str) -> None:
@@ -1982,18 +1271,6 @@ class RealtimeVoiceSession:
         cb = self._on_user_speech_started_cb
         if cb:
             Clock.schedule_once(lambda _dt: self._safe_call(cb), 0)
-
-    def _emit_user_transcript_rejected(self, item_id: str = "") -> None:
-        """Fired when a turn's transcript was rejected as a phantom.
-
-        The UI uses this to remove the rejected turn's bubble — whether it
-        is still the "…" placeholder from speech_stopped or was already
-        painted by streaming partials — so a rejected turn leaves no trace
-        in the transcript.
-        """
-        cb = self._on_user_transcript_rejected_cb
-        if cb:
-            Clock.schedule_once(lambda _dt: self._safe_call(cb, item_id), 0)
 
     # ------------------------------------------------------------------
     # Live caption (on-device Vosk partials while the user speaks)
@@ -2713,37 +1990,12 @@ class RealtimeVoiceSession:
             env_dev = (os.getenv("MEETINGBOX_OUTPUT_DEVICE_INDEX") or "").strip()
             if env_dev.isdigit():
                 device = int(env_dev)
-            # Feed the AEC far-end reference straight from the device callback:
-            # the exact rendered block, at device pace, including the barge-in
-            # fade and the zero-fill silence — the ground-truth echo source.
-            far_ref = self._far_ref
-            on_pcm = None
-            if (
-                self._aec3_full_duplex
-                and far_ref is not None
-                and not getattr(far_ref, "active_capture", True)
-            ):
-                on_pcm = far_ref.feed_playback
             player = PcmStreamPlayer(
-                sample_rate=_REALTIME_RATE, channels=1, device=device,
-                on_pcm=on_pcm,
+                sample_rate=_REALTIME_RATE, channels=1, device=device
             )
             if not player.start():
                 logger.warning("Realtime: PortAudio playback sink unavailable")
                 return
-            self._far_ref_via_player = on_pcm is not None
-            if on_pcm is not None:
-                # The reference is now fed at device pace: enable its
-                # ride-height control (underrun re-prime + overrun trim +
-                # starvation flag) and top the silence cushion up so mic-side
-                # scheduling jitter drains the cushion instead of underrunning
-                # the ring (an underrun inserts zeros that shift the far
-                # timeline).
-                try:
-                    far_ref.device_paced = True
-                    far_ref.prime()
-                except Exception:
-                    pass
             self._win_player = player
             logger.info(
                 "Realtime PortAudio playback started (rate=%s device=%s)",
@@ -2827,20 +2079,10 @@ class RealtimeVoiceSession:
         # Skipped entirely when the OS AEC is the mic source: it cancels echo at
         # the source and never reads this ring, so filling it would just be
         # wasted work.
-        # AEC3 render-fed reference: normally the PcmStreamPlayer device
-        # callback feeds it the exact rendered blocks (_far_ref_via_player).
-        # Only feed from here as a fallback when no player tap is installed
-        # (e.g. the aplay path). Loopback references capture the speaker
-        # output themselves and ignore this feed.
-        if _USE_SD_PLAYBACK:
-            # Create the sink (and its render tap) before deciding whether to
-            # fall back, so the first chunk is not double-fed.
-            self._ensure_win_player()
-        if (
-            self._far_ref is not None
-            and not self._far_ref.active_capture
-            and not self._far_ref_via_player
-        ):
+        # AEC3 (macOS): hand the far-end reference the exact PCM we're about to
+        # play so it can cancel it from the mic. Windows loopback captures the
+        # real speaker output itself, so its reference ignores this feed.
+        if self._far_ref is not None and not self._far_ref.active_capture:
             try:
                 self._far_ref.feed_playback(raw)
             except Exception:
@@ -2905,48 +2147,6 @@ class RealtimeVoiceSession:
         with self._playback_clock_lock:
             self._assistant_audio_play_until = 0.0
             self._mute_mic_uplink_until = 0.0
-        # Playback is gone now, so there is no more echo to cancel or gate. If we
-        # left the AEC3 residual gate's far-active cooldown armed, it would keep
-        # the elevated echo-suppression threshold in force for up to a second and
-        # swallow the user's quieter syllables mid-utterance -> garbled/clipped
-        # transcripts. Release it immediately so the barge-in utterance streams
-        # cleanly (the cooldown still applies to natural turn-ends, which do not
-        # call _abort_aplay).
-        self._aec3_far_active_until = 0.0
-        self._aec3_gate_open_until = 0.0
-        self._aec3_gate_consecutive = 0
-        self._aec3_residual_floor = 0.0
-        # Same for the OS-DSP gate: once playback is aborted there is no more echo
-        # to suppress, so release the gate immediately for the barge-in utterance.
-        self._os_dsp_gate_active_until = 0.0
-        self._os_dsp_gate_open_until = 0.0
-        self._os_dsp_gate_consecutive = 0
-        self._os_dsp_gate_floor = 0.0
-        # Collapse the evidence layer's echo-risk window to a short decay tail.
-        # It was anchored to the pre-abort play-until clock, which could sit
-        # tens of seconds in the future; leaving it would score the user's
-        # NEXT utterances against the strict during-playback bar and reject
-        # them as phantoms (the post-barge-in "Can you hear me?" lockout).
-        self._playback_echo_risk_until = min(
-            self._playback_echo_risk_until,
-            time.monotonic() + _EVIDENCE_PLAYBACK_HANGOVER_S,
-        )
-        # Flush not-yet-consumed far-end reference audio: the render tap only
-        # feeds what actually played, but anything already sitting in the ring
-        # / engine buffer refers to audio the abort just discarded — consuming
-        # it later would misalign the reference against the mic.
-        if self._far_ref is not None and not getattr(
-            self._far_ref, "active_capture", True
-        ):
-            try:
-                self._far_ref.clear()
-            except Exception:
-                pass
-        if self._aec3 is not None:
-            try:
-                self._aec3.clear_far()
-            except Exception:
-                pass
         if _USE_SD_PLAYBACK:
             player = self._win_player
             self._win_player = None
@@ -3041,16 +2241,30 @@ class RealtimeVoiceSession:
                     self._safe_call(self._on_before_open_mic_cb)
                     await asyncio.sleep(0.01)
 
-                # OS Voice Capture DSP (CWMAudioAEC): only when explicitly
-                # preferred (REALTIME_PREFER_OS_AEC=1). Its cancellation
-                # quality is whatever the vendor audio driver provides —
-                # device-dependent by construction — so the default engine
-                # order runs software AEC3 first (below) and keeps this as
-                # the escape hatch / fallback. In source mode it opens the
-                # default communications mic itself, so we must NOT also
-                # open a PortAudio mic on the same device.
+                # PREFERRED: genuine WebRTC AEC3 driven by a real playback
+                # reference (WASAPI loopback / app-PCM). Opens a normal mic and
+                # cancels the assistant's echo in software with device- and
+                # volume-agnostic quality. When it goes live it becomes the mic
+                # engine, runs true full-duplex, and supersedes the OS DSP and
+                # Speex paths. Falls through cleanly if anything is unavailable.
+                aec3_live = False
+                if self._webrtc_aec_available:
+                    try:
+                        aec3_live = self._start_aec3_capture()
+                    except Exception:
+                        logger.debug("AEC3 capture start failed", exc_info=True)
+                        aec3_live = False
+                    if aec3_live:
+                        # AEC3 owns the mic; do not also start the OS DSP.
+                        self._os_aec = None
+
+                # Prefer the OS echo canceller. In source mode it opens the
+                # default communications mic itself and returns clean,
+                # echo-cancelled audio, so we must NOT also open a PortAudio mic
+                # on the same device. When it starts, it becomes the mic source,
+                # supersedes Speex, and we run full-duplex.
                 os_aec_live = False
-                if _PREFER_OS_AEC and self._os_aec is not None:
+                if not aec3_live and self._os_aec is not None:
                     try:
                         if self._os_aec.start():
                             os_aec_live = True
@@ -3076,80 +2290,15 @@ class RealtimeVoiceSession:
                                 "(device='%s')",
                                 self._os_aec.device_name,
                             )
-                            self._log_voice_event(
-                                "aec_engine",
-                                engine="windows_voice_capture_dsp",
-                                reference="os_shared_clock",
-                                aec_rate=self._mic_native_sr,
-                                mic_rate=self._mic_native_sr,
-                            )
                         else:
                             logger.warning(
                                 "Realtime AEC: OS AEC failed to start (%s); "
-                                "falling back to WebRTC AEC3 + loopback",
+                                "falling back to mic + Speex",
                                 self._os_aec.last_error,
                             )
                             self._os_aec = None
                     except Exception:
                         logger.debug("OS AEC start failed", exc_info=True)
-                        self._os_aec = None
-
-                # PREFERRED: genuine WebRTC AEC3 (the canceller Chrome/Meet/
-                # ChatGPT desktop use) driven by a real playback reference —
-                # WASAPI loopback on Windows (the post-mix signal the speaker
-                # actually renders), app-PCM on macOS. Pure software: identical
-                # deterministic behavior on every device regardless of audio
-                # chip or driver. Opens a normal mic and cancels the echo in
-                # software; when live it becomes the mic engine and runs
-                # full-duplex behind the residual gate, with the APM speech
-                # probability feeding the evidence layer.
-                aec3_live = False
-                if not os_aec_live and self._webrtc_aec_available:
-                    try:
-                        aec3_live = self._start_aec3_capture()
-                    except Exception:
-                        logger.debug("AEC3 capture start failed", exc_info=True)
-                        aec3_live = False
-                    if aec3_live:
-                        # AEC3 owns the mic; do not also start the OS DSP.
-                        self._os_aec = None
-
-                # FALLBACK: OS Voice Capture DSP, when AEC3 could not start
-                # (pywebrtc_audio missing, loopback capture failed, mic open
-                # failed at AEC3 rates).
-                if not aec3_live and not os_aec_live and self._os_aec is not None:
-                    try:
-                        if self._os_aec.start():
-                            os_aec_live = True
-                            self._os_aec_full_duplex = True
-                            self._mic_native_sr = 16000
-                            self._half_duplex = False
-                            if self._aec is not None:
-                                try:
-                                    self._aec.close()
-                                except Exception:
-                                    pass
-                                self._aec = None
-                            logger.info(
-                                "Realtime AEC: Windows Voice Capture DSP live "
-                                "(fallback) — device='%s'",
-                                self._os_aec.device_name,
-                            )
-                            self._log_voice_event(
-                                "aec_engine",
-                                engine="windows_voice_capture_dsp",
-                                reference="os_shared_clock",
-                                aec_rate=self._mic_native_sr,
-                                mic_rate=self._mic_native_sr,
-                            )
-                        else:
-                            logger.warning(
-                                "Realtime AEC: OS AEC fallback failed to start (%s)",
-                                self._os_aec.last_error,
-                            )
-                            self._os_aec = None
-                    except Exception:
-                        logger.debug("OS AEC fallback start failed", exc_info=True)
                         self._os_aec = None
 
                 if not aec3_live and not os_aec_live:
@@ -3192,7 +2341,6 @@ class RealtimeVoiceSession:
                 # against the idle budget (safety net for cold sessions).
                 self._touch()
                 idle_task = asyncio.create_task(self._idle_watchdog())
-                lag_task = asyncio.create_task(self._loop_lag_monitor())
 
                 # Warm session just woken: greet only after the local wake-word
                 # mic has been released and the Realtime mic is open. Speaking
@@ -3211,15 +2359,8 @@ class RealtimeVoiceSession:
                         pass
                     pump_task.cancel()
                     idle_task.cancel()
-                    lag_task.cancel()
-                    # In-flight response.done handlers (tool round-trips) die
-                    # with the session — their ws is closed anyway.
-                    done_tasks = list(self._response_done_tasks)
-                    for t in done_tasks:
-                        t.cancel()
                     await asyncio.gather(
-                        pump_task, idle_task, lag_task, *done_tasks,
-                        return_exceptions=True,
+                        pump_task, idle_task, return_exceptions=True
                     )
 
         except Exception as e:
@@ -3243,7 +2384,6 @@ class RealtimeVoiceSession:
                 except Exception:
                     pass
                 self._far_ref = None
-                self._far_ref_via_player = False
             if self._aec3 is not None:
                 try:
                     self._aec3.close()
@@ -3261,11 +2401,6 @@ class RealtimeVoiceSession:
                 except Exception:
                     pass
                 self._aec = None
-            for tap in (self._debug_raw_tap, self._debug_uplink_tap):
-                if tap is not None:
-                    tap.close()
-            self._debug_raw_tap = None
-            self._debug_uplink_tap = None
             self._emit_session_end()
 
     # ------------------------------------------------------------------
@@ -3585,28 +2720,11 @@ class RealtimeVoiceSession:
         except Exception:
             logger.debug("local barge-in response.cancel failed", exc_info=True)
 
-    async def _upload_resampled_audio(
-        self, ws, resampled: bytes, *, speech_prob: float | None = None
-    ) -> None:
+    async def _upload_resampled_audio(self, ws, resampled: bytes) -> None:
         if self._aec is not None:
             resampled = self._aec_process(resampled)
             if not resampled:
                 return
-        # Score the exact audio the server will hear (post-AEC, post-gates)
-        # against the local VAD so every committed turn has acoustic ground
-        # truth attached (transcript validation + interrupt gating).
-        if self._speech_monitor is not None:
-            try:
-                self._speech_monitor.observe(
-                    resampled,
-                    speech_prob=speech_prob,
-                    echo_risk=self._uplink_echo_risk(),
-                    echo_active=self._uplink_echo_active(),
-                )
-            except Exception:
-                logger.debug("speech monitor observe failed", exc_info=True)
-        if self._debug_uplink_tap is not None:
-            self._debug_uplink_tap.write(resampled)
         # Feed the same echo-cancelled PCM to the live-caption recognizer
         # (non-blocking; dropped if the side thread falls behind).
         if self._caption_q is not None:
@@ -3614,32 +2732,11 @@ class RealtimeVoiceSession:
                 self._caption_q.put_nowait(resampled)
             except queue.Full:
                 pass
-        # Transcode to the wire codec at the very last step. AEC, captions and
-        # the speech monitor above all consumed the full 24 kHz PCM16; only the
-        # bytes we actually upload are shrunk (G.711 mu-law 8 kHz ~= 1/6 the
-        # PCM16 bitrate), so a marginal upstream can sustain continuous speech.
-        if self._uplink_g711 and self._uplink_resampler is not None:
-            wire_bytes = _pcm16_to_ulaw(self._uplink_resampler.process(resampled))
-        else:
-            wire_bytes = resampled
-        if not wire_bytes:
-            return
-        payload = base64.b64encode(wire_bytes).decode("ascii")
-        _send_t0 = time.monotonic()
+        payload = base64.b64encode(resampled).decode("ascii")
         await ws.send(json.dumps({
             "type": "input_audio_buffer.append",
             "audio": payload,
         }))
-        _send_dt = time.monotonic() - _send_t0
-        self._frames_sent += 1
-        self._last_frame_sent_at = time.monotonic()
-        if _send_dt > self._max_send_dt:
-            self._max_send_dt = _send_dt
-        if _send_dt > 1.0:
-            logger.warning(
-                "Realtime uplink send stalled %.1fs (network/backpressure — "
-                "WS keepalive + audio uplink at risk)", _send_dt,
-            )
         self._touch()
 
     # ------------------------------------------------------------------
@@ -3655,94 +2752,6 @@ class RealtimeVoiceSession:
         np.clip(s, -32768.0, 32767.0, out=s)
         return s.astype(np.int16).tobytes()
 
-    def _os_dsp_gate_buffer_preroll(self, pcm16: bytes) -> None:
-        """Hold onset frames so a confirmed barge-in loses no leading audio."""
-        if _OS_DSP_GATE_PREROLL_S <= 0.0 or not pcm16:
-            return
-        self._os_dsp_gate_preroll.append(pcm16)
-        self._os_dsp_gate_preroll_bytes += len(pcm16)
-        max_bytes = int(_REALTIME_RATE * 2 * _OS_DSP_GATE_PREROLL_S)
-        while (
-            self._os_dsp_gate_preroll_bytes > max_bytes
-            and self._os_dsp_gate_preroll
-        ):
-            dropped = self._os_dsp_gate_preroll.popleft()
-            self._os_dsp_gate_preroll_bytes -= len(dropped)
-
-    def _os_dsp_gate_should_send(self, near_pcm16: bytes) -> bool:
-        """Render-clock double-talk gate for the Windows OS-DSP uplink.
-
-        The OS Voice Capture DSP cancels the assistant's echo at the source, but
-        residual survives on loud playback. Streamed continuously, that residual
-        trips the server VAD into a phantom one-word turn. While the assistant is
-        playing (per the reliable render clock) we withhold frames that merely
-        sit at the residual-echo floor and forward only genuine double-talk
-        (clearly louder than that floor), so residual echo never reaches the
-        server. When the assistant is silent the gate is fully open — normal user
-        turns are untouched. Unlike the AEC3 gate this needs no far-end signal:
-        the render clock alone tells us when echo is possible, which sidesteps the
-        loopback onset-blind-window and clock-drift that made the AEC3 gate fragile.
-        """
-        if not _OS_DSP_GATE_ENABLED:
-            return True
-        now = time.monotonic()
-        playback_active = (
-            self.audio_playback_remaining_s() > 0.03
-            or self._state == "speaking"
-        )
-        if playback_active:
-            self._os_dsp_gate_active_until = now + _OS_DSP_GATE_COOLDOWN_S
-        if now >= self._os_dsp_gate_active_until:
-            # Assistant effectively silent -> no echo risk; gate fully open.
-            self._os_dsp_gate_open_until = 0.0
-            self._os_dsp_gate_floor = 0.0
-            self._os_dsp_gate_consecutive = 0
-            if self._os_dsp_gate_preroll:
-                self._os_dsp_gate_preroll.clear()
-                self._os_dsp_gate_preroll_bytes = 0
-            return True
-        near_rms = self._pcm_rms(near_pcm16)
-        floor = self._os_dsp_gate_floor
-        threshold = max(_OS_DSP_GATE_MIN_RMS, floor * _OS_DSP_GATE_FLOOR_RATIO)
-        # Gate already open (recent sustained double-talk): keep passing frames
-        # through the hangover window so a real utterance flows across pauses.
-        if now < self._os_dsp_gate_open_until:
-            if near_rms >= threshold:
-                self._os_dsp_gate_open_until = now + _OS_DSP_GATE_HANGOVER_S
-            return True
-        if near_rms >= threshold:
-            self._os_dsp_gate_consecutive += 1
-            if self._os_dsp_gate_consecutive >= _OS_DSP_GATE_CONSEC_FRAMES:
-                self._os_dsp_gate_consecutive = 0
-                self._os_dsp_gate_open_until = now + _OS_DSP_GATE_HANGOVER_S
-                self._log_voice_event(
-                    "os_dsp_gate_opened",
-                    near_rms=round(near_rms, 1),
-                    threshold=round(threshold, 1),
-                )
-                return True
-            # Not yet confirmed — hold the onset frame in the preroll.
-            self._os_dsp_gate_buffer_preroll(near_pcm16)
-            return False
-        # Residual echo only: reset the run, adapt the floor from this real
-        # residual sample (fast initial seed, slow thereafter), buffer the
-        # preroll, and withhold. Never seed the floor from a speech-level frame.
-        self._os_dsp_gate_consecutive = 0
-        self._os_dsp_gate_floor = (
-            near_rms if floor <= 0.0 else (floor * 0.95) + (near_rms * 0.05)
-        )
-        self._os_dsp_gate_buffer_preroll(near_pcm16)
-        self._os_dsp_gate_suppressed += 1
-        if now - self._os_dsp_gate_last_log >= 2.0:
-            self._os_dsp_gate_last_log = now
-            self._log_voice_event(
-                "os_dsp_residual_gated",
-                near_rms=round(near_rms, 1),
-                threshold=round(threshold, 1),
-                suppressed=self._os_dsp_gate_suppressed,
-            )
-        return False
-
     def _aec3_gate_should_send(self, near_pcm24: bytes, far_pcm48: bytes) -> bool:
         """Residual-echo gate for the AEC3 uplink.
 
@@ -3755,121 +2764,35 @@ class RealtimeVoiceSession:
         """
         if not _AEC3_RESIDUAL_GATE_ENABLED:
             return True
-        now = time.monotonic()
         far_rms = self._pcm_rms(far_pcm48)
-        # Loopback references can trail the first playback chunks on some
-        # desktop routes. Use local playback clock/state as an additional
-        # "assistant is active" signal so onset residual cannot leak through
-        # before loopback RMS climbs.
-        playback_active = (
-            self.audio_playback_remaining_s() > 0.03
-            or self._state == "speaking"
-        )
-        # Arm the echo-suppression window. Prefer the reliable render clock: if
-        # the assistant is (or was just) playing, hold the window through a
-        # cooldown after the last playback frame so trailing room-resonance /
-        # decaying echo of the final words cannot reach the server VAD. Fall
-        # back to the far-end RMS (loopback) with only a short hangover when the
-        # render clock is idle, to absorb reference flicker around the tail.
-        if playback_active:
-            self._aec3_far_active_until = now + _AEC3_GATE_COOLDOWN_S
-        elif far_rms >= _AEC3_GATE_FAR_ACTIVE_RMS:
-            self._aec3_far_active_until = max(
-                self._aec3_far_active_until,
-                now + _AEC3_GATE_FAR_ACTIVE_HANGOVER_S,
-            )
-        if now >= self._aec3_far_active_until:
-            # Assistant effectively silent -> no echo risk; keep the gate open.
+        # Assistant effectively silent -> no echo risk; keep the gate wide open.
+        if far_rms < _AEC3_GATE_FAR_ACTIVE_RMS:
             self._aec3_gate_open_until = 0.0
             self._aec3_residual_floor = 0.0
-            self._aec3_gate_consecutive = 0
             if self._aec3_gate_preroll:
                 self._aec3_gate_preroll.clear()
                 self._aec3_gate_preroll_bytes = 0
             return True
         near_rms = self._pcm_rms(near_pcm24)
         floor = self._aec3_residual_floor
-        # ERLE-aware threshold: the higher of the absolute floor, an adaptive
-        # multiple of the measured residual floor, and a fraction of the current
-        # far-end level (residual echo scales with playback level, especially
-        # during AEC3 re-convergence). Genuine near-end speech clears all three;
-        # loud-playback residual bursts do not.
-        threshold = max(
-            _AEC3_GATE_MIN_RMS,
-            floor * _AEC3_GATE_FLOOR_RATIO,
-            far_rms * _AEC3_GATE_FAR_LEAK_RATIO,
-        )
-
-        # Gate already confirmed open (recent sustained double-talk): keep
-        # passing frames through the hangover window without re-confirming so a
-        # real utterance flows uninterrupted across natural pauses.
-        if now < self._aec3_gate_open_until:
-            if near_rms >= threshold:
-                self._aec3_gate_open_until = now + _AEC3_GATE_HANGOVER_S
-            return True
-
-        # AEC-blind guard: the assistant is playing but the reference has no
-        # signal (far_rms ~ 0). With no reference AEC3 cannot subtract
-        # anything, so whatever the mic hears right now is uncancellable echo
-        # we cannot verify. Drop it outright so raw playback echo can never
-        # reach the server transcriber. Two ways a reference goes blind:
-        #   * loopback captures (active_capture) lag playback onset or drop
-        #     out — always eligible;
-        #   * the render-fed ring just underran (consumer clock ran ahead of
-        #     the device tap) — eligible only while its starvation flag is
-        #     up. Outside starvation, render-fed far silence is ground truth
-        #     (a genuine pause between TTS words), and mic energy then may be
-        #     REAL user onset that must flow into the normal near-vs-residual
-        #     logic below, not be dropped.
-        reference_live = far_rms >= _AEC3_GATE_FAR_ACTIVE_RMS
-        reference_can_go_blind = bool(
-            getattr(self._far_ref, "active_capture", False)
-        ) or bool(getattr(self._far_ref, "starved_recently", False))
-        if playback_active and not reference_live and reference_can_go_blind:
-            self._aec3_gate_consecutive = 0
-            self._aec3_gate_suppressed += 1
-            if now - self._aec3_gate_last_log >= 2.0:
-                self._aec3_gate_last_log = now
-                self._log_voice_event(
-                    "aec3_reference_blind_gated",
-                    near_rms=round(near_rms, 1),
-                    far_rms=round(far_rms, 1),
-                    suppressed=self._aec3_gate_suppressed,
-                )
-            return False
-
+        threshold = max(_AEC3_GATE_MIN_RMS, floor * _AEC3_GATE_FLOOR_RATIO)
+        now = time.monotonic()
         if near_rms >= threshold:
-            # Candidate double-talk. A single above-threshold frame can be a
-            # transient residual-echo spike, so require several consecutive
-            # frames before opening the gate or recording speech evidence — a
-            # short echo burst can never trip a phantom turn or self-interrupt.
-            self._aec3_gate_consecutive += 1
-            if self._aec3_gate_consecutive >= _AEC3_GATE_CONSEC_FRAMES:
-                self._aec3_gate_consecutive = 0
-                self._aec3_gate_open_until = now + _AEC3_GATE_HANGOVER_S
-                self._aec3_recent_speech_evidence_until = (
-                    now + _AEC3_SPEECH_EVIDENCE_WINDOW_S
-                )
-                self._log_voice_event(
-                    "aec3_gate_opened",
-                    near_rms=round(near_rms, 1),
-                    far_rms=round(far_rms, 1),
-                    threshold=round(threshold, 1),
-                )
-                return True
-            # Not yet confirmed — hold the onset frame in the preroll so it is
-            # flushed intact once (and if) the gate confirms.
-            self._aec3_gate_buffer_preroll(near_pcm24)
-            return False
-
-        # Residual echo only: reset the run, seed/adapt the floor from real
-        # residual frames, buffer the preroll, and withhold the frame (never
-        # seed the floor from a speech-level sample).
-        self._aec3_gate_consecutive = 0
+            self._aec3_gate_open_until = now + _AEC3_GATE_HANGOVER_S
+            return True
+        if now < self._aec3_gate_open_until:
+            return True
+        # Residual echo only: seed/adapt the floor from real residual frames and
+        # withhold the frame (never seed the floor from a speech-level sample).
         self._aec3_residual_floor = (
             near_rms if floor <= 0.0 else (floor * 0.95) + (near_rms * 0.05)
         )
-        self._aec3_gate_buffer_preroll(near_pcm24)
+        self._aec3_gate_preroll.append(near_pcm24)
+        self._aec3_gate_preroll_bytes += len(near_pcm24)
+        budget = int(_REALTIME_RATE * 2 * _AEC3_GATE_PREROLL_S)
+        while self._aec3_gate_preroll_bytes > budget and len(self._aec3_gate_preroll) > 1:
+            dropped = self._aec3_gate_preroll.popleft()
+            self._aec3_gate_preroll_bytes -= len(dropped)
         self._aec3_gate_suppressed += 1
         if now - self._aec3_gate_last_log >= 2.0:
             self._aec3_gate_last_log = now
@@ -3881,247 +2804,6 @@ class RealtimeVoiceSession:
                 suppressed=self._aec3_gate_suppressed,
             )
         return False
-
-    def _aec3_gate_buffer_preroll(self, near_pcm24: bytes) -> None:
-        """Append a withheld near-end frame to the bounded gate preroll ring."""
-        self._aec3_gate_preroll.append(near_pcm24)
-        self._aec3_gate_preroll_bytes += len(near_pcm24)
-        budget = int(_REALTIME_RATE * 2 * _AEC3_GATE_PREROLL_S)
-        while self._aec3_gate_preroll_bytes > budget and len(self._aec3_gate_preroll) > 1:
-            dropped = self._aec3_gate_preroll.popleft()
-            self._aec3_gate_preroll_bytes -= len(dropped)
-
-    def _uplink_echo_risk(self, now: float | None = None) -> bool:
-        """Is the uplink currently at risk of carrying speaker echo?
-
-        True while the speaker is emitting audio (or within a decay hangover
-        after it stops). Two oracles, best available wins:
-
-          * Loopback ground truth (AEC3 path): ``_aec3_far_active_until`` is
-            driven by the measured RMS of the WASAPI loopback capture — the
-            post-mix signal the speaker is ACTUALLY rendering, including
-            system sounds and other apps' audio that the playback clock can
-            never see. This is authoritative.
-          * Playback-clock estimate (all paths): our own play-until clock plus
-            the "speaking" state. Kept as a floor because the loopback can be
-            briefly blind at onset, and it is the only oracle on the OS-DSP /
-            Speex paths.
-
-        Evidence frames observed inside this window face the stricter
-        double-talk bar in the monitor.
-        """
-        ts = time.monotonic() if now is None else now
-        try:
-            with self._playback_clock_lock:
-                play_until = self._assistant_audio_play_until
-        except Exception:
-            play_until = 0.0
-        # Anchor the hangover to when playback actually ends (the play-until
-        # clock), not to when this happened to be called — uplink frames are
-        # not guaranteed to flow continuously during playback (half-duplex
-        # withholds them entirely).
-        risk_until = self._playback_echo_risk_until
-        if play_until > 0.0:
-            risk_until = max(risk_until, play_until + _EVIDENCE_PLAYBACK_HANGOVER_S)
-        if self._state == "speaking":
-            risk_until = max(risk_until, ts + _EVIDENCE_PLAYBACK_HANGOVER_S)
-        if self._aec3_far_active_until > 0.0:
-            # Loopback heard real speaker output recently (any source).
-            risk_until = max(
-                risk_until,
-                self._aec3_far_active_until + _EVIDENCE_PLAYBACK_HANGOVER_S,
-            )
-        self._playback_echo_risk_until = risk_until
-        return ts <= risk_until
-
-    def _uplink_echo_active(self, now: float | None = None) -> bool:
-        """Is the speaker emitting audio RIGHT NOW (no hangover)?
-
-        Distinct from :meth:`_uplink_echo_risk`: this excludes the decay
-        hangover. Only frames captured inside this window are allowed to
-        teach the monitor's residual-echo envelope — outside it there is no
-        echo source, so the energy is ambient or the user's voice.
-        """
-        ts = time.monotonic() if now is None else now
-        if self._state == "speaking":
-            return True
-        try:
-            with self._playback_clock_lock:
-                if self._assistant_audio_play_until > ts:
-                    return True
-        except Exception:
-            pass
-        return self._aec3_far_active_until >= ts
-
-    def _turn_evidence_stats(
-        self, *, item_id: str | None = None, now: float | None = None
-    ) -> dict:
-        """Evidence aggregate for the current/most-recent user turn.
-
-        Once a turn has been committed, its evidence is FROZEN: the snapshot
-        taken at input_audio_buffer.committed is returned as-is. Transcription
-        finishes well after the commit, and any audio captured in between
-        belongs to the NEXT turn — recomputing live would let the user's next
-        utterance retroactively validate a phantom micro-turn.
-
-        For a not-yet-committed turn the window opens shortly before the
-        server's speech_started timestamp (covers VAD prefix padding + event
-        latency) but never before the previous turn's commit, so back-to-back
-        turns cannot cross-contaminate. When no speech_started was seen
-        (rare), fall back to a generous recent window.
-        """
-        if self._speech_monitor is None:
-            return {}
-        if item_id:
-            snapshot = self._turn_commit_stats.get(str(item_id))
-            if snapshot is not None:
-                return snapshot
-        ts = time.monotonic() if now is None else now
-        started_at = 0.0
-        if item_id:
-            started_at = self._turn_started_by_item.get(str(item_id), 0.0)
-        if started_at <= 0.0:
-            started_at = self._turn_started_at
-        if started_at > 0.0:
-            since = started_at - _EVIDENCE_TURN_LOOKBACK_S
-        else:
-            since = ts - 8.0
-        if self._last_turn_commit_at > 0.0:
-            since = max(since, self._last_turn_commit_at)
-        return self._speech_monitor.stats_since(since)
-
-    def _transcript_rejected_by_evidence(
-        self, text: str, *, item_id: str | None = None
-    ) -> tuple[bool, dict]:
-        """Validate a final transcript against the turn's acoustic evidence.
-
-        Returns (reject, stats). A transcript is rejected as an ASR
-        hallucination when the audio the server actually received for this
-        turn carried (near-)zero speech-like signal — the recognizer cannot
-        have genuinely heard words in it. Short fragments (the classic
-        hallucination shape: "it", "hello", ".") require a bit more evidence;
-        real one-word answers ("yes", "confirm") comfortably clear it.
-        Disabled paths (monitor off) never reject.
-        """
-        stats: dict = {}
-        if not _TURN_EVIDENCE_ENABLED or self._speech_monitor is None:
-            return False, stats
-        spoken = (text or "").strip()
-        if not spoken:
-            return False, stats
-        stats = self._turn_evidence_stats(item_id=item_id)
-        speech_ms = float(stats.get("speech_ms") or 0.0)
-        if speech_ms < _EVIDENCE_HARD_MIN_SPEECH_MS:
-            return True, stats
-        words = len(_normalize_words(spoken).split())
-        if words <= _EVIDENCE_SHORT_MAX_WORDS and speech_ms < _EVIDENCE_SHORT_MIN_SPEECH_MS:
-            return True, stats
-        return False, stats
-
-    def _client_turn_authority(self) -> bool:
-        """True when the client (not the server VAD) owns turn-taking.
-
-        With the evidence layer live, the session is configured with
-        create_response/interrupt_response OFF and the client decides — at
-        input_audio_buffer.committed, from acoustic evidence — whether a turn
-        deserves a response at all. A phantom turn is deleted from the
-        conversation before any response can exist, so the model never sees
-        or answers words that were never spoken.
-        """
-        return _TURN_EVIDENCE_ENABLED and self._speech_monitor is not None
-
-    def _turn_has_commit_evidence(self, stats: dict) -> bool:
-        """Commit-time go/no-go: did this turn carry ANY genuine speech?
-
-        Deliberately uses only the hard floor (not the stricter short-word
-        bar) so a genuine turn is never left unanswered; the transcript-level
-        validation still applies the finer rules once text exists.
-        """
-        return float(stats.get("speech_ms") or 0.0) >= _EVIDENCE_HARD_MIN_SPEECH_MS
-
-    async def _excise_phantom_turn(self, ws, item_id: str, *, source: str) -> None:
-        """Remove a phantom user turn from the server conversation.
-
-        Deleting the item (rather than merely cancelling a response) is what
-        keeps the model's context clean: the conversation history ends up
-        exactly as if the phantom had never happened, so later responses
-        cannot be steered by words nobody said.
-        """
-        if not item_id:
-            return
-        self._phantom_items.add(item_id)
-        while len(self._phantom_items) > 32:
-            self._phantom_items.pop()
-        try:
-            await ws.send(json.dumps({
-                "type": "conversation.item.delete",
-                "item_id": item_id,
-            }))
-            self._log_voice_event(
-                "phantom_turn_deleted", item_id=item_id, source=source
-            )
-        except Exception:
-            logger.debug("conversation.item.delete failed", exc_info=True)
-
-    def _has_interrupt_speech_evidence(self, now: float) -> bool:
-        """Should a server speech_started be allowed to interrupt the assistant?
-
-        True when the assistant has nothing in flight (no audible playback and
-        no response being generated — nothing to protect), or when the uplink
-        recently carried locally-verified speech (the same audio the server
-        VAD triggered on). A speech_started that no local speech evidence can
-        explain is residual echo / noise — cancelling playback or an in-flight
-        response for it is the false self-interruption bug.
-        """
-        protecting_output = (
-            self._response_in_progress
-            or self.audio_playback_remaining_s() > 0.05
-            or self._state == "speaking"
-            or (now - self._response_requested_at) < _RESPONSE_CREATE_PROTECT_S
-        )
-        if not protecting_output:
-            return True
-        if self._speech_monitor is None:
-            # Evidence layer disabled — preserve pre-existing behavior.
-            return not self._aec3_full_duplex or (
-                now <= self._aec3_recent_speech_evidence_until
-            )
-        # The monitor is the SOLE authority here: it observes every frame the
-        # server hears (including everything the AEC3 gate passed) and applies
-        # the echo-aware double-talk bar. The AEC3 gate's own "double-talk"
-        # opening must NOT override it — the gate opens on residual echo
-        # bursts during loopback drift (measured: near RMS ~860 vs bar 1500),
-        # and accepting it as interrupt evidence is what killed genuine
-        # responses mid-sentence.
-        return self._speech_monitor.recent_speech(
-            _EVIDENCE_INTERRUPT_WINDOW_S, now=now
-        )
-
-    def _should_drop_aec3_phantom_transcript(self, text: str) -> bool:
-        """Heuristic guard for tiny echo-only transcripts on AEC3 sessions.
-
-        AEC3 removes most echo, but on some laptop paths a tiny residual can
-        still trigger a server VAD micro-turn near assistant playback tail,
-        producing one-token transcripts like "." / "it" / "the". Drop only
-        those tiny fragments and only while assistant playback is still active
-        (or immediately after it).
-        """
-        spoken = (text or "").strip()
-        if not spoken:
-            return False
-        if not self._aec3_full_duplex:
-            return False
-        now = time.monotonic()
-        if now > (self._assistant_audio_play_until + _AEC3_PHANTOM_TRANSCRIPT_TAIL_S):
-            return False
-        # Keep potentially-short real barge-ins when local near-end evidence
-        # was recently observed.
-        if now <= self._aec3_recent_speech_evidence_until:
-            return False
-        norm = _normalize_words(spoken)
-        if not norm:
-            return True
-        return len(norm.split()) == 1
 
     def _drain_far(self, nbytes: int) -> None:
         """Drop ``nbytes`` from the FRONT of the AEC far-end ring.
@@ -4155,17 +2837,6 @@ class RealtimeVoiceSession:
             self._mic_resampler = _AntiAliasResampler(native_sr, _REALTIME_RATE)
         resampler = self._mic_resampler
 
-        if _AUDIO_DEBUG_DIR:
-            stamp = time.strftime("%Y%m%d_%H%M%S")
-            self._debug_raw_tap = _DebugWavTap(
-                os.path.join(_AUDIO_DEBUG_DIR, f"{stamp}_raw_mic_{native_sr}hz.wav"),
-                native_sr,
-            )
-            self._debug_uplink_tap = _DebugWavTap(
-                os.path.join(_AUDIO_DEBUG_DIR, f"{stamp}_uplink_{_REALTIME_RATE}hz.wav"),
-                _REALTIME_RATE,
-            )
-
         def _get() -> bytes:
             try:
                 return self._audio_q.get(timeout=_MIC_QUEUE_POLL_S)
@@ -4178,8 +2849,6 @@ class RealtimeVoiceSession:
                 break
             if not piece:
                 continue
-            if self._debug_raw_tap is not None:
-                self._debug_raw_tap.write(piece)
             try:
                 # WebRTC AEC3 full-duplex path (preferred desktop echo engine).
                 # Cancel the assistant's echo in software against the real
@@ -4200,14 +2869,6 @@ class RealtimeVoiceSession:
                         if self._aec3_out_resampler is not None else cleaned48
                     )
                     if cleaned24:
-                        # WebRTC APM's spectral VAD scored this exact frame —
-                        # feed it to the evidence monitor for better-than-RMS
-                        # speech decisions. Exactly 0.0 means the native module
-                        # does not expose the probability (wrapper fallback);
-                        # treat that as unavailable rather than "not speech".
-                        apm_prob = self._aec3.speech_probability
-                        if apm_prob <= 0.0:
-                            apm_prob = None
                         # Residual-echo gate: withhold echo-only frames so AEC3
                         # leftovers never trip the server VAD into a phantom
                         # turn; pass genuine speech (+ preroll) straight through.
@@ -4217,12 +2878,8 @@ class RealtimeVoiceSession:
                                 self._aec3_gate_preroll.clear()
                                 self._aec3_gate_preroll_bytes = 0
                                 for pf in preroll:
-                                    await self._upload_resampled_audio(
-                                        ws, pf, speech_prob=apm_prob
-                                    )
-                            await self._upload_resampled_audio(
-                                ws, cleaned24, speech_prob=apm_prob
-                            )
+                                    await self._upload_resampled_audio(ws, pf)
+                            await self._upload_resampled_audio(ws, cleaned24)
                     continue
 
                 if resampler is not None:
@@ -4239,19 +2896,7 @@ class RealtimeVoiceSession:
                 # heuristics, no mic muting. This is the phone/desktop
                 # voice-assistant model and the whole point of the OS canceller.
                 if self._os_aec_full_duplex:
-                    # Residual-echo gate: while the assistant is playing, withhold
-                    # frames that merely sit at the OS-DSP echo-residual floor so
-                    # leftover echo never trips the server VAD into a phantom
-                    # one-word turn; genuine speech (+ preroll) passes straight
-                    # through. Fully open when the assistant is silent.
-                    if self._os_dsp_gate_should_send(resampled):
-                        if self._os_dsp_gate_preroll:
-                            preroll = list(self._os_dsp_gate_preroll)
-                            self._os_dsp_gate_preroll.clear()
-                            self._os_dsp_gate_preroll_bytes = 0
-                            for pf in preroll:
-                                await self._upload_resampled_audio(ws, pf)
-                        await self._upload_resampled_audio(ws, resampled)
+                    await self._upload_resampled_audio(ws, resampled)
                     continue
 
                 # Desktop: once the server VAD has flagged user speech, trust it
@@ -4327,173 +2972,13 @@ class RealtimeVoiceSession:
     # Idle watchdog
     # ------------------------------------------------------------------
 
-    async def _loop_lag_monitor(self) -> None:
-        """Measure event-loop responsiveness on the realtime-voice thread.
-
-        This loop also services the WebSocket keepalive (ping/pong) and streams
-        mic audio. If a plain ``asyncio.sleep(1.0)`` returns significantly late,
-        the loop is being starved of CPU/GIL time — the prime suspect for
-        mid-session stalls (pings ACK late -> server drops us; uplink frames
-        stall -> the model hears silence). Logs only on significant lag so the
-        signal is unambiguous when correlating with a stall/close.
-        """
-        interval = 1.0
-        _hb_accum = 0.0
-        _hb_last_frames = self._frames_sent
-        while not self._stop.is_set():
-            t0 = time.monotonic()
-            await asyncio.sleep(interval)
-            lag = (time.monotonic() - t0) - interval
-            if lag >= 0.4:
-                logger.warning(
-                    "Realtime loop lag: sleep(%.1fs) overran by %.2fs "
-                    "(event loop starved — WS keepalive/audio uplink at risk)",
-                    interval, lag,
-                )
-            # Periodic uplink-health heartbeat. Because this coroutine shares the
-            # loop with the WS keepalive and the mic pump, its steady ticking
-            # PROVES the loop is alive. The deltas then localize any stall:
-            #   * frames advancing + server events stale  -> receive/server stall
-            #   * frames frozen + queue GROWING            -> outbound send stall
-            #   * frames frozen + queue EMPTY              -> mic callback died
-            _hb_accum += interval + max(0.0, lag)
-            if _hb_accum >= 8.0:
-                now = time.monotonic()
-                sent = self._frames_sent
-                try:
-                    qdepth = self._audio_q.qsize()
-                except Exception:
-                    qdepth = -1
-                logger.info(
-                    "Realtime uplink heartbeat: frames=%d (+%d/%.0fs) q=%d "
-                    "last_send=%.1fs ago last_server_evt=%.1fs ago "
-                    "max_send_dt=%.2fs state=%s",
-                    sent, sent - _hb_last_frames, _hb_accum, qdepth,
-                    now - self._last_frame_sent_at,
-                    now - self._last_server_event_at,
-                    self._max_send_dt, self._state,
-                )
-                _hb_accum = 0.0
-                _hb_last_frames = sent
-                self._max_send_dt = 0.0
-
     async def _idle_watchdog(self) -> None:
         ws = self._ws
         if ws is None:
             return
         while not self._stop.is_set():
             await asyncio.sleep(1.0)
-
-            # ---- Dead inbound link (half-open socket) ---------------------
-            # We are actively streaming mic audio but the server has returned
-            # NOTHING (no deltas, no VAD, no acks) for too long -> the inbound
-            # half of the socket is dead. Reconnect immediately instead of
-            # streaming into the void until the network reaps the zombie (~60 s).
-            # Closing as UNEXPECTED (we do NOT set _user_ended) lets the
-            # session-end handler re-arm the warm standby.
-            now = time.monotonic()
-            recv_silence = now - self._last_server_event_at
-            uplink_active = (now - self._last_frame_sent_at) <= 2.0
-            # `_caption_active` is True only between a server speech_started and
-            # its speech_stopped: during that window a long single utterance
-            # (dictation) legitimately produces no further server events, so we
-            # suppress the fast trip and rely on the hard cap.
-            in_acked_utterance = self._caption_active
-            # A tool call's HTTP round-trip is another known-quiet window: the
-            # server is waiting for OUR function_call_output, so it owes us no
-            # events at all (and the recv loop is blocked awaiting the tool
-            # result, freezing _last_server_event_at). A slow backend write
-            # (e.g. assistant_intent email send taking 30s+) must never be
-            # mistaken for a dead socket — suppress the check entirely; the
-            # tool HTTP call has its own 90s timeout bounding this window.
-            dead_link = (
-                uplink_active
-                and not self._tool_roundtrip_active
-                and (
-                    recv_silence >= _DEAD_LINK_HARD_S
-                    or (
-                        recv_silence >= _DEAD_LINK_RECV_SILENCE_S
-                        and not in_acked_utterance
-                    )
-                )
-            )
-            if dead_link:
-                # Silence threshold tripped — but that alone is only a
-                # suspicion (a user quietly thinking between turns looks
-                # identical). Confirm with a ws ping: pong -> link is alive,
-                # the silence is legitimate; no pong -> genuinely dead.
-                link_alive = False
-                try:
-                    pong_waiter = await ws.ping()
-                    await asyncio.wait_for(
-                        pong_waiter, timeout=_DEAD_LINK_PING_TIMEOUT_S
-                    )
-                    link_alive = True
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    link_alive = False
-                if link_alive:
-                    # Treat the pong as a server liveness event so the
-                    # detector re-arms (next probe only after another full
-                    # silence threshold) instead of ping-spamming every tick.
-                    self._last_server_event_at = time.monotonic()
-                    logger.debug(
-                        "Realtime: dead-link suspicion after %.1fs of server "
-                        "silence — ping verified link alive; not reconnecting.",
-                        recv_silence,
-                    )
-                    continue
-                # Recompute after the ping wait so the logged numbers reflect
-                # the moment of the decision (not up to 10s stale/negative).
-                now = time.monotonic()
-                recv_silence = now - self._last_server_event_at
-                logger.warning(
-                    "Realtime: inbound link dead — no server event for %.1fs and "
-                    "ping unanswered for %.1fs while uplink active "
-                    "(last_send=%.1fs ago, state=%s). Reconnecting.",
-                    recv_silence, _DEAD_LINK_PING_TIMEOUT_S,
-                    now - self._last_frame_sent_at, self._state,
-                )
-                self._log_voice_event(
-                    "dead_link_reconnect",
-                    recv_silence=round(recv_silence, 1),
-                    ping_timeout=_DEAD_LINK_PING_TIMEOUT_S,
-                    in_utterance=in_acked_utterance,
-                    state=self._state,
-                )
-                # Leave _user_ended False so this counts as an unexpected drop
-                # and the app re-arms a warm standby (wake word to resume).
-                self._stop.set()
-                try:
-                    await ws.close()
-                except Exception:
-                    pass
-                break
-
             if self._state == "speaking" or self._response_in_progress:
-                # Stall recovery: if we're still "speaking" but the assistant
-                # audio has fully drained and nothing has extended it for a
-                # grace period, the response stopped streaming without a
-                # response.done. Unstick the state so the AEC3 gate reopens
-                # (mic works again) and the UI pill leaves "talking"; a healthy
-                # response always flips to "listening" via response.*.done long
-                # before this fires.
-                if (
-                    self._state == "speaking"
-                    and self.audio_playback_remaining_s() <= 0.05
-                    and (time.monotonic() - self._assistant_audio_play_until)
-                    >= _RESPONSE_STALL_RECOVERY_S
-                ):
-                    self._log_voice_event(
-                        "response_stall_recovered",
-                        drained_for=round(
-                            time.monotonic() - self._assistant_audio_play_until, 1
-                        ),
-                    )
-                    self._response_in_progress = False
-                    self._response_requested_at = 0.0
-                    self._emit_state("listening")
                 continue
             idle_for = time.monotonic() - self._last_activity_monotonic
             if idle_for >= _SESSION_IDLE_CLOSE_S:
@@ -4517,7 +3002,6 @@ class RealtimeVoiceSession:
             async for raw in ws:
                 if self._stop.is_set():
                     break
-                self._last_server_event_at = time.monotonic()
                 try:
                     if isinstance(raw, (bytes, bytearray)):
                         raw = raw.decode("utf-8")
@@ -4551,28 +3035,7 @@ class RealtimeVoiceSession:
                 # ---- User speech --------------------------------------
                 elif t == "input_audio_buffer.speech_started":
                     self._touch()
-                    # Anchor the evidence window for this turn's transcript
-                    # validation (see _turn_evidence_stats).
-                    self._turn_started_at = time.monotonic()
-                    _turn_item = str(msg.get("item_id") or "").strip()
-                    if _turn_item:
-                        self._turn_started_by_item[_turn_item] = self._turn_started_at
-                        # Bounded: only recent turns matter (evidence retention
-                        # is ~12 s anyway).
-                        while len(self._turn_started_by_item) > 8:
-                            self._turn_started_by_item.pop(
-                                next(iter(self._turn_started_by_item))
-                            )
-                    _mon = self._speech_monitor
-                    self._log_voice_event(
-                        "speech_started",
-                        noise_floor=round(_mon.noise_floor, 1) if _mon else None,
-                        recent_speech=(
-                            _mon.recent_speech(_EVIDENCE_INTERRUPT_WINDOW_S)
-                            if _mon else None
-                        ),
-                        playback_remaining_s=round(self.audio_playback_remaining_s(), 2),
-                    )
+                    self._log_voice_event("speech_started")
                     # The user is taking over — stop auto-driving the briefing so
                     # we don't fight their request (e.g. "skip to my emails").
                     # Hand the model the context it lacks (the briefing was on a
@@ -4590,47 +3053,14 @@ class RealtimeVoiceSession:
                     self._caption_active = True
                     self._caption_reset.set()
                     self._emit_user_speech_started()
-                    # A server speech_started may only stop playback when the
-                    # uplink actually carried locally-verified speech recently
-                    # (any engine path) — otherwise it is residual echo / noise
-                    # tripping the server VAD, and killing playback for it is
-                    # the false self-interruption bug. In half-duplex we
-                    # additionally require a recent local barge-in confirm.
-                    now_mono = time.monotonic()
-                    has_local_speech_evidence = self._has_interrupt_speech_evidence(
-                        now_mono
-                    )
-                    # OS-AEC full-duplex: the Windows Voice Capture DSP gives a
-                    # genuinely clean mic, and the residual-echo gate only lets
-                    # real speech reach the server — so a server speech_started
-                    # here IS the evidence. Trust it and stop playback instantly
-                    # (the phone/desktop full-duplex model). The local
-                    # speech-monitor evidence gate below is for the Speex/AEC3
-                    # paths, where residual echo can trip the server VAD; do not
-                    # let it defer a genuine OS-AEC barge-in (assistant would
-                    # otherwise finish its sentence before yielding).
-                    # OS-AEC full-duplex trusts the server VAD as barge-in
-                    # evidence — but only as a genuine barge-in, i.e. while the
-                    # assistant is actually speaking. If nothing is queued for
-                    # the speaker, a server speech_started is the user's own
-                    # turn (or a residual-echo / trailing-speech VAD re-trigger),
-                    # NOT an interrupt; cancelling the just-requested reply for
-                    # it kills responses before they can speak and makes long
-                    # dictation crawl. Below the playback floor, fall through to
-                    # the local-evidence gate (which also honors the
-                    # response-create protection window).
-                    assistant_speaking = (
-                        self.audio_playback_remaining_s() > _BARGE_IN_MIN_PLAYBACK_S
-                    )
+                    # In half-duplex, server-side speech_started can still
+                    # occasionally come from residual echo on some external
+                    # mic/speaker paths. Only force-stop playback when local
+                    # barge-in already confirmed recently; otherwise defer to
+                    # the local detector and avoid false self-interrupt.
                     should_force_interrupt = (
-                        (self._os_aec_full_duplex and assistant_speaking)
-                        or (
-                            has_local_speech_evidence
-                            and (
-                                not self._half_duplex
-                                or (now_mono - self._barge_in_last_cancel_at) <= 0.9
-                            )
-                        )
+                        not self._half_duplex
+                        or (time.monotonic() - self._barge_in_last_cancel_at) <= 0.9
                     )
                     if should_force_interrupt:
                         # User started talking. Cut playback now so they hear
@@ -4638,7 +3068,7 @@ class RealtimeVoiceSession:
                         # the in-flight response on its own (interrupt_response).
                         self._abort_aplay()
                         self._suppress_audio_until = (
-                            now_mono + _BARGE_IN_SUPPRESS_AUDIO_S
+                            time.monotonic() + _BARGE_IN_SUPPRESS_AUDIO_S
                         )
                         # Send an explicit cancel too. Some routes can take a
                         # little longer for server-side interruption.
@@ -4654,7 +3084,7 @@ class RealtimeVoiceSession:
                                 if len(self._aec_far_buf) > retain_bytes:
                                     del self._aec_far_buf[: len(self._aec_far_buf) - retain_bytes]
                         self._emit_state("listening")
-                    elif IS_DESKTOP and self._half_duplex:
+                    elif IS_DESKTOP:
                         # The server's VAD detected the user. On a desktop the
                         # local energy detector is unreliable (built-in mic +
                         # speakers), so instead of withholding the turn, open
@@ -4676,14 +3106,9 @@ class RealtimeVoiceSession:
                             window_s=_REALTIME_SPEECH_UPLINK_S,
                         )
                     else:
-                        reason = (
-                            "no_local_speech_evidence"
-                            if not has_local_speech_evidence
-                            else "half_duplex_unconfirmed"
-                        )
                         self._log_voice_event(
                             "speech_started_ignored",
-                            reason=reason,
+                            reason="half_duplex_unconfirmed",
                         )
 
                 elif t == "input_audio_buffer.speech_stopped":
@@ -4692,76 +3117,14 @@ class RealtimeVoiceSession:
                     # echo-mute gate resumes for the assistant's reply.
                     self._force_uplink_until = 0.0
                     self._log_voice_event("speech_stopped")
+                    self._emit_state("thinking")
                     # Stop live captions — OpenAI's accurate transcript now
                     # owns the bubble for this finished utterance.
                     self._caption_active = False
-                    # Tell the UI to drop in a placeholder user bubble right
-                    # away so the gap before transcription/AI is filled with
-                    # immediate visual feedback — but ONLY when the turn
-                    # actually carried speech. A phantom turn (echo/noise)
-                    # must never paint a "…" user bubble the dropped
-                    # transcript can never replace.
-                    _stop_evidence_ok = True
-                    if self._client_turn_authority():
-                        _stop_evidence_ok = self._turn_has_commit_evidence(
-                            self._turn_evidence_stats()
-                        )
-                    if _stop_evidence_ok:
-                        self._emit_state("thinking")
-                        self._emit_user_speech_stopped()
-
-                elif t == "input_audio_buffer.committed":
-                    # A turn was committed to the conversation. This is the
-                    # client-authority decision point: the server VAD only
-                    # segmented the audio — whether the turn deserves a
-                    # response is decided HERE, from acoustic evidence.
-                    self._touch()
-                    _commit_item = str(msg.get("item_id") or "")
-                    _commit_stats = (
-                        self._turn_evidence_stats(item_id=_commit_item)
-                        if self._speech_monitor is not None else {}
-                    )
-                    # Freeze this turn's evidence NOW. The transcription that
-                    # arrives later must be judged against the audio the turn
-                    # actually contained — not against whatever the user says
-                    # next while the ASR is still working.
-                    if _commit_item and self._speech_monitor is not None:
-                        self._turn_commit_stats[_commit_item] = dict(_commit_stats)
-                        while len(self._turn_commit_stats) > 8:
-                            self._turn_commit_stats.pop(
-                                next(iter(self._turn_commit_stats))
-                            )
-                    self._last_turn_commit_at = time.monotonic()
-                    self._log_voice_event(
-                        "turn_committed",
-                        item_id=_commit_item,
-                        **_commit_stats,
-                    )
-                    if self._client_turn_authority():
-                        if self._turn_has_commit_evidence(_commit_stats):
-                            # Genuine speech: request the response ourselves
-                            # (create_response is off server-side).
-                            try:
-                                await ws.send(json.dumps({"type": "response.create"}))
-                                self._response_requested_at = time.monotonic()
-                                self._log_voice_event(
-                                    "response_create_sent",
-                                    source="turn_commit_evidence",
-                                    item_id=_commit_item,
-                                )
-                            except Exception:
-                                logger.debug(
-                                    "commit-gate response.create failed",
-                                    exc_info=True,
-                                )
-                        else:
-                            # No genuine speech reached the server for this
-                            # turn: excise it before it can influence the
-                            # conversation. No response is ever created, so
-                            # there is nothing to cancel and nothing to hear.
-                            await self._excise_phantom_turn(
-                                ws, _commit_item, source="commit_evidence_gate"
-                            )
+                    # Tell the UI to drop in a placeholder user bubble
+                    # right away so the gap before transcription/AI is
+                    # filled with immediate visual feedback.
+                    self._emit_user_speech_stopped()
 
                 # ---- User transcript (streaming partial) ----------------
                 # Newer API versions emit partial transcripts as deltas so
@@ -4779,10 +3142,6 @@ class RealtimeVoiceSession:
                     delta = msg.get("delta")
                     if not isinstance(delta, str) or not delta:
                         delta = self._extract_transcript(msg)
-                    if str(msg.get("item_id") or "") in self._phantom_items:
-                        # Turn already excised as a phantom — its (late)
-                        # transcription must never reach the UI.
-                        delta = None
                     if isinstance(delta, str) and delta:
                         item_id = (
                             msg.get("item_id")
@@ -4795,27 +3154,12 @@ class RealtimeVoiceSession:
                             self._user_transcript_buf = ""
                         self._user_transcript_buf += delta
                         # Suppress streaming partials that are prompt-echo
-                        # hallucinations, and partials for turns with no local
-                        # speech evidence (probable hallucination — the final
-                        # validation below makes the authoritative call), so a
-                        # phantom never paints a bubble.
+                        # hallucinations so the phantom never paints a bubble.
                         # Partial — not final, so the UI skips grammar
                         # correction until the .completed event.
-                        evidence_ok = True
-                        if _TURN_EVIDENCE_ENABLED and self._speech_monitor is not None:
-                            evidence_ok = (
-                                float(
-                                    self._turn_evidence_stats(
-                                        item_id=str(msg.get("item_id") or "")
-                                    ).get("speech_ms") or 0.0
-                                )
-                                >= _EVIDENCE_HARD_MIN_SPEECH_MS
-                            )
-                        if evidence_ok and not _is_prompt_echo(self._user_transcript_buf):
+                        if not _is_prompt_echo(self._user_transcript_buf):
                             self._emit_user_transcript(
-                                self._user_transcript_buf,
-                                is_final=False,
-                                item_id=str(item_id),
+                                self._user_transcript_buf, is_final=False
                             )
 
                 # ---- User transcript (final) ---------------------------
@@ -4825,99 +3169,13 @@ class RealtimeVoiceSession:
                 ):
                     self._touch()
                     spoken = self._extract_transcript(msg)
-                    _final_item = str(msg.get("item_id") or "")
                     # Utterance finished — reset the streaming buffer so the
                     # next utterance starts clean.
                     self._user_transcript_buf = ""
                     self._active_user_transcript_item_id = ""
-                    if spoken and _final_item in self._phantom_items:
-                        # This turn was already excised at commit time; its
-                        # late transcription is noise by definition.
-                        self._log_voice_event(
-                            "phantom_transcript_dropped",
-                            text=spoken,
-                            source="excised_turn",
-                        )
-                        spoken = ""
                     if spoken and _is_prompt_echo(spoken):
                         logger.debug("Realtime: dropped prompt-echo phantom %r", spoken)
                         spoken = ""
-                    # Authoritative hallucination check: does the audio the
-                    # server actually received for this turn support ANY
-                    # transcript at all? Engine-agnostic, works while the
-                    # assistant speaks and while it is idle.
-                    evidence_stats: dict = {}
-                    if spoken:
-                        rejected, evidence_stats = (
-                            self._transcript_rejected_by_evidence(
-                                spoken, item_id=_final_item
-                            )
-                        )
-                        self._log_voice_event(
-                            "turn_audit",
-                            text=spoken,
-                            accepted=not rejected,
-                            **evidence_stats,
-                        )
-                        if rejected:
-                            logger.info(
-                                "Realtime: dropped hallucinated transcript %r "
-                                "(no speech evidence: %s)",
-                                spoken, evidence_stats,
-                            )
-                            self._log_voice_event(
-                                "phantom_transcript_dropped",
-                                text=spoken,
-                                source="speech_evidence_guard",
-                                **evidence_stats,
-                            )
-                            spoken = ""
-                            # The turn passed the coarse commit gate but its
-                            # text failed the finer validation. Excise the
-                            # item so the model's context stays clean, stop
-                            # the response we requested for it, and silence
-                            # whatever already reached the speaker.
-                            await self._excise_phantom_turn(
-                                ws, _final_item, source="speech_evidence_guard"
-                            )
-                            try:
-                                await ws.send(json.dumps({"type": "response.cancel"}))
-                                self._log_voice_event(
-                                    "response_cancel_sent",
-                                    source="speech_evidence_guard",
-                                )
-                            except Exception:
-                                logger.debug(
-                                    "evidence guard response.cancel failed",
-                                    exc_info=True,
-                                )
-                            self._abort_aplay()
-                            self._suppress_audio_until = (
-                                time.monotonic() + _BARGE_IN_SUPPRESS_AUDIO_S
-                            )
-                            self._emit_user_transcript_rejected(_final_item)
-                    self._turn_started_at = 0.0
-                    if spoken and self._should_drop_aec3_phantom_transcript(spoken):
-                        logger.info("Realtime: dropped probable AEC3 phantom %r", spoken)
-                        self._log_voice_event(
-                            "phantom_transcript_dropped",
-                            text=spoken,
-                            source="aec3_tail_guard",
-                        )
-                        spoken = ""
-                        # Best-effort: if the server already started forming a
-                        # response for this phantom micro-turn, stop it.
-                        try:
-                            await ws.send(json.dumps({"type": "response.cancel"}))
-                            self._log_voice_event(
-                                "response_cancel_sent",
-                                source="phantom_transcript_guard",
-                            )
-                        except Exception:
-                            logger.debug(
-                                "phantom transcript response.cancel failed",
-                                exc_info=True,
-                            )
                     if spoken:
                         logger.info("User said: %r", spoken)
                         self._log_voice_event(
@@ -4925,9 +3183,7 @@ class RealtimeVoiceSession:
                             text=spoken,
                             transcript_model=_DEFAULT_INPUT_TRANSCRIPTION_MODEL,
                         )
-                        self._emit_user_transcript(
-                            spoken, is_final=True, item_id=_final_item
-                        )
+                        self._emit_user_transcript(spoken, is_final=True)
                         # Client-side farewell fallback: if the transcript is
                         # a clear goodbye phrase, close the session immediately
                         # without waiting for the model to call end_session.
@@ -5058,18 +3314,8 @@ class RealtimeVoiceSession:
                     if leftover:
                         logger.info("AI said (flushed from deltas): %r", leftover)
                         self._emit_ai_transcript(leftover)
-                    # Run the handler (tool HTTP round-trips can take 30s+) in
-                    # the background so this recv loop keeps draining frames:
-                    # blocking here pauses the websocket reader once its buffer
-                    # fills, the server's keepalive pings go unanswered, and
-                    # OpenAI drops the connection mid-tool-call.
-                    task = asyncio.create_task(
-                        self._run_response_done_handler(ws, msg)
-                    )
-                    self._response_done_tasks.add(task)
-                    task.add_done_callback(self._response_done_tasks.discard)
+                    await self._handle_response_done(ws, msg)
                     self._response_in_progress = False
-                    self._response_requested_at = 0.0
                     self._active_audio_item_id = None
                     self._active_audio_content_index = 0
                     # _play_delta already extended the mute window to cover
@@ -5101,21 +3347,8 @@ class RealtimeVoiceSession:
                     # WS itself and surface via _async_main's except.
                     logger.warning("Realtime server (non-fatal) error: %s", em)
 
-        except websockets.ConnectionClosed as e:
-            # Capture WHY the socket died — a 1011 (keepalive/internal) or an
-            # abnormal 1006 points at a starved event loop / dropped pings,
-            # whereas a clean 1000 is a normal server close. Without this the
-            # root cause of mid-session stalls is invisible.
-            rcvd = getattr(e, "rcvd", None)
-            sent = getattr(e, "sent", None)
-            code = getattr(rcvd, "code", None) if rcvd else getattr(e, "code", None)
-            reason = getattr(rcvd, "reason", None) if rcvd else getattr(e, "reason", None)
-            since_recv = round(time.monotonic() - self._last_server_event_at, 1)
-            logger.info(
-                "Realtime WebSocket closed by server (code=%s reason=%r sent=%s "
-                "silent_for=%ss)",
-                code, reason, sent, since_recv,
-            )
+        except websockets.ConnectionClosed:
+            logger.info("Realtime WebSocket closed by server")
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -5253,10 +3486,12 @@ class RealtimeVoiceSession:
           - input.transcription.model — enables a transcript stream of
             user speech (used for farewell detection and the transcript
             overlay).
-          - input.turn_detection — mode/eagerness, plus create_response
-            and interrupt_response both OFF when the evidence layer is
-            live (client-authority turn-taking: the client requests or
-            suppresses responses per turn from acoustic evidence).
+          - input.turn_detection.eagerness — how quickly the assistant
+            replies after the user stops. The server defaults to "low"
+            (most conservative) for hardware without echo cancellation;
+            AEC (speex) is now enabled, so we bump to "medium" (env
+            REALTIME_VAD_EAGERNESS) for a snappier turn-around while
+            keeping create_response/interrupt_response TRUE.
           - tools — server tools + end_session.
         """
         merged_tools = list(self._server_tools) + [END_SESSION_TOOL, START_RECORDING_TOOL]
@@ -5269,44 +3504,19 @@ class RealtimeVoiceSession:
         audio_input: dict = {
             "transcription": transcription_cfg,
         }
-        # Tell the server which codec the mic leg uses. The ephemeral session is
-        # minted as 24 kHz PCM16; when we transcode the uplink to G.711 mu-law
-        # (REALTIME_UPLINK_CODEC=g711_ulaw) the server MUST be told or it will
-        # misdecode the bytes as PCM16 (garbled speech / no transcript). The
-        # downlink/output format is left untouched (full-quality assistant
-        # voice). Format keys follow the GA realtime schema.
-        if self._uplink_g711:
-            audio_input["format"] = {"type": "audio/pcmu"}
-        else:
-            audio_input["format"] = {"type": "audio/pcm", "rate": _REALTIME_RATE}
-        # Client-authority turn-taking: when the local speech-evidence layer is
-        # live, the server VAD is demoted to a pure audio segmenter. It must
-        # neither auto-create responses nor auto-interrupt playback, because it
-        # cannot tell genuine speech from residual echo/noise — only the client
-        # holds the acoustic evidence. The client explicitly:
-        #   * sends response.create when a committed turn carries real speech,
-        #   * deletes committed turns that carry none (phantom excision),
-        #   * cancels + aborts playback on evidence-backed barge-in.
-        # This ordering is what makes phantom suppression airtight on ANY
-        # device: no response can exist before the evidence check passes.
-        # With the evidence layer disabled (REALTIME_TURN_EVIDENCE=0) the
-        # legacy server-driven behavior is preserved.
-        client_authority = _TURN_EVIDENCE_ENABLED and self._speech_monitor is not None
-        create_response = not client_authority
-        interrupt_response = not client_authority
+        # Keep server-side interruption enabled. Half-duplex echo protection now
+        # happens locally before frames reach OpenAI; when the local detector
+        # does release user speech, the latest user turn must still win.
+        interrupt_response = True
         # Decide turn detection. On desktop the OS AEC gives a clean mic, so we
         # default to energy-based server_vad (focused on the active talker,
         # ignores sub-threshold ambient, commits a fixed time after you stop).
         # The appliance keeps its semantic_vad behavior unless overridden.
         td_mode = _REALTIME_TURN_DETECTION
         if td_mode == "auto":
-            # Desktop (Windows): semantic end-of-turn detection — the natural,
-            # low-latency turn-taking the shipping EXE used. (The energy-based
-            # server_vad experiment felt laggier on coupled laptop mics and,
-            # paired with the client-authority layer, could strand the uplink.)
-            # Appliance keeps semantic too. Force energy-based detection
-            # explicitly with REALTIME_TURN_DETECTION=server_vad.
-            td_mode = "semantic_vad" if IS_DESKTOP else "semantic"
+            # Desktop (Windows): energy-based server_vad — focused on the active
+            # talker, ignores sub-threshold ambient. Appliance keeps semantic.
+            td_mode = "server_vad" if IS_DESKTOP else "semantic"
         turn_detection = None
         if td_mode == "server_vad":
             turn_detection = {
@@ -5314,14 +3524,14 @@ class RealtimeVoiceSession:
                 "threshold": _REALTIME_VAD_THRESHOLD,
                 "prefix_padding_ms": _REALTIME_VAD_PREFIX_MS,
                 "silence_duration_ms": _REALTIME_VAD_SILENCE_MS,
-                "create_response": create_response,
+                "create_response": True,
                 "interrupt_response": interrupt_response,
             }
         elif td_mode == "semantic_vad":
             turn_detection = {
                 "type": "semantic_vad",
                 "eagerness": (_REALTIME_VAD_EAGERNESS if _REALTIME_VAD_EAGERNESS != "auto" else "medium"),
-                "create_response": create_response,
+                "create_response": True,
                 "interrupt_response": interrupt_response,
             }
         elif _REALTIME_VAD_EAGERNESS and _REALTIME_VAD_EAGERNESS != "auto":
@@ -5329,7 +3539,7 @@ class RealtimeVoiceSession:
             turn_detection = {
                 "type": "semantic_vad",
                 "eagerness": _REALTIME_VAD_EAGERNESS,
-                "create_response": create_response,
+                "create_response": True,
                 "interrupt_response": interrupt_response,
             }
         if turn_detection is not None:
@@ -5353,11 +3563,8 @@ class RealtimeVoiceSession:
                 vad_threshold=_REALTIME_VAD_THRESHOLD if td_mode == "server_vad" else None,
                 vad_silence_ms=_REALTIME_VAD_SILENCE_MS if td_mode == "server_vad" else None,
                 vad_eagerness=_REALTIME_VAD_EAGERNESS,
-                create_response=create_response,
                 interrupt_response=interrupt_response,
-                client_authority=client_authority,
                 half_duplex=self._half_duplex,
-                uplink_codec=("g711_ulaw" if self._uplink_g711 else "pcm16"),
             )
         except Exception:
             logger.warning("Realtime session.update failed", exc_info=True)
@@ -5365,21 +3572,6 @@ class RealtimeVoiceSession:
     # ------------------------------------------------------------------
     # Tool round-trip on response.done
     # ------------------------------------------------------------------
-
-    async def _run_response_done_handler(self, ws, msg: dict) -> None:
-        """Background wrapper for _handle_response_done (spawned by _recv_loop).
-
-        The lock keeps handlers strictly ordered if a second response.done
-        arrives while a slow tool round-trip is still in flight; exceptions
-        are logged here because nothing awaits this task directly.
-        """
-        try:
-            async with self._response_done_lock:
-                await self._handle_response_done(ws, msg)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("Realtime: response.done handler failed")
 
     async def _handle_response_done(self, ws, msg: dict) -> None:
         response = msg.get("response") or {}
@@ -5445,17 +3637,13 @@ class RealtimeVoiceSession:
                 "Realtime tool invoke: name=%s call_id=%s args=%s",
                 name, call_id, args[:200],
             )
-            self._tool_roundtrip_active = True
-            try:
-                out = await asyncio.get_running_loop().run_in_executor(
-                    None,
-                    lambda _b=self._backend_base_url, _t=self._device_token,
-                           _c=call_id, _n=name, _a=args: invoke_realtime_tool_sync(
-                        _b, _t, call_id=_c, name=_n, arguments=_a,
-                    ),
-                )
-            finally:
-                self._tool_roundtrip_active = False
+            out = await asyncio.get_running_loop().run_in_executor(
+                None,
+                lambda _b=self._backend_base_url, _t=self._device_token,
+                       _c=call_id, _n=name, _a=args: invoke_realtime_tool_sync(
+                    _b, _t, call_id=_c, name=_n, arguments=_a,
+                ),
+            )
             logger.info("Realtime tool result: name=%s out_len=%d", name, len(out or ""))
 
             model_out = out

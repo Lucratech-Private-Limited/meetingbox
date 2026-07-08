@@ -26,36 +26,25 @@ import math
 import random
 import time
 
-from kivy.animation import Animation
 from kivy.clock import Clock
 from kivy.graphics import (
     Color,
     Ellipse,
     Line,
-    PopMatrix,
-    PushMatrix,
     RoundedRectangle,
-    Scale,
-    Translate,
     Triangle,
 )
-from kivy.properties import NumericProperty
 from kivy.uix.anchorlayout import AnchorLayout
 from kivy.uix.behaviors import ButtonBehavior
 from kivy.uix.floatlayout import FloatLayout
 from kivy.uix.label import Label
 from kivy.uix.widget import Widget
 
-from page_swipe import PageSwipeController
-
-from components.device_status_bar import DeviceStatusBar
 from config import display_now
 from frame19_layout import (
-    CANVAS_H,
     BG_BOT,
     BG_TOP,
     BTN_PAUSE,
-    canvas_box,
     COL_BATT_GREEN,
     COL_PURPLE,
     COL_REC_GREY,
@@ -91,18 +80,6 @@ logger = logging.getLogger(__name__)
 
 _FONT = "42dot-Sans"
 _FONT_SB = "42dot-SB"
-_FONT_MED = "42dot-Med"
-
-# READY pre-state layout — Figma ``1225:34`` ("Meeting_2"). Same 1260×800 canvas
-# as the active recording state, so the orb / waveform / status bar stay in place
-# and the page simply evolves from READY → RECORDING.
-READY_TITLE = canvas_box(453.0, 92.0, 354.0, 55.0)        # "Ready to record.."
-READY_SUBTITLE = canvas_box(280.0, 569.0, 660.0, 30.0)    # supporting subtitle
-START_BTN = canvas_box(415.0, 635.0, 430.0, 88.0)         # Start Recording CTA
-READY_TITLE_FS_RATIO = 46.0 / CANVAS_H
-READY_SUBTITLE_FS_RATIO = 25.0 / CANVAS_H
-START_FS_RATIO = 40.0 / CANVAS_H
-COL_SUBTITLE = (106 / 255, 104 / 255, 111 / 255, 1.0)     # #6A686F
 
 
 class _Orb(Widget):
@@ -138,32 +115,19 @@ class _Wavebar(Widget):
     _SILENCE_THRESHOLD = 0.04
     _FLAT_RATIO = 0.10
 
-    # Figma "Group 194" waveform geometry (node 1225:55 / 1031:66). Bars sit in
-    # a 166 × 136 box; left offsets, width and heights are taken verbatim so the
-    # READY page and the active RECORDING state render the *same* bars (the orb
-    # waveform must stay visually continuous through the morph).
-    _BOX_W_FIG = 166.0
-    _BOX_H_FIG = 136.0
-    _BAR_W_FIG = 10.0
-    _BAR_X_FIG = (0.0, 26.0, 52.0, 78.0, 104.0, 130.0, 156.0)
-    _BAR_H_FIG = (57.0, 73.0, 136.0, 104.0, 42.0, 89.0, 58.0)
-
     def __init__(self, *, n_bars: int = 7, **kwargs):
         super().__init__(**kwargs)
         self.n_bars = n_bars
         self._bar_max_ratio = 1.0
-        # The Figma waveform envelope (normalised bar heights). Used both as the
-        # static READY shape and as the rest shape the live animation breathes
-        # around, so activating the recording waveform never causes a jump.
-        if n_bars == len(self._BAR_H_FIG):
-            self._envelope = [h / self._BOX_H_FIG for h in self._BAR_H_FIG]
-        else:
-            centre = (n_bars - 1) / 2.0
-            self._envelope = [
-                0.24 + 0.76 * max(0.0, math.cos(((i - centre) / centre) * math.pi / 2.0))
-                for i in range(n_bars)
-            ]
-        self._levels = list(self._envelope)
+        # A fixed bell-ish envelope so the row reads as a calm voice waveform
+        # even at rest (matches the Figma static — 7 bars, tall centre,
+        # short edges), amplified by live audio.
+        centre = (n_bars - 1) / 2.0
+        self._envelope = [
+            0.24 + 0.76 * max(0.0, math.cos(((i - centre) / centre) * math.pi / 2.0))
+            for i in range(n_bars)
+        ]
+        self._levels = [self._FLAT_RATIO] * n_bars
         self._latest_audio = 0.0
         self._anim_event = None
         self._is_active = False
@@ -206,54 +170,47 @@ class _Wavebar(Widget):
         self._latest_audio = 0.0
         self._color.rgba = (1, 1, 1, 0.5)
 
-    def show_static(self) -> None:
-        """Freeze the bars at the Figma rest shape (used by the READY page)."""
-        self.stop()
-        self._is_active = False
-        self._latest_audio = 0.0
-        self._color.rgba = (1, 1, 1, 1)
-        self._levels = list(self._envelope)
-        self._redraw()
-
     # -- tick / draw ---------------------------------------------------
     def _tick(self, dt: float) -> None:
         n = self.n_bars
         if n <= 1:
             return
+        centre = (n - 1) / 2.0
         voice = self._is_active and self._latest_audio > self._SILENCE_THRESHOLD
-        t = time.monotonic()
         for i in range(n):
             env = self._envelope[i]
             if voice:
-                # Rise from the rest shape in proportion to the live mic level
-                # (taller bars = louder voice) while keeping the Figma envelope.
-                target = env * (0.6 + 0.6 * self._latest_audio) * self._jitter[i]
-                target = max(env * 0.45, min(1.0, target))
+                # VU-meter behaviour: bar height rises from the flat stub in
+                # direct proportion to the live mic level (bell envelope keeps
+                # the centre tallest), so louder voice = taller bars.
+                target = max(
+                    self._FLAT_RATIO,
+                    (self._FLAT_RATIO + (1.0 - self._FLAT_RATIO) * self._latest_audio)
+                    * env * self._jitter[i],
+                )
             else:
-                # At rest the waveform stays alive but subtle — a slow breathe
-                # around the Figma shape rather than collapsing flat.
-                breathe = 0.94 + 0.06 * math.sin(t * 1.6 + self._idle_phase[i])
-                target = env * breathe
+                # No audio (silence / mic gone / paused): stay flat.
+                target = self._FLAT_RATIO
             self._levels[i] += (target - self._levels[i]) * 0.35
         self._latest_audio *= 0.93
         if voice and random.random() < 0.18:
-            self._jitter[random.randrange(n)] = random.uniform(0.6, 1.0)
+            self._jitter[random.randrange(n)] = random.uniform(0.55, 1.0)
         self._redraw()
 
     def _redraw(self) -> None:
         w, h = self.size
         if w <= 0 or h <= 0:
             return
-        sx = w / self._BOX_W_FIG
-        bar_w = max(1.0, self._BAR_W_FIG * sx)
+        n = self.n_bars
+        # Figma: bars are slightly wider than the gaps between them.
+        bar_w = max(1.0, (w * 0.58) / n)
+        gap = (w - bar_w * n) / max(1, n - 1)
         max_h = h * self._bar_max_ratio
         cy = self.y + h / 2.0
         radius = bar_w / 2.0
         for i, rect in enumerate(self._bars):
-            if i >= len(self._BAR_X_FIG):
-                break
             bar_h = max(bar_w, max_h * self._levels[i])
-            x = self.x + self._BAR_X_FIG[i] * sx
+            x = self.x + i * (bar_w + gap)
             rect.pos = (x, cy - bar_h / 2.0)
             rect.size = (bar_w, bar_h)
             rect.radius = [radius]
@@ -520,108 +477,6 @@ class _StopPill(ButtonBehavior, Widget):
         self._label.font_size = value
 
 
-class _StartButton(ButtonBehavior, Widget):
-    """READY-state CTA capsule — Figma ``1225:70`` (Frame 22).
-
-    Light ``#F4F5F7`` capsule with a soft white top-stroke + drop shadow and a
-    centred "Start Recording" caption. Tapping it plays a brief tactile press
-    (scale-down → soft spring back) before firing ``on_fire``.
-    """
-
-    # NB: must NOT be named ``press`` — Kivy would route changes to an
-    # ``on_press`` method, colliding with ButtonBehavior's ``on_press`` event
-    # (and crashing with a signature mismatch when the scale animates).
-    press_scale = NumericProperty(1.0)
-
-    def __init__(self, *, fs_ratio: float, on_fire=None, suppress=None, **kwargs):
-        super().__init__(**kwargs)
-        self._fs_ratio = fs_ratio
-        self._on_fire = on_fire
-        self._suppress = suppress
-        with self.canvas.before:
-            PushMatrix()
-            self._scale = Scale(1, 1, 1)
-        with self.canvas:
-            Color(*PILL_SHADOW)
-            self._shadow = RoundedRectangle(pos=self.pos, size=self.size, radius=[44])
-            Color(*PILL_FILL)
-            self._fill = RoundedRectangle(pos=self.pos, size=self.size, radius=[44])
-            self._border_color = Color(*PILL_BORDER)
-            self._border = Line(rounded_rectangle=(0, 0, 0, 0, 44), width=2.0)
-        with self.canvas.after:
-            PopMatrix()
-        self._label = Label(
-            text="Start Recording",
-            font_name=_FONT,
-            color=COL_TEXT,
-            halign="center",
-            valign="middle",
-            size_hint=(None, None),
-        )
-        self._label.bind(size=self._label.setter("text_size"))
-        self.add_widget(self._label)
-        self.bind(pos=self._sync, size=self._sync, press_scale=self._sync_scale)
-
-    def _sync_scale(self, *_):
-        cx, cy = self.center
-        self._scale.origin = (cx, cy, 0)
-        self._scale.x = self.press_scale
-        self._scale.y = self.press_scale
-
-    def _sync(self, *_):
-        x, y, w, h = self.x, self.y, self.width, self.height
-        if w <= 0 or h <= 0:
-            return
-        r = h / 2.0
-        self._shadow.pos = (x, y - max(2.0, h * 0.03))
-        self._shadow.size = (w, h)
-        self._shadow.radius = [r]
-        self._fill.pos = (x, y)
-        self._fill.size = (w, h)
-        self._fill.radius = [r]
-        bw = max(1.5, h * 0.022)
-        self._border.width = bw
-        self._border.rounded_rectangle = (x, y, w, h, r)
-        self._label.pos = (x, y)
-        self._label.size = (w, h)
-        self._sync_scale()
-
-    @property
-    def font_size(self) -> float:
-        return self._label.font_size
-
-    @font_size.setter
-    def font_size(self, value: float) -> None:
-        self._label.font_size = value
-
-    def on_touch_down(self, touch):
-        # While disabled (the RECORDING state) this button overlaps the Pause /
-        # Stop controls. A disabled Kivy widget normally *absorbs* touches that
-        # land on it, which would swallow taps meant for Stop — so stay fully
-        # transparent to touches here and let the controls beneath respond.
-        if self.disabled:
-            return False
-        return super().on_touch_down(touch)
-
-    # Phase 1 — button press: slight scale-down then soft spring release.
-    def on_press(self):
-        if self.disabled:
-            return
-        Animation.cancel_all(self, "press_scale")
-        Animation(press_scale=0.96, duration=0.12, t="out_quad").start(self)
-
-    def on_release(self):
-        if self.disabled:
-            return
-        Animation.cancel_all(self, "press_scale")
-        Animation(press_scale=1.0, duration=0.20, t="out_back").start(self)
-        # A back-swipe that started on this button must not also fire the morph.
-        if self._suppress is not None and self._suppress():
-            return
-        if self._on_fire is not None:
-            self._on_fire(self)
-
-
 class _StatusBar(Widget):
     """Minimal top-right wifi + battery glyphs (Group 203).
 
@@ -688,39 +543,7 @@ class RecordingScreen(BaseScreen):
         self._is_paused = False
         self._rec_base_elapsed = 0.0
         self._rec_active_start = None
-        # READY / RECORDING state machine.
-        self.enter_ready_next = False        # set by the Home swipe before entry
-        self._mode = "recording"             # "ready" | "recording"
-        self._morphing = False
-        self._recording_active = False
-        self._page_tx = None                 # transform-only page translate
         self._build_ui()
-        # Interactive back-swipe (Start-Recording READY → Home), mirror of the
-        # Home → Start-Recording reveal. Only armed while in the READY state.
-        self._back_pager = PageSwipeController(
-            self,
-            "home",
-            direction=-1,
-            prepare_dest=lambda dest: getattr(dest, "prime_preview", lambda: None)(),
-            commit=lambda: self.app.goto_screen("home", transition="none"),
-            can_start=lambda: (
-                self._mode == "ready"
-                and not self._morphing
-                and not self._recording_active
-            ),
-        )
-
-    @property
-    def is_recording_active(self) -> bool:
-        """True once the in-place morph (or a direct entry) has begun recording."""
-        return self._recording_active
-
-    def _recording_mode(self) -> str:
-        mode = (getattr(self.app, "current_recording_mode", "meeting") or "meeting").strip().lower()
-        return "note" if mode == "note" else "meeting"
-
-    def _recording_label_text(self) -> str:
-        return "Taking notes...." if self._recording_mode() == "note" else "Recording...."
 
     # ------------------------------------------------------------------ UI
     def _build_ui(self):
@@ -733,11 +556,8 @@ class RecordingScreen(BaseScreen):
         self._canvas = FloatLayout(size_hint=(None, None))
         anchor.add_widget(self._canvas)
 
-        # Top-right hardware-aware status bar.
-        self._canvas.add_widget(DeviceStatusBar(
-            debug_location="recording.py:DeviceStatusBar",
-            **kivy_hints(STATUS_BAR),
-        ))
+        # Top-right status bar.
+        self._canvas.add_widget(_StatusBar(**kivy_hints(STATUS_BAR)))
 
         # Centre orb + waveform.
         self._canvas.add_widget(_Orb(**kivy_hints(ORB)))
@@ -780,32 +600,7 @@ class RecordingScreen(BaseScreen):
         self.stop_pill.bind(on_release=self._on_stop)
         self._canvas.add_widget(self.stop_pill)
 
-        # ── READY pre-state widgets (Figma 1225:34) ──────────────────────────
-        # Drawn in the same slots so the morph is a pure cross-fade in place.
-        self.ready_title = self._add_label(
-            "Ready to record..", READY_TITLE, READY_TITLE_FS_RATIO, COL_TEXT,
-            bold=False, font_name=_FONT,
-        )
-        self.ready_subtitle = self._add_label(
-            "Tap the below button when you are ready to start meeting",
-            READY_SUBTITLE, READY_SUBTITLE_FS_RATIO, COL_SUBTITLE,
-            bold=False, font_name=_FONT_MED,
-        )
-        self.start_btn = _StartButton(
-            fs_ratio=START_FS_RATIO,
-            on_fire=self._on_start_pressed,
-            suppress=lambda: (
-                getattr(self, "_back_pager", None) is not None
-                and self._back_pager.is_engaged
-            ),
-            **kivy_hints(START_BTN),
-        )
-        self._canvas.add_widget(self.start_btn)
-
         self.add_widget(self._root)
-        # Default visual state is the active recording UI (voice / idle paths
-        # enter straight into recording); the swipe path flips this in on_enter.
-        self._apply_recording_visuals()
         Clock.schedule_once(lambda _dt: self._on_root_resize(self._root, self._root.size), 0)
 
     # --------------------------------------------------------------- helpers
@@ -827,16 +622,11 @@ class RecordingScreen(BaseScreen):
     def _on_root_resize(self, _root, size):
         w, h = scaled_canvas(size[0], size[1])
         self._canvas.size = (w, h)
-        for lbl in (
-            self.rec_label, self.started_label, self.timer_label,
-            self.ready_title, self.ready_subtitle,
-        ):
+        for lbl in (self.rec_label, self.started_label, self.timer_label):
             if lbl is not None:
                 lbl.font_size = font_px(lbl._fs_ratio, h)  # noqa: SLF001
         if hasattr(self, "stop_pill"):
             self.stop_pill.font_size = font_px(STOP_FS_RATIO, h)
-        if hasattr(self, "start_btn"):
-            self.start_btn.font_size = font_px(START_FS_RATIO, h)
         self._sync_rec_dot()
 
     def _sync_rec_dot(self, *_):
@@ -863,201 +653,35 @@ class RecordingScreen(BaseScreen):
         gap = dot.width * 0.85
         dot.pos = (cx - text_w / 2.0 - gap - dot.width, cy - dot.height / 2.0)
 
-    # --------------------------------------------------- page translate (swipe)
-    def _ensure_page_translate(self):
-        """Install a transform-only translate around the whole screen so the
-        page can be dragged as one GPU-cheap layer (no per-frame relayout)."""
-        if self._page_tx is not None:
-            return
-        with self.canvas.before:
-            PushMatrix()
-            self._page_tx = Translate(0, 0, 0)
-        with self.canvas.after:
-            PopMatrix()
-
-    def set_page_offset(self, dx: float) -> None:
-        self._ensure_page_translate()
-        self._page_tx.x = float(dx)
-
-    # --------------------------------------------------- READY / RECORDING state
-    _READY_WIDGETS = ("ready_title", "ready_subtitle", "start_btn")
-    _REC_WIDGETS = (
-        "status_dot", "rec_label", "started_label",
-        "timer_label", "pause_btn", "stop_pill",
-    )
-
-    def _apply_ready_visuals(self):
-        for name in self._REC_WIDGETS:
-            w = getattr(self, name, None)
-            if w is not None:
-                Animation.cancel_all(w, "opacity")
-                w.opacity = 0.0
-        for name in self._READY_WIDGETS:
-            w = getattr(self, name, None)
-            if w is not None:
-                Animation.cancel_all(w, "opacity")
-                w.opacity = 1.0
-        self.start_btn.disabled = False
-        self.start_btn.press_scale = 1.0
-        self.pause_btn.disabled = True
-        self.stop_pill.disabled = True
-        self.status_dot.stop_blink()
-
-    def _apply_recording_visuals(self):
-        for name in self._READY_WIDGETS:
-            w = getattr(self, name, None)
-            if w is not None:
-                Animation.cancel_all(w, "opacity")
-                w.opacity = 0.0
-        for name in self._REC_WIDGETS:
-            w = getattr(self, name, None)
-            if w is not None:
-                Animation.cancel_all(w, "opacity")
-                w.opacity = 1.0
-        self.start_btn.disabled = True
-        self.pause_btn.disabled = False
-        self.stop_pill.disabled = False
-
-    def show_ready_preview(self):
-        """Put the screen into a static READY look for the Home swipe preview
-        (no timers, no animation) — must match :meth:`_enter_ready` exactly."""
-        self._mode = "ready"
-        self._recording_active = False
-        self._morphing = False
-        if self.timer_event:
-            self.timer_event.cancel()
-            self.timer_event = None
-        self.set_page_offset(0.0)
-        self._apply_ready_visuals()
-        self.wavebar.show_static()
-
     # ------------------------------------------------------------- lifecycle
     def on_enter(self):
-        # ``enter_ready_next`` is a latch (not consumed here): on_enter may be
-        # dispatched twice — once by the ScreenManager transition and once by
-        # the app's manual navigation — so both passes must agree on the mode.
-        # It is cleared in on_leave.
-        self.set_page_offset(0.0)
-        if self.enter_ready_next:
-            self._enter_ready()
-        else:
-            self._enter_recording_direct()
-
-    def _enter_ready(self):
-        self._mode = "ready"
-        self._recording_active = False
-        self._morphing = False
         if self.timer_event:
             self.timer_event.cancel()
             self.timer_event = None
-        self.status_dot.stop_blink()
-        self._apply_ready_visuals()
-        self.wavebar.show_static()
 
-    def _enter_recording_direct(self):
-        self._mode = "recording"
-        self._morphing = False
-        self._apply_recording_visuals()
-        self._start_timer_now()
-        self.wavebar.start()
-        self.wavebar.start_voice()
-        self._recording_active = True
-
-    def _start_timer_now(self):
-        if self.timer_event:
-            self.timer_event.cancel()
-            self.timer_event = None
         self._is_paused = False
         self.elapsed_seconds = 0
         self._rec_base_elapsed = 0.0
         self._rec_active_start = time.monotonic()
         self.timer_label.set_text("00:00:00")
-        self.rec_label.text = self._recording_label_text()
+        self.rec_label.text = "Recording...."
         self.status_dot.set_recording(True)
         self.pause_btn.set_paused(False)
+
         now = display_now()
         # Figma shows "Started at 11:01AM" (no space before AM/PM).
         self.started_label.text = f"Started at {now.strftime('%I:%M%p').lstrip('0')}"
+
         self.timer_event = Clock.schedule_interval(self._tick_timer, 0.5)
-
-    # ----------------------------------------------- START tap → in-place morph
-    def _on_start_pressed(self, _btn):
-        if self._mode != "ready" or self._morphing:
-            return
-        self._morphing = True
-        self.start_btn.disabled = True
-
-        # Kick the backend optimistically so capture spins up in parallel; the
-        # UI evolves immediately for a native, lag-free feel.
-        try:
-            self.app.start_recording()
-        except Exception:
-            logger.exception("recording: optimistic start_recording failed")
-
-        # Timer begins counting right away (it fades in gently below).
-        self._start_timer_now()
-        self._recording_active = True
-
-        # Phase 2 — dissolve the READY content (opacity only, no movement).
-        for name in self._READY_WIDGETS:
-            w = getattr(self, name, None)
-            if w is not None:
-                Animation.cancel_all(w, "opacity")
-                Animation(opacity=0.0, duration=0.20, t="out_quad").start(w)
-
-        # Phase 3 — recording controls fade in with a gentle overlap so the
-        # interface never reads as empty.
-        def _phase3(_dt):
-            for name in ("status_dot", "rec_label", "started_label", "timer_label"):
-                w = getattr(self, name, None)
-                if w is not None:
-                    Animation(opacity=1.0, duration=0.26, t="out_cubic").start(w)
-            for name in ("pause_btn", "stop_pill"):
-                w = getattr(self, name, None)
-                if w is not None:
-                    Animation(opacity=1.0, duration=0.30, t="out_cubic").start(w)
-        Clock.schedule_once(_phase3, 0.10)
-
-        # Phase 4 — once controls are present, bring the waveform alive.
-        def _phase4(_dt):
-            self.wavebar.start()
-            self.wavebar.start_voice()
-        Clock.schedule_once(_phase4, 0.34)
-
-        # Controls become interactive only after the transition settles.
-        def _done(_dt):
-            self._morphing = False
-            self._mode = "recording"
-            self.pause_btn.disabled = False
-            self.stop_pill.disabled = False
-        Clock.schedule_once(_done, 0.46)
+        self.wavebar.start()
+        self.wavebar.start_voice()
 
     def on_leave(self):
-        self.enter_ready_next = False
-        if self._back_pager is not None:
-            self._back_pager.cancel()
-        self.set_page_offset(0.0)
         if self.timer_event:
             self.timer_event.cancel()
             self.timer_event = None
         self.wavebar.stop()
         self.status_dot.stop_blink()
-
-    # ------------------------------------------------------------- back swipe
-    def on_touch_down(self, touch):
-        if self._back_pager is not None and self._back_pager.on_touch_down(touch):
-            return True
-        return super().on_touch_down(touch)
-
-    def on_touch_move(self, touch):
-        if self._back_pager is not None and self._back_pager.on_touch_move(touch):
-            return True
-        return super().on_touch_move(touch)
-
-    def on_touch_up(self, touch):
-        if self._back_pager is not None and self._back_pager.on_touch_up(touch):
-            return True
-        return super().on_touch_up(touch)
 
     # ---------------------------------------------------------------- timer
     def _elapsed_from_monotonic(self) -> int:
@@ -1104,7 +728,7 @@ class RecordingScreen(BaseScreen):
             return
         self._is_paused = False
         self._rec_active_start = time.monotonic()
-        self.rec_label.text = self._recording_label_text()
+        self.rec_label.text = "Recording...."
         self.status_dot.set_recording(True)
         self.pause_btn.set_paused(False)
         self.wavebar.start_voice()

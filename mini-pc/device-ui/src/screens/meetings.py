@@ -12,7 +12,6 @@ from components.button import SecondaryButton
 from components.meeting_card import MeetingCard
 from components.status_bar import StatusBar
 from config import COLORS, FONT_SIZES, MEETINGS_LIST_LIMIT, SPACING
-from platform_compat import TAP_OR_CLICK
 from screens.base_screen import BaseScreen
 
 
@@ -60,7 +59,7 @@ class MeetingsScreen(BaseScreen):
         self.hero_title.bind(size=self.hero_title.setter('text_size'))
         title_box.add_widget(self.hero_title)
         self.hero_subtitle = Label(
-            text=f'Browse synced summaries, transcripts, decisions, and action items. {TAP_OR_CLICK} any meeting to open details.',
+            text='Browse synced summaries, transcripts, decisions, and action items. Tap any meeting to open details.',
             font_size=sf(FONT_SIZES['small']),
             color=COLORS['gray_300'],
             halign='left',
@@ -146,7 +145,7 @@ class MeetingsScreen(BaseScreen):
 
     def _populate(self):
         self.meetings_container.clear_widgets()
-        self.hero_subtitle.text = f'{len(self.meetings)} recent meetings synced from Pepper AI memory.'
+        self.hero_subtitle.text = f'{len(self.meetings)} recent meetings synced from MeetingBox memory.'
         if not self.meetings:
             self._show_empty('No meetings yet. Start a recording from Home to build memory.')
             return

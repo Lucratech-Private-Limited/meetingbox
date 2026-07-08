@@ -11,8 +11,6 @@ import os
 from pathlib import Path
 from urllib.parse import urlparse, urlunparse
 
-import platform_compat
-
 logger = logging.getLogger(__name__)
 
 # ============================================================================
@@ -121,7 +119,6 @@ _WS_ENV = (os.getenv("BACKEND_WS_URL", "") or "").strip()
 BACKEND_WS_URL = _fix_ws_wrong_under_api(_WS_ENV) if _WS_ENV else _default_ws_url(BACKEND_URL)
 DEVICE_AUTH_TOKEN = os.getenv('DEVICE_AUTH_TOKEN', '')
 DEVICE_AUTH_TOKEN_FILE_NAME = 'device_auth_token'
-DEVICE_AUTH_TOKEN_REVOKED_MARKER_NAME = 'device_auth_token.revoked'
 
 # Use mock backend for testing (set MOCK_BACKEND=1)
 USE_MOCK_BACKEND = os.getenv('MOCK_BACKEND', '0') == '1'
@@ -213,22 +210,6 @@ TARGET_FPS = int(os.getenv('TARGET_FPS', '30'))
 
 # Fullscreen mode (set FULLSCREEN=0 for windowed dev mode)
 FULLSCREEN = os.getenv('FULLSCREEN', '0') == '1'
-
-
-def dock_companion_enabled() -> bool:
-    """True when running as the Windows floating-dock desktop companion.
-
-    In that mode the dock is the only navigation surface, so the per-screen
-    back buttons are removed (screens are summoned/dismissed via the dock).
-    """
-    try:
-        from platform_compat import IS_DESKTOP, IS_WINDOWS
-    except Exception:
-        return False
-    return bool(
-        IS_WINDOWS and IS_DESKTOP and not FULLSCREEN
-        and os.getenv("MEETINGBOX_DOCK", "1") != "0"
-    )
 
 # ============================================================================
 # DISPLAY CLOCK (wall time in UI — default India Standard Time)
@@ -518,7 +499,7 @@ DEFAULT_AUTO_DELETE = 'never'       # never, 30, 60, 90
 # DEVICE INFO
 # ============================================================================
 
-DEVICE_MODEL = 'Pepper AI v1.0'
+DEVICE_MODEL = 'MeetingBox v1.0'
 
 _d_label, _d_public = _normalize_dashboard_config(os.getenv("DASHBOARD_URL", "meetingbox.local"))
 # Compact host:port for subtitles (e.g. Configure at …)
@@ -531,7 +512,7 @@ DASHBOARD_PUBLIC_URL = _d_public
 # ============================================================================
 
 LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')
-LOG_FILE = os.getenv('LOG_FILE', platform_compat.default_log_file())
+LOG_FILE = os.getenv('LOG_FILE', '/tmp/meetingbox-ui.log')
 LOG_TO_CONSOLE = os.getenv('LOG_TO_CONSOLE', '1') == '1'
 
 # ============================================================================
@@ -575,21 +556,9 @@ def resolve_device_config_dir() -> Path:
     """
     Writable directory for device_profiles.json and local .setup_complete.
 
-    On the Linux appliance, prefers /data/config when the compose volume
-    exists and is writable, otherwise BASE_DIR/data/config (under the app
-    tree). On Windows/macOS, prefers the per-user data dir
-    (e.g. %LOCALAPPDATA%\\MeetingBox\\data\\config) which is always writable
-    even when the app is installed under Program Files.
+    Prefers /data/config when the compose volume exists and is writable.
+    Otherwise uses BASE_DIR/data/config (under the app tree).
     """
-    desktop_dir = platform_compat.default_config_dir()
-    if desktop_dir is not None:
-        try:
-            desktop_dir.mkdir(parents=True, exist_ok=True)
-            if desktop_dir.is_dir() and os.access(desktop_dir, os.W_OK):
-                return desktop_dir
-        except OSError:
-            pass
-
     for d in (Path('/data/config'), Path('/opt/meetingbox/data/config')):
         if _system_config_dir_usable(d):
             return d
@@ -706,30 +675,17 @@ def get_device_auth_token() -> str:
                     return t
         except OSError:
             continue
-    for d in _device_token_storage_dirs():
-        try:
-            if (d / DEVICE_AUTH_TOKEN_REVOKED_MARKER_NAME).is_file():
-                return ""
-        except OSError:
-            continue
     return (DEVICE_AUTH_TOKEN or "").strip()
 
 
-def clear_stored_device_auth_token(*, revoked: bool = True) -> None:
-    """Remove persisted mbd_ token and suppress stale env fallback after revoke."""
+def clear_stored_device_auth_token() -> None:
+    """Remove persisted mbd_ token (after unpair). Env DEVICE_AUTH_TOKEN is unchanged."""
     for d in _device_token_storage_dirs():
         path = d / DEVICE_AUTH_TOKEN_FILE_NAME
         try:
             path.unlink(missing_ok=True)
         except OSError as e:
             logger.warning('Could not remove device auth token file %s: %s', path, e)
-        if revoked:
-            try:
-                d.mkdir(parents=True, exist_ok=True)
-                marker = d / DEVICE_AUTH_TOKEN_REVOKED_MARKER_NAME
-                marker.write_text('revoked\n', encoding='utf-8')
-            except OSError as e:
-                logger.debug('Could not write device auth revoke marker in %s: %s', d, e)
 
 
 def persist_device_auth_token(token: str) -> bool:
@@ -751,10 +707,6 @@ def persist_device_auth_token(token: str) -> bool:
         try:
             path.write_text(t + '\n', encoding='utf-8')
             try:
-                (d / DEVICE_AUTH_TOKEN_REVOKED_MARKER_NAME).unlink(missing_ok=True)
-            except OSError:
-                pass
-            try:
                 path.chmod(0o600)
             except OSError:
                 pass
@@ -773,40 +725,6 @@ try:
     (ASSETS_DIR / "welcome").mkdir(exist_ok=True)
 except OSError as e:
     logger.warning("Could not create assets/fonts/icons dirs: %s", e)
-
-
-def _seed_desktop_audio_env() -> None:
-    """On Windows/macOS, default the audio child's recording paths and token
-    file to the per-user data dir so a Program-Files install still records.
-
-    The audio_capture child process inherits these via the supervisor's
-    ``os.environ.copy()``. Linux keeps its /data defaults untouched.
-    """
-    rec = platform_compat.default_recordings_dir()
-    tmp = platform_compat.default_temp_segments_dir()
-    if rec is None or tmp is None:
-        return
-    cfg = resolve_device_config_dir()
-    defaults = {
-        "RECORDINGS_DIR": str(rec),
-        "TEMP_SEGMENTS_DIR": str(tmp),
-        "DEVICE_AUTH_TOKEN_FILE": str(cfg / DEVICE_AUTH_TOKEN_FILE_NAME),
-        # The Linux appliance defaults the capture backend to arecord; on
-        # desktop OSes force PortAudio so no ALSA tooling is required.
-        "AUDIO_CAPTURE_BACKEND": "sounddevice",
-    }
-    for key, value in defaults.items():
-        if not (os.environ.get(key) or "").strip():
-            os.environ[key] = value
-    for d in (rec, tmp):
-        try:
-            Path(d).mkdir(parents=True, exist_ok=True)
-        except OSError:
-            pass
-
-
-if platform_compat.IS_WINDOWS or platform_compat.IS_MACOS:
-    _seed_desktop_audio_env()
 
 # ============================================================================
 # DEVELOPMENT

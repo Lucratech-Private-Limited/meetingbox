@@ -416,8 +416,6 @@ def list_recent_messages(
 
     _META_HEADERS = [
         "From",
-        "To",                    # recipients — critical for sent mail
-        "Cc",                    # CC recipients
         "Subject",
         "Date",
         "List-Unsubscribe",
@@ -526,7 +524,7 @@ def list_recent_messages(
             ):
                 continue
 
-            row: dict = {
+            out.append({
                 "id": mid,
                 "threadId": m.get("threadId"),
                 "snippet": snippet,
@@ -534,14 +532,7 @@ def list_recent_messages(
                 "subject": subj,
                 "date": headers_lc.get("date", ""),
                 "is_read": "UNREAD" not in label_ids,
-            }
-            to_hdr = headers_lc.get("to", "")
-            cc_hdr = headers_lc.get("cc", "")
-            if to_hdr:
-                row["to"] = to_hdr
-            if cc_hdr:
-                row["cc"] = cc_hdr
-            out.append(row)
+            })
 
         if not page_token:
             break
@@ -966,7 +957,6 @@ def get_message_with_attachments(credentials, message_id: str) -> dict:
         "threadId": m.get("threadId"),
         "from": headers.get("From", ""),
         "to": headers.get("To", ""),
-        "cc": headers.get("Cc", ""),
         "subject": headers.get("Subject", ""),
         "date": headers.get("Date", ""),
         "snippet": m.get("snippet", ""),

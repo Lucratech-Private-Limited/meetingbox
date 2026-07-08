@@ -24,7 +24,6 @@ from config import (
     other_screen_horizontal_scale,
     other_screen_vertical_scale,
 )
-from platform_compat import IS_DESKTOP
 
 _GEAR_ICON = ASSETS_DIR / "recording" / "icon_settings_gear.png"
 
@@ -81,12 +80,6 @@ class StatusBar(BoxLayout):
         kwargs.setdefault('spacing', _suh(10))
 
         super().__init__(**kwargs)
-
-        # Desktop (Windows/macOS) has no in-app Settings screen — the OS owns
-        # device configuration — so the gear is never shown regardless of what
-        # a caller passed. Appliance behavior is unchanged.
-        if IS_DESKTOP:
-            show_settings = False
 
         self._status_color = status_color or COLORS['green']
         self.pulsing = pulsing

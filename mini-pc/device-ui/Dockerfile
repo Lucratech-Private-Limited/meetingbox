@@ -68,14 +68,11 @@ RUN set -eux; \
             espeak-ng \
             alsa-utils \
             network-manager \
-            libglib2.0-bin \
             sudo \
             bluez \
             pulseaudio-utils \
             pipewire \
-            pipewire-alsa \
             wireplumber \
-            libasound2-plugins \
         ; then \
             success=1; \
             break; \
@@ -104,16 +101,11 @@ RUN chmod +x /app/docker-entrypoint.sh
 
 # Create non-root user with host-matching groups for device access
 # `audio` is required for /dev/snd (mic test uses sounddevice → PortAudio → ALSA).
-# Install the privileged Wi-Fi join helper (D-Bus workaround for nmcli/daemon
-# version skew — see scripts/meetingbox-wifi-connect for details).
-RUN cp /app/scripts/meetingbox-wifi-connect /usr/local/bin/meetingbox-wifi-connect \
-    && chmod 0755 /usr/local/bin/meetingbox-wifi-connect
-
 RUN groupadd -g 44 video 2>/dev/null || true \
     && groupadd -g 105 input 2>/dev/null || true \
     && useradd -m -u 1000 -s /bin/bash -G video,input,audio uiuser \
     && chown -R uiuser:uiuser /app \
-    && printf '%s\n' 'uiuser ALL=(root) NOPASSWD: /usr/local/bin/meetingbox-host-reboot, /usr/local/bin/meetingbox-host-poweroff, /usr/local/bin/meetingbox-host-orientation-lock, /bin/sh /usr/local/bin/meetingbox-host-reboot, /bin/sh /usr/local/bin/meetingbox-host-poweroff, /bin/sh /usr/local/bin/meetingbox-host-orientation-lock, /bin/sh /usr/local/bin/meetingbox-bluetooth *, /bin/sh /usr/local/bin/meetingbox-timedatectl *, /usr/local/bin/meetingbox-wifi-connect *, /usr/bin/tee /sys/class/backlight/*/brightness, /usr/bin/tee /sys/class/backlight/*/bl_power, /usr/bin/nmcli, /usr/bin/bluetoothctl, /usr/bin/rfkill, /usr/sbin/rfkill, /sbin/rfkill' > /etc/sudoers.d/meetingbox-host-power \
+    && printf '%s\n' 'uiuser ALL=(root) NOPASSWD: /usr/local/bin/meetingbox-host-reboot, /usr/local/bin/meetingbox-host-poweroff, /bin/sh /usr/local/bin/meetingbox-host-reboot, /bin/sh /usr/local/bin/meetingbox-host-poweroff, /bin/sh /usr/local/bin/meetingbox-bluetooth *, /bin/sh /usr/local/bin/meetingbox-timedatectl *, /usr/bin/tee /sys/class/backlight/*/brightness, /usr/bin/tee /sys/class/backlight/*/bl_power, /usr/bin/nmcli, /usr/bin/bluetoothctl, /usr/bin/rfkill, /usr/sbin/rfkill, /sbin/rfkill' > /etc/sudoers.d/meetingbox-host-power \
     && chmod 0440 /etc/sudoers.d/meetingbox-host-power \
     && visudo -cf /etc/sudoers.d/meetingbox-host-power
 

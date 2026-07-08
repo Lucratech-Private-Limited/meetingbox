@@ -1,9 +1,0 @@
-<svg viewBox="0 0 13 13" fill="none" xmlns="http://www.w3.org/2000/svg">
-<circle cx="6.522" cy="6.522" r="6.522" fill="url(#emailDotUnread)"/>
-<defs>
-<linearGradient id="emailDotUnread" x1="6.522" y1="0" x2="6.522" y2="13.044" gradientUnits="userSpaceOnUse">
-<stop stop-color="#467DFE"/>
-<stop offset="1" stop-color="#0058F4"/>
-</linearGradient>
-</defs>
-</svg>

@@ -8,7 +8,7 @@ interface BadgeProps {
   className?: string
 }
 
-export default function Badge({ text, color = 'bg-app-raised text-app-ink', className }: BadgeProps) {
+export default function Badge({ text, color = 'bg-gray-100 text-gray-800', className }: BadgeProps) {
   return (
     <span
       className={clsx(

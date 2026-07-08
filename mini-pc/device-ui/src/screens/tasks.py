@@ -40,9 +40,7 @@ import logging
 from datetime import date, datetime, timedelta
 
 from kivy.clock import Clock
-from kivy.graphics import (
-    Color, Ellipse, Line, PopMatrix, PushMatrix, Rectangle, RoundedRectangle, Translate,
-)
+from kivy.graphics import Color, Ellipse, Line, Rectangle, RoundedRectangle
 from kivy.uix.behaviors import ButtonBehavior
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.floatlayout import FloatLayout
@@ -54,13 +52,9 @@ from kivy.uix.textinput import TextInput
 from kivy.uix.widget import Widget
 
 from async_helper import run_async
-from components.live_wifi_icon import LiveWifiIcon as _WifiIcon
 from config import ASSETS_DIR, DISPLAY_HEIGHT, DISPLAY_WIDTH, display_now
-from frame19_layout import BG_BOT, BG_TOP
-from page_swipe import PageSwipeController, any_modal_open
 from screens.base_screen import BaseScreen
 from screens.home import _BatteryWidget, _VoiceStatePill  # noqa: PLC2701
-from ui_bg import attach_swirl_bg
 
 logger = logging.getLogger(__name__)
 
@@ -160,6 +154,35 @@ def _lbl(text: str, font: str, size: int | float, color: tuple,
 class _ImgBtn(ButtonBehavior, Image):
     pass
 
+
+class _WifiIcon(Widget):
+    """Hand-drawn WiFi glyph (3 arcs + dot), black — matches voice screens."""
+    _COL = (0.0, 0.0, 0.0, 1.0)
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        with self.canvas:
+            self._c    = Color(*self._COL)
+            self._arc1 = Line(width=1.4)
+            self._arc2 = Line(width=1.4)
+            self._arc3 = Line(width=1.4)
+            self._dotc = Color(*self._COL)
+            self._dot  = Ellipse()
+        self.bind(pos=self._redraw, size=self._redraw)
+        Clock.schedule_once(self._redraw, 0)
+
+    def _redraw(self, *_) -> None:
+        w, h = self.size
+        if w <= 1 or h <= 1:
+            return
+        cx = self.x + w / 2
+        cy = self.y + h * 0.08
+        for arc, frac in [(self._arc1, 0.30), (self._arc2, 0.58), (self._arc3, 0.86)]:
+            r = h * frac
+            arc.ellipse = (cx - r, cy - r, 2 * r, 2 * r, 45, 135)
+        dr = h * 0.09
+        self._dot.pos  = (cx - dr, cy - dr)
+        self._dot.size = (dr * 2, dr * 2)
 
 
 class _Dot(Widget):
@@ -300,7 +323,7 @@ def _categorize(row: dict) -> str | None:
     status = (row.get("status") or "").lower()
     if status in ("completed", "cancelled", "canceled"):
         return None
-    raw = (row.get("due_at") or "").strip()
+    raw = (row.get("due_at") or row.get("remind_at") or "").strip()
     if not raw:
         return "unplanned"
     d = _parse_dt(raw)
@@ -625,9 +648,6 @@ class TasksScreen(BaseScreen):
         self._rows: dict[str, list] = {k: [] for k in _TAB_IDS}
         self._loading: bool = False
         self._refresh_ev = None
-        # Optimistically-added rows (e.g. a task the user just created by voice).
-        # Kept visible until the real row arrives from the backend fetch.
-        self._optimistic: list[dict] = []
 
         # runtime widget refs
         self._tab_cells:   dict[str, FloatLayout] = {}
@@ -638,33 +658,33 @@ class TasksScreen(BaseScreen):
         self._list_box:    BoxLayout | None        = None
         self._voice_pill:  _VoiceStatePill | None  = None
         self._menu_overlay: Widget | None          = None
-        self._back_btn = None                      # top-left back button
-        # Set by the Calendar→Tasks swipe so the back button is suppressed when
-        # Tasks is reached as part of the Home page-swipe chain (you swipe back).
-        self.entered_via_swipe = False
-        self._page_tx = None                       # transform-only page translate
 
         self._build_ui()
-
-        # Tasks is the right-most page in the chain. A left-to-right swipe reveals
-        # Calendar (which sits to its left); there is no page to the right.
-        self._calendar_pager = PageSwipeController(
-            self,
-            "calendar",
-            direction=1,
-            prepare_dest=self._prepare_adjacent,
-            commit=lambda: self.app.goto_screen("calendar", transition="none"),
-            can_start=self._can_page,
-        )
 
     # ── Build ──────────────────────────────────────────────────────────────────
 
     def _build_ui(self) -> None:
         root = FloatLayout(size_hint=(1, 1))
 
-        # Shared light paper-swirl background — identical to the Start-Recording /
-        # Calendar screens — so the Home page-swipe chain feels continuous.
-        attach_swirl_bg(root, BG_TOP, BG_BOT)
+        # Base colour behind the image (in case the asset is missing)
+        with root.canvas.before:
+            Color(*_BG_BASE)
+            self._bg_rect = Rectangle(pos=root.pos, size=root.size)
+        root.bind(pos=lambda w, v: setattr(self._bg_rect, "pos", v),
+                  size=lambda w, v: setattr(self._bg_rect, "size", v))
+
+        bg_src = _vs_asset("vs_bg.png")
+        if bg_src:
+            root.add_widget(Image(source=bg_src, size_hint=(1, 1), pos_hint={"x": 0, "y": 0},
+                                  fit_mode="fill", allow_stretch=True, keep_ratio=False))
+
+        ov = Widget(size_hint=(1, 1), pos_hint={"x": 0, "y": 0})
+        with ov.canvas:
+            Color(*_OVERLAY)
+            _ovr = Rectangle(pos=ov.pos, size=ov.size)
+        ov.bind(pos=lambda w, p: setattr(_ovr, "pos", p),
+                size=lambda w, s: setattr(_ovr, "size", s))
+        root.add_widget(ov)
 
         self._build_header(root)
         self._build_tab_bar(root)
@@ -685,16 +705,11 @@ class TasksScreen(BaseScreen):
                                  ha="center", va="middle", size_hint=(1, 1),
                                  pos_hint={"x": 0, "y": 0}))
         back.bind(on_release=lambda *_: self.go_back())
-        self._back_btn = back
         root.add_widget(back)
 
-        # "Tasks" title — black, 42dot Bold 40. When the back button is
-        # suppressed (floating-dock companion) pull the title to the left margin
-        # so it aligns with the content instead of leaving an awkward gap.
-        from config import dock_companion_enabled
-        _title_x = 40.0 if dock_companion_enabled() else 98.0
+        # "Tasks" title — black, 42dot Bold 40
         root.add_widget(_lbl("Tasks", _F_BOLD, _ff(40), _TITLE_BLK, bold=True,
-                             ha="left", va="middle", **_ph(_title_x, 88.0, 320.0, 48.0)))
+                             ha="left", va="middle", **_ph(98.0, 88.0, 320.0, 48.0)))
 
     # ── Tab bar  (Figma 29,170 1202×69 #DFDFDF r38) ─────────────────────────────
 
@@ -749,75 +764,54 @@ class TasksScreen(BaseScreen):
     # ── List card  (Figma 29,263 1202×… white90 r[0,0,38,38]) ───────────────────
 
     def _build_list_area(self, root: FloatLayout) -> None:
-        # Two decoupled pieces avoid the ScrollView-resize bug:
-        #   1. A canvas-only white background widget that HUGS the active section's
-        #      content height (Figma: 143 px card for 2 tasks), top square / bottom
-        #      rounded, anchored at Figma y=263 and growing downward.
-        #   2. A FIXED full-height (transparent) ScrollView holding the task rows.
-        #      Resizing a ScrollView dynamically detaches its content to (0,0); a
-        #      fixed-size ScrollView keeps the rows pinned at the top correctly.
-        CARD_TOP_FY = 263.0
-        AVAIL_FH = FH - CARD_TOP_FY - 21.0
+        # Card top is square, bottom rounded — drawn as rounded rect + a plain
+        # rect over the top `r` px to square the upper corners.
+        CARD_Y, CARD_H = 263.0, 800.0 - 263.0 - 21.0   # extend to near bottom
+        # FloatLayout (not bare Widget) so the ScrollView child honours size_hint.
+        card = FloatLayout(**_ph(29.0, CARD_Y, 1202.0, CARD_H))
         r = _ff(38)
-
-        # 1 ── white background that hugs the content height ─────────────────────
-        card_bg = Widget(size_hint=(1202.0 / FW, None),
-                         pos_hint={"x": 29.0 / FW, "top": (FH - CARD_TOP_FY) / FH})
-        card_bg.height = _ff(150)
-        self._card = card_bg
-        # Single rounded rect with per-corner radius: square top, rounded bottom.
-        # (Order is [bottom-left, bottom-right, top-right, top-left].)
-        _crad = [r, r, 0, 0]
-        with card_bg.canvas.before:
+        with card.canvas.before:
             Color(*_CARD_BG)
-            self._card_round = RoundedRectangle(pos=card_bg.pos, size=card_bg.size, radius=_crad)
+            self._card_round = RoundedRectangle(pos=card.pos, size=card.size, radius=[r])
+            self._card_top   = Rectangle()
 
-        def _sync_bg(w, *_):
+        def _sync_card(w, *_):
             self._card_round.pos = w.pos
             self._card_round.size = w.size
-            self._card_round.radius = _crad
+            self._card_round.radius = [r]
+            self._card_top.pos = (w.x, w.top - r)
+            self._card_top.size = (w.width, r)
 
-        card_bg.bind(pos=_sync_bg, size=_sync_bg)
-        Clock.schedule_once(lambda _dt: _sync_bg(card_bg), 0)
-        root.add_widget(card_bg)
+        card.bind(pos=_sync_card, size=_sync_card)
+        Clock.schedule_once(lambda _dt: _sync_card(card), 0)
+        root.add_widget(card)
 
-        # 2 ── fixed full-height scroll area with the task rows (on top of bg) ────
-        sv = ScrollView(do_scroll_x=False, do_scroll_y=True,
+        sv = ScrollView(size_hint=(1, 1), do_scroll_x=False, do_scroll_y=True,
                         bar_width=_ff(5), bar_color=[*_ACTIVE[:3], 0.5],
                         bar_inactive_color=[*_ACTIVE[:3], 0.15],
-                        scroll_type=["bars", "content"],
-                        **_ph(29.0, CARD_TOP_FY, 1202.0, AVAIL_FH))
-        self._scroll = sv
+                        scroll_type=["bars", "content"])
         box = BoxLayout(orientation="vertical", size_hint_y=None,
                         padding=[0, 0, 0, _ff(14)], spacing=0)
         box.bind(minimum_height=box.setter("height"))
         self._list_box = box
-
-        # Background hugs content, clamped to the space below the tab bar.
-        def _fit_bg(*_):
-            ph = self.height or float(DISPLAY_HEIGHT)
-            max_h = max(_ff(80), ph * (AVAIL_FH / FH))
-            card_bg.height = max(_ff(80), min(box.minimum_height, max_h))
-        self._fit_card = _fit_bg
-        box.bind(minimum_height=_fit_bg)
-        self.bind(height=_fit_bg)
-
         sv.add_widget(box)
-        root.add_widget(sv)
+        card.add_widget(sv)
 
         box.add_widget(_lbl("Loading tasks…", _F_MED, _ff(26), _DUE_TXT,
                             ha="center", va="middle", size_hint=(1, None), height=_ff(120)))
-        Clock.schedule_once(lambda _dt: _fit_bg(), 0)
 
     # ── Top-right chrome: voice pill + wifi + battery ───────────────────────────
 
     def _build_chrome(self, root: FloatLayout) -> None:
-        # Voice-state pill: rendered exclusively by the global VoiceControlBar
-        # (see voice_control_bar.py) for consistent size/position/font.
-        # self._voice_pill stays None here on purpose; existing
-        # `if self._voice_pill:` guards elsewhere no-op safely.
-        # (WiFi + battery indicators removed — not relevant for the desktop app.)
-        return
+        self._voice_pill = _VoiceStatePill(**_ph(851.0, 17.0, 222.0, 47.0))
+        self._voice_pill.opacity = 1.0
+        try:
+            self._voice_pill.set_state_text("Listening")
+        except Exception:
+            pass
+        root.add_widget(self._voice_pill)
+        root.add_widget(_WifiIcon(**_ph(1109.0, 31.0, 29.0, 20.0)))
+        root.add_widget(_BatteryWidget(**_ph(1175.0, 30.0, 47.0, 21.0)))
 
     # ── Tab selection / styling ─────────────────────────────────────────────────
 
@@ -1080,7 +1074,6 @@ class TasksScreen(BaseScreen):
 
             def _apply(_dt):
                 self._loading = False
-                self._merge_optimistic(bucketed)
                 self._rows = bucketed
                 self._update_counts()
                 self._rebuild_task_list(error_msg=error_msg)
@@ -1088,63 +1081,6 @@ class TasksScreen(BaseScreen):
             Clock.schedule_once(_apply, 0)
 
         run_async(_go())
-
-    def add_optimistic_task(self, title: str, due_date: str | None = None) -> str | None:
-        """Show a just-created task immediately, before the backend round-trips.
-
-        Returns the bucket id the task landed in (so callers can select the
-        matching tab), or ``None`` if nothing was added.
-        """
-        title = (title or "").strip()
-        if not title:
-            return None
-        import uuid
-        due_at = (due_date or "").strip() or None
-        row = {
-            "id": f"opt-{uuid.uuid4().hex[:8]}",
-            "title": title,
-            "due_at": due_at,
-            "status": "",
-            "_optimistic": True,
-        }
-        bucket = _categorize(row) or "unplanned"
-        # De-dupe against an identical pending optimistic row.
-        if not any(
-            (o.get("title") or "").strip().lower() == title.lower()
-            for o in self._optimistic
-        ):
-            self._optimistic.append(row)
-            self._rows.setdefault(bucket, []).append(row)
-            if bucket in _SHOW_DUE:
-                self._rows[bucket].sort(
-                    key=_due_sort_key, reverse=(bucket != "upcoming"))
-            self._update_counts()
-            self._rebuild_task_list()
-        return bucket
-
-    def _merge_optimistic(self, bucketed: dict[str, list]) -> None:
-        """Fold still-pending optimistic rows into a freshly-fetched bucket map.
-
-        An optimistic row is dropped once a real row with the same title shows
-        up in the fetch (the backend now owns it)."""
-        if not self._optimistic:
-            return
-        real_titles = {
-            (r.get("title") or "").strip().lower()
-            for rows in bucketed.values() for r in rows
-        }
-        still_pending: list[dict] = []
-        for opt in self._optimistic:
-            title = (opt.get("title") or "").strip().lower()
-            if title in real_titles:
-                continue
-            bucket = _categorize(opt) or "unplanned"
-            bucketed.setdefault(bucket, []).append(opt)
-            if bucket in _SHOW_DUE:
-                bucketed[bucket].sort(
-                    key=_due_sort_key, reverse=(bucket != "upcoming"))
-            still_pending.append(opt)
-        self._optimistic = still_pending
 
     # ── Voice state (live Listening pill) ───────────────────────────────────────
 
@@ -1156,85 +1092,10 @@ class TasksScreen(BaseScreen):
         if label:
             self._voice_pill.set_state_text(label)
             self._voice_pill.opacity = 1.0
-        else:
-            self._voice_pill.opacity = 0.0
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
-    # ── Interactive page swipe (Tasks → Calendar) ─────────────────────────────
-
-    def _can_page(self) -> bool:
-        return self._menu_overlay is None and not any_modal_open()
-
-    def _prepare_adjacent(self, dest) -> None:
-        try:
-            dest.prime_preview()
-        except Exception:
-            logger.exception("tasks: failed to prime adjacent page preview")
-
-    def _ensure_page_translate(self) -> None:
-        if self._page_tx is not None:
-            return
-        with self.canvas.before:
-            PushMatrix()
-            self._page_tx = Translate(0, 0, 0)
-        with self.canvas.after:
-            PopMatrix()
-
-    def set_page_offset(self, dx: float) -> None:
-        self._ensure_page_translate()
-        self._page_tx.x = float(dx)
-
-    def prime_preview(self) -> None:
-        """Refresh content so the swipe preview shows live data.
-
-        Reaching Tasks via a swipe means the back button is redundant (you swipe
-        back), so hide it for the preview too — avoids a flash on commit.
-        """
-        self.set_page_offset(0.0)
-        self._set_back_visible(False)
-        try:
-            Clock.schedule_once(self._load_tasks, 0)
-        except Exception:
-            logger.debug("tasks: prime_preview failed", exc_info=True)
-
-    def _set_back_visible(self, visible: bool) -> None:
-        if self._back_btn is None:
-            return
-        # In the floating-dock companion the dock is the only navigation surface,
-        # so the back button is always suppressed.
-        from config import dock_companion_enabled
-        if dock_companion_enabled():
-            visible = False
-        self._back_btn.opacity = 1.0 if visible else 0.0
-        self._back_btn.disabled = not visible
-
-    def on_touch_down(self, touch):
-        pager = getattr(self, "_calendar_pager", None)
-        if pager is not None and pager.on_touch_down(touch):
-            return True
-        return super().on_touch_down(touch)
-
-    def on_touch_move(self, touch):
-        pager = getattr(self, "_calendar_pager", None)
-        if pager is not None and pager.on_touch_move(touch):
-            return True
-        return super().on_touch_move(touch)
-
-    def on_touch_up(self, touch):
-        pager = getattr(self, "_calendar_pager", None)
-        if pager is not None and pager.on_touch_up(touch):
-            return True
-        return super().on_touch_up(touch)
-
     def on_enter(self) -> None:
-        pager = getattr(self, "_calendar_pager", None)
-        if pager is not None:
-            pager.cancel()
-        self.set_page_offset(0.0)
-        # Show the back button only when Tasks was opened by normal navigation
-        # (e.g. voice), not when reached via the Home→Calendar→Tasks swipe chain.
-        self._set_back_visible(not self.entered_via_swipe)
         self._loading = True
         if self._list_box is not None:
             self._list_box.clear_widgets()
@@ -1246,11 +1107,6 @@ class TasksScreen(BaseScreen):
             self._refresh_ev = Clock.schedule_interval(self._load_tasks, _REFRESH_INTERVAL)
 
     def on_leave(self) -> None:
-        pager = getattr(self, "_calendar_pager", None)
-        if pager is not None:
-            pager.cancel()
-        self.set_page_offset(0.0)
-        self.entered_via_swipe = False
         self._close_menu()
         if self._refresh_ev is not None:
             self._refresh_ev.cancel()
