@@ -28,6 +28,8 @@ import re
 import subprocess
 from dataclasses import dataclass
 
+from platform_compat import has_linux_audio_tools
+
 logger = logging.getLogger(__name__)
 
 
@@ -274,6 +276,13 @@ def resolve_audio_pair(sd=None) -> AudioDevicePair:
     Call once at session startup. Pass the sounddevice module (or None).
     """
     pair = AudioDevicePair()
+
+    # Non-Linux (Windows/macOS): ALSA/PulseAudio CLI tools do not exist. Use
+    # PortAudio defaults for both capture and playback (capture=None lets the
+    # caller fall back to the host default mic; playback is handled by the
+    # cross-platform audio_output helper, not aplay).
+    if not has_linux_audio_tools():
+        return pair
 
     # Priority 0: Bluetooth via PulseAudio/PipeWire.
     # BT devices are NOT listed by `arecord -l` — they only exist as

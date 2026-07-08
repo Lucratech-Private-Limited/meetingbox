@@ -58,6 +58,7 @@ echo "Building native binary with Nuitka..."
     --output-dir="$NATIVE_BUILD_DIR" \
     --output-filename=meetingbox-ui.bin \
     --include-data-dir="$DEVICE_UI_DIR/assets=assets" \
+    --include-package=websockets \
     ${NUITKA_EXTRA_ARGS:-} \
     "$DEVICE_UI_DIR/src/main.py"
 )

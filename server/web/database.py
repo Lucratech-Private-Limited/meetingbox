@@ -29,7 +29,8 @@ def init_database() -> None:
               audio_path TEXT,
               status TEXT,
               created_at TEXT,
-              participants TEXT
+              participants TEXT,
+              recording_mode TEXT DEFAULT 'meeting'
             )
             """
         )
@@ -113,6 +114,7 @@ def init_database() -> None:
         for statement in [
             "ALTER TABLE meetings ADD COLUMN user_id TEXT",
             "ALTER TABLE meetings ADD COLUMN device_id TEXT",
+            "ALTER TABLE meetings ADD COLUMN recording_mode TEXT DEFAULT 'meeting'",
         ]:
             try:
                 cursor.execute(statement)
@@ -478,10 +480,122 @@ def init_database() -> None:
             "ON analysis_runs(user_id, job_type, run_date)"
         )
 
+        # Personal notes — free-form note-taking per user.
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_notes (
+              id         TEXT PRIMARY KEY,
+              user_id    TEXT NOT NULL,
+              title      TEXT NOT NULL DEFAULT '',
+              content    TEXT NOT NULL DEFAULT '',
+              tags       TEXT DEFAULT '[]',
+              pinned     INTEGER NOT NULL DEFAULT 0,
+              source     TEXT NOT NULL DEFAULT 'manual',
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+            """
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_user_notes_user_updated "
+            "ON user_notes(user_id, updated_at)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_user_notes_user_pinned "
+            "ON user_notes(user_id, pinned)"
+        )
+
+        _init_recording_intelligence_schema(cursor)
+
         conn.commit()
     finally:
         conn.close()
     run_alembic_upgrade()
+
+
+def _init_recording_intelligence_schema(cursor: "sqlite3.Cursor") -> None:
+    """
+    Rich, searchable metadata + semantic-search infrastructure for the
+    Notes/Meetings retrieval system.
+
+    Three stores, all keyed by ``meetings.id`` (the session id):
+
+    * ``recording_context`` — the intent/context captured before and after a
+      recording, plus entities (people, projects, events, …) and keywords
+      extracted from the transcript. This is what makes a note about the
+      "board meeting" findable even when those words never appear in the
+      recorded audio.
+    * ``recording_embeddings`` — one dense vector per recording (transcript +
+      summary + metadata) for semantic similarity ranking. Vector is stored as
+      raw float32 bytes so it works on a stock SQLite build.
+    * ``recordings_fts`` — an FTS5 full-text index over the composed searchable
+      text, used for fast, scalable keyword/transcript matching instead of
+      ``LIKE '%word%'`` table scans.
+    """
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS recording_context (
+          meeting_id            TEXT PRIMARY KEY,
+          session_type          TEXT DEFAULT 'meeting',
+          session_intent        TEXT DEFAULT '',
+          pre_context           TEXT DEFAULT '',
+          post_context          TEXT DEFAULT '',
+          intent_tags           TEXT DEFAULT '[]',
+          context_tags          TEXT DEFAULT '[]',
+          referenced_people     TEXT DEFAULT '[]',
+          referenced_projects   TEXT DEFAULT '[]',
+          referenced_events     TEXT DEFAULT '[]',
+          referenced_organizations TEXT DEFAULT '[]',
+          referenced_locations  TEXT DEFAULT '[]',
+          referenced_topics     TEXT DEFAULT '[]',
+          keywords              TEXT DEFAULT '[]',
+          future_reference_tags TEXT DEFAULT '[]',
+          search_blob           TEXT DEFAULT '',
+          created_at            TEXT,
+          updated_at            TEXT,
+          FOREIGN KEY (meeting_id) REFERENCES meetings(id)
+        )
+        """
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_recording_context_type "
+        "ON recording_context(session_type)"
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS recording_embeddings (
+          meeting_id TEXT PRIMARY KEY,
+          model      TEXT NOT NULL,
+          dim        INTEGER NOT NULL,
+          vector     BLOB NOT NULL,
+          updated_at TEXT,
+          FOREIGN KEY (meeting_id) REFERENCES meetings(id)
+        )
+        """
+    )
+
+    # FTS5 may not be available on exotic SQLite builds; degrade gracefully.
+    try:
+        cursor.execute(
+            """
+            CREATE VIRTUAL TABLE IF NOT EXISTS recordings_fts USING fts5(
+              meeting_id UNINDEXED,
+              title,
+              summary,
+              transcript,
+              metadata,
+              tokenize = 'porter unicode61'
+            )
+            """
+        )
+    except sqlite3.OperationalError:
+        import logging
+
+        logging.getLogger("meetingbox.database").warning(
+            "FTS5 not available; recording search will fall back to LIKE matching."
+        )
 
 
 def run_alembic_upgrade() -> None:

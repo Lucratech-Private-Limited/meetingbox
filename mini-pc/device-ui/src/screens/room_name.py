@@ -105,4 +105,11 @@ class RoomNameScreen(BaseScreen):
             except Exception:
                 pass
         run_async(_save())
-        self.goto('network_choice', transition='slide_left')
+        # On desktop (Windows/macOS) the PC already manages its own network,
+        # so skip the appliance Wi-Fi setup screens and go straight to pairing.
+        import sys
+        if not sys.platform.startswith('linux'):
+            self.app.setup_network_is_ethernet = True
+            self.goto('pair_device', transition='slide_left')
+        else:
+            self.goto('network_choice', transition='slide_left')

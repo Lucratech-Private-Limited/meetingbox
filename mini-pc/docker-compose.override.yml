@@ -1,0 +1,6 @@
+# Auto-generated override to pass PIPECAT_VOICE to the device-ui container.
+# .env must contain PIPECAT_VOICE=1 to enable the Pipecat voice agent.
+services:
+  device-ui:
+    environment:
+      - PIPECAT_VOICE=${PIPECAT_VOICE:-0}

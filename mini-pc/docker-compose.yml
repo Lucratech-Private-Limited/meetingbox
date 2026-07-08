@@ -132,6 +132,8 @@ services:
       - ./scripts/meetingbox-bluetooth:/usr/local/bin/meetingbox-bluetooth:ro
       # Date/Time and Timezone: timedatectl via nsenter into host (systemd-timedated on host).
       - ./scripts/meetingbox-timedatectl:/usr/local/bin/meetingbox-timedatectl:ro
+      # Landscape lock: mask host iio-sensor-proxy via nsenter so the panel never auto-rotates.
+      - ./scripts/meetingbox-host-orientation-lock:/usr/local/bin/meetingbox-host-orientation-lock:ro
       # nmcli/bluetoothctl in the container talks to host NetworkManager / BlueZ via D-Bus.
       - /run/dbus/system_bus_socket:/run/dbus/system_bus_socket
       # Bind the whole sound device directory so USB mic hot-plug creates new

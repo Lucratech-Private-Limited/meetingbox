@@ -19,6 +19,8 @@ import httpx
 import websockets
 from websockets.exceptions import ConnectionClosed
 
+from ssl_compat import ws_ssl_context
+
 from config import (
     BACKEND_URL,
     BACKEND_WS_URL,
@@ -415,17 +417,100 @@ class BackendClient:
         self._refresh_auth_header()
         return data
 
+    async def get_google_services_auth_url(self, user_jwt: str) -> str:
+        """Combined Gmail + Calendar consent URL (the same one the web app uses).
+
+        Calls ``GET /api/integrations/google/auth-url`` with the *user* JWT — the
+        ``google`` provider requests gmail.{send,compose,readonly} +
+        calendar.{events,readonly} in a single consent screen. The backend
+        callback saves the tokens server-side and redirects the browser to the
+        hosted dashboard, so the device confirms completion by polling
+        :meth:`get_integrations` rather than catching the redirect.
+        """
+        jwt = (user_jwt or "").strip()
+        if not jwt:
+            raise ValueError("Missing Google sign-in token")
+        async with httpx.AsyncClient(timeout=API_TIMEOUT) as raw:
+            resp = await raw.get(
+                f"{self.base_url}/api/integrations/google/auth-url",
+                headers={"Authorization": f"Bearer {jwt}"},
+            )
+        resp.raise_for_status()
+        url = (resp.json().get("auth_url") or "").strip()
+        if not url:
+            raise ValueError("Server did not return a Google services consent URL")
+        return url
+
+    async def finalize_google_signin(
+        self,
+        user_jwt: str,
+        device_name: Optional[str] = None,
+    ) -> Dict:
+        """Self-pair this desktop after a Google sign-in and persist its device token.
+
+        The desktop sign-in yields a *user* JWT. Device API routes
+        (pairing-status, audio commands, uploads) require a *device* ``mbd_``
+        token, so we use the user JWT to mint a pairing code
+        (``POST /api/devices/pairing-codes``) and immediately claim it
+        (``POST /api/devices/claim``) — the same handshake the dashboard +
+        appliance perform, but entirely on-device. The resulting device token is
+        persisted and becomes the client's Bearer credential.
+
+        Returns the claim response (``device`` + ``owner_email``).
+        """
+        jwt = (user_jwt or "").strip()
+        if not jwt:
+            raise ValueError("Missing Google sign-in token")
+        async with httpx.AsyncClient(timeout=API_TIMEOUT) as raw:
+            code_resp = await raw.post(
+                f"{self.base_url}/api/devices/pairing-codes",
+                headers={"Authorization": f"Bearer {jwt}"},
+            )
+            code_resp.raise_for_status()
+            code = (code_resp.json().get("code") or "").strip()
+            if not code:
+                raise ValueError("Could not generate a pairing code for this account")
+
+            payload: Dict[str, str] = {"code": code}
+            dn = (device_name or "").strip()
+            if dn:
+                payload["device_name"] = dn
+            claim_resp = await raw.post(
+                f"{self.base_url}/api/devices/claim",
+                json=payload,
+            )
+        claim_resp.raise_for_status()
+        data = claim_resp.json()
+        access = (data.get("access_token") or "").strip()
+        if not access:
+            raise ValueError("Claim response missing access_token")
+        persist_device_auth_token(access)
+        self._refresh_auth_header()
+        return data
+
     # ==================================================================
     # MEETINGS API
     # ==================================================================
 
-    async def start_recording(self) -> Dict:
+    async def start_recording(self, recording_mode: str = "meeting", context: Dict = None) -> Dict:
         """
         POST /api/meetings/start
         Returns: { session_id, status }
+
+        ``context`` carries pre-recording intent/people/topics captured by the
+        voice agent, stored server-side as searchable metadata.
         """
         try:
-            resp = await self.client.post(f"{self.base_url}/api/meetings/start")
+            mode = (recording_mode or "meeting").strip().lower()
+            if mode not in {"meeting", "note"}:
+                mode = "meeting"
+            body = {"recording_mode": mode}
+            if isinstance(context, dict) and context:
+                body["context"] = context
+            resp = await self.client.post(
+                f"{self.base_url}/api/meetings/start",
+                json=body,
+            )
             resp.raise_for_status()
             data = resp.json()
             logger.info(f"Started recording: {data.get('session_id')}")
@@ -787,6 +872,46 @@ class BackendClient:
     # SETTINGS API (device route)
     # ==================================================================
 
+    async def validate_device_token(self) -> str:
+        """Check whether the persisted device token is still accepted by the backend.
+
+        Used at startup so an expired/revoked Google sign-in doesn't leave the
+        user on a home screen where every request silently fails (e.g. voice
+        stuck on "Listening"). Probes ``GET /api/device/pairing-status``.
+
+        Returns one of:
+          ``"valid"``   – token works (HTTP 200).
+          ``"invalid"`` – token rejected (HTTP 401/403): caller should re-run
+                          Google sign-in.
+          ``"unknown"`` – couldn't determine (network/server error): caller
+                          should NOT discard the token (likely offline / a blip).
+        """
+        token = (get_device_auth_token() or "").strip()
+        if not token:
+            return "invalid"
+        self._refresh_auth_header()
+        try:
+            resp = await self.client.get(
+                f"{self.base_url}/api/device/pairing-status",
+                timeout=8.0,
+            )
+        except Exception as e:
+            logger.warning("Device token validation could not reach backend: %s", e)
+            return "unknown"
+        if resp.status_code == 200:
+            return "valid"
+        if resp.status_code in (401, 403):
+            logger.warning(
+                "Device token rejected (HTTP %s) — re-authentication required",
+                resp.status_code,
+            )
+            return "invalid"
+        logger.warning(
+            "Device token validation got HTTP %s — treating as unknown",
+            resp.status_code,
+        )
+        return "unknown"
+
     async def get_pairing_status(self) -> Dict:
         """GET /api/device/pairing-status — 401 if unpaired from dashboard."""
         try:
@@ -953,12 +1078,14 @@ class BackendClient:
         commitment_id: str,
         status: str | None = None,
         due_date: str | None = None,
+        title: str | None = None,
+        description: str | None = None,
     ) -> Dict:
-        """PATCH /api/commitments/{id} — change status and/or assign a due_date.
+        """PATCH /api/commitments/{id} — change status, due_date, title and/or description.
 
         Pass status='completed' / 'cancelled' / 'snoozed' / 'active' to change state,
-        and/or due_date='YYYY-MM-DD' to assign or change the deadline. At least one
-        of status or due_date is required.
+        due_date='YYYY-MM-DD' to assign or change the deadline, and/or title /
+        description to edit the task text. At least one field is required.
         """
         try:
             body: Dict = {}
@@ -966,6 +1093,10 @@ class BackendClient:
                 body["status"] = status
             if due_date:
                 body["due_date"] = due_date
+            if title is not None:
+                body["title"] = title
+            if description is not None:
+                body["description"] = description
             resp = await self.client.patch(
                 f"{self.base_url}/api/commitments/{commitment_id}",
                 json=body,
@@ -1361,6 +1492,7 @@ class BackendClient:
                     ping_interval=20,
                     ping_timeout=20,
                     max_size=None,
+                    ssl=ws_ssl_context(ws_connect_url),
                 ) as ws:
                     logger.info("WebSocket connected")
                     self._ws_reconnect_attempts = 0
@@ -1378,8 +1510,17 @@ class BackendClient:
                         except json.JSONDecodeError:
                             continue
 
-            except ConnectionClosed:
-                logger.warning("WebSocket closed, reconnecting…")
+            except ConnectionClosed as e:
+                rcvd = getattr(e, "rcvd", None)
+                sent = getattr(e, "sent", None)
+                code = getattr(rcvd, "code", None) if rcvd else getattr(e, "code", None)
+                reason = (
+                    getattr(rcvd, "reason", None) if rcvd else getattr(e, "reason", None)
+                )
+                logger.warning(
+                    "WebSocket closed (code=%s reason=%r sent=%s), reconnecting…",
+                    code, reason, sent,
+                )
                 self.ws_connection = None
                 await self._handle_reconnect()
             except Exception as e:

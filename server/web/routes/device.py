@@ -336,7 +336,7 @@ def _load_settings() -> dict:
         "auto_summarize": False,
         "transcript_storage_enabled": True,
         "recording_consent_reminder": False,
-        "voice_wake_phrase": "hey buddy",
+        "voice_wake_phrase": "hey pepper",
         "voice_realtime_assistant": False,
         "voice_assistant_enabled": True,
         "assistant_speech_volume": 85,
@@ -364,6 +364,13 @@ def _load_settings() -> dict:
         try:
             with open(SETTINGS_FILE) as f:
                 saved = json.load(f)
+            if saved.get("voice_wake_phrase") == "hey tony":
+                saved["voice_wake_phrase"] = "hey pepper"
+                try:
+                    with open(SETTINGS_FILE, "w") as f:
+                        json.dump(saved, f, indent=2)
+                except Exception:
+                    pass
             defaults.update(saved)
         except Exception:
             pass
@@ -562,7 +569,10 @@ async def device_home_summary(
     if current_actor["type"] == "device":
         user_id = current_actor["device"].get("owner_user_id") or current_actor["user"]["id"]
         device_id = current_actor["device"]["id"]
-        scope_sql = "(m.user_id = ? OR m.device_id = ?)"
+        # user_id=? catches explicitly-owned meetings; the fallback catches unclaimed
+        # device recordings (user_id IS NULL) without leaking meetings that were already
+        # attributed to a different user when the device changes hands.
+        scope_sql = "(m.user_id = ? OR (COALESCE(TRIM(m.user_id), '') = '' AND m.device_id = ?))"
         scope_params: list[Any] = [user_id, device_id]
     else:
         user_id = current_actor["user"]["id"]
@@ -792,7 +802,7 @@ def finalize_first_boot_setup(body: SetupCompleteBody) -> dict:
 # ======================================================================
 
 @router.get("/device-info")
-async def device_info(current_user: Optional[dict] = Depends(get_optional_user)):
+async def device_info(current_actor: Optional[dict] = Depends(get_optional_actor)):
     """
     Extended system info for the OLED display.
     Returns everything the device-ui HomeScreen footer + Settings need.
@@ -806,7 +816,15 @@ async def device_info(current_user: Optional[dict] = Depends(get_optional_user))
         conn = get_connection()
         try:
             cur = conn.cursor()
-            cur.execute("SELECT COUNT(*) FROM meetings")
+            # Resolve user_id from either a user token or a device token.
+            actor_user_id = str(((current_actor or {}).get("user") or {}).get("id") or "").strip()
+            if actor_user_id:
+                cur.execute(
+                    "SELECT COUNT(*) FROM meetings WHERE user_id = ? OR device_id IN (SELECT id FROM devices WHERE user_id = ?)",
+                    (actor_user_id, actor_user_id),
+                )
+            else:
+                cur.execute("SELECT COUNT(*) FROM meetings")
             meetings_count = cur.fetchone()[0]
         finally:
             conn.close()

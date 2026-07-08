@@ -7,13 +7,21 @@ remote server (the API cannot see the mini-PC's wlan0).
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import shutil
 import subprocess
+import sys
 import time
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+# Desktop (Windows/macOS): the OS owns Wi-Fi. These functions become read-only
+# reflections of the PC's connection (via net_status); mutations are no-ops
+# that return a clear "managed by the OS" message.
+_DESKTOP = not sys.platform.startswith("linux")
 
 
 def has_nmcli() -> bool:
@@ -105,6 +113,12 @@ def get_wifi_radio_enabled() -> Optional[bool]:
     True if NetworkManager Wi-Fi radio is on.
     Returns None if nmcli output could not be parsed.
     """
+    if _DESKTOP:
+        try:
+            import net_status
+            return net_status.wifi_radio_on()
+        except Exception:
+            return None
     if not has_nmcli():
         return None
     try:
@@ -123,6 +137,8 @@ def get_wifi_radio_enabled() -> Optional[bool]:
 
 def set_wifi_radio(enabled: bool) -> dict:
     """Turn the main Wi-Fi hardware/software switch on or off (nmcli)."""
+    if _DESKTOP:
+        return {"ok": False, "message": "Wi-Fi is managed by Windows. Change it in Windows settings."}
     if not has_nmcli():
         return {"ok": False, "message": "nmcli not available"}
     arg = "on" if enabled else "off"
@@ -210,6 +226,20 @@ def empty_scan_hint() -> str:
 
 
 def scan_wifi_networks(rescan: bool = False) -> list[dict]:
+    if _DESKTOP:
+        try:
+            import net_status
+            cur = net_status.current_wifi()
+            return [
+                {
+                    "ssid": cur["ssid"],
+                    "signal_strength": cur.get("signal_strength", 0),
+                    "security": "",
+                    "connected": True,
+                }
+            ] if cur and cur.get("ssid") else []
+        except Exception:
+            return []
     if not has_nmcli():
         raise RuntimeError("nmcli not available")
     if rescan:
@@ -231,6 +261,11 @@ def scan_wifi_networks(rescan: bool = False) -> list[dict]:
         timeout=15,
     )
     nets: list[dict] = []
+    # nmcli returns one row per BSSID/AP, so dual-band routers (2.4 + 5 GHz)
+    # and mesh nodes yield several rows with the same SSID. Collapse them to a
+    # single entry per SSID, keeping the strongest signal and marking the
+    # network connected if any of its BSSIDs is the active one.
+    by_ssid: dict[str, dict] = {}
     cur: dict[str, str] = {}
 
     def flush_current():
@@ -244,14 +279,25 @@ def scan_wifi_networks(rescan: bool = False) -> list[dict]:
             signal = int(signal_raw) if signal_raw else 0
         except ValueError:
             signal = 0
-        nets.append(
-            {
+        connected = in_use == "*"
+
+        existing = by_ssid.get(ssid)
+        if existing is None:
+            entry = {
                 "ssid": ssid,
                 "signal_strength": signal,
                 "security": sec_raw or "open",
-                "connected": in_use == "*",
+                "connected": connected,
             }
-        )
+            by_ssid[ssid] = entry
+            nets.append(entry)
+            return
+
+        # Merge into the existing SSID entry.
+        if signal > existing["signal_strength"]:
+            existing["signal_strength"] = signal
+            existing["security"] = sec_raw or "open"
+        existing["connected"] = existing["connected"] or connected
 
     for line in res.stdout.splitlines():
         if ":" not in line:
@@ -282,11 +328,76 @@ def _is_connected_to(ssid: str) -> bool:
     return False
 
 
-def connect_wifi_network(ssid: str, password: Optional[str]) -> dict:
-    iface = detect_wifi_iface()
-    args = ["device", "wifi", "connect", ssid]
+def _is_nm_version_skew_property_error(text: str) -> bool:
+    """True for the nmcli(new)/NetworkManager(old) 'unknown property' rejection.
+
+    Debian-13 nmcli (1.52+) serialises properties such as
+    ``802-11-wireless.mac-address-denylist`` that an older host daemon (e.g.
+    1.46) does not recognise, so every profile creation fails. The D-Bus join
+    helper avoids this by sending only properties the daemon understands.
+    """
+    s = (text or "").lower()
+    return "unknown property" in s or "mac-address-denylist" in s
+
+
+def _connect_via_dbus_helper(iface: Optional[str], ssid: str,
+                             password: Optional[str]) -> Optional[dict]:
+    """Join Wi-Fi via the privileged gdbus helper (version-skew workaround).
+
+    Returns a result dict, or None if the helper is unavailable so the caller
+    can fall back to the normal error path.
+    """
+    helper = "/usr/local/bin/meetingbox-wifi-connect"
+    if not (shutil.which("sudo") and os.path.exists(helper)):
+        return None
+    use_iface = iface or detect_wifi_iface() or "wlan0"
+    keymgmt = "wpa-psk" if password else "open"
+    argv = ["sudo", "-n", helper, use_iface, ssid, keymgmt]
     if password:
-        args += ["password", password]
+        argv.append(password)
+    try:
+        res = subprocess.run(argv, capture_output=True, text=True, timeout=40)
+    except Exception as e:  # noqa: BLE001
+        return {"status": "failed", "message": str(e)[:300]}
+
+    out = (res.stdout or "").strip()
+    # Helper prints a single JSON line; tolerate extra log noise.
+    for line in reversed(out.splitlines()):
+        line = line.strip()
+        if line.startswith("{") and line.endswith("}"):
+            try:
+                data = json.loads(line)
+                if isinstance(data, dict) and data.get("status"):
+                    return data
+            except Exception:  # noqa: BLE001
+                continue
+    if res.returncode == 0:
+        return {"status": "connected", "message": f"Connected to {ssid}"}
+    err = (res.stderr or out or "Connection failed").strip()
+    return {"status": "failed", "message": err[:300]}
+
+
+def connect_wifi_network(ssid: str, password: Optional[str]) -> dict:
+    ssid = (ssid or "").strip()
+    if not ssid:
+        return {"status": "failed", "message": "SSID is required"}
+    if _DESKTOP:
+        return {"status": "failed",
+                "message": "Wi-Fi is managed by Windows. Connect from the Windows network menu."}
+
+    # QuickPanel can call connect immediately after enabling Wi-Fi.
+    # Ensure radio is ON before join attempts.
+    radio = get_wifi_radio_enabled()
+    if radio is False:
+        set_wifi_radio(True)
+        time.sleep(0.8)
+
+    iface = detect_wifi_iface()
+    args_base = ["device", "wifi", "connect", ssid]
+    if password:
+        args_base += ["password", password]
+
+    args = list(args_base)
     if iface:
         args += ["ifname", iface]
     res = nmcli_run(args, timeout=30)
@@ -294,6 +405,61 @@ def connect_wifi_network(ssid: str, password: Optional[str]) -> dict:
     stderr = (res.stderr or "").strip()
     stdout = (res.stdout or "").strip()
     combined = (stderr + " " + stdout).lower()
+
+    # nmcli(new)/NetworkManager(old) version skew: the client serialises a
+    # property the daemon rejects ("unknown property"). No nmcli retry can fix
+    # this, so build the connection via the D-Bus helper instead.
+    if res.returncode != 0 and _is_nm_version_skew_property_error(combined):
+        logger.info(
+            "connect_wifi_network: nmcli version-skew property error; "
+            "using D-Bus helper for SSID %s",
+            ssid,
+        )
+        helper_result = _connect_via_dbus_helper(iface, ssid, password)
+        if helper_result is not None:
+            return helper_result
+
+    # Some appliances report a wifi device mismatch when ifname is supplied.
+    # Retry once without ifname.
+    if res.returncode != 0 and iface:
+        if any(
+            s in combined
+            for s in (
+                "no suitable device found",
+                "device not found",
+                "no wi-fi device",
+                "not a wi-fi device",
+                "unmanaged",
+                "wifi device",
+            )
+        ):
+            logger.info("connect_wifi_network retrying without ifname for SSID %s", ssid)
+            res = nmcli_run(args_base, timeout=30)
+            stderr = (res.stderr or "").strip()
+            stdout = (res.stdout or "").strip()
+            combined = (stderr + " " + stdout).lower()
+
+    # If scan cache was stale, do one rescan + retry.
+    if res.returncode != 0 and any(
+        s in combined
+        for s in (
+            "no network with ssid",
+            "network not found",
+            "ssid not found",
+        )
+    ):
+        try:
+            nmcli_run(["device", "wifi", "rescan"], timeout=10)
+            time.sleep(1.0)
+        except Exception:
+            pass
+        retry_args = list(args_base)
+        if iface:
+            retry_args += ["ifname", iface]
+        res = nmcli_run(retry_args, timeout=30)
+        stderr = (res.stderr or "").strip()
+        stdout = (res.stdout or "").strip()
+        combined = (stderr + " " + stdout).lower()
 
     # Immediate success
     if res.returncode == 0:
@@ -333,6 +499,18 @@ def connect_wifi_network(ssid: str, password: Optional[str]) -> dict:
                 "See scripts/sudoers.meetingbox-nmcli.example or scripts/polkit/"
             )
     return {"status": "failed", "message": msg}
+
+
+def get_current_wifi_signal() -> Optional[int]:
+    """Return signal strength 0–100 for the active WiFi connection, or None if not connected."""
+    try:
+        nets = scan_wifi_networks(rescan=False)
+        for n in nets:
+            if n.get("connected"):
+                return int(n.get("signal_strength") or 0)
+    except Exception:  # noqa: BLE001
+        pass
+    return None
 
 
 def list_saved_wifi_connection_names() -> list[str]:

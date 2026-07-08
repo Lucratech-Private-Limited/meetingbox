@@ -3,12 +3,12 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from voice_assistant import VoiceCommandInterpreter, utterance_is_voice_farewell
+from voice_assistant import VoiceAssistant, VoiceCommandInterpreter, utterance_is_voice_farewell
 
 
 def _mk() -> VoiceCommandInterpreter:
     return VoiceCommandInterpreter(
-        wake_phrase="hey tony",
+        wake_phrase="hey pepper",
         start_commands=["start meeting"],
         command_timeout_seconds=6.0,
         action_cooldown_seconds=2.0,
@@ -16,16 +16,22 @@ def _mk() -> VoiceCommandInterpreter:
     )
 
 
+def test_voice_assistant_default_wake_phrase_is_pepper(monkeypatch):
+    monkeypatch.delenv("VOICE_ASSISTANT_WAKE_PHRASE", raising=False)
+    assistant = VoiceAssistant(lambda _intent: None)
+    assert assistant.wake_phrase == "hey pepper"
+
+
 def test_combined_wake_and_command_starts_meeting():
     interpreter = _mk()
-    intent = interpreter.handle_transcript("hey tony start meeting", now=10.0)
+    intent = interpreter.handle_transcript("hey pepper start meeting", now=10.0)
     assert intent is not None
     assert intent.name == "start_meeting"
 
 
 def test_separate_wake_then_command_starts_meeting():
     interpreter = _mk()
-    assert interpreter.handle_transcript("hey tony", now=10.0) is None
+    assert interpreter.handle_transcript("hey pepper", now=10.0) is None
     intent = interpreter.handle_transcript("start meeting", now=12.0)
     assert intent is not None
     assert intent.name == "start_meeting"
@@ -38,7 +44,7 @@ def test_command_without_wake_is_ignored():
 
 def test_fuzzy_wake_phrase_allows_minor_transcript_variation():
     interpreter = _mk()
-    assert interpreter.handle_transcript("hey toni", now=10.0) is None
+    assert interpreter.handle_transcript("hey pepr", now=10.0) is None
     intent = interpreter.handle_transcript("start meeting", now=11.0)
     assert intent is not None
     assert intent.name == "start_meeting"
@@ -46,13 +52,13 @@ def test_fuzzy_wake_phrase_allows_minor_transcript_variation():
 
 def test_wake_phrase_times_out():
     interpreter = _mk()
-    assert interpreter.handle_transcript("hey tony", now=10.0) is None
+    assert interpreter.handle_transcript("hey pepper", now=10.0) is None
     assert interpreter.handle_transcript("start meeting", now=17.0) is None
 
 
 def test_status_query_after_wake_returns_intent():
     interpreter = _mk()
-    assert interpreter.handle_transcript("hey tony", now=10.0) is None
+    assert interpreter.handle_transcript("hey pepper", now=10.0) is None
     intent = interpreter.handle_transcript("wifi status", now=11.0)
     assert intent is not None
     assert intent.name == "wifi_status"
@@ -60,7 +66,7 @@ def test_status_query_after_wake_returns_intent():
 
 def test_brightness_command_captures_value():
     interpreter = _mk()
-    intent = interpreter.handle_transcript("hey tony brightness medium", now=10.0)
+    intent = interpreter.handle_transcript("hey pepper brightness medium", now=10.0)
     assert intent is not None
     assert intent.name == "brightness"
     assert intent.value == "medium"
@@ -68,7 +74,7 @@ def test_brightness_command_captures_value():
 
 def test_unsupported_command_returns_fallback_intent():
     interpreter = _mk()
-    intent = interpreter.handle_transcript("hey tony speaker test", now=10.0)
+    intent = interpreter.handle_transcript("hey pepper speaker test", now=10.0)
     assert intent is not None
     assert intent.name == "unsupported"
     assert intent.value == "speaker_test"
@@ -98,30 +104,30 @@ def test_confirmation_times_out():
 
 def test_help_command_is_supported():
     interpreter = _mk()
-    intent = interpreter.handle_transcript("hey tony what can you do", now=10.0)
+    intent = interpreter.handle_transcript("hey pepper what can you do", now=10.0)
     assert intent is not None
     assert intent.name == "help"
 
 
 def test_wake_only_utterance_detected():
     interpreter = _mk()
-    assert interpreter.is_wake_only_utterance("hey tony") is True
-    assert interpreter.is_wake_only_utterance("please hey tony uh") is True
+    assert interpreter.is_wake_only_utterance("hey pepper") is True
+    assert interpreter.is_wake_only_utterance("please hey pepper uh") is True
 
 
 def test_non_wake_only_with_extra_words():
     interpreter = _mk()
-    assert interpreter.is_wake_only_utterance("hey tony what time is it") is False
+    assert interpreter.is_wake_only_utterance("hey pepper what time is it") is False
 
 
 def test_is_awaiting_command_after_wake():
     interpreter = _mk()
-    interpreter.handle_transcript("hey tony", now=10.0)
+    interpreter.handle_transcript("hey pepper", now=10.0)
     assert interpreter.is_awaiting_command(now=10.5) is True
 
 
 def test_farewell_detects_common_sign_offs():
-    wp = "hey tony"
+    wp = "hey pepper"
     assert utterance_is_voice_farewell(wp, "thanks bye") is True
     assert utterance_is_voice_farewell(wp, "okay bye") is True
     assert utterance_is_voice_farewell(wp, "bye") is True
@@ -129,7 +135,7 @@ def test_farewell_detects_common_sign_offs():
 
 def test_farewell_not_triggered_on_scheduling_small_talk():
     """Regression: substring farewells must not trip on scheduling / filler."""
-    wp = "hey tony"
+    wp = "hey pepper"
     assert utterance_is_voice_farewell(wp, "see ya know what I mean") is False
     assert utterance_is_voice_farewell(wp, "see you later at five") is False
     assert utterance_is_voice_farewell(wp, "tomorrow could have a good day") is False
@@ -137,5 +143,5 @@ def test_farewell_not_triggered_on_scheduling_small_talk():
 
 
 def test_farewell_see_you_later_short_utterance():
-    assert utterance_is_voice_farewell("hey tony", "see you later") is True
-    assert utterance_is_voice_farewell("hey tony", "ok see you later") is True
+    assert utterance_is_voice_farewell("hey pepper", "see you later") is True
+    assert utterance_is_voice_farewell("hey pepper", "ok see you later") is True

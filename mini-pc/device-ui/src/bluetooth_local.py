@@ -18,10 +18,15 @@ import logging
 import os
 import shutil
 import subprocess
+import sys
 import time
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+# Desktop (Windows/macOS): the OS owns the Bluetooth radio. Reads reflect the
+# PC's state via net_status; power/pair mutations are no-ops with a clear msg.
+_DESKTOP = not sys.platform.startswith("linux")
 
 _BLUETOOTHCTL = None
 _HELPER = "/usr/local/bin/meetingbox-bluetooth"
@@ -136,6 +141,13 @@ def get_power_state() -> Optional[bool]:
 
     Uses the nsenter helper for live reads so the result reflects the host adapter.
     """
+    if _DESKTOP:
+        try:
+            import net_status
+            return net_status.bluetooth_radio_on()
+        except Exception:
+            return None
+
     # Return cached state if set recently (avoids flip-back on quick re-entry)
     if _cached_power_state is not None and (time.time() - _cached_power_time) < _CACHE_TTL:
         logger.debug("get_power_state: using cached %s", _cached_power_state)
@@ -192,6 +204,9 @@ def set_power(enabled: bool) -> dict:
     polkit sees a native host process (root) — same pattern as WiFi nmcli.
     """
     arg = "on" if enabled else "off"
+
+    if _DESKTOP:
+        return {"ok": False, "message": "Bluetooth is managed by Windows. Change it in Windows settings."}
 
     # Primary: nsenter helper (runs bluetoothctl in host context as root)
     try:
@@ -265,6 +280,12 @@ def list_paired_devices() -> list[dict]:
     Uses the nsenter helper so the query reaches the host BlueZ adapter
     even when polkit would block the container's direct D-Bus call.
     """
+    if _DESKTOP:
+        try:
+            import net_status
+            return net_status.bluetooth_devices()
+        except Exception:
+            return []
     try:
         r = _run_helper(["devices", "Paired"], timeout=10)
         if r.returncode == 0:

@@ -86,20 +86,20 @@ function ResultPreview({ action }: { action: AgenticAction }) {
 
   if (action.connector_target === 'gmail') {
     return (
-      <div className="rounded-lg border border-gray-200 bg-gray-50 p-4 space-y-2">
+      <div className="rounded-lg border border-app-border bg-app-page p-4 space-y-2">
         <div>
-          <p className="text-xs uppercase tracking-wide text-gray-500">Recipients</p>
-          <p className="text-sm text-gray-900">
+          <p className="text-xs uppercase tracking-wide text-app-ink-subtle">Recipients</p>
+          <p className="text-sm text-app-ink">
             {Array.isArray(action.payload.to) ? (action.payload.to as string[]).join(', ') : ''}
           </p>
         </div>
         <div>
-          <p className="text-xs uppercase tracking-wide text-gray-500">Subject</p>
-          <p className="text-sm text-gray-900">{String(action.payload.subject ?? '')}</p>
+          <p className="text-xs uppercase tracking-wide text-app-ink-subtle">Subject</p>
+          <p className="text-sm text-app-ink">{String(action.payload.subject ?? '')}</p>
         </div>
         <div>
-          <p className="text-xs uppercase tracking-wide text-gray-500">Body</p>
-          <p className="text-sm text-gray-700 whitespace-pre-wrap">{String(action.payload.body ?? '')}</p>
+          <p className="text-xs uppercase tracking-wide text-app-ink-subtle">Body</p>
+          <p className="text-sm text-app-ink-muted whitespace-pre-wrap">{String(action.payload.body ?? '')}</p>
         </div>
       </div>
     )
@@ -107,14 +107,14 @@ function ResultPreview({ action }: { action: AgenticAction }) {
 
   if (action.connector_target === 'calendar') {
     return (
-      <div className="rounded-lg border border-gray-200 bg-gray-50 p-4 space-y-2">
+      <div className="rounded-lg border border-app-border bg-app-page p-4 space-y-2">
         <div>
-          <p className="text-xs uppercase tracking-wide text-gray-500">Event</p>
-          <p className="text-sm text-gray-900">{String(action.payload.title ?? action.title)}</p>
+          <p className="text-xs uppercase tracking-wide text-app-ink-subtle">Event</p>
+          <p className="text-sm text-app-ink">{String(action.payload.title ?? action.title)}</p>
         </div>
         <div>
-          <p className="text-xs uppercase tracking-wide text-gray-500">Suggested time</p>
-          <p className="text-sm text-gray-900">
+          <p className="text-xs uppercase tracking-wide text-app-ink-subtle">Suggested time</p>
+          <p className="text-sm text-app-ink">
             {String(action.payload.suggested_date ?? '')} {String(action.payload.suggested_time ?? '')}{' '}
             {action.payload.timezone ? `(${String(action.payload.timezone)})` : ''}
           </p>
@@ -134,8 +134,8 @@ function ResultPreview({ action }: { action: AgenticAction }) {
   }
 
   return (
-    <div className="rounded-lg border border-gray-200 bg-gray-50 p-4">
-      <pre className="text-xs text-gray-700 whitespace-pre-wrap">{JSON.stringify(action.payload, null, 2)}</pre>
+    <div className="rounded-lg border border-app-border bg-app-page p-4">
+      <pre className="text-xs text-app-ink-muted whitespace-pre-wrap">{JSON.stringify(action.payload, null, 2)}</pre>
     </div>
   )
 }
@@ -303,16 +303,16 @@ export default function ActionCard({ action, onChanged }: ActionCardProps) {
 
   return (
     <div
-      className={`overflow-hidden rounded-2xl border ${isDismissed ? 'border-gray-200 bg-gray-50/60 opacity-70' : 'border-gray-200 bg-white'}`}
+      className={`overflow-hidden rounded-2xl border ${isDismissed ? 'border-app-border bg-app-page/85 opacity-70' : 'border-app-border bg-app-surface'}`}
     >
-      <div className="border-b border-gray-100 bg-gradient-to-r from-primary-50 via-white to-emerald-50 px-6 py-5">
+      <div className="border-b border-app-border bg-gradient-to-r from-primary-900/50 via-app-surface to-emerald-900/35 px-6 py-5">
         <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
           <div className="space-y-2">
             <div className="flex flex-wrap items-center gap-2">
-              <span className="rounded-full bg-primary-100 px-2.5 py-1 text-xs font-semibold uppercase tracking-wide text-primary-800">
+              <span className="rounded-full bg-primary-900/55 px-2.5 py-1 text-xs font-semibold uppercase tracking-wide text-primary-200">
                 {action.kind.replaceAll('_', ' ')}
               </span>
-              <span className="rounded-full bg-gray-100 px-2.5 py-1 text-xs font-medium text-gray-700">
+              <span className="rounded-full bg-app-raised px-2.5 py-1 text-xs font-medium text-app-ink-muted">
                 {connectorLabels[action.connector_target] ?? action.connector_target}
               </span>
               {isDone && (
@@ -321,20 +321,20 @@ export default function ActionCard({ action, onChanged }: ActionCardProps) {
                 </span>
               )}
               {isDismissed && (
-                <span className="rounded-full bg-gray-200 px-2.5 py-1 text-xs font-medium text-gray-700">
+                <span className="rounded-full bg-app-border px-2.5 py-1 text-xs font-medium text-app-ink-muted">
                   Dismissed
                 </span>
               )}
             </div>
             <div>
-              <h3 className="text-xl font-semibold text-gray-950">{action.title}</h3>
-              {action.description && <p className="mt-1 text-sm text-gray-600">{action.description}</p>}
+              <h3 className="text-xl font-semibold text-app-ink">{action.title}</h3>
+              {action.description && <p className="mt-1 text-sm text-app-ink-muted">{action.description}</p>}
             </div>
           </div>
           {action.confidence != null && (
-            <div className="rounded-xl bg-white/80 px-3 py-2 text-right shadow-sm ring-1 ring-gray-100">
-              <p className="text-[11px] uppercase tracking-wide text-gray-500">Confidence</p>
-              <p className="text-sm font-semibold text-gray-900">{Math.round(action.confidence * 100)}%</p>
+            <div className="rounded-xl bg-app-surface/88 px-3 py-2 text-right shadow-sm ring-1 ring-app-border">
+              <p className="text-[11px] uppercase tracking-wide text-app-ink-subtle">Confidence</p>
+              <p className="text-sm font-semibold text-app-ink">{Math.round(action.confidence * 100)}%</p>
             </div>
           )}
         </div>
@@ -343,8 +343,8 @@ export default function ActionCard({ action, onChanged }: ActionCardProps) {
       <div className="grid gap-6 px-6 py-5 lg:grid-cols-[1.1fr_0.9fr]">
         <div className="space-y-4">
           <div>
-            <p className="text-xs uppercase tracking-wide text-gray-500">What happens on execute</p>
-            <p className="mt-1 text-sm text-gray-800">
+            <p className="text-xs uppercase tracking-wide text-app-ink-subtle">What happens on execute</p>
+            <p className="mt-1 text-sm text-app-ink">
               {action.connector_target === 'gmail' &&
                 'You review recipients and message text, then MeetingBox sends via your connected Gmail.'}
               {action.connector_target === 'calendar' &&
@@ -354,7 +354,7 @@ export default function ActionCard({ action, onChanged }: ActionCardProps) {
 
           {sourceSignals.length > 0 && (
             <div>
-              <p className="text-xs uppercase tracking-wide text-gray-500">Why this matters</p>
+              <p className="text-xs uppercase tracking-wide text-app-ink-subtle">Why this matters</p>
               <div className="mt-2 flex flex-wrap gap-2">
                 {sourceSignals.map((signal) => (
                   <span
@@ -374,7 +374,7 @@ export default function ActionCard({ action, onChanged }: ActionCardProps) {
         </div>
 
         <div className="space-y-3">
-          <p className="text-xs uppercase tracking-wide text-gray-500">
+          <p className="text-xs uppercase tracking-wide text-app-ink-subtle">
             {isDone ? 'Saved output' : 'Prepared output'}
           </p>
           <ResultPreview action={action} />
@@ -382,13 +382,13 @@ export default function ActionCard({ action, onChanged }: ActionCardProps) {
       </div>
 
       {!isDone && !isDismissed && (
-        <div className="flex flex-wrap items-center justify-between gap-2 border-t border-gray-100 bg-gray-50/70 px-6 py-4">
+        <div className="flex flex-wrap items-center justify-between gap-2 border-t border-app-border bg-app-page/70 px-6 py-4">
           <div className="flex flex-wrap gap-2">
             <button
               type="button"
               onClick={handleDismiss}
               disabled={isDismissing}
-              className="rounded-lg border border-gray-300 bg-white px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50 disabled:opacity-50"
+              className="rounded-lg border border-app-border-light bg-app-surface px-4 py-2 text-sm font-medium text-app-ink-muted hover:bg-app-page disabled:opacity-50"
             >
               {isDismissing ? 'Dismissing...' : 'Dismiss'}
             </button>
@@ -396,7 +396,7 @@ export default function ActionCard({ action, onChanged }: ActionCardProps) {
               type="button"
               onClick={() => void handleIgnore()}
               disabled={isIgnoring}
-              className="rounded-lg border border-gray-300 bg-white px-4 py-2 text-sm font-medium text-gray-600 hover:bg-gray-50 disabled:opacity-50"
+              className="rounded-lg border border-app-border-light bg-app-surface px-4 py-2 text-sm font-medium text-app-ink-muted hover:bg-app-page disabled:opacity-50"
             >
               {isIgnoring ? 'Hiding...' : 'Ignore'}
             </button>
@@ -410,17 +410,17 @@ export default function ActionCard({ action, onChanged }: ActionCardProps) {
               Review &amp; execute
             </button>
           ) : (
-            <p className="text-sm text-gray-500">This action type is not executable from the dashboard.</p>
+            <p className="text-sm text-app-ink-subtle">This action type is not executable from the dashboard.</p>
           )}
         </div>
       )}
 
       {isDone && !isDismissed && showConnectorReview && (
-        <div className="flex justify-end border-t border-gray-100 bg-gray-50/40 px-6 py-3">
+        <div className="flex justify-end border-t border-app-border bg-app-page/40 px-6 py-3">
           <button
             type="button"
             onClick={openReview}
-            className="rounded-lg border border-gray-300 bg-white px-4 py-2 text-sm font-medium text-gray-600 hover:bg-gray-50"
+            className="rounded-lg border border-app-border-light bg-app-surface px-4 py-2 text-sm font-medium text-app-ink-muted hover:bg-app-page"
           >
             Review &amp; run again
           </button>
@@ -435,11 +435,11 @@ export default function ActionCard({ action, onChanged }: ActionCardProps) {
             aria-label="Close"
             onClick={() => !isExecuting && setShowReview(false)}
           />
-          <div className="relative max-h-[90vh] w-full max-w-lg overflow-y-auto rounded-2xl border border-gray-200 bg-white p-6 shadow-xl">
-            <h4 className="text-lg font-semibold text-gray-900">
+          <div className="relative max-h-[90vh] w-full max-w-lg overflow-y-auto rounded-2xl border border-app-border bg-app-surface p-6 shadow-xl">
+            <h4 className="text-lg font-semibold text-app-ink">
               {action.connector_target === 'calendar' ? 'Review calendar event' : 'Review email'}
             </h4>
-            <p className="mt-1 text-sm text-gray-600">
+            <p className="mt-1 text-sm text-app-ink-muted">
               Confirm details before sending. You can edit every field; empty optional fields use AI or server defaults
               only when required fields are filled.
             </p>
@@ -447,42 +447,42 @@ export default function ActionCard({ action, onChanged }: ActionCardProps) {
             {action.connector_target === 'calendar' && (
               <div className="mt-5 space-y-4">
                 <label className="block">
-                  <span className="text-xs font-medium text-gray-600">Title</span>
+                  <span className="text-xs font-medium text-app-ink-muted">Title</span>
                   <input
                     type="text"
                     value={calTitle}
                     onChange={(e) => setCalTitle(e.target.value)}
-                    className="mt-1 w-full rounded-lg border border-gray-300 px-3 py-2 text-sm"
+                    className="mt-1 w-full rounded-lg border border-app-border-light px-3 py-2 text-sm"
                   />
                 </label>
                 <div className="grid grid-cols-2 gap-3">
                   <label className="block">
-                    <span className="text-xs font-medium text-gray-600">Date</span>
+                    <span className="text-xs font-medium text-app-ink-muted">Date</span>
                     <input
                       type="date"
                       value={calDate}
                       onChange={(e) => setCalDate(e.target.value)}
-                      className="mt-1 w-full rounded-lg border border-gray-300 px-3 py-2 text-sm"
+                      className="mt-1 w-full rounded-lg border border-app-border-light px-3 py-2 text-sm"
                     />
                   </label>
                   <label className="block">
-                    <span className="text-xs font-medium text-gray-600">Time</span>
+                    <span className="text-xs font-medium text-app-ink-muted">Time</span>
                     <input
                       type="time"
                       value={calTime}
                       onChange={(e) => setCalTime(e.target.value)}
-                      className="mt-1 w-full rounded-lg border border-gray-300 px-3 py-2 text-sm"
+                      className="mt-1 w-full rounded-lg border border-app-border-light px-3 py-2 text-sm"
                     />
                   </label>
                 </div>
                 <label className="block">
-                  <span className="text-xs font-medium text-gray-600">Timezone (IANA)</span>
+                  <span className="text-xs font-medium text-app-ink-muted">Timezone (IANA)</span>
                   <input
                     type="text"
                     list="tz-options"
                     value={calTimezone}
                     onChange={(e) => setCalTimezone(e.target.value)}
-                    className="mt-1 w-full rounded-lg border border-gray-300 px-3 py-2 text-sm"
+                    className="mt-1 w-full rounded-lg border border-app-border-light px-3 py-2 text-sm"
                   />
                   <datalist id="tz-options">
                     {COMMON_TIMEZONES.map((tz) => (
@@ -491,32 +491,32 @@ export default function ActionCard({ action, onChanged }: ActionCardProps) {
                   </datalist>
                 </label>
                 <label className="block">
-                  <span className="text-xs font-medium text-gray-600">Duration (minutes)</span>
+                  <span className="text-xs font-medium text-app-ink-muted">Duration (minutes)</span>
                   <input
                     type="number"
                     min={5}
                     max={1440}
                     value={calDuration}
                     onChange={(e) => setCalDuration(Number(e.target.value) || 30)}
-                    className="mt-1 w-full rounded-lg border border-gray-300 px-3 py-2 text-sm"
+                    className="mt-1 w-full rounded-lg border border-app-border-light px-3 py-2 text-sm"
                   />
                 </label>
                 <label className="block">
-                  <span className="text-xs font-medium text-gray-600">Attendees (emails, comma or space separated)</span>
+                  <span className="text-xs font-medium text-app-ink-muted">Attendees (emails, comma or space separated)</span>
                   <textarea
                     value={calAttendees}
                     onChange={(e) => setCalAttendees(e.target.value)}
                     rows={2}
-                    className="mt-1 w-full rounded-lg border border-gray-300 px-3 py-2 text-sm"
+                    className="mt-1 w-full rounded-lg border border-app-border-light px-3 py-2 text-sm"
                   />
                 </label>
                 <label className="block">
-                  <span className="text-xs font-medium text-gray-600">Description</span>
+                  <span className="text-xs font-medium text-app-ink-muted">Description</span>
                   <textarea
                     value={calDescription}
                     onChange={(e) => setCalDescription(e.target.value)}
                     rows={4}
-                    className="mt-1 w-full rounded-lg border border-gray-300 px-3 py-2 text-sm"
+                    className="mt-1 w-full rounded-lg border border-app-border-light px-3 py-2 text-sm"
                   />
                 </label>
               </div>
@@ -525,40 +525,40 @@ export default function ActionCard({ action, onChanged }: ActionCardProps) {
             {action.connector_target === 'gmail' && (
               <div className="mt-5 space-y-4">
                 <label className="block">
-                  <span className="text-xs font-medium text-gray-600">To</span>
+                  <span className="text-xs font-medium text-app-ink-muted">To</span>
                   <textarea
                     value={mailTo}
                     onChange={(e) => setMailTo(e.target.value)}
                     rows={2}
                     placeholder="a@example.com, b@example.com"
-                    className="mt-1 w-full rounded-lg border border-gray-300 px-3 py-2 text-sm"
+                    className="mt-1 w-full rounded-lg border border-app-border-light px-3 py-2 text-sm"
                   />
                 </label>
                 <label className="block">
-                  <span className="text-xs font-medium text-gray-600">Cc (optional)</span>
+                  <span className="text-xs font-medium text-app-ink-muted">Cc (optional)</span>
                   <textarea
                     value={mailCc}
                     onChange={(e) => setMailCc(e.target.value)}
                     rows={2}
-                    className="mt-1 w-full rounded-lg border border-gray-300 px-3 py-2 text-sm"
+                    className="mt-1 w-full rounded-lg border border-app-border-light px-3 py-2 text-sm"
                   />
                 </label>
                 <label className="block">
-                  <span className="text-xs font-medium text-gray-600">Subject</span>
+                  <span className="text-xs font-medium text-app-ink-muted">Subject</span>
                   <input
                     type="text"
                     value={mailSubject}
                     onChange={(e) => setMailSubject(e.target.value)}
-                    className="mt-1 w-full rounded-lg border border-gray-300 px-3 py-2 text-sm"
+                    className="mt-1 w-full rounded-lg border border-app-border-light px-3 py-2 text-sm"
                   />
                 </label>
                 <label className="block">
-                  <span className="text-xs font-medium text-gray-600">Body</span>
+                  <span className="text-xs font-medium text-app-ink-muted">Body</span>
                   <textarea
                     value={mailBody}
                     onChange={(e) => setMailBody(e.target.value)}
                     rows={8}
-                    className="mt-1 w-full rounded-lg border border-gray-300 px-3 py-2 text-sm"
+                    className="mt-1 w-full rounded-lg border border-app-border-light px-3 py-2 text-sm"
                   />
                 </label>
               </div>
@@ -569,7 +569,7 @@ export default function ActionCard({ action, onChanged }: ActionCardProps) {
                 type="button"
                 disabled={isExecuting}
                 onClick={() => setShowReview(false)}
-                className="rounded-lg border border-gray-300 bg-white px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50 disabled:opacity-50"
+                className="rounded-lg border border-app-border-light bg-app-surface px-4 py-2 text-sm font-medium text-app-ink-muted hover:bg-app-page disabled:opacity-50"
               >
                 Cancel
               </button>
@@ -579,7 +579,7 @@ export default function ActionCard({ action, onChanged }: ActionCardProps) {
                 onClick={() => void handleConfirmExecute()}
                 className={
                   action.status === 'executed'
-                    ? 'rounded-lg border border-gray-300 bg-white px-5 py-2 text-sm font-medium text-gray-800 hover:bg-gray-50 disabled:opacity-50'
+                    ? 'rounded-lg border border-app-border-light bg-app-surface px-5 py-2 text-sm font-medium text-app-ink hover:bg-app-page disabled:opacity-50'
                     : 'rounded-lg bg-primary-600 px-5 py-2 text-sm font-medium text-white hover:bg-primary-700 disabled:opacity-50'
                 }
               >

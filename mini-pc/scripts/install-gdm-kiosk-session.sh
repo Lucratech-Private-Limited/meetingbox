@@ -65,6 +65,16 @@ wait_for_apt_idle
 apt-get update -qq
 DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends openbox x11-xserver-utils xinput
 
+# Permanently disable accelerometer auto-rotation so the panel stays locked in
+# the single landscape orientation set by apply-kiosk-display-orientation.sh.
+# Masking prevents the daemon from ever starting (no rotation events, no UI flip).
+if systemctl list-unit-files iio-sensor-proxy.service &>/dev/null; then
+  systemctl stop iio-sensor-proxy.service 2>/dev/null || true
+  systemctl mask iio-sensor-proxy.service 2>/dev/null \
+    && echo "Masked iio-sensor-proxy.service (auto-rotation disabled — landscape locked)." \
+    || echo "WARNING: could not mask iio-sensor-proxy.service; auto-rotation may persist."
+fi
+
 install -m 0755 "$MINI_PC_ROOT/scripts/gdm-kiosk-session.sh" /usr/local/bin/meetingbox-gdm-kiosk-session
 install -m 0755 "$MINI_PC_ROOT/scripts/apply-kiosk-display-orientation.sh" /usr/local/bin/meetingbox-apply-kiosk-display-orientation
 install -m 0644 "$MINI_PC_ROOT/kiosk-desktop/meetingbox-kiosk.desktop" /usr/share/xsessions/meetingbox-kiosk.desktop

@@ -13,9 +13,17 @@ from kivy.graphics import Color, Rectangle
 from kivy.animation import Animation
 from kivy.clock import Clock
 
+import sys
+
 from screens.base_screen import BaseScreen
 from async_helper import run_async
-from config import COLORS, FONT_SIZES, SPLASH_DURATION, USE_MOCK_BACKEND
+from config import (
+    COLORS,
+    FONT_SIZES,
+    SPLASH_DURATION,
+    USE_MOCK_BACKEND,
+    get_device_auth_token,
+)
 
 
 class SplashScreen(BaseScreen):
@@ -39,7 +47,7 @@ class SplashScreen(BaseScreen):
 
         # Logo text (centred)
         self.logo_label = Label(
-            text='MeetingBox AI',
+            text='Pepper AI',
             font_size=self.suf(36),
             bold=True,
             color=COLORS['white'],
@@ -66,6 +74,26 @@ class SplashScreen(BaseScreen):
 
     def _advance(self, _dt):
         """Move to next screen based on setup state (server marker is authoritative)."""
+        # TEMP (UI testing): skip the desktop login/pairing flow and land on Home
+        # so the floating dock + panels can be exercised without a paired device.
+        # Gated behind an env var (off by default) — launch with
+        # MEETINGBOX_SKIP_LOGIN=1 to enable. Remove once pairing is verified.
+        import os
+        if os.getenv("MEETINGBOX_SKIP_LOGIN") == "1":
+            self.goto('home', transition='fade')
+            return
+        # Desktop (Windows/macOS): the appliance pairing-code + Wi-Fi onboarding
+        # is replaced by an on-device Google sign-in. If we already hold a device
+        # token go straight home; otherwise show the sign-in step.
+        if not sys.platform.startswith('linux'):
+            if (get_device_auth_token() or '').strip():
+                # We have a saved token, but it may have expired or been revoked.
+                # Verify it against the backend before landing on home so the user
+                # isn't stuck on a screen where every request silently fails.
+                run_async(self._advance_desktop_with_token_check())
+            else:
+                self.goto('onboarding_welcome', transition='fade')
+            return
         if USE_MOCK_BACKEND:
             if self.app.needs_setup():
                 self.goto('welcome', transition='fade')
@@ -73,6 +101,35 @@ class SplashScreen(BaseScreen):
                 self.goto('home', transition='fade')
             return
         run_async(self._advance_with_backend())
+
+    async def _advance_desktop_with_token_check(self):
+        """Desktop only: validate the saved device token, re-auth if it's dead."""
+        try:
+            status = await self.backend.validate_device_token()
+        except Exception:
+            status = 'unknown'
+
+        def _go(_clk):
+            if self.manager.current != 'splash':
+                return
+            if status == 'invalid':
+                # Token expired/revoked: forget it and send the user back through
+                # Google sign-in. "unknown" (offline/blip) keeps the token and
+                # proceeds home so a network hiccup never forces a re-login.
+                try:
+                    from config import clear_stored_device_auth_token
+                    clear_stored_device_auth_token()
+                except Exception:
+                    pass
+                try:
+                    self.backend.set_device_auth_header(None)
+                except Exception:
+                    pass
+                self.goto('sign_in', transition='fade')
+            else:
+                self.goto('home', transition='fade')
+
+        Clock.schedule_once(_go, 0)
 
     async def _advance_with_backend(self):
         need = self.app.needs_setup()

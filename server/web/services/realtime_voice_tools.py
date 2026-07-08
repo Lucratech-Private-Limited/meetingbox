@@ -17,7 +17,9 @@ from assistant_service import (
     process_assistant_intent,
     reject_pending_action as svc_reject_pending_action,
 )
+from services.approval import require_user_approval
 from services.briefing_context import build_briefing_context_dict
+from tools.memory_tool import memory_fetch_meeting, memory_search_meetings
 from services.mem0_service import (
     ingest_voice_explicit_memory,
     maybe_ingest_assistant_turn,
@@ -343,7 +345,8 @@ def _fetch_news_sync(category: str = "top", limit: int = 6) -> dict:
 
 # Whitelist returned to the device; Kivy `goto_screen` must support the name.
 REALTIME_DEVICE_NAV_SCREENS = frozenset(
-    {"home", "calendar", "emails", "meetings", "tasks", "morning_brief", "settings", "mic_test"}
+    {"home", "voice_session", "calendar", "emails", "meetings", "tasks",
+     "morning_brief", "settings", "mic_test"}
 )
 
 _SIDE_EFFECT_HINTS = (
@@ -422,14 +425,32 @@ def _resolve_pending_for_approval(user_id: str, requested_pending_id: str) -> tu
         "truth_status": {"writes_committed": False, "note": "No write executed."},
     }
 
+def _normalise_hhmm(value: str | None) -> str | None:
+    """Coerce a spoken/typed time into 24-hour HH:MM, or None if unparseable.
+
+    Accepts "15:30", "3:30 PM", "3 PM", "3pm", "9:05am", "15.30".
+    """
+    s = (value or "").strip().lower().replace(".", ":")
+    if not s:
+        return None
+    from datetime import datetime as _dt
+    for fmt in ("%H:%M", "%I:%M %p", "%I %p", "%I:%M%p", "%I%p", "%H"):
+        try:
+            return _dt.strptime(s.upper() if "%p" in fmt else s, fmt).strftime("%H:%M")
+        except ValueError:
+            continue
+    return None
+
+
 # OpenAI Realtime function tools (JSON schema parameters).
 REALTIME_VOICE_TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "type": "function",
         "name": "memory_search",
         "description": (
-            "Search the user's long-term Mem0 memory for facts, notes, reminders, and past context. "
-            "Use for questions like what they saved, asked before, or discussed earlier."
+            "Search the user's long-term Mem0 memory for facts, preferences, past conversations, and prior context. "
+            "Use for 'what did I tell you about X', 'do you remember Y', 'what are my preferences for Z'. "
+            "Do NOT use this for 'show my notes' / 'list my notes' / 'what notes do I have' — use note_list for those."
         ),
         "parameters": {
             "type": "object",
@@ -446,10 +467,21 @@ REALTIME_VOICE_TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "type": "function",
         "name": "memory_remember",
         "description": (
-            "Save a stable fact the user wants you to remember across future sessions: preferences, deadlines, "
-            "names, ongoing projects, commitments they asked you to retain, or corrections to what you knew. "
-            "Call when they say remember, don't forget, note that, keep in mind, etc. "
-            "Pass one short self-contained factual sentence (no chit-chat)."
+            "Save anything that should persist across future sessions so you act like a personal assistant who "
+            "knows this user. This covers TWO kinds of memory:\n"
+            "1) FACTS — preferences, deadlines, names, relationships, ongoing projects, interests, choices, "
+            "corrections to what you knew.\n"
+            "2) STANDING DIRECTIVES — how the user wants you to behave/speak: tone, persona, style, verbosity, "
+            "what to call them, things to always or never do.\n"
+            "Call this NOT ONLY for explicit 'remember / don't forget / note that / keep in mind' requests, but "
+            "ALSO whenever the user states a lasting preference or instruction, even without those words — e.g. "
+            "'talk to me in a sarcastic tone from now on', 'always keep answers short', 'never call me sir', "
+            "'I prefer morning meetings', 'call me Vivek', 'from now on ...', 'I like ...', 'I hate ...'. "
+            "Cues like 'from now on', 'always', 'never', 'I prefer', 'going forward', 'stop doing X' mean it is "
+            "a standing preference — store it AND apply it immediately. "
+            "Do NOT store one-off requests scoped to the current task ('make THIS email formal') or transient "
+            "chit-chat. Pass one short self-contained sentence written so a future session understands it with "
+            "no other context (e.g. \"User wants the assistant to always speak in a sarcastic tone.\")."
         ),
         "parameters": {
             "type": "object",
@@ -500,6 +532,29 @@ REALTIME_VOICE_TOOL_DEFINITIONS: list[dict[str, Any]] = [
                     ),
                 },
             },
+        },
+    },
+    {
+        "type": "function",
+        "name": "get_sent_emails",
+        "description": (
+            "Retrieve emails the user sent (outbox / sent mail). Use for: 'who did I email last', "
+            "'find my email to Rahul', 'draft a follow-up to the email I sent', 'what did I send today'. "
+            "Do NOT use get_briefing_context for sent mail — it shows INBOX only, never sent mail."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Optional Gmail search refinement, e.g. 'to:rahul' or 'subject:invoice'. Leave empty to get latest sent.",
+                },
+                "max_results": {
+                    "type": "integer",
+                    "description": "Number of sent emails to return (1–20, default 5).",
+                },
+            },
+            "required": [],
         },
     },
     {
@@ -584,6 +639,9 @@ REALTIME_VOICE_TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "description": (
             "Open a main screen on the tabletop device (Kivy UI). Use when the user asks to open/show/go to "
             "calendar, email/inbox, tasks/todos, meetings, home, morning brief, settings, or microphone test. "
+            "Also use screen='voice_session' to return to the audio transcription / live listening screen — "
+            "this is the default conversational home; go there when a temporary experience like the morning "
+            "brief is finished or the user no longer wants it. "
             "Does not fetch data — combine with get_briefing_context or assistant_intent when they also want information."
         ),
         "parameters": {
@@ -608,11 +666,62 @@ REALTIME_VOICE_TOOL_DEFINITIONS: list[dict[str, Any]] = [
                     "description": (
                         "Section/tab to activate within the screen. "
                         "For screen=tasks: today | upcoming | unfinished | unplanned. "
-                        "For screen=emails: today | all | unread | sent | drafts."
+                        "For screen=emails: today | all | unread | sent | drafts. "
+                        "For screen=morning_brief: schedule | tasks | emails | next | previous "
+                        "(switch the carousel card; use during a guided morning briefing)."
                     ),
                 },
             },
             "required": ["screen"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "show_meeting_summary",
+        "description": (
+            "Open the on-screen MEETING / NOTE SUMMARY page for a specific recorded meeting or note so "
+            "the user can READ it on the device. Use this — NOT assistant_intent — whenever the user "
+            "EXPLICITLY asks to SHOW / OPEN / PULL UP / DISPLAY / 'bring up' a meeting or note summary on "
+            "screen (e.g. 'show me the summary of the board meeting', 'pull up my note about Project "
+            "Atlas', 'open the summary of my last meeting', 'display the notes from the investor call'). "
+            "The server runs ranked, context-aware retrieval over the user's recordings, then the device "
+            "opens the full summary page (title, AI summary, decisions, action items). Pass the user's "
+            "description as `query` — treat it as keywords/context (participants, topic, project, event, "
+            "date), NEVER as an exact title. When the call returns ok with a meeting, say exactly ONE "
+            "short line — e.g. 'Here's your board-meeting summary from June 17.' — and do NOT read the "
+            "summary body aloud; the screen is the reading surface. If it returns needs_clarification, "
+            "read the clarification question aloud and let the user choose. If it returns found=false, "
+            "tell the user you couldn't find that recording. For spoken-only recall where the user is NOT "
+            "asking to see it on screen ('what was decided?', 'who was in the meeting?', 'summarize my "
+            "last meeting'), keep using assistant_intent instead."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": (
+                        "Free-text describing which recording to open — participants, topic, project, "
+                        "event, or date context the user gave. Keywords/context, never an exact title."
+                    ),
+                },
+                "session_type": {
+                    "type": "string",
+                    "enum": ["meeting", "note"],
+                    "description": (
+                        "Optional: restrict to a meeting or a personal note when the user is specific "
+                        "('my note about X' -> note; 'the meeting with Y' -> meeting)."
+                    ),
+                },
+                "meeting_id": {
+                    "type": "string",
+                    "description": (
+                        "Optional exact recording id when already known (e.g. from a prior "
+                        "assistant_intent result). When given, skips search and opens it directly."
+                    ),
+                },
+            },
+            "required": ["query"],
         },
     },
     {
@@ -910,8 +1019,23 @@ REALTIME_VOICE_TOOL_DEFINITIONS: list[dict[str, Any]] = [
                     "type": "string",
                     "description": "Same optional detail shown on screen, if any.",
                 },
+                "confirmed_by_user": {
+                    "type": "boolean",
+                    "description": (
+                        "Must be true, and only after the user has explicitly approved saving this "
+                        "task (a spoken yes / 'save it' / 'go ahead', or a Confirm tap)."
+                    ),
+                },
+                "confirmation_phrase": {
+                    "type": "string",
+                    "description": (
+                        "The user's actual approving words (e.g. 'yes save it', 'go ahead') or the "
+                        "'[BUTTON:Confirm]' marker the device sends on a Confirm tap. The server "
+                        "validates this is genuine approval before writing."
+                    ),
+                },
             },
-            "required": ["title"],
+            "required": ["title", "confirmed_by_user", "confirmation_phrase"],
         },
     },
     {
@@ -920,6 +1044,185 @@ REALTIME_VOICE_TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "description": (
             "Cancel the task that is currently shown on the task-creation screen WITHOUT saving it. "
             "Call this when the user verbally declines after show_task_creation — e.g. 'discard', "
+            "'cancel', 'no', 'never mind', 'forget it'. This dismisses the screen on the device. "
+            "After it returns, acknowledge briefly: 'Okay, cancelled.'"
+        ),
+        "parameters": {"type": "object", "properties": {}},
+    },
+    {
+        "type": "function",
+        "name": "show_calendar_event",
+        "description": (
+            "Show the calendar event-creation screen on the device. Call this — instead of "
+            "assistant_intent — whenever the user directly asks to schedule, create, set up, or add "
+            "a calendar event / meeting / appointment. The screen has five fields: Event Name, Date, "
+            "Time, Duration, and Attendees. The user reviews them on screen, then confirms (creates) or "
+            "discards (cancels) — EITHER by speaking ('confirm' / 'discard' / 'yes create it' / "
+            "'no cancel') OR by tapping the on-screen buttons. "
+            "CALL IT PROGRESSIVELY: open it as soon as the event flow begins (with whatever fields "
+            "you have — they MAY be empty) and call it again as you collect each field so the screen "
+            "fills in live. Only the fields you pass are updated; omitted fields keep their value. "
+            "DATE: resolve relative dates ('tomorrow', 'next Monday') to YYYY-MM-DD. "
+            "TIME: pass a 24-hour HH:MM string (e.g. '15:30'). "
+            "DURATION: pass duration_minutes as an integer (e.g. 30, 45, 60). "
+            "ATTENDEES: add a person ONLY after resolving them with show_recipient_picker "
+            "(field='attendee') and the user confirms — the confirmed contact appears as a chip on "
+            "this screen automatically, so you usually do NOT need to re-pass attendees here. "
+            "After the screen has the details, say exactly: 'I've set it up — say confirm to create "
+            "it, say discard to cancel, or tap the buttons on screen.' Then WAIT. The event is NOT "
+            "created yet. IMPORTANT: this review stage is still fully editable — if the user asks to "
+            "add/remove/replace attendees, or change name/date/time/duration, apply that update "
+            "immediately via show_calendar_event and/or show_recipient_picker(field='attendee') "
+            "instead of refusing or forcing confirm/discard first. When the user confirms, call "
+            "confirm_calendar_event. When they cancel, call discard_calendar_event."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Event name / title (e.g. 'Marketing review').",
+                },
+                "date": {
+                    "type": "string",
+                    "description": "Event date as ISO YYYY-MM-DD. Resolve relative dates yourself.",
+                },
+                "time": {
+                    "type": "string",
+                    "description": "Event start time as 24-hour HH:MM (e.g. '15:30').",
+                },
+                "duration_minutes": {
+                    "type": "integer",
+                    "description": "Event duration in minutes (e.g. 30, 45, 60).",
+                },
+                "attendees": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Confirmed attendees as email addresses (optionally 'Name <email>'). "
+                        "Usually left empty — attendees confirmed via show_recipient_picker "
+                        "(field='attendee') are added to the screen automatically."
+                    ),
+                },
+                "attendees_mode": {
+                    "type": "string",
+                    "enum": ["replace", "append"],
+                    "description": "How attendee list should be applied. Default 'replace'.",
+                },
+                "edit_mode": {
+                    "type": "boolean",
+                    "description": (
+                        "True when opening an existing event for edits even if event_id is unknown."
+                    ),
+                },
+                "event_id": {
+                    "type": "string",
+                    "description": (
+                        "Existing event id when editing a previously created calendar event. "
+                        "If omitted, this is a fresh invite workflow."
+                    ),
+                },
+                "reset": {
+                    "type": "boolean",
+                    "description": (
+                        "When true (default for fresh invites), clear prior draft state before showing."
+                    ),
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "name": "confirm_calendar_event",
+        "description": (
+            "Create — or, when event_id is provided, UPDATE — the calendar event currently shown on "
+            "the calendar-event screen. Call this the moment the user confirms after "
+            "show_calendar_event — e.g. 'confirm', 'yes', 'create it', 'go ahead', 'add it'. This "
+            "writes the event to the user's Google Calendar and dismisses the screen on the device. "
+            "Pass the SAME name, date, time and attendees shown on screen (re-state them exactly — do "
+            "not change wording or invent details). FOR AN EDIT, also pass event_id so the existing "
+            "event is updated in place instead of a new one being created; if you don't have the "
+            "event_id, the original name + date are used to locate it. After it returns success the "
+            "device sends the user to the Calendar screen; confirm: 'Done — it's on your calendar. "
+            "You can see it there now.' If it returns an error, apologise and offer to try again."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "Same event name shown on screen.",
+                },
+                "date": {
+                    "type": "string",
+                    "description": "Same event date (ISO YYYY-MM-DD) shown on screen.",
+                },
+                "time": {
+                    "type": "string",
+                    "description": "Same event start time (24-hour HH:MM) shown on screen.",
+                },
+                "duration_minutes": {
+                    "type": "integer",
+                    "description": "Event duration in minutes. Default 30 if not specified.",
+                },
+                "attendees": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Same attendee email addresses shown on screen, if any.",
+                },
+                "event_id": {
+                    "type": "string",
+                    "description": (
+                        "Google Calendar event id of an EXISTING event being edited. Pass this ONLY "
+                        "when updating an event the user already had (rename / reschedule / add "
+                        "attendee). Leave empty to create a brand-new event."
+                    ),
+                },
+                "attendees_add": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Attendees to add during edit mode.",
+                },
+                "attendees_remove": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Attendees to remove during edit mode.",
+                },
+                "attendees_replace": {
+                    "type": "boolean",
+                    "description": (
+                        "When true in edit mode, replace attendee list with provided attendees."
+                    ),
+                },
+                "edit_mode": {
+                    "type": "boolean",
+                    "description": "Force update mode even if event_id is unavailable.",
+                },
+                "confirmed_by_user": {
+                    "type": "boolean",
+                    "description": (
+                        "Must be true, and only after the user has explicitly approved creating/"
+                        "updating this event (a spoken yes / 'create it' / 'go ahead', or a Confirm tap)."
+                    ),
+                },
+                "confirmation_phrase": {
+                    "type": "string",
+                    "description": (
+                        "The user's actual approving words (e.g. 'yes create it', 'go ahead') or the "
+                        "'[BUTTON:Confirm]' marker the device sends on a Confirm tap. The server "
+                        "validates this is genuine approval before writing."
+                    ),
+                },
+            },
+            "required": ["name", "date", "time", "confirmed_by_user", "confirmation_phrase"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "discard_calendar_event",
+        "description": (
+            "Cancel the event currently shown on the calendar-event screen WITHOUT creating it. "
+            "Call this when the user verbally declines after show_calendar_event — e.g. 'discard', "
             "'cancel', 'no', 'never mind', 'forget it'. This dismisses the screen on the device. "
             "After it returns, acknowledge briefly: 'Okay, cancelled.'"
         ),
@@ -1033,22 +1336,31 @@ REALTIME_VOICE_TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "type": "function",
         "name": "show_recipient_picker",
         "description": (
-            "RESOLVE AND CONFIRM an email recipient the user referred to by NAME. This is the "
-            "REQUIRED first step whenever the user wants to email / draft / reply / forward to a "
-            "person without spelling the full address (e.g. 'email Rahul', 'draft a mail to Neha'). "
+            "RESOLVE AND CONFIRM a person the user referred to by NAME. This is the REQUIRED first "
+            "step whenever the user wants to email / draft / reply / forward to a person — OR add a "
+            "person as an attendee to a calendar invite — without spelling the full address (e.g. "
+            "'email Rahul', 'draft a mail to Neha', 'add Priya to the invite', 'invite Karthik'). "
+            "Set field='attendee' when the person is being added to a calendar event so their "
+            "resolved address lands on the invite. "
             "The server searches ALL known contact sources (sent mail, received mail, draft "
             "recipients, calendar attendees) ranked by interaction frequency, and displays the "
             "matching contacts as tappable cards on the device screen so the user can confirm by "
             "voice OR touch. "
-            "CRITICAL: you MUST call this and wait for the user to confirm BEFORE drafting — never "
-            "assume a recipient, even when only one match exists. "
+            "CRITICAL: you MUST call this and wait for the user to confirm BEFORE drafting / adding — "
+            "never assume a recipient, even when only one match exists. "
             "Behavior based on the returned 'count': "
             "1 match -> say e.g. 'I found [Name] at [email] — is that the right person?' and wait for "
             "a yes / tap. "
             ">1 match -> say e.g. 'I found a few: (1) [Name] [email], (2) [Name] [email]. Which one?' "
             "and wait for a spoken choice ('the first one' / a name) or a tap. "
-            "0 matches -> say EXACTLY 'Sorry, I couldn't find anyone by that name. Could you tell me "
-            "their email address?', take the dictated address, then call remember_contact. "
+            "0 matches -> NO picker is shown; say EXACTLY 'There are no contacts associated with "
+            "[name]. Please provide the email address.', take the dictated address, then call "
+            "remember_contact. "
+            "ONCE THE USER CONFIRMS a contact (by voice or by tapping a card), the picker is "
+            "dismissed automatically — do NOT call show_recipient_picker again for that same "
+            "person. Proceed straight to show_email_draft (for emails) or show_calendar_event (for "
+            "attendees) to record the choice. Re-calling the picker re-opens the popup and traps the "
+            "user. "
             "For 'email Rahul and Neha', call show_recipient_picker once per person and confirm each "
             "before continuing."
         ),
@@ -1061,11 +1373,12 @@ REALTIME_VOICE_TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 },
                 "field": {
                     "type": "string",
-                    "enum": ["to", "cc", "bcc"],
+                    "enum": ["to", "cc", "bcc", "attendee"],
                     "description": (
-                        "Which email field this recipient is being resolved for. "
-                        "Use 'to' for direct recipients, 'cc' for CC recipients, 'bcc' for BCC. "
-                        "Defaults to 'to' if omitted."
+                        "Which field this contact is being resolved for. "
+                        "Use 'to' for direct email recipients, 'cc' for CC, 'bcc' for BCC, and "
+                        "'attendee' when adding a person to a calendar event being created on the "
+                        "calendar-event screen. Defaults to 'to' if omitted."
                     ),
                 },
             },
@@ -1167,6 +1480,245 @@ REALTIME_VOICE_TOOL_DEFINITIONS: list[dict[str, Any]] = [
             },
         },
     },
+    # ── Email view tools ─────────────────────────────────────────────────────
+    {
+        "type": "function",
+        "name": "fetch_and_show_email",
+        "description": (
+            "Search Gmail for a specific email and display its full content on the device screen. "
+            "This is the PRIMARY tool whenever the user asks to open, view, read, or see an email "
+            "(e.g. 'show me the email from Shiva', 'open the latest email', 'show unread emails', "
+            "'the email about the progress update'). One call does everything — the server searches "
+            "Gmail, fetches the full body, and populates the screen automatically. "
+            "You do NOT need to call show_email_view or assistant_intent separately. "
+            "After the call, say something short like 'Here\\'s that email from [sender].' "
+            "and do NOT read the body aloud unless the user explicitly asks."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": (
+                        "Gmail search string to find the email. Use Gmail q syntax. Examples: "
+                        "'from:Shiva' — emails from Shiva; "
+                        "'is:unread' — latest unread email; "
+                        "'subject:progress update' — by subject keyword; "
+                        "'from:Vivek is:unread' — unread from Vivek. "
+                        "Leave empty or omit to fetch the most recent inbox email."
+                    ),
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "name": "show_email_view",
+        "description": (
+            "Display a single received email on the device screen. Call this IMMEDIATELY once "
+            "you have retrieved the email content — the user has asked to SEE a specific email "
+            "on the screen (not compose one). The device navigates to the email view page and "
+            "renders the email in a large, readable card. "
+            "Always call this before reading the email aloud — let the screen be the primary "
+            "surface and keep your spoken summary SHORT (e.g. 'Here's the email from Shiva.'). "
+            "You do NOT need to read the full body unless the user asks."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "subject": {
+                    "type": "string",
+                    "description": "The email subject line.",
+                },
+                "sender_name": {
+                    "type": "string",
+                    "description": "Display name of the sender (e.g. 'Shiva Kumar').",
+                },
+                "sender_initial": {
+                    "type": "string",
+                    "description": (
+                        "Single letter to show in the sender avatar circle "
+                        "(first letter of sender_name). Omit to auto-derive."
+                    ),
+                },
+                "sender_email": {
+                    "type": "string",
+                    "description": "Sender's email address (optional, not displayed prominently).",
+                },
+                "time": {
+                    "type": "string",
+                    "description": "Human-readable time/date of the email (e.g. '2:57 PM', 'Mon 9 AM').",
+                },
+                "recipient_label": {
+                    "type": "string",
+                    "description": (
+                        "Short label for the recipient field shown below the sender name. "
+                        "Use 'to me' for emails sent directly to the user, or a short name "
+                        "like 'to Vivek' when appropriate. Defaults to 'to me'."
+                    ),
+                },
+                "body": {
+                    "type": "string",
+                    "description": "Full plain-text body of the email.",
+                },
+            },
+            "required": ["subject", "body"],
+        },
+    },
+    # ── Personal Notes tools ──────────────────────────────────────────────────
+    {
+        "type": "function",
+        "name": "note_create",
+        "description": (
+            "Save a personal note for the user. Call this when they say 'take a note', "
+            "'note this down', 'remember this for me', 'jot that down', 'save this idea', etc. "
+            "The note is stored permanently and can be recalled in future sessions via memory_search "
+            "or note_list. Always confirm after saving: 'I've saved that note for you.'"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "title": {
+                    "type": "string",
+                    "description": "Short descriptive title (1-8 words). If not obvious from context, infer from content.",
+                },
+                "content": {
+                    "type": "string",
+                    "description": "Full note content as the user dictated or implied.",
+                },
+                "tags": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional topic tags (e.g. ['work', 'ideas', 'follow-up']).",
+                },
+                "pinned": {
+                    "type": "boolean",
+                    "description": "True if the user explicitly asks to pin the note.",
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "name": "note_list",
+        "description": (
+            "List or BROWSE the user's saved notes (e.g. 'show my notes', 'read my notes'). "
+            "Returns notes newest-first with their created date/time. Supports keyword, tag, "
+            "and date-range filters. Each note includes created_at — when reading a note back, "
+            "tell the user WHEN it was saved. "
+            "NOTE: for finding ONE specific note by topic/person/context (e.g. 'pull up my note "
+            "about the board meeting'), prefer assistant_intent, which ranks by meaning, not just "
+            "title text."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "search": {
+                    "type": "string",
+                    "description": "Keyword(s) to search in title and content. A note matches if ANY keyword appears — pass a natural phrase, not an exact title.",
+                },
+                "tag": {
+                    "type": "string",
+                    "description": "Optional tag to filter by (e.g. 'work').",
+                },
+                "pinned_only": {
+                    "type": "boolean",
+                    "description": "If true, return only pinned notes.",
+                },
+                "date_from": {
+                    "type": "string",
+                    "description": "Only notes created on/after this date (YYYY-MM-DD). Use for 'notes from June 17', 'notes since Monday', etc.",
+                },
+                "date_to": {
+                    "type": "string",
+                    "description": "Only notes created on/before this date (YYYY-MM-DD). For a single day, set date_from and date_to to the same date.",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Max notes to return (default 10, max 50).",
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "name": "note_update",
+        "description": (
+            "Update an existing note. Use when the user wants to edit, rename, add to, or "
+            "pin/unpin a note. You must have a note_id from a prior note_list call."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "note_id": {
+                    "type": "string",
+                    "description": "The note id to update (from note_list).",
+                },
+                "title": {
+                    "type": "string",
+                    "description": "New title. Omit to keep existing.",
+                },
+                "content": {
+                    "type": "string",
+                    "description": "New content. Omit to keep existing.",
+                },
+                "append": {
+                    "type": "boolean",
+                    "description": "If true, append content to the existing text instead of replacing it.",
+                },
+                "tags": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Replace the tags list. Omit to keep existing.",
+                },
+                "pinned": {
+                    "type": "boolean",
+                    "description": "Set pinned status.",
+                },
+            },
+            "required": ["note_id"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "note_delete",
+        "description": (
+            "Permanently delete a note. Only call when the user explicitly confirms deletion. "
+            "Always confirm after: 'Done, I've deleted that note.'"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "note_id": {
+                    "type": "string",
+                    "description": "The note id to delete (from note_list).",
+                },
+            },
+            "required": ["note_id"],
+        },
+    },
+]
+
+# Live-internet tools are intentionally disabled: this is an audio-only personal
+# assistant whose scope is the user's own meetings, calendar, emails, tasks, notes
+# and saved memory (plus general knowledge it already has). It does NOT browse the
+# web or fetch real-time data. The definitions above are kept for easy re-enable,
+# but they are never exposed to the model and are refused if somehow invoked.
+_DISABLED_VOICE_TOOLS = frozenset(
+    {
+        "web_search",
+        "deep_research",
+        "get_news",
+        "get_weather",
+        "get_stock_price",
+        "convert_currency",
+        "get_sports_score",
+        "find_research_paper",
+    }
+)
+
+REALTIME_VOICE_TOOL_DEFINITIONS = [
+    _t for _t in REALTIME_VOICE_TOOL_DEFINITIONS if _t.get("name") not in _DISABLED_VOICE_TOOLS
 ]
 
 
@@ -1310,6 +1862,22 @@ def execute_realtime_voice_tool(
     if not (user_id or "").strip():
         return json.dumps({"error": "unauthenticated"})
 
+    if name in _DISABLED_VOICE_TOOLS:
+        # Live-web tools are disabled; never run a lookup even if a stale client requests one.
+        return json.dumps(
+            {
+                "disabled": True,
+                "scope": "personal_only",
+                "message": (
+                    "Live web and real-time lookups are turned off. This assistant only covers the "
+                    "user's own meetings, calendar, emails, tasks, notes and saved memory, plus "
+                    "general knowledge it already has. Tell the user warmly that this is outside "
+                    "your scope and offer to help with their personal info instead. Do NOT mention "
+                    "tools, and never ask them to type, paste, or show you anything."
+                ),
+            }
+        )
+
     try:
         if name == "memory_search":
             # Use the runtime-ready check (not just the disable-env check):
@@ -1384,6 +1952,38 @@ def execute_realtime_voice_tool(
                 logger.debug("get_briefing_context: gmail ingest failed", exc_info=True)
             return json.dumps(bundle, default=str)
 
+        if name == "get_sent_emails":
+            query = str(args.get("query") or "").strip()
+            max_r = min(max(int(args.get("max_results") or 5), 1), 20)
+            try:
+                from routes.integrations import get_credentials_for_provider
+                from services.gmail import list_recent_messages
+                creds_g = get_credentials_for_provider(user_id, "gmail")
+                if not creds_g:
+                    return json.dumps({"error": "Gmail not connected. Ask the user to connect Gmail in Settings."})
+                q = f"in:sent {query}".strip()
+                msgs = list_recent_messages(creds_g, max_results=max_r, q=q)
+                # Annotate each message for clarity when speaking to the user.
+                # Each msg now has: to, cc (if present), from (user's own address), subject, date, snippet.
+                for m in msgs:
+                    m["direction"] = "sent"
+                try:
+                    maybe_ingest_gmail_snapshot(user_id, {"messages": msgs, "count": len(msgs)})
+                except Exception:
+                    logger.debug("get_sent_emails: mem0 ingest failed", exc_info=True)
+                return json.dumps({
+                    "sent_messages": msgs,
+                    "count": len(msgs),
+                    "note": (
+                        "These are sent emails. Each entry includes 'to' (primary recipient), "
+                        "'cc' (if any), 'subject', 'date', and 'snippet'. "
+                        "Read the 'to' field to answer who the user emailed."
+                    ),
+                }, default=str)
+            except Exception as exc:
+                logger.warning("get_sent_emails failed: %s", exc)
+                return json.dumps({"error": str(exc)[:300]})
+
         if name == "assistant_intent":
             msg = str(args.get("message") or "").strip()
             if not msg:
@@ -1430,30 +2030,11 @@ def execute_realtime_voice_tool(
             pid, resolve_err = _resolve_pending_for_approval(user_id, pid_raw)
             if resolve_err:
                 return json.dumps(resolve_err, default=str)
-            if args.get("confirmed_by_user") is not True:
-                return json.dumps(
-                    {
-                        "error": "confirmation_required",
-                        "detail": "Explicit user confirmation is required before executing actions.",
-                        "truth_status": {
-                            "writes_committed": False,
-                            "note": "No write executed because confirmation is missing.",
-                        },
-                    }
-                )
-            phrase = str(args.get("confirmation_phrase") or "").strip().lower()
-            allowed = ("yes", "confirm", "go ahead", "approve", "do it", "send it")
-            if not phrase or not any(a in phrase for a in allowed):
-                return json.dumps(
-                    {
-                        "error": "confirmation_phrase_required",
-                        "detail": "Provide the user's explicit confirmation phrase.",
-                        "truth_status": {
-                            "writes_committed": False,
-                            "note": "No write executed because confirmation phrase was insufficient.",
-                        },
-                    }
-                )
+            ok_appr, appr_err = require_user_approval(
+                args.get("confirmed_by_user"), args.get("confirmation_phrase")
+            )
+            if not ok_appr:
+                return json.dumps(appr_err)
             try:
                 out = svc_approve_pending_action(pid, user_id)
             except HTTPException as e:
@@ -1464,6 +2045,21 @@ def execute_realtime_voice_tool(
                     "writes_committed": ok,
                     "note": "Write executed successfully." if ok else "Write did not execute successfully.",
                 }
+                result = out.get("result") if isinstance(out.get("result"), dict) else {}
+                email_result_keys = (
+                    "gmail",
+                    "gmail_send_draft",
+                    "gmail_reply",
+                    "gmail_reply_all",
+                    "gmail_forward",
+                )
+                if ok and any(k in result for k in email_result_keys):
+                    # The email send itself is the committed write. Do not rely on
+                    # the model to remember a follow-up show_email_draft(state=sent)
+                    # call; emit the device terminal directive from the write result
+                    # so the send animation always fires exactly when the send
+                    # actually succeeds.
+                    out["device_email_draft"] = {"state": "sent"}
             return json.dumps(out, default=str)
 
         if name == "reject_pending_action":
@@ -1482,6 +2078,11 @@ def execute_realtime_voice_tool(
                 raw = "emails"
             if raw in ("task", "action_items", "todo", "todos"):
                 raw = "tasks"
+            if raw in (
+                "transcription", "audio_transcription", "transcribe", "transcript",
+                "listening", "voice", "voice_assistant", "recording", "assistant",
+            ):
+                raw = "voice_session"
             if raw not in REALTIME_DEVICE_NAV_SCREENS:
                 return json.dumps(
                     {
@@ -1517,7 +2118,145 @@ def execute_realtime_voice_tool(
                 tab = _email_tab_aliases.get(tab, "")
                 if tab:
                     payload["target_tab"] = tab
+            if raw == "morning_brief":
+                tab = str(args.get("target_tab") or "").strip().lower()
+                _mb_tab_aliases = {
+                    "schedule": "schedule", "calendar": "schedule",
+                    "meetings": "schedule", "meeting": "schedule", "today": "schedule",
+                    "tasks": "tasks", "task": "tasks", "todo": "tasks", "todos": "tasks",
+                    "emails": "emails", "email": "emails", "inbox": "emails", "mail": "emails",
+                    "next": "next", "forward": "next",
+                    "previous": "previous", "prev": "previous", "back": "previous",
+                }
+                tab = _mb_tab_aliases.get(tab, "")
+                if tab:
+                    payload["target_tab"] = tab
+                _mb_steps = {
+                    "schedule": (
+                        "The morning-brief carousel is now on the SCHEDULE card. Speak ONLY today's "
+                        "meetings now — lead with the next upcoming meeting (time + title), then the rest, "
+                        "in one or two short sentences. Do NOT mention tasks or emails yet. The MOMENT you "
+                        "finish speaking the meetings aloud, call "
+                        "navigate_device_ui(screen='morning_brief', target_tab='tasks')."
+                    ),
+                    "tasks": (
+                        "The carousel is now on the TASKS card. Speak ONLY tasks due today now. Do NOT "
+                        "mention overdue, upcoming, or unplanned tasks. Do NOT mention emails yet. The "
+                        "MOMENT you finish, call navigate_device_ui(screen='morning_brief', target_tab='emails')."
+                    ),
+                    "emails": (
+                        "The carousel is now on the EMAILS card. Speak ONLY the latest unread emails now "
+                        "(sender + subject), briefly. This is the FINAL section — after it, give a one-line "
+                        "wrap-up. Do NOT call navigate_device_ui again."
+                    ),
+                    "next": "The carousel advanced to the next card. Narrate the section now shown, briefly.",
+                    "previous": "The carousel moved to the previous card. Narrate the section now shown, briefly.",
+                }
+                if tab in _mb_steps:
+                    payload["briefing_step"] = _mb_steps[tab]
             return json.dumps(payload)
+
+        if name == "show_meeting_summary":
+            mid = str(args.get("meeting_id") or "").strip()
+            query = str(args.get("query") or "").strip()
+            stype = str(args.get("session_type") or "").strip().lower()
+            if stype not in ("meeting", "note"):
+                stype = None
+            top: dict[str, Any] | None = None
+            if not mid:
+                if not query:
+                    return json.dumps({"error": "query_required"})
+                try:
+                    res = memory_search_meetings(
+                        user_id, query, max_results=8, session_type=stype
+                    )
+                except Exception as e:
+                    logger.exception("show_meeting_summary search failed")
+                    return json.dumps({"error": "search_failed", "detail": str(e)})
+                if res.get("needs_clarification") and res.get("clarification"):
+                    return json.dumps(
+                        {
+                            "ok": True,
+                            "needs_clarification": True,
+                            "clarification": res.get("clarification"),
+                        },
+                        default=str,
+                    )
+                meetings = res.get("meetings") or []
+                if not meetings:
+                    return json.dumps(
+                        {
+                            "ok": True,
+                            "found": False,
+                            "message": "No matching meeting or note recording was found.",
+                        }
+                    )
+                top = meetings[0]
+                mid = str(top.get("id") or "").strip()
+            if not mid:
+                return json.dumps(
+                    {
+                        "ok": True,
+                        "found": False,
+                        "message": "No matching meeting or note recording was found.",
+                    }
+                )
+
+            # Resolve the summary content server-side so the device paints it
+            # directly (mirrors tapping the "summary ready" notification, which
+            # passes the real summary dict). This avoids relying solely on the
+            # device's secondary fetch.
+            def _fetch_detail(rec_id: str) -> dict[str, Any] | None:
+                try:
+                    d = memory_fetch_meeting(
+                        user_id, rec_id, max_segments=1, max_total_chars=600
+                    )
+                    return d if isinstance(d, dict) and not d.get("error") else None
+                except Exception:
+                    logger.debug("show_meeting_summary detail fetch failed", exc_info=True)
+                    return None
+
+            detail = _fetch_detail(mid)
+            # If the top hit has no summary yet, prefer the next ranked recording
+            # that actually has one (only when we searched — not for an explicit id).
+            if (not detail or not str(detail.get("summary") or "").strip()) and top is not None:
+                for cand in (meetings or [])[1:5]:
+                    cid = str(cand.get("id") or "").strip()
+                    if not cid or cid == mid:
+                        continue
+                    d2 = _fetch_detail(cid)
+                    if d2 and str(d2.get("summary") or "").strip():
+                        detail, mid, top = d2, cid, cand
+                        break
+
+            summary_data: dict[str, Any] = {}
+            if detail:
+                summary_data = {
+                    "title": detail.get("title"),
+                    "recording_mode": detail.get("recording_mode") or detail.get("session_type"),
+                    "started_at": detail.get("start_time") or detail.get("created_at"),
+                    "generated_at": detail.get("created_at"),
+                    "participants": detail.get("participants") or [],
+                    "summary": {
+                        "summary": detail.get("summary") or "",
+                        "action_items": detail.get("action_items") or [],
+                        "decisions": detail.get("decisions") or [],
+                    },
+                }
+
+            payload: dict[str, Any] = {
+                "ok": True,
+                "found": True,
+                "device_navigate": "summary_review",
+                "meeting_id": mid,
+                "summary_data": summary_data,
+            }
+            src = detail if detail else (top if isinstance(top, dict) else None)
+            if isinstance(src, dict):
+                payload["title"] = src.get("title")
+                payload["recorded_at"] = src.get("start_time") or src.get("created_at")
+                payload["session_type"] = src.get("session_type") or src.get("recording_mode")
+            return json.dumps(payload, default=str)
 
         if name == "web_search":
             query = str(args.get("query") or "").strip()
@@ -1637,6 +2376,12 @@ def execute_realtime_voice_tool(
             })
 
         if name == "confirm_task_creation":
+            ok_appr, appr_err = require_user_approval(
+                args.get("confirmed_by_user"), args.get("confirmation_phrase")
+            )
+            if not ok_appr:
+                return json.dumps(appr_err)
+
             from services.tasks_service import (
                 voice_create_task,
                 TaskFidelityError,
@@ -1681,6 +2426,249 @@ def execute_realtime_voice_tool(
                         "note": "Task saved to user_commitments.",
                     },
                     "message": "Task saved. Confirm to the user: 'Done — it's on your list.'",
+                },
+                default=str,
+            )
+
+        if name == "show_calendar_event":
+            ev_name   = str(args.get("name") or args.get("title") or "").strip() or None
+            ev_date   = str(args.get("date") or "").strip() or None
+            ev_time   = str(args.get("time") or "").strip() or None
+            ev_id     = str(args.get("event_id") or "").strip() or None
+            raw_dur   = args.get("duration_minutes")
+            try:
+                ev_dur = int(raw_dur) if raw_dur not in (None, "", 0) else None
+            except (TypeError, ValueError):
+                ev_dur = None
+            attendees_mode = str(args.get("attendees_mode") or "replace").strip().lower()
+            if attendees_mode not in ("replace", "append"):
+                attendees_mode = "replace"
+            # IMPORTANT: never infer fresh-reset implicitly.
+            # The model may call show_calendar_event() with partial/no args while
+            # resolving attendees; implicit reset would wipe title/date/time and
+            # previously confirmed chips. A fresh draft reset must be explicit.
+            reset = bool(args.get("reset")) if "reset" in args else False
+            ev_attend = args.get("attendees")
+            if isinstance(ev_attend, str):
+                ev_attend = [ev_attend] if ev_attend.strip() else []
+            elif not isinstance(ev_attend, list):
+                ev_attend = None
+            device_payload: dict[str, Any] = {}
+            if ev_name is not None:
+                device_payload["name"] = ev_name
+            if ev_date is not None:
+                device_payload["date"] = ev_date
+            if ev_time is not None:
+                device_payload["time"] = ev_time
+            if ev_dur is not None:
+                device_payload["duration_minutes"] = ev_dur
+            if ev_attend is not None:
+                device_payload["attendees"] = [str(a).strip() for a in ev_attend if str(a).strip()]
+                device_payload["attendees_mode"] = attendees_mode
+            if ev_id is not None:
+                device_payload["event_id"] = ev_id
+            device_payload["reset"] = reset
+            return json.dumps({
+                "ok": True,
+                "device_calendar_event": device_payload,
+                "message": (
+                    "Calendar event UI shown on device. The user will confirm (create) or discard "
+                    "(cancel) by voice or by tapping. Wait for confirm_calendar_event / "
+                    "discard_calendar_event — do NOT claim the event is created yet."
+                ),
+            })
+
+        if name == "discard_calendar_event":
+            return json.dumps({
+                "ok": True,
+                # Dict payload tells the device this was a cancel (no navigation
+                # to the calendar screen). Truthy so the dismiss directive fires.
+                "device_calendar_event_dismiss": {"created": False},
+                "message": "Event discarded — screen dismissed. Acknowledge briefly: 'Okay, cancelled.'",
+            })
+
+        if name == "confirm_calendar_event":
+            ok_appr, appr_err = require_user_approval(
+                args.get("confirmed_by_user"), args.get("confirmation_phrase")
+            )
+            if not ok_appr:
+                return json.dumps(appr_err)
+
+            from routes.integrations import get_credentials_for_provider
+            from services.calendar import (
+                create_event,
+                default_calendar_tz_name,
+                list_upcoming_events,
+                update_event,
+            )
+
+            ev_name = str(args.get("name") or args.get("title") or "").strip()
+            ev_date = str(args.get("date") or "").strip()
+            ev_time = str(args.get("time") or "").strip()
+            event_id = str(args.get("event_id") or "").strip() or None
+            attendees_replace_flag = bool(args.get("attendees_replace", False))
+            # Support post-send editing even when the model does not pass event_id:
+            # if there's a concrete edit instruction, locate by title/date and patch.
+            is_edit = bool(
+                event_id
+                or attendees_replace_flag
+                or args.get("attendees_remove")
+                or args.get("attendees_add")
+                or args.get("new_time")
+                or args.get("new_date")
+                or args.get("new_duration_minutes")
+                or args.get("edit_mode")
+            )
+            if not ev_name:
+                return json.dumps({"ok": False, "error": "name_required"})
+            duration = args.get("duration_minutes")
+            try:
+                duration = int(duration) if duration else 30
+            except (TypeError, ValueError):
+                duration = 30
+
+            # Extract bare email addresses from "Name <email>" or plain strings.
+            raw_attend = args.get("attendees")
+            if isinstance(raw_attend, str):
+                raw_attend = [raw_attend]
+            elif not isinstance(raw_attend, list):
+                raw_attend = []
+            emails: list[str] = []
+            for a in raw_attend:
+                s = str(a or "").strip()
+                if not s:
+                    continue
+                if "<" in s and ">" in s:
+                    s = s[s.find("<") + 1:s.find(">")].strip()
+                if "@" in s and s not in emails:
+                    emails.append(s)
+            raw_add = args.get("attendees_add")
+            raw_remove = args.get("attendees_remove")
+            add_list = raw_add if isinstance(raw_add, list) else []
+            remove_list = raw_remove if isinstance(raw_remove, list) else []
+            attendees_add: list[str] = []
+            attendees_remove: list[str] = []
+            for item in add_list:
+                s = str(item or "").strip()
+                if "<" in s and ">" in s:
+                    s = s[s.find("<") + 1:s.find(">")].strip()
+                if "@" in s and s not in attendees_add:
+                    attendees_add.append(s)
+            for item in remove_list:
+                s = str(item or "").strip()
+                if "<" in s and ">" in s:
+                    s = s[s.find("<") + 1:s.find(">")].strip()
+                if "@" in s and s not in attendees_remove:
+                    attendees_remove.append(s)
+
+            # Normalise the time to HH:MM (24-hour) for the calendar service.
+            hhmm = _normalise_hhmm(ev_time)
+
+            creds = get_credentials_for_provider(user_id, "calendar")
+            if not creds:
+                return json.dumps({
+                    "ok": False,
+                    "device_calendar_event_dismiss": {"created": False},
+                    "error": "calendar_not_connected",
+                    "message": (
+                        "Google Calendar is not connected. Tell the user to connect it in "
+                        "Settings → Integrations."
+                    ),
+                })
+            try:
+                if is_edit:
+                    resolved_event_id = event_id
+                    if not resolved_event_id and ev_name:
+                        try:
+                            rows = list_upcoming_events(
+                                creds,
+                                max_results=50,
+                                date_filter=(ev_date or None),
+                                days_ahead=1 if ev_date else 30,
+                                timezone=default_calendar_tz_name(),
+                            )
+                            match = next(
+                                (
+                                    r for r in rows
+                                    if ev_name.lower() in str(r.get("summary") or "").lower()
+                                ),
+                                None,
+                            )
+                            if isinstance(match, dict):
+                                resolved_event_id = str(match.get("id") or "").strip() or None
+                        except Exception:
+                            resolved_event_id = None
+                    # Build a combined ISO start so the time-of-day moves too.
+                    new_start = f"{ev_date}T{hhmm}:00" if (ev_date and hhmm) else None
+                    result = update_event(
+                        creds,
+                        event_id=resolved_event_id,
+                        title_hint=(ev_name if not resolved_event_id else None),
+                        date_hint=(ev_date or None if not resolved_event_id else None),
+                        timezone=default_calendar_tz_name(),
+                        title=ev_name,
+                        new_start_time=new_start,
+                        new_date=(ev_date or None if not new_start else None),
+                        new_duration_minutes=duration,
+                        attendees_replace=(emails if attendees_replace_flag else None),
+                        attendees_add=((attendees_add or emails) if not attendees_replace_flag else None),
+                        attendees_remove=attendees_remove or None,
+                    )
+                else:
+                    result = create_event(
+                        credentials=creds,
+                        title=ev_name,
+                        duration_minutes=duration,
+                        attendees=emails or None,
+                        timezone=default_calendar_tz_name(),
+                        start_date=ev_date or None,
+                        start_time_hhmm=hhmm,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("confirm_calendar_event failed: %s", exc)
+                return json.dumps({
+                    "ok": False,
+                    "device_calendar_event_dismiss": {"created": False},
+                    "error": "calendar_save_failed",
+                    "detail": str(exc),
+                    "message": "Saving the event failed. Apologise and offer to try again.",
+                })
+
+            # Resolve the event date for the device so it can open the Calendar
+            # screen on the right day. Prefer the API result, fall back to args.
+            result_date = ev_date or None
+            try:
+                start = (result.get("start") or {})
+                start_iso = start.get("dateTime") or start.get("date") or ""
+                if start_iso:
+                    result_date = str(start_iso)[:10]
+            except Exception:
+                pass
+
+            action = "updated" if is_edit else "created"
+            return json.dumps(
+                {
+                    "ok": True,
+                    # Dict payload: tells the device the event was saved and on
+                    # which day, so it navigates to the Calendar screen.
+                    "device_calendar_event_dismiss": {
+                        "created": True,
+                        "action": action,
+                        "date": result_date,
+                    },
+                    "event": {
+                        "id": result.get("id"),
+                        "title": ev_name,
+                        "htmlLink": result.get("htmlLink"),
+                    },
+                    "truth_status": {
+                        "writes_committed": True,
+                        "note": f"Event {action} on the user's Google Calendar.",
+                    },
+                    "message": (
+                        f"Event {action}. Confirm to the user: 'Done — it's on your "
+                        "calendar. You can see it there now.'"
+                    ),
                 },
                 default=str,
             )
@@ -1884,7 +2872,7 @@ def execute_realtime_voice_tool(
             from services.contacts_service import lookup_contacts
             query = str(args.get("query") or "").strip()
             field = str(args.get("field") or "to").strip().lower()
-            if field not in ("to", "cc", "bcc"):
+            if field not in ("to", "cc", "bcc", "attendee"):
                 field = "to"
             if not query:
                 return json.dumps({"error": "query_required"})
@@ -1924,29 +2912,47 @@ def execute_realtime_voice_tool(
                 for m in matches
                 if m.get("email")
             ]
+            # Prevent duplicate cards for the same address.
+            seen_emails: set[str] = set()
+            uniq: list[dict[str, str]] = []
+            for c in candidates:
+                em = str(c.get("email") or "").strip().lower()
+                if not em or em in seen_emails:
+                    continue
+                seen_emails.add(em)
+                uniq.append(c)
+            candidates = uniq
             payload = {
                 "ok": True,
-                "device_recipient_picker": {"query": query, "candidates": candidates, "field": field},
                 "contacts": candidates,
                 "count": len(candidates),
             }
             if not candidates:
+                # No match → do NOT pop a contact card on the device (an empty
+                # picker confuses the user). The model tells them out loud and
+                # asks for the address instead.
                 payload["note"] = (
-                    f"No known contacts match '{query}'. Say EXACTLY: 'Sorry, I couldn't find "
-                    "anyone by that name. Could you tell me their email address?' Then take the "
-                    "dictated address and call remember_contact. NEVER guess an address."
-                )
-            elif len(candidates) == 1:
-                payload["note"] = (
-                    "One match — the card is shown on screen. Confirm with the user "
-                    "(voice or tap) BEFORE drafting. Never assume it is correct."
+                    f"There are no contacts associated with {query}. Please provide the email address. "
+                    "Do NOT show a picker. Take the dictated address and call remember_contact. "
+                    "NEVER guess an address."
                 )
             else:
-                payload["note"] = (
-                    "Multiple matches — all cards are shown on screen. Read them out and ask "
-                    "which one (the user may say 'the first one' / a name, or tap a card). "
-                    "Confirm before drafting."
-                )
+                # Only render the on-device picker when we actually have cards.
+                payload["device_recipient_picker"] = {
+                    "query": query, "candidates": candidates, "field": field,
+                }
+                payload["none_option_label"] = "None of these"
+                if len(candidates) == 1:
+                    payload["note"] = (
+                        "One match — the card is shown on screen. Confirm with the user "
+                        "(voice or tap) BEFORE drafting. Never assume it is correct."
+                    )
+                else:
+                    payload["note"] = (
+                        "Multiple matches — all cards are shown on screen. Read them out and ask "
+                        "which one (the user may say 'the first one' / a name, or tap a card). "
+                        "Confirm before drafting."
+                    )
             return json.dumps(payload, default=str)
 
         if name == "remember_contact":
@@ -2029,6 +3035,219 @@ def execute_realtime_voice_tool(
                     "spoken reply short and do NOT read the body aloud unless the user asks."
                 ),
             }, default=str)
+
+        if name == "fetch_and_show_email":
+            query = str(args.get("query") or "").strip()
+            try:
+                from routes.integrations import get_credentials_for_provider
+                from services.gmail import list_recent_messages, get_message_with_attachments
+                from zoneinfo import ZoneInfo
+                from datetime import datetime as _dt
+
+                creds = get_credentials_for_provider(user_id, "gmail")
+                if not creds:
+                    return json.dumps({"ok": False, "error": "Gmail not connected. Ask the user to connect Gmail in the web dashboard."})
+
+                messages = list_recent_messages(creds, max_results=1, q=query or "")
+                if not messages:
+                    return json.dumps({
+                        "ok": False,
+                        "error": "no_email_found",
+                        "message": "No email found matching that description. Ask the user to be more specific.",
+                    })
+
+                msg = messages[0]
+                message_id = msg.get("id", "")
+                full = get_message_with_attachments(creds, message_id)
+
+                # Parse sender
+                from_raw = full.get("from", "")
+                sender_name, sender_email_addr = _email_utils.parseaddr(from_raw)
+                if not sender_name:
+                    sender_name = sender_email_addr.split("@")[0] if sender_email_addr else from_raw
+                sender_name = sender_name.strip()
+                sender_initial = sender_name[0].upper() if sender_name else "?"
+
+                # Format time
+                date_raw = full.get("date", "")
+                time_str = ""
+                try:
+                    tz_name = "Asia/Kolkata"
+                    try:
+                        from services.calendar import default_calendar_tz_name as _dtz
+                        tz_name = _dtz()
+                    except Exception:
+                        pass
+                    dt_parsed = _email_utils.parsedate_to_datetime(date_raw)
+                    dt_local = dt_parsed.astimezone(ZoneInfo(tz_name))
+                    today_date = _dt.now(ZoneInfo(tz_name)).date()
+                    if dt_local.date() == today_date:
+                        time_str = dt_local.strftime("%I:%M %p").lstrip("0")
+                    else:
+                        time_str = dt_local.strftime("%b %-d")
+                except Exception:
+                    time_str = date_raw[:16] if date_raw else ""
+
+                _body_raw = (full.get("body", "") or full.get("snippet", "")
+                             or msg.get("snippet", "") or "")
+                # Normalise line-endings: strip \r so Kivy Label never
+                # renders carriage-returns as tofu boxes.
+                _body_clean = _body_raw.replace("\r\n", "\n").replace("\r", "\n")
+
+                view = {
+                    "subject":        full.get("subject", "") or msg.get("subject", ""),
+                    "sender_name":    sender_name,
+                    "sender_initial": sender_initial,
+                    "sender_email":   sender_email_addr or "",
+                    "time":           time_str,
+                    "recipient_label": "to me",
+                    "body":           _body_clean,
+                }
+                sender_display = sender_name or sender_email_addr or "unknown sender"
+                thread_id_val = full.get("threadId") or msg.get("threadId") or ""
+                to_val = full.get("to", "")
+                cc_val = full.get("cc", "")
+                return json.dumps({
+                    "ok": True,
+                    "device_email_view": view,
+                    "sender": sender_display,
+                    "from_email": sender_email_addr or "",
+                    "subject": view["subject"],
+                    "thread_id": thread_id_val,
+                    "message_id": message_id,
+                    "to": to_val,
+                    "cc": cc_val,
+                    "note": (
+                        f"Email from {sender_display} is now displayed on screen. "
+                        "Say 'Here\\'s that email from [sender].' and keep it short — "
+                        "do NOT read the body aloud unless the user explicitly asks. "
+                        "IMPORTANT: thread_id is the Gmail thread id for this email. "
+                        "When the user wants to reply, ALWAYS treat it as reply-all: "
+                        "call show_email_draft(reply_all_thread_id=<thread_id>, state='drafting', ...) "
+                        "so the server fills every participant into To + Cc on screen. "
+                        "Then when sending, phrase assistant_intent as "
+                        "'Reply all to thread <thread_id> with body: ...' — NEVER as a new email send."
+                    ),
+                }, default=str)
+            except Exception as exc:
+                logger.info("fetch_and_show_email failed: %s", exc, exc_info=True)
+                return json.dumps({"ok": False, "error": str(exc)})
+
+        if name == "show_email_view":
+            view: dict = {}
+            for key in ("subject", "sender_name", "sender_initial", "sender_email",
+                        "time", "recipient_label", "body"):
+                if key in args:
+                    view[key] = str(args.get(key) or "")
+            return json.dumps({
+                "ok": True,
+                "device_email_view": view,
+                "note": (
+                    "Email is now displayed on screen. Keep your spoken reply short — "
+                    "do NOT read the full body aloud unless the user asks."
+                ),
+            }, default=str)
+
+        # ── Personal Notes handlers ───────────────────────────────────────────
+        if name == "note_create":
+            from services.notes_service import upsert_note
+            title = str(args.get("title") or "").strip()
+            content = str(args.get("content") or "").strip()
+            if not title and not content:
+                return json.dumps({"error": "title or content is required to create a note"})
+            tags_raw = args.get("tags")
+            tags = [str(t) for t in (tags_raw if isinstance(tags_raw, list) else []) if t]
+            pinned = bool(args.get("pinned", False))
+            try:
+                row = upsert_note(user_id, {
+                    "title": title,
+                    "content": content,
+                    "tags": tags,
+                    "pinned": pinned,
+                    "source": "voice",
+                })
+                logger.info("NOTE_CREATE ok user=%s note_id=%s title=%r", user_id, row.get("id"), row.get("title"))
+                try:
+                    from services.mem0_service import maybe_ingest_note
+                    maybe_ingest_note(user_id, row)
+                except Exception:
+                    logger.debug("note_create: mem0 ingest failed", exc_info=True)
+                return json.dumps({"ok": True, "note_id": row["id"], "title": row["title"],
+                                   "message": "Note saved successfully."}, default=str)
+            except ValueError as exc:
+                return json.dumps({"error": str(exc)})
+
+        if name == "note_list":
+            from services.notes_service import list_notes
+            search = str(args.get("search") or "").strip() or None
+            tag = str(args.get("tag") or "").strip() or None
+            pinned_only = bool(args.get("pinned_only", False))
+            date_from = str(args.get("date_from") or "").strip() or None
+            date_to = str(args.get("date_to") or "").strip() or None
+            try:
+                limit = max(1, min(int(args.get("limit") or 10), 50))
+            except (TypeError, ValueError):
+                limit = 10
+            try:
+                rows = list_notes(user_id, limit=limit, pinned_only=pinned_only,
+                                  tag_filter=tag, search=search,
+                                  date_from=date_from, date_to=date_to)
+                logger.info("NOTE_LIST user=%s count=%d (search=%r tag=%r pinned_only=%s date=%s..%s)",
+                            user_id, len(rows), search, tag, pinned_only, date_from, date_to)
+                # Strip internal DB fields that the LLM has no reason to read aloud
+                # (source/user_id were causing the agent to say "voice note" verbatim).
+                _drop = {"source", "user_id"}
+                clean = [{k: v for k, v in r.items() if k not in _drop} for r in rows]
+                return json.dumps({"notes": clean, "count": len(clean)}, default=str)
+            except Exception as exc:
+                logger.warning("note_list failed user=%s: %s", user_id, exc, exc_info=True)
+                return json.dumps({"error": str(exc)[:300]})
+
+        if name == "note_update":
+            from services.notes_service import upsert_note
+            note_id = str(args.get("note_id") or "").strip()
+            if not note_id:
+                return json.dumps({"error": "note_id required"})
+            payload: dict = {"note_id": note_id}
+            if "title" in args:
+                payload["title"] = str(args["title"] or "").strip()
+            if "content" in args:
+                payload["content"] = str(args["content"] or "")
+                payload["append"] = bool(args.get("append", False))
+            if "tags" in args:
+                tags_raw = args["tags"]
+                payload["tags"] = [str(t) for t in (tags_raw if isinstance(tags_raw, list) else []) if t]
+            if "pinned" in args:
+                payload["pinned"] = bool(args["pinned"])
+            try:
+                row = upsert_note(user_id, payload)
+                try:
+                    from services.mem0_service import maybe_ingest_note
+                    maybe_ingest_note(user_id, row)
+                except Exception:
+                    logger.debug("note_update: mem0 ingest failed", exc_info=True)
+                return json.dumps({"ok": True, "note_id": row["id"], "title": row["title"],
+                                   "message": "Note updated."}, default=str)
+            except ValueError as exc:
+                return json.dumps({"error": str(exc)})
+
+        if name == "note_delete":
+            from services.notes_service import delete_note
+            note_id = str(args.get("note_id") or "").strip()
+            if not note_id:
+                return json.dumps({"error": "note_id required"})
+            try:
+                deleted = delete_note(user_id, note_id)
+                if deleted:
+                    try:
+                        from services.mem0_service import delete_note_from_mem0
+                        delete_note_from_mem0(user_id, note_id)
+                    except Exception:
+                        logger.debug("note_delete: mem0 cleanup failed", exc_info=True)
+                return json.dumps({"ok": deleted, "message": "Note deleted." if deleted else "Note not found."})
+            except Exception as exc:
+                logger.warning("note_delete failed: %s", exc)
+                return json.dumps({"error": str(exc)[:300]})
 
         return json.dumps({"error": "unknown_tool", "name": name})
     except Exception:

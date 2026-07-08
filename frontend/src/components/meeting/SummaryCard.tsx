@@ -117,8 +117,8 @@ export default function SummaryCard({ summary, meetingId }: SummaryCardProps) {
 
   if (!summary) {
     return (
-      <div className="bg-white rounded-lg border border-gray-200 p-6">
-        <p className="text-gray-500">No summary available yet. The meeting is still being processed.</p>
+      <div className="bg-app-surface rounded-lg border border-app-border p-6">
+        <p className="text-app-ink-subtle">No summary available yet. The meeting is still being processed.</p>
       </div>
     )
   }
@@ -131,35 +131,35 @@ export default function SummaryCard({ summary, meetingId }: SummaryCardProps) {
   )
   const useLegacySummaryOnly = !hasParsedSections && Boolean(summary.summary?.trim())
 
-  const proseClass = 'text-gray-700 leading-relaxed whitespace-pre-wrap break-words'
+  const proseClass = 'text-app-ink-muted leading-relaxed whitespace-pre-wrap break-words'
   const actionableItems = (summary.action_items ?? []).filter(itemHasFollowUpShortcut)
 
   return (
     <div className="space-y-6">
       {useLegacySummaryOnly && (
-        <div className="bg-white rounded-lg border border-gray-200 p-6">
-          <h3 className="text-lg font-semibold text-gray-900 mb-4">Summary</h3>
+        <div className="bg-app-surface rounded-lg border border-app-border p-6">
+          <h3 className="text-lg font-semibold text-app-ink mb-4">Summary</h3>
           <div className={proseClass}>{summary.summary}</div>
         </div>
       )}
 
       {!useLegacySummaryOnly && Boolean(parsed.overview) && (
-        <div className="bg-white rounded-lg border border-gray-200 p-6">
-          <h3 className="text-lg font-semibold text-gray-900 mb-4">Overview</h3>
+        <div className="bg-app-surface rounded-lg border border-app-border p-6">
+          <h3 className="text-lg font-semibold text-app-ink mb-4">Overview</h3>
           <div className={proseClass}>{parsed.overview}</div>
         </div>
       )}
 
       {!useLegacySummaryOnly && parsed.detailedAccount && (
-        <div className="bg-white rounded-lg border border-gray-200 p-6">
-          <h3 className="text-lg font-semibold text-gray-900 mb-4">Detailed account</h3>
+        <div className="bg-app-surface rounded-lg border border-app-border p-6">
+          <h3 className="text-lg font-semibold text-app-ink mb-4">Detailed account</h3>
           <div className={proseClass}>{parsed.detailedAccount}</div>
         </div>
       )}
 
       {!useLegacySummaryOnly && parsed.openQuestions.length > 0 && (
-        <div className="bg-white rounded-lg border border-gray-200 p-6">
-          <h3 className="text-lg font-semibold text-gray-900 mb-4">Open questions</h3>
+        <div className="bg-app-surface rounded-lg border border-app-border p-6">
+          <h3 className="text-lg font-semibold text-app-ink mb-4">Open questions</h3>
           <ul className="space-y-3">
             {parsed.openQuestions.map((q, i) => (
               <li key={`open-${i}-${q.slice(0, 48)}`} className="flex items-start">
@@ -177,7 +177,7 @@ export default function SummaryCard({ summary, meetingId }: SummaryCardProps) {
                     d="M8.228 9c.549-1.165 2.03-2 3.772-2 2.21 0 4 1.343 4 3 0 1.4-1.278 2.575-3.006 2.907-.542.104-.994.54-.994 1.093m0 3h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"
                   />
                 </svg>
-                <span className="text-gray-700">{q}</span>
+                <span className="text-app-ink-muted">{q}</span>
               </li>
             ))}
           </ul>
@@ -185,8 +185,8 @@ export default function SummaryCard({ summary, meetingId }: SummaryCardProps) {
       )}
 
       {!useLegacySummaryOnly && parsed.risksConcerns.length > 0 && (
-        <div className="bg-white rounded-lg border border-gray-200 p-6">
-          <h3 className="text-lg font-semibold text-gray-900 mb-4">Risks / concerns</h3>
+        <div className="bg-app-surface rounded-lg border border-app-border p-6">
+          <h3 className="text-lg font-semibold text-app-ink mb-4">Risks / concerns</h3>
           <ul className="space-y-3">
             {parsed.risksConcerns.map((r, i) => (
               <li key={`risk-${i}-${r.slice(0, 48)}`} className="flex items-start">
@@ -202,7 +202,7 @@ export default function SummaryCard({ summary, meetingId }: SummaryCardProps) {
                     clipRule="evenodd"
                   />
                 </svg>
-                <span className="text-gray-700">{r}</span>
+                <span className="text-app-ink-muted">{r}</span>
               </li>
             ))}
           </ul>
@@ -211,15 +211,15 @@ export default function SummaryCard({ summary, meetingId }: SummaryCardProps) {
 
       {/* Decisions Made */}
       {summary.decisions?.length > 0 && (
-        <div className="bg-white rounded-lg border border-gray-200 p-6">
-          <h3 className="text-lg font-semibold text-gray-900 mb-4">Decisions Made</h3>
+        <div className="bg-app-surface rounded-lg border border-app-border p-6">
+          <h3 className="text-lg font-semibold text-app-ink mb-4">Decisions Made</h3>
           <ul className="space-y-3">
             {summary.decisions.map((decision) => (
               <li key={decision} className="flex items-start">
                 <svg className="w-5 h-5 text-green-500 mr-3 mt-0.5 flex-shrink-0" fill="currentColor" viewBox="0 0 20 20">
                   <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" />
                 </svg>
-                <span className="text-gray-700">{decision}</span>
+                <span className="text-app-ink-muted">{decision}</span>
               </li>
             ))}
           </ul>
@@ -228,11 +228,11 @@ export default function SummaryCard({ summary, meetingId }: SummaryCardProps) {
 
       {/* Action Items */}
       {summary.action_items?.length > 0 && (
-        <div className="bg-white rounded-lg border border-gray-200 p-6">
+        <div className="bg-app-surface rounded-lg border border-app-border p-6">
           <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
             <div className="min-w-0 flex-1">
-              <h3 className="text-lg font-semibold text-gray-900">Action Items</h3>
-              <p className="mt-1 text-sm text-gray-600">
+              <h3 className="text-lg font-semibold text-app-ink">Action Items</h3>
+              <p className="mt-1 text-sm text-app-ink-muted">
                 Calendar invites and email drafts are sent to the assistant for approval. Connect Gmail and Calendar under
                 Settings → Integrations.
               </p>
@@ -250,11 +250,11 @@ export default function SummaryCard({ summary, meetingId }: SummaryCardProps) {
           </div>
           <ul className="space-y-4">
             {summary.action_items.map((item, idx) => (
-              <li key={`${idx}-${item.task.slice(0, 80)}`} className="border-b border-gray-100 pb-4 last:border-0 last:pb-0">
+              <li key={`${idx}-${item.task.slice(0, 80)}`} className="border-b border-app-border pb-4 last:border-0 last:pb-0">
                 <div className="min-w-0">
-                  <p className={`text-gray-900 ${item.completed ? 'line-through text-gray-500' : ''}`}>{item.task}</p>
+                  <p className={`text-app-ink ${item.completed ? 'line-through text-app-ink-subtle' : ''}`}>{item.task}</p>
                   {(item.assignee || item.due_date) && (
-                    <div className="mt-1 flex flex-wrap items-center gap-x-4 gap-y-1 text-sm text-gray-500">
+                    <div className="mt-1 flex flex-wrap items-center gap-x-4 gap-y-1 text-sm text-app-ink-subtle">
                       {item.assignee && (
                         <span className="flex items-center">
                           <svg className="w-4 h-4 mr-1 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -274,16 +274,16 @@ export default function SummaryCard({ summary, meetingId }: SummaryCardProps) {
                     </div>
                   )}
                   {normalizeActionItemType(item.type) === 'calendar_invite' && (
-                    <p className="mt-1 text-xs text-gray-500">Included when you use Plan follow-ups → calendar request.</p>
+                    <p className="mt-1 text-xs text-app-ink-subtle">Included when you use Plan follow-ups → calendar request.</p>
                   )}
                   {normalizeActionItemType(item.type) === 'email_draft' && (
-                    <p className="mt-1 text-xs text-gray-500">Included when you use Plan follow-ups → Gmail draft (not sent until you send from Gmail).</p>
+                    <p className="mt-1 text-xs text-app-ink-subtle">Included when you use Plan follow-ups → Gmail draft (not sent until you send from Gmail).</p>
                   )}
                   {normalizeActionItemType(item.type) === 'task' && (
-                    <p className="mt-1 text-xs text-gray-500">General task — not queued with Plan follow-ups.</p>
+                    <p className="mt-1 text-xs text-app-ink-subtle">General task — not queued with Plan follow-ups.</p>
                   )}
                   {normalizeActionItemType(item.type) === undefined && itemHasFollowUpShortcut(item) && (
-                    <p className="mt-1 text-xs text-gray-500">Legacy item: both calendar and email requests may be queued.</p>
+                    <p className="mt-1 text-xs text-app-ink-subtle">Legacy item: both calendar and email requests may be queued.</p>
                   )}
                 </div>
               </li>

@@ -1,0 +1,10 @@
+# Use this as .gitignore in meetingbox-frontend-release when dist/ is built on the server
+# and NOT committed to git. (Monorepo frontend/.gitignore ignores /dist instead.)
+
+/node_modules
+.env
+.env.local
+.env.*.local
+!.env.production.example
+dist
+.DS_Store

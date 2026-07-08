@@ -24,7 +24,7 @@ export default function Modal({ isOpen, onClose, title, children }: ModalProps) 
           leaveFrom="opacity-100"
           leaveTo="opacity-0"
         >
-          <div className="fixed inset-0 bg-black bg-opacity-25" />
+          <div className="fixed inset-0 bg-app-deep/70 backdrop-blur-sm" />
         </Transition.Child>
 
         {/* Panel */}
@@ -39,8 +39,8 @@ export default function Modal({ isOpen, onClose, title, children }: ModalProps) 
               leaveFrom="opacity-100 scale-100"
               leaveTo="opacity-0 scale-95"
             >
-              <Dialog.Panel className="w-full max-w-2xl transform overflow-hidden rounded-lg bg-white p-6 shadow-xl transition-all">
-                <Dialog.Title className="text-lg font-semibold text-gray-900 mb-4">
+              <Dialog.Panel className="w-full max-w-2xl transform overflow-hidden rounded-lg bg-app-surface p-6 shadow-xl transition-all">
+                <Dialog.Title className="text-lg font-semibold text-app-ink mb-4">
                   {title}
                 </Dialog.Title>
                 {children}

@@ -173,10 +173,17 @@ class FigmaConnectingBadge(Widget):
             Color(*FIGMA_ACCENT)
             Ellipse(pos=(cx - r, cy - r), size=(r * 2, r * 2))
             Color(1, 1, 1, 1)
+            # Anchor the dot + concentric arcs at a common point in the lower
+            # third so the glyph reads as an upright WiFi fan (∩), matching the
+            # status-bar icon. Kivy circle angles: 0° = top, clockwise; the
+            # -62°→62° sweep arches over the top of the dot.
+            dot_cy = cy - r * 0.38
+            dr = max(1.5, r * 0.16)
+            Ellipse(pos=(cx - dr, dot_cy - dr), size=(dr * 2, dr * 2))
             for scale in (0.42, 0.68, 0.94):
-                rr = r * 0.5 * scale
+                rr = r * 0.95 * scale
                 Line(
-                    circle=(cx, cy - rr * 0.1, rr, 118, 242),
+                    circle=(cx, dot_cy, rr, -62, 62),
                     width=lw,
                 )
 

@@ -12,7 +12,7 @@ export default function Card({ children, className }: CardProps) {
   return (
     <div
       className={clsx(
-        'bg-white rounded-lg border border-gray-200 overflow-hidden',
+        'bg-app-surface rounded-lg border border-app-border overflow-hidden',
         className
       )}
     >

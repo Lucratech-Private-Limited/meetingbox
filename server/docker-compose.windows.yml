@@ -1,0 +1,100 @@
+# Second, independent MeetingBox server instance for the Windows exe app.
+#
+# It runs the SAME application code as the main stack (server/web) but as a
+# separate container on its own port, and it SHARES the main stack's data:
+#   - same Redis event bus         (service "redis")
+#   - same Mem0 Postgres / Neo4j   (services "mem0-postgres" / "mem0-neo4j")
+#   - same DATA_ROOT volumes       (SQLite DB + audio + config)
+#
+# Because it shares those backing services, the MAIN stack (docker-compose.yml)
+# must already be running — it owns redis / postgres / neo4j and the network.
+#
+# Bring up (from the server repo root):
+#   1) docker compose up -d                                    # main stack first
+#   2) docker compose -f docker-compose.windows.yml --env-file .env up -d
+#
+# The Windows device UI then connects to  http://<host>:${WINDOWS_WEB_PORT:-8100}
+# (WebSocket: ws://<host>:${WINDOWS_WEB_PORT:-8100}/ws).
+#
+# See WINDOWS_INSTANCE.md for the full guide.
+
+name: meetingbox-windows
+
+services:
+  web-win:
+    build:
+      context: ./web
+    container_name: meetingbox-web-win
+    restart: unless-stopped
+    ports:
+      - "${WINDOWS_WEB_PORT:-8100}:8000"
+    environment:
+      - PYTHONUNBUFFERED=1
+      # Marker so logs / future Windows-only endpoints can tell which instance they run in.
+      - MEETINGBOX_INSTANCE=${MEETINGBOX_INSTANCE:-windows}
+      - WEB_CONCURRENCY=${WINDOWS_WEB_CONCURRENCY:-4}
+      - MEETINGBOX_I_ACKNOWLEDGE_MULTI_WORKER_RECORDING=${MEETINGBOX_I_ACKNOWLEDGE_MULTI_WORKER_RECORDING:-1}
+      # Reach the MAIN stack's Redis / Mem0 services by their service names on the shared network.
+      - REDIS_HOST=${WINDOWS_REDIS_HOST:-redis}
+      - MEETINGBOX_REBOOT_HELPER=/usr/local/bin/meetingbox-host-reboot
+      - MEETINGBOX_POWEROFF_HELPER=/usr/local/bin/meetingbox-host-poweroff
+      # Shared database + recordings (same paths as the main web service).
+      - MEETINGBOX_DB_PATH=/data/transcripts/meetings.db
+      - RECORDINGS_DIR=/data/audio/recordings
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OPENAI_ROUTER_MODEL=${OPENAI_ROUTER_MODEL:-}
+      - MEM0_PGVECTOR_HOST=${MEM0_PGVECTOR_HOST:-mem0-postgres}
+      - MEM0_PGVECTOR_PORT=${MEM0_PGVECTOR_PORT:-5432}
+      - MEM0_PGVECTOR_USER=${MEM0_PGVECTOR_USER:-postgres}
+      - MEM0_PGVECTOR_PASSWORD=${MEM0_PGVECTOR_PASSWORD:-}
+      - MEM0_PGVECTOR_DB=${MEM0_PGVECTOR_DB:-postgres}
+      - MEM0_NEO4J_URI=${MEM0_NEO4J_URI:-bolt://mem0-neo4j:7687}
+      - MEM0_NEO4J_USERNAME=${MEM0_NEO4J_USERNAME:-neo4j}
+      - MEM0_NEO4J_PASSWORD=${MEM0_NEO4J_PASSWORD:-}
+      - MEM0_NEO4J_OPTIONAL=${MEM0_NEO4J_OPTIONAL:-1}
+      - MEM0_LLM_MODEL=${MEM0_LLM_MODEL:-gpt-4o-mini}
+      - OPENAI_TRANSCRIBE_MODEL=${OPENAI_TRANSCRIBE_MODEL:-whisper-1}
+      - OPENAI_TRANSCRIBE_PROMPT=${OPENAI_TRANSCRIBE_PROMPT:-}
+      - OPENAI_TRANSCRIBE_LANGUAGE=${OPENAI_TRANSCRIBE_LANGUAGE:-}
+      - OPENAI_TRANSCRIBE_CHUNK_SECONDS=${OPENAI_TRANSCRIBE_CHUNK_SECONDS:-600}
+      - OPENAI_TRANSCRIBE_MAX_BYTES=${OPENAI_TRANSCRIBE_MAX_BYTES:-25165824}
+      - MEETINGBOX_MAX_UPLOAD_BYTES=${MEETINGBOX_MAX_UPLOAD_BYTES:-2147483648}
+      - MEETINGBOX_MAX_MEETING_UPLOAD_SECONDS=${MEETINGBOX_MAX_MEETING_UPLOAD_SECONDS:-28800}
+      - MEETINGBOX_FFMPEG_TIMEOUT_SECONDS=${MEETINGBOX_FFMPEG_TIMEOUT_SECONDS:-1800}
+      - OPENAI_TTS_VOICE=${OPENAI_TTS_VOICE:-shimmer}
+      - OPENAI_TTS_MODEL=${OPENAI_TTS_MODEL:-tts-1}
+      - MEETINGBOX_REALTIME_VOICE_ENABLED=${MEETINGBOX_REALTIME_VOICE_ENABLED:-1}
+      - OPENAI_REALTIME_MODEL=${OPENAI_REALTIME_MODEL:-gpt-realtime-2}
+      - OPENAI_REALTIME_VOICE=${OPENAI_REALTIME_VOICE:-marin}
+      - MEETINGBOX_MEM0_INGEST_CALENDAR=${MEETINGBOX_MEM0_INGEST_CALENDAR:-1}
+      - MEETINGBOX_MEM0_INGEST_GMAIL=${MEETINGBOX_MEM0_INGEST_GMAIL:-1}
+      - MEETINGBOX_MEM0_INGEST_CHAT=${MEETINGBOX_MEM0_INGEST_CHAT:-1}
+      - AI_MODEL=${AI_MODEL:-claude-sonnet-4-5-20250929}
+      - AI_REPORT_MAX_TOKENS=${AI_REPORT_MAX_TOKENS:-16384}
+      - BRAVE_SEARCH_API_KEY=${BRAVE_SEARCH_API_KEY:-}
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY:?Set JWT_SECRET_KEY in .env}
+      - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:-}
+      - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET:-}
+      - APP_BASE_URL=${APP_BASE_URL:-http://localhost:8000}
+      - FRONTEND_BASE_URL=${FRONTEND_BASE_URL:-}
+      - OAUTH_PUBLIC_BASE_URL=${OAUTH_PUBLIC_BASE_URL:-}
+    volumes:
+      # SAME host paths as the main stack -> one shared SQLite DB, audio and config.
+      - ${DATA_ROOT:-./data}/transcripts:/data/transcripts
+      - ${DATA_ROOT:-./data}/audio:/data/audio
+      - ${DATA_ROOT:-./data}/config:/data/config
+      - ${FRONTEND_DIST:-./frontend/dist}:/app/static
+      - ./scripts/host_reboot.sh:/usr/local/bin/meetingbox-host-reboot:ro
+      - ./scripts/host_poweroff.sh:/usr/local/bin/meetingbox-host-poweroff:ro
+    networks:
+      - shared
+
+networks:
+  # Join the MAIN stack's network so "redis", "mem0-postgres" and "mem0-neo4j"
+  # resolve. The default matches the network the main compose creates
+  # (project "meetingbox-server" + network "meetingbox-server-net"). Override
+  # SHARED_NETWORK_NAME in .env if `docker network ls` shows a different name.
+  shared:
+    external: true
+    name: ${SHARED_NETWORK_NAME:-meetingbox-server_meetingbox-server-net}

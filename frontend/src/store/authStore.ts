@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import { apiClient } from '../api/client'
+import { apiClient, AUTH_REQUEST_TIMEOUT_MS } from '../api/client'
 
 interface User {
   id: string
@@ -35,7 +35,9 @@ export const useAuthStore = create<AuthState>((set) => ({
       const token = localStorage.getItem('auth_token')
       if (!token) return { token: null, user: null }
       try {
-        const { data } = await apiClient.get('/api/auth/me')
+        const { data } = await apiClient.get('/api/auth/me', {
+          timeout: AUTH_REQUEST_TIMEOUT_MS,
+        })
         return { token, user: data as User }
       } catch {
         localStorage.removeItem('auth_token')
@@ -45,7 +47,9 @@ export const useAuthStore = create<AuthState>((set) => ({
 
     const checkHasUsers = async () => {
       try {
-        const { data } = await apiClient.get('/api/auth/has-users')
+        const { data } = await apiClient.get('/api/auth/has-users', {
+          timeout: AUTH_REQUEST_TIMEOUT_MS,
+        })
         return data.has_users as boolean
       } catch {
         return null
@@ -62,8 +66,14 @@ export const useAuthStore = create<AuthState>((set) => ({
   },
 
   startGoogleSignIn: async () => {
-    const { data } = await apiClient.get('/api/auth/google/auth-url')
-    window.location.href = data.auth_url
+    const { data } = await apiClient.get('/api/auth/google/auth-url', {
+      timeout: AUTH_REQUEST_TIMEOUT_MS,
+    })
+    const authUrl = String((data as { auth_url?: string })?.auth_url ?? '').trim()
+    if (!authUrl || !/^https?:\/\//i.test(authUrl)) {
+      throw new Error('Server returned an invalid Google sign-in URL. Check API configuration.')
+    }
+    window.location.assign(authUrl)
   },
 
   logout: () => {
@@ -75,7 +85,9 @@ export const useAuthStore = create<AuthState>((set) => ({
   consumeGoogleCallback: async (token: string) => {
     localStorage.setItem('auth_token', token)
     try {
-      const { data } = await apiClient.get('/api/auth/me')
+      const { data } = await apiClient.get('/api/auth/me', {
+        timeout: AUTH_REQUEST_TIMEOUT_MS,
+      })
       const user = data as User
       set({ token, user, hasUsers: true })
       return user

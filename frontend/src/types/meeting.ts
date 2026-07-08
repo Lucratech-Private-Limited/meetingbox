@@ -9,6 +9,8 @@ export interface Meeting {
   status: 'recording' | 'transcribing' | 'summarizing' | 'finalizing' | 'completed' | 'transcription_failed'
   audio_path: string | null
   created_at: string
+  has_summary?: boolean | number
+  transcript_segments?: number
   pending_actions?: number
   /** Gmail/Calendar agentic actions run from this meeting */
   executed_actions?: number

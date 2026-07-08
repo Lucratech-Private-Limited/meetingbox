@@ -127,7 +127,7 @@ def execute_device_tool(user_id: str, tool: str) -> dict[str, Any]:
         emit_audio_command(actor, {"action": "start_recording", "session_id": sid}, device_id=device_id)
         r.set(_current_meeting_key(device_id), sid)
         r.set(_recording_state_key(device_id), "recording")
-        _publish_recording_ws_event("recording_started", sid, device_id=device_id)
+        _publish_recording_ws_event("recording_started", sid, device_id=device_id, user_id=user_id)
         return {"session_id": sid, "status": "recording_started"}
 
     if tool == TOOL_DEVICE_STOP:
@@ -136,7 +136,7 @@ def execute_device_tool(user_id: str, tool: str) -> dict[str, Any]:
             sid = sid.decode()
         emit_audio_command(actor, {"action": "stop_recording", "session_id": sid}, device_id=device_id)
         r.set(_recording_state_key(device_id), "processing")
-        _publish_recording_ws_event("recording_stopped", sid, device_id=device_id)
+        _publish_recording_ws_event("recording_stopped", sid, device_id=device_id, user_id=user_id)
         if sid:
             r.delete(_current_meeting_key(device_id))
         return {"session_id": sid, "status": "recording_stopped"}
@@ -149,7 +149,7 @@ def execute_device_tool(user_id: str, tool: str) -> dict[str, Any]:
             sid = sid.decode()
         emit_audio_command(actor, {"action": "pause_recording", "session_id": sid}, device_id=device_id)
         r.set(_recording_state_key(device_id), "paused")
-        _publish_recording_ws_event("recording_paused", sid, device_id=device_id)
+        _publish_recording_ws_event("recording_paused", sid, device_id=device_id, user_id=user_id)
         return {"session_id": sid, "status": "paused"}
 
     if tool == TOOL_DEVICE_RESUME:
@@ -160,7 +160,7 @@ def execute_device_tool(user_id: str, tool: str) -> dict[str, Any]:
             sid = sid.decode()
         emit_audio_command(actor, {"action": "resume_recording", "session_id": sid}, device_id=device_id)
         r.set(_recording_state_key(device_id), "recording")
-        _publish_recording_ws_event("recording_resumed", sid, device_id=device_id)
+        _publish_recording_ws_event("recording_resumed", sid, device_id=device_id, user_id=user_id)
         return {"session_id": sid, "status": "recording"}
 
     raise HTTPException(status_code=400, detail=f"Unsupported device tool: {tool}")

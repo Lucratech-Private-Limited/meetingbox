@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
 from auth import get_current_actor
-from services.commitments_service import list_commitments_for_user, upsert_commitment
+from services.commitments_service import list_commitments_for_user
 from services.tasks_service import (
     AmbiguousTaskMatchError,
     SimilarTaskExistsError,
@@ -70,12 +70,19 @@ async def create_user_commitment(
         )
     except TaskFidelityError as exc:
         raise HTTPException(status_code=400, detail={"error": "task_fidelity", "detail": str(exc)})
+    try:
+        from services.mem0_service import maybe_ingest_commitment_row
+        maybe_ingest_commitment_row(user_id, row)
+    except Exception:
+        logger.debug("commitment create mem0 ingest failed", exc_info=True)
     return row
 
 
 class CommitmentPatch(BaseModel):
     status: str | None = None
     due_date: str | None = None
+    title: str | None = None
+    description: str | None = None
 
 
 @router.patch("/commitments/{commitment_id}")
@@ -89,16 +96,26 @@ async def patch_commitment(
     Supports:
       • status change (active / snoozed / completed / cancelled)
       • due_date assignment / re-assignment (sets due_at on the task)
+      • title / description edit (from the Tasks screen Edit menu)
     """
     user_id = actor["user"]["id"]
-    if body.status is None and body.due_date is None:
-        raise HTTPException(status_code=400, detail="status or due_date required")
+    if (
+        body.status is None
+        and body.due_date is None
+        and body.title is None
+        and body.description is None
+    ):
+        raise HTTPException(
+            status_code=400, detail="status, due_date, title or description required"
+        )
     try:
         row = voice_update_task(
             user_id=user_id,
             task_id=commitment_id,
+            title=body.title,
             status=body.status,
             due_date=body.due_date,
+            description=body.description,
         )
     except TaskNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
@@ -106,4 +123,9 @@ async def patch_commitment(
         raise HTTPException(status_code=400, detail={"error": "ambiguous", "candidates": exc.candidates})
     except TaskFidelityError as exc:
         raise HTTPException(status_code=400, detail={"error": "task_fidelity", "detail": str(exc)})
+    try:
+        from services.mem0_service import maybe_ingest_commitment_row
+        maybe_ingest_commitment_row(user_id, row)
+    except Exception:
+        logger.debug("commitment patch mem0 ingest failed", exc_info=True)
     return row

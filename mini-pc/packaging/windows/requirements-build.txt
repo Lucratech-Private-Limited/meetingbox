@@ -1,0 +1,24 @@
+# Windows build toolchain for the MeetingBox PyInstaller bundle.
+# Installed into the build venv ON TOP OF device-ui/requirements.txt.
+#
+#   python -m pip install -r packaging\windows\requirements-build.txt
+#
+# Produces dist\MeetingBox\MeetingBox.exe + meetingbox-audio.exe (see MeetingBox.spec).
+
+# Freezer.
+pyinstaller>=6.21.0
+
+# Kivy's native Windows runtime libs (SDL2, GLEW, ANGLE). The spec imports
+# ``from kivy_deps import sdl2, glew, angle`` and bundles their DLLs via Tree().
+# Kivy pulls these in on Windows, but pin them here so a clean build venv has
+# them even if Kivy's extras change.
+kivy_deps.sdl2>=0.8.0
+kivy_deps.glew>=0.3.1
+kivy_deps.angle>=0.4.0
+
+# TLS CA bundle collected into _internal for httpx / websockets.
+certifi>=2024.2.2
+
+# NOTE: Echo cancellation + full-duplex barge-in on Windows is provided by the
+# OS "Voice Capture DSP" (CWMAudioAEC), driven via comtypes (already a runtime
+# dependency for SAPI TTS). No extra audio package is required for it.

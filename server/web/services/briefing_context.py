@@ -61,6 +61,7 @@ def recent_meetings_for_briefing(user_id: str, limit: int = 8) -> list[dict]:
                    (SELECT substr(s.summary, 1, 160) FROM summaries s WHERE s.meeting_id = m.id) AS summary_excerpt
             FROM meetings m
             WHERE m.user_id = ?
+              AND (m.recording_mode IS NULL OR m.recording_mode != 'note')
             ORDER BY datetime(COALESCE(m.start_time, m.created_at)) DESC
             LIMIT ?
             """,
@@ -236,9 +237,14 @@ def build_briefing_context_dict(
         future_gmail = _pool.submit(_fetch_gmail)
 
         # Fast local (SQLite) work — runs while network I/O is in flight.
-        commitments = list_commitments_for_user(user_id, status_filter=None, limit=24)
+        commitments = list_commitments_for_user(user_id, status_filter=None, limit=100)
         pending = list_assistant_queue_for_briefing(user_id, limit=24)
         meetings_recent = recent_meetings_for_briefing(user_id, limit=8)
+        try:
+            from services.notes_service import list_notes as _list_notes
+            recent_notes = _list_notes(user_id, limit=10)
+        except Exception:
+            recent_notes = []
 
         # Collect network results (block only if not finished yet).
         calendar_connected, calendar_days = future_cal.result()
@@ -269,4 +275,5 @@ def build_briefing_context_dict(
         "mem0_snippet": mem0_snippet,
         "pending_assistant": pending_out,
         "gmail_preview": gmail_preview,
+        "recent_notes": recent_notes,
     }

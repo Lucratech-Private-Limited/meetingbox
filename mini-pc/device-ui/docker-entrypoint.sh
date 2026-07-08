@@ -18,4 +18,16 @@ if [ "${MEETINGBOX_SYNC_DISPLAY_FROM_XRANDR:-0}" = "1" ]; then
     echo "MeetingBox device-ui: MEETINGBOX_SYNC_DISPLAY_FROM_XRANDR=1 but xrandr missing; install x11-xserver-utils in image." >&2
   fi
 fi
+
+# --- Disable auto-rotation and lock the panel to landscape ---
+# GNOME auto-rotates via the host iio-sensor-proxy. Mask it (no sensor = no
+# rotation), then set landscape once. Disable with MEETINGBOX_LOCK_LANDSCAPE=0.
+if [ "${MEETINGBOX_LOCK_LANDSCAPE:-1}" = "1" ]; then
+  sudo -n /bin/sh /usr/local/bin/meetingbox-host-orientation-lock 2>/dev/null || true
+  if command -v xrandr >/dev/null 2>&1; then
+    _out=$(xrandr 2>/dev/null | awk '/ connected/{print $1; exit}')
+    [ -n "$_out" ] && xrandr --output "$_out" --rotate "${MEETINGBOX_PANEL_ROTATE:-right}" 2>/dev/null || true
+  fi
+fi
+
 exec "$@"

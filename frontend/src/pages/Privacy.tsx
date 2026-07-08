@@ -4,21 +4,21 @@ const LAST_UPDATED = 'April 17, 2026'
 
 export default function Privacy() {
   return (
-    <div className="min-h-screen bg-gray-950 text-gray-200">
-      <header className="border-b border-gray-800 px-4 py-4">
+    <div className="min-h-screen bg-app-page text-app-ink-muted">
+      <header className="border-b border-app-border-light px-4 py-4">
         <div className="mx-auto max-w-3xl flex items-center justify-between gap-4">
           <Link to="/login" className="text-sm font-medium text-blue-400 hover:text-blue-300">
             ← Back to sign in
           </Link>
-          <span className="text-sm text-gray-500">MeetingBox AI</span>
+          <span className="text-sm text-app-ink-subtle">MeetingBox AI</span>
         </div>
       </header>
 
       <main className="mx-auto max-w-3xl px-4 py-10 pb-16">
         <h1 className="text-3xl font-bold text-white tracking-tight mb-2">Privacy Policy</h1>
-        <p className="text-sm text-gray-500 mb-8">Last updated: {LAST_UPDATED}</p>
+        <p className="text-sm text-app-ink-subtle mb-8">Last updated: {LAST_UPDATED}</p>
 
-        <div className="space-y-6 text-sm leading-relaxed text-gray-300">
+        <div className="space-y-6 text-sm leading-relaxed text-app-ink-muted">
           <p className="rounded-lg border border-amber-900/50 bg-amber-950/30 px-4 py-3 text-amber-200/90">
             This policy is provided as a starting point for your Google Cloud OAuth and compliance
             checklist. It is not legal advice. Have qualified counsel review it before production use.
@@ -28,7 +28,7 @@ export default function Privacy() {
             <h2 className="text-lg font-semibold text-white mb-2">1. Who we are</h2>
             <p>
               MeetingBox AI is operated by{' '}
-              <strong className="text-gray-100">Lucra Tech Solutions</strong> (&quot;we&quot;,
+              <strong className="text-app-ink">Lucra Tech Solutions</strong> (&quot;we&quot;,
               &quot;us&quot;). Contact:{' '}
               <a
                 href="mailto:privacy@lucratechsol.com"
@@ -52,17 +52,17 @@ export default function Privacy() {
             <h2 className="text-lg font-semibold text-white mb-2">3. Information we collect</h2>
             <ul className="list-disc pl-5 space-y-2 mt-2">
               <li>
-                <strong className="text-gray-100">Account data:</strong> Information from your sign-in
+                <strong className="text-app-ink">Account data:</strong> Information from your sign-in
                 provider (for example Google), such as name, email address, and profile identifiers
                 needed to authenticate you.
               </li>
               <li>
-                <strong className="text-gray-100">Meeting content:</strong> Audio, transcripts,
+                <strong className="text-app-ink">Meeting content:</strong> Audio, transcripts,
                 summaries, notes, and related metadata you or your organization upload or generate in
                 the product.
               </li>
               <li>
-                <strong className="text-gray-100">Technical data:</strong> Logs, diagnostics, IP
+                <strong className="text-app-ink">Technical data:</strong> Logs, diagnostics, IP
                 address, device/browser type, and timestamps used to secure and operate the service.
               </li>
             </ul>
@@ -141,7 +141,7 @@ export default function Privacy() {
             </p>
           </section>
 
-          <p className="pt-4 text-gray-500">
+          <p className="pt-4 text-app-ink-subtle">
             See also our{' '}
             <Link to="/terms" className="text-blue-400 hover:text-blue-300 underline">
               Terms of Service

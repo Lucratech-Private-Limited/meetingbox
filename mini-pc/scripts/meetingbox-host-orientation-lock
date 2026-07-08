@@ -1,0 +1,39 @@
+#!/bin/sh
+# Lock the host display to a fixed orientation by disabling accelerometer
+# auto-rotation. On GNOME the screen "dances" (rotates / flips 180°) when the
+# device is moved because gnome-settings-daemon rotates based on iio-sensor-proxy.
+# Masking that service removes the sensor feed entirely, so nothing can rotate the
+# panel — the orientation set by xrandr (see docker-entrypoint.sh) then stays put.
+#
+# Runs as root via ``sudo -n`` from uiuser (NOPASSWD sudoers rule shipped in the
+# device-ui image), then ``nsenter -t 1`` into host PID 1 — same mechanism as
+# meetingbox-host-reboot. Requires compose ``pid: host`` + ``privileged: true``.
+# The mask is persistent (survives reboot), so this is effectively idempotent.
+
+set -e
+SELF=/usr/local/bin/meetingbox-host-orientation-lock
+
+if [ "$(id -u)" -ne 0 ]; then
+  if ! command -v sudo >/dev/null 2>&1; then
+    echo "meetingbox-host-orientation-lock: need root but sudo is missing — rebuild device-ui image" >&2
+    exit 1
+  fi
+  sudo -n "$SELF" "$@" || {
+    echo "meetingbox-host-orientation-lock: sudo -n failed. Rebuild device-ui (sudo+sudoers) or check NOPASSWD for $SELF" >&2
+    exit 1
+  }
+  exit 0
+fi
+
+if ! command -v nsenter >/dev/null 2>&1; then
+  echo "meetingbox-host-orientation-lock: nsenter not found (install util-linux in the image)" >&2
+  exit 1
+fi
+
+# Mask + stop iio-sensor-proxy on the host. Try a couple of systemctl paths so this
+# works regardless of where systemctl lives in the host PATH inside the entered ns.
+exec nsenter -t 1 -m -u -i -n -p -- /bin/sh -c \
+  'systemctl mask --now iio-sensor-proxy.service 2>/dev/null \
+    || /usr/bin/systemctl mask --now iio-sensor-proxy.service 2>/dev/null \
+    || /bin/systemctl mask --now iio-sensor-proxy.service 2>/dev/null \
+    || true'

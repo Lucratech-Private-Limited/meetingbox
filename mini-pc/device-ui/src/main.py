@@ -10,6 +10,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -30,7 +31,72 @@ _src_dir = Path(__file__).resolve().parent
 if str(_src_dir) not in sys.path:
     sys.path.insert(0, str(_src_dir))
 
+# Load packaged/desktop configuration (device-ui.env) into the environment
+# BEFORE config is imported, so BACKEND_URL/DASHBOARD_URL/etc. take effect.
+# No-op on the Linux appliance unless a device-ui.env is present.
+try:
+    from env_file import load_env_file
+    load_env_file()
+except Exception:
+    pass
+
+# PyInstaller frozen builds: bundled data files live under sys._MEIPASS.
+# Point asset resolution there so fonts/icons/welcome images load correctly.
+if getattr(sys, "frozen", False):
+    _meipass = getattr(sys, "_MEIPASS", None)
+    if _meipass:
+        os.environ.setdefault("MEETINGBOX_APP_DIR", _meipass)
+        _assets = os.path.join(_meipass, "assets")
+        if os.path.isdir(_assets):
+            os.environ.setdefault("MEETINGBOX_ASSETS_DIR", _assets)
+
+    # In a windowed (--noconsole) build there is no console, so sys.stdout and
+    # sys.stderr are None. Every ``print(..., flush=True)`` would then raise
+    # (AttributeError: 'NoneType' has no 'write'/'flush'). Route them to a log
+    # file so diagnostics survive and prints never crash the app.
+    if sys.stdout is None or sys.stderr is None:
+        _sink = None
+        try:
+            import platform_compat as _pc
+            _root = _pc.app_user_data_dir()
+            if _root is not None:
+                _logs = _root / "logs"
+                _logs.mkdir(parents=True, exist_ok=True)
+                _sink = open(_logs / "meetingbox-stdout.log", "a", buffering=1,
+                             encoding="utf-8", errors="replace")
+        except Exception:
+            _sink = None
+        if _sink is None:
+            class _NullWriter:
+                def write(self, *_a, **_k):
+                    return 0
+                def flush(self):
+                    pass
+            _sink = _NullWriter()
+        if sys.stdout is None:
+            sys.stdout = _sink
+        if sys.stderr is None:
+            sys.stderr = _sink
+
 from xauthority_util import display_refers_to_screen_zero, xauthority_list_has_display_zero
+
+# On Windows, an app that hasn't declared DPI awareness gets bitmap-stretched
+# by the OS to match the display's scale factor (100%/125%/150%/200%...).
+# That is why the window opened at the right pixel size (1260x800) on one
+# machine but looked a different physical size — and blurry, misaligned
+# widgets ("UI glitches") — on another with different display scaling. Must
+# run before SDL creates the window (i.e. before Kivy's Window is imported).
+if sys.platform == "win32":
+    try:
+        import ctypes
+        # PROCESS_PER_MONITOR_DPI_AWARE = 2 (Windows 8.1+): render at true
+        # pixels, no OS scaling of our window contents.
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
 
 # Before importing Kivy: stable clipboard provider on Linux (see kivy_options).
 if sys.platform.startswith("linux"):
@@ -46,6 +112,24 @@ if (
     _disp = os.environ.get("DISPLAY", "")
     if _disp.startswith("localhost:") and Path("/tmp/.X11-unix/X0").exists():
         os.environ["DISPLAY"] = ":0"
+
+# Quiet Kivy's logger BEFORE importing Kivy. At import time Kivy attaches its
+# own handler to the root logger at DEBUG; left alone it dumps every websocket
+# frame (including base64 Realtime audio) and httpx wire traffic to disk on the
+# asyncio thread, which severely degrades voice/UI performance. Default to
+# 'warning'; honor an explicit KIVY_LOG_LEVEL or a DEBUG app LOG_LEVEL when
+# troubleshooting. KIVY_NO_FILELOG stops Kivy writing its own rotating log too.
+_app_log_level = (os.environ.get("LOG_LEVEL", "INFO") or "INFO").strip().upper()
+os.environ.setdefault(
+    "KIVY_LOG_LEVEL", "debug" if _app_log_level == "DEBUG" else "warning"
+)
+os.environ.setdefault("KIVY_NO_FILELOG", "1")
+# Stop Kivy from installing its console handler and hijacking sys.stdout/stderr.
+# Matches the Docker appliance (KIVY_NO_CONSOLELOG=1). Without this, a logging
+# encoding error gets written to Kivy's stderr wrapper, which feeds it back into
+# logging and recurses forever (multi-GB log). Our own file/stream handlers in
+# setup_logging() still capture everything.
+os.environ.setdefault("KIVY_NO_CONSOLELOG", "1")
 
 from kivy.app import App
 from kivy.uix.screenmanager import (
@@ -95,20 +179,184 @@ def _env_display_int(name: str, default: int) -> int:
     return v
 
 
-_W = _env_display_int("DISPLAY_WIDTH", 1024)
-_H = _env_display_int("DISPLAY_HEIGHT", 600)
+def _env_display_float(name: str, default: float) -> float:
+    """Parse a float env (physical size / density); never raises, runs pre-config."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    s = str(raw).strip()
+    if not s:
+        return default
+    try:
+        return float(s)
+    except ValueError:
+        print(
+            f"[MeetingBox] WARNING: {name}={raw!r} is not a number; ignoring",
+            file=sys.stderr,
+            flush=True,
+        )
+        return default
+
+
+def _windows_system_scale() -> float:
+    """Windows display-scale factor of the primary monitor (1.0 = 100%, 1.5 = 150%)."""
+    try:
+        import ctypes
+
+        # GetDpiForSystem (Win10 1607+) returns the primary monitor's DPI.
+        dpi = ctypes.windll.user32.GetDpiForSystem()
+        if dpi and dpi > 0:
+            return dpi / 96.0
+    except Exception:
+        pass
+    return 1.0
+
+
+def _windows_display_ppcm():
+    """Best-effort pixel density (px per cm) to REQUEST from Kivy for a real size.
+
+    Two things stack on Windows:
+      * the monitor has a true physical density (from EDID), and
+      * Kivy's SDL2 window uses ALLOW_HIGHDPI, so it multiplies the requested
+        pixel size by the monitor's display-scale factor (100%/125%/150%/...).
+    To land a real, e.g. 15 cm window we must therefore request in *scale-
+    adjusted* pixels: physical_density / scale_factor (SDL then multiplies it
+    back up to the true physical pixels). Requires the process to be DPI-aware so
+    HORZRES/VERTRES are the true physical pixel counts. Returns (ppcm_x, ppcm_y)
+    or None when the physical size is unavailable or implausible.
+    """
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+
+        user32 = ctypes.windll.user32
+        gdi32 = ctypes.windll.gdi32
+        hdc = user32.GetDC(0)
+        if not hdc:
+            return None
+        try:
+            HORZSIZE, VERTSIZE, HORZRES, VERTRES = 4, 6, 8, 10
+            w_mm = gdi32.GetDeviceCaps(hdc, HORZSIZE)
+            h_mm = gdi32.GetDeviceCaps(hdc, VERTSIZE)
+            w_px = gdi32.GetDeviceCaps(hdc, HORZRES)
+            h_px = gdi32.GetDeviceCaps(hdc, VERTRES)
+        finally:
+            user32.ReleaseDC(0, hdc)
+        if min(w_mm, h_mm, w_px, h_px) <= 0:
+            return None
+        ppcm_x = w_px / (w_mm / 10.0)
+        ppcm_y = h_px / (h_mm / 10.0)
+        # Real panels sit around 30–160 px/cm (≈76–406 PPI). Outside that the
+        # driver returned a bogus/assumed size — treat detection as failed.
+        if not (30.0 <= ppcm_x <= 160.0 and 30.0 <= ppcm_y <= 160.0):
+            return None
+        scale = _windows_system_scale()
+        if scale <= 0:
+            scale = 1.0
+        return (ppcm_x / scale, ppcm_y / scale)
+    except Exception:
+        return None
+
+
+def _physical_target_px(default_w: int, default_h: int):
+    """Window pixel size for the desired PHYSICAL size on Windows (windowed mode).
+
+    The device is a 7" 1260x800 panel (~15.01 cm x 9.53 cm). To look the same
+    physical size on any monitor regardless of resolution/density, convert the
+    target cm to pixels using that monitor's real pixel density.
+
+    Density resolution order:
+      1. DISPLAY_PPCM env (manual pixels-per-cm) — use when auto-detect is wrong.
+      2. Auto-detected physical density from the monitor's EDID.
+      3. Windows standard 96 DPI as a last resort (still physical-cm based, so it
+         never overflows the screen like a fixed pixel count would).
+    """
+    if sys.platform != "win32" or _FULLSCREEN:
+        return default_w, default_h
+    cm_w = _env_display_float("DISPLAY_PHYSICAL_WIDTH_CM", 15.01)
+    cm_h = _env_display_float("DISPLAY_PHYSICAL_HEIGHT_CM", 9.53)
+    if cm_w <= 0 or cm_h <= 0:
+        return default_w, default_h
+    # Density is expressed as the monitor's TRUE physical pixels-per-cm. Kivy's
+    # SDL2 window re-applies the display-scale factor, so divide it back out to
+    # get the pixel size to actually request (see _windows_display_ppcm).
+    ppcm_override = _env_display_float("DISPLAY_PPCM", 0.0)
+    if ppcm_override > 0:
+        scale = _windows_system_scale() or 1.0
+        ppcm_x = ppcm_y = ppcm_override / scale
+    else:
+        ppcm = _windows_display_ppcm()
+        if ppcm is not None:
+            ppcm_x, ppcm_y = ppcm
+        else:
+            ppcm_x = ppcm_y = 96.0 / 2.54
+            print(
+                "[MeetingBox] WARNING: physical display size unavailable; "
+                "assuming 96 DPI. If the window is the wrong size, set "
+                "DISPLAY_PPCM (pixels per cm) in device-ui.env.",
+                file=sys.stderr,
+                flush=True,
+            )
+    w = int(round(cm_w * ppcm_x))
+    h = int(round(cm_h * ppcm_y))
+    if w < 32 or h < 32:
+        return default_w, default_h
+    return w, h
+
+
+_W = _env_display_int("DISPLAY_WIDTH", 1260)
+_H = _env_display_int("DISPLAY_HEIGHT", 800)
+
+# Size the window to a fixed PHYSICAL size (default 15.01 cm x 9.53 cm — the 7"
+# device panel) instead of a fixed pixel count, so it measures the same on every
+# monitor. config.py reads DISPLAY_WIDTH/HEIGHT to scale the layout, so keep the
+# env in sync (config is imported later, ~L320) — the whole UI then scales to
+# the physical window instead of overflowing the screen.
+_pw, _ph = _physical_target_px(_W, _H)
+if (_pw, _ph) != (_W, _H):
+    _W, _H = _pw, _ph
+    os.environ["DISPLAY_WIDTH"] = str(_W)
+    os.environ["DISPLAY_HEIGHT"] = str(_H)
 
 Config.set('graphics', 'window_state', 'visible')
-Config.set('graphics', 'position', 'custom')
-Config.set('graphics', 'left', '0')
-Config.set('graphics', 'top', '0')
+if _FULLSCREEN:
+    # Kiosk / appliance: borderless, pinned top-left, fullscreen.
+    Config.set('graphics', 'position', 'custom')
+    Config.set('graphics', 'left', '0')
+    Config.set('graphics', 'top', '0')
+    Config.set('graphics', 'borderless', '1')
+    Config.set('graphics', 'fullscreen', 'auto')
+else:
+    # Desktop windowed: a normal decorated frame (title bar with minimize and
+    # close), centered by the OS so the title bar is always on-screen and
+    # reachable, and movable like any standard Windows app. The window is
+    # NON-resizable: the UI is laid out against a fixed DISPLAY_WIDTH x
+    # DISPLAY_HEIGHT (the device 1260:800 aspect), so allowing free resize would
+    # stretch/distort the layout. Locking it preserves the device aspect ratio.
+    Config.set('graphics', 'position', 'auto')
+    Config.set('graphics', 'borderless', '0')
+    Config.set('graphics', 'fullscreen', '0')
+    Config.set('graphics', 'resizable', '0')
+    # Desktop dock runs as an always-on-top, per-pixel-transparent layered
+    # window that DWM must recomposite every frame. At the default 60 fps this
+    # continuous composition (driven by the endless dock breathing/listening
+    # animations) saturates the render path and jitters the background audio
+    # thread, which shows up as AEC render-feed underruns → the echo canceller
+    # withholds mic frames → the user's speech arrives choppy and gets dropped
+    # ("heard me but said nothing"). Halving the frame rate roughly halves that
+    # composition load; 30 fps is still smooth for this UI. Override with
+    # MEETINGBOX_MAXFPS if needed.
+    Config.set('graphics', 'maxfps', os.getenv('MEETINGBOX_MAXFPS', '30'))
 Config.set('graphics', 'width', str(_W))
 Config.set('graphics', 'height', str(_H))
-Config.set('graphics', 'borderless', '1' if _FULLSCREEN else '0')
-Config.set('graphics', 'fullscreen', 'auto' if _FULLSCREEN else '0')
 Config.set('input', 'mouse', 'mouse,multitouch_on_demand')
-# On-screen keyboard for TextInput when no system keyboard (touch / kiosk).
-Config.set('kivy', 'keyboard_mode', 'systemanddock')
+# On the touch appliance, dock an on-screen keyboard for TextInput. On desktop
+# a physical keyboard always exists, so use the system keyboard only (no popup).
+if sys.platform.startswith('linux'):
+    Config.set('kivy', 'keyboard_mode', 'systemanddock')
+else:
+    Config.set('kivy', 'keyboard_mode', 'system')
 
 
 def _configure_kivy_default_font() -> None:
@@ -237,6 +485,7 @@ from config import (
     WAKE_LOCAL_VOICE_ONLY,
 )
 
+from platform_compat import IS_DESKTOP, IS_WINDOWS
 from api_client import BackendClient
 from mock_backend import MockBackendClient
 from hardware import (
@@ -261,6 +510,10 @@ REALTIME_WARM_STANDBY = os.environ.get(
 
 # Boot-flow screens
 from screens.splash import SplashScreen
+from screens.sign_in import SignInScreen
+from screens.onboarding_welcome import OnboardingWelcomeScreen
+from screens.onboarding_capabilities import OnboardingCapabilitiesScreen
+from screens.onboarding_ready import OnboardingReadyScreen
 from screens.welcome import WelcomeScreen
 from screens.room_name import RoomNameScreen
 from screens.network_choice import NetworkChoiceScreen
@@ -323,7 +576,9 @@ from screens.emails import EmailsScreen
 from screens.tasks import TasksScreen
 from screens.email_draft import EmailDraftScreen
 from screens.voice_task_creation import VoiceTaskCreationScreen
+from screens.calendar_event_creation import CalendarEventCreationScreen
 from components.quick_panel import QuickPanel
+from components.voice_control_bar import VoiceControlBar
 
 # ------------------------------------------------------------------
 # Logging
@@ -337,13 +592,44 @@ def setup_logging():
             '%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
         handlers.append(ch)
     try:
-        fh = logging.FileHandler(LOG_FILE)
+        # encoding="utf-8" is REQUIRED: the default FileHandler encoding on
+        # Windows is cp1252, which raises UnicodeEncodeError on the many
+        # non-ASCII characters in our log messages (→, —, …). That error is
+        # routed to stderr, which Kivy reroutes back into logging, causing an
+        # infinite recursion that floods the log file to many GB.
+        fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
         fh.setFormatter(logging.Formatter(
             '%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
         handlers.append(fh)
     except Exception as e:
         print(f"Warning: Could not create log file {LOG_FILE}: {e}")
-    logging.basicConfig(level=getattr(logging, LOG_LEVEL), handlers=handlers)
+    # force=True is essential: Kivy already attached a handler to the root logger
+    # at import time, which makes a plain basicConfig() a no-op (our level and
+    # file handler would be silently ignored — that's why meetingbox-ui.log was
+    # empty while DEBUG flooded stdout).
+    logging.basicConfig(
+        level=getattr(logging, LOG_LEVEL, logging.INFO),
+        handlers=handlers,
+        force=True,
+    )
+    # Silence very chatty third-party loggers. At DEBUG these dump full HTTP and
+    # WebSocket payloads (including base64 audio) on the hot path, which is the
+    # single biggest desktop performance regression. Keep them at WARNING unless
+    # the app itself is explicitly in DEBUG.
+    _noisy_level = (
+        logging.DEBUG if str(LOG_LEVEL).upper() == "DEBUG" else logging.WARNING
+    )
+    for _name in (
+        "websockets",
+        "websockets.client",
+        "websockets.protocol",
+        "httpx",
+        "httpcore",
+        "PIL",
+        "asyncio",
+        "urllib3",
+    ):
+        logging.getLogger(_name).setLevel(_noisy_level)
 
 setup_logging()
 logger = logging.getLogger(__name__)
@@ -368,6 +654,22 @@ _PAIRING_UNPAIR_DEFER_SCREENS = frozenset({
     'summary_review',
     'complete',
 })
+
+
+def _voice_phrase_context(intent) -> dict | None:
+    """Capture the spoken command phrase as pre-recording context metadata.
+
+    The offline Vosk path has limited context (just the command utterance), but
+    storing it still helps later retrieval. Returns None when nothing useful.
+    """
+    phrase = ""
+    try:
+        phrase = str(getattr(intent, "phrase", "") or "").strip()
+    except Exception:
+        phrase = ""
+    if not phrase:
+        return None
+    return {"pre_context": phrase}
 
 
 def _recording_start_transient_network(exc: BaseException) -> bool:
@@ -410,10 +712,10 @@ def _recording_start_error_screen_args(exc: BaseException) -> tuple[str, str]:
     if _recording_start_transient_network(exc):
         return (
             "Cannot reach server",
-            "Could not connect to the MeetingBox backend. After switching networks (for "
+            "Could not connect to the Pepper AI backend. After switching networks (for "
             "example unplugging Ethernet and using Wi‑Fi), wait a few seconds, confirm this "
-            "device can reach the server URL, then tap TRY AGAIN. If it keeps failing, check "
-            "BACKEND_URL in the appliance configuration.",
+            "device can reach the server URL, then press TRY AGAIN. If it keeps failing, check "
+            "BACKEND_URL in the configuration.",
         )
     msg = (str(exc) or "Unknown error").strip()
     if len(msg) > 400:
@@ -443,6 +745,27 @@ def _post_tts_wake_guard_seconds() -> float:
     except ValueError:
         return 0.6
     return max(0.0, min(4.0, v))
+
+
+def _post_realtime_session_wake_guard_seconds() -> float:
+    """After a Realtime session ENDS (e.g. the user said goodbye), suppress the
+    wake word for this long, so the goodbye tail / echo doesn't instantly
+    re-open a session.
+
+    Historically this was 2.5s because, without echo cancellation, the
+    conversation tail + room echo were routinely misheard by Vosk as the wake
+    phrase. The Windows OS-AEC now removes the assistant's own voice at the
+    source, and the wake matcher requires a "hey"+"pepper" structure, so the
+    false re-wake risk is low. Keep only a short guard so the user can
+    re-engage almost immediately after a session ends."""
+    raw = (os.getenv("MEETINGBOX_POST_REALTIME_WAKE_GUARD_SEC") or "").strip()
+    if not raw:
+        return 1.0
+    try:
+        v = float(raw)
+    except ValueError:
+        return 1.0
+    return max(0.0, min(8.0, v))
 
 
 def _tts_aplay_device_argv() -> list[str]:
@@ -606,6 +929,8 @@ def _pick_english_piper_model_path() -> str | None:
 # ==================================================================
 
 class MeetingBoxApp(App):
+    # Window title shown in the desktop title bar / taskbar.
+    title = "Pepper AI"
     """
     Main Kivy application for the MeetingBox device UI.
 
@@ -637,6 +962,8 @@ class MeetingBoxApp(App):
 
         # Application state
         self.current_session_id = None
+        self.current_recording_mode = "meeting"
+        self._note_tasks_persisted: set[str] = set()
         self.recording_state = {
             'active': False,
             'paused': False,
@@ -707,6 +1034,12 @@ class MeetingBoxApp(App):
         # old local Redis listener used.
         from audio_supervisor import maybe_create_from_env as _maybe_audio
         self._audio_supervisor = _maybe_audio(on_event=self._on_audio_supervisor_event)
+        # The capture child is started lazily the first time the home screen is
+        # reached (see ``_ensure_audio_capture_started``) so it never competes
+        # with the onboarding flow for the mic / startup CPU. Returning users
+        # (device token present) land on home immediately, so recording is
+        # unaffected.
+        self._audio_supervisor_started = False
 
         # Idle screen timeout (seconds; 0 = never).
         # Replaces the older display-off timer: instead of cutting the
@@ -726,6 +1059,12 @@ class MeetingBoxApp(App):
         self.root_layout = None
         self._transcript_overlay = None
         self._pending_user_msg_id: str | None = None
+        self._current_user_msg_id: str | None = None
+        # Conversation item_id -> overlay bubble id. Transcript events carry
+        # the server's item_id, so text (and phantom rejections) always land
+        # on the bubble that belongs to that turn — even when transcription
+        # for turn N finishes after turn N+1 already started.
+        self._user_msg_by_item: dict[str, str] = {}
         self.voice_indicator = None
         self._voice_indicator_override = None
         self._voice_indicator_reset_ev = None
@@ -766,22 +1105,36 @@ class MeetingBoxApp(App):
         self._realtime_mic_acquired = False
         self._voice_runtime_state = "idle"
         self.voice_realtime_assistant = False
-        # Sync interpreter to the UI default immediately so wake works before
-        # async device-settings load (VoiceAssistant env-var default is "hey tony").
-        self.voice_wake_phrase_display = "Hey Tony"
-        self.voice_assistant.apply_server_settings(wake_phrase="hey tony")
+        # Sync interpreter to the product default immediately so wake works
+        # before async device-settings load.
+        self.voice_wake_phrase_display = "Hey Pepper"
+        self.voice_assistant.apply_server_settings(wake_phrase="hey pepper")
         self.voice_assistant_enabled = True
         self.assistant_speech_volume = 85
         # Realtime may only start when _handle_voice_wake_phrase sets this True (one-shot).
         self._realtime_launch_permitted = False
+        # Active summary context session (user viewing a meeting/note summary).
+        # _pending_summary_context is consumed at session start; the *_meeting_id
+        # tracks which summary the voice agent is currently grounded on.
+        self._pending_summary_context: tuple[str, str] | None = None
+        self._active_summary_meeting_id: str | None = None
         # Number of consecutive auto-reconnects since the last user-triggered wake.
         # Capped at 1 so a runaway reconnect loop doesn't block the wake listener.
         self._realtime_reconnect_count = 0
         # Which email field the current recipient picker is resolving ("to"/"cc"/"bcc").
         self._picker_current_field = "to"
+        # Queue recipient-pickers so ambiguous contacts resolve strictly one-at-a-time.
+        self._recipient_picker_queue: list[dict] = []
+        self._recipient_picker_active: dict | None = None
         # Holds task data (title/description/due_date) between show_task_creation
         # directive and the user tapping Confirm/Discard.
         self._pending_task_data: dict = {}
+        # Holds calendar-event data (name/date/time/attendees) between
+        # show_calendar_event directive and the user tapping Confirm/Discard.
+        self._pending_event_data: dict = {}
+        # Last explicitly selected attendee candidate for immediate correction
+        # phrases like "No, I meant the first one."
+        self._last_attendee_selection: dict = {}
         # Limits cloud NL replies per wake/mic activation (local wake listening unaffected).
         self._voice_cloud_qa_budget = 0
         # Serialises TTS calls — overlapping replies are dropped, not stacked
@@ -806,12 +1159,30 @@ class MeetingBoxApp(App):
     def ui_cache_set(self, key: str, value):
         self._ui_data_cache[key] = value
         self._ui_data_cache_ts[key] = time.time()
+        self._evict_calendar_week_cache()
         self._ui_cache_persist_to_disk()
         for cb in list(self._ui_cache_subscribers.get(key, [])):
             try:
                 cb(value)
             except Exception:
                 logger.debug("ui_cache subscriber failed for %s", key, exc_info=True)
+
+    def _evict_calendar_week_cache(self, max_weeks: int = 8) -> None:
+        """Keep only the most recently set calendar-week entries.
+
+        Each distinct week the user browses created a permanent
+        ``calendar_week:<monday>`` key that was never removed (only its
+        freshness timestamp was cleared on invalidate), so the cache — and the
+        JSON file it is persisted to on every write — grew without bound over a
+        long-running session. Cap it to the most recent weeks.
+        """
+        week_keys = [k for k in self._ui_data_cache if str(k).startswith("calendar_week:")]
+        if len(week_keys) <= max_weeks:
+            return
+        week_keys.sort(key=lambda k: self._ui_data_cache_ts.get(k, 0.0))
+        for stale in week_keys[: len(week_keys) - max_weeks]:
+            self._ui_data_cache.pop(stale, None)
+            self._ui_data_cache_ts.pop(stale, None)
 
     def ui_cache_is_fresh(self, key: str, ttl_s: float | None = None) -> bool:
         ts = self._ui_data_cache_ts.get(key)
@@ -1059,6 +1430,10 @@ class MeetingBoxApp(App):
 
         # Register ALL screens
         self.screen_manager.add_widget(SplashScreen(name='splash'))
+        self.screen_manager.add_widget(SignInScreen(name='sign_in'))
+        self.screen_manager.add_widget(OnboardingWelcomeScreen(name='onboarding_welcome'))
+        self.screen_manager.add_widget(OnboardingCapabilitiesScreen(name='onboarding_capabilities'))
+        self.screen_manager.add_widget(OnboardingReadyScreen(name='onboarding_ready'))
         self.screen_manager.add_widget(WelcomeScreen(name='welcome'))
         self.screen_manager.add_widget(RoomNameScreen(name='room_name'))
         self.screen_manager.add_widget(NetworkChoiceScreen(name='network_choice'))
@@ -1078,6 +1453,12 @@ class MeetingBoxApp(App):
             on_discard=self._on_task_creation_discard_tapped,
         )
         self.screen_manager.add_widget(_vtc)
+        _cec = CalendarEventCreationScreen(
+            name='calendar_event_creation',
+            on_confirm=self._on_calendar_event_confirm_tapped,
+            on_discard=self._on_calendar_event_discard_tapped,
+        )
+        self.screen_manager.add_widget(_cec)
         self.screen_manager.add_widget(RecordingScreen(name='recording'))
         self.screen_manager.add_widget(ProcessingScreen(name='processing'))
         self.screen_manager.add_widget(CompleteScreen(name='complete'))
@@ -1086,34 +1467,41 @@ class MeetingBoxApp(App):
         self.screen_manager.add_widget(BriefingScreen(name='briefing'))
         self.screen_manager.add_widget(IdleScreen(name='idle'))
 
-        self.screen_manager.add_widget(SettingsScreen(name='settings'))
-        self.screen_manager.add_widget(AutoDeletePickerScreen(name='auto_delete_picker'))
-        self.screen_manager.add_widget(BrightnessPickerScreen(name='brightness_picker'))
-        self.screen_manager.add_widget(BrightnessSliderScreen(name='brightness_slider'))
-        self.screen_manager.add_widget(SpeechVolumePickerScreen(name='speech_volume_picker'))
-        self.screen_manager.add_widget(NotificationVolumePickerScreen(name='notification_volume_picker'))
-        self.screen_manager.add_widget(MicGainPickerScreen(name='mic_gain_picker'))
-        self.screen_manager.add_widget(IdleTimeoutPickerScreen(name='idle_timeout_picker'))
-        self.screen_manager.add_widget(MicTestScreen(name='mic_test'))
-        self.screen_manager.add_widget(UpdateCheckScreen(name='update_check'))
-        self.screen_manager.add_widget(UpdateInstallScreen(name='update_install'))
-        self.screen_manager.add_widget(UpdateChannelPickerScreen(name='update_channel_picker'))
-        self.screen_manager.add_widget(TimezonePickerScreen(name='timezone_picker'))
-        self.screen_manager.add_widget(AudioSinkPickerScreen(name='audio_output_picker'))
-        self.screen_manager.add_widget(AudioSourcePickerScreen(name='audio_input_picker'))
-        self.screen_manager.add_widget(WiFiForgetScreen(name='wifi_forget_screen'))
-        self.screen_manager.add_widget(BluetoothScreen(name='bluetooth_screen'))
-        self.screen_manager.add_widget(DateTimeScreen(name='datetime_screen'))
-        self.screen_manager.add_widget(StorageBreakdownScreen(name='storage_breakdown'))
-        self.screen_manager.add_widget(DiagnosticLogsScreen(name='diagnostic_logs'))
-        self.screen_manager.add_widget(AboutScreen(name='about_screen'))
-        self.screen_manager.add_widget(SendFeedbackScreen(name='send_feedback'))
-        self.screen_manager.add_widget(NotificationsSettingsScreen(name='notifications_settings'))
-        self.screen_manager.add_widget(SecuritySettingsScreen(name='security_settings'))
-        self.screen_manager.add_widget(IntegrationDetailScreen(name='integration_detail'))
-        self.screen_manager.add_widget(UsbInfoScreen(name='usb_info'))
-        self.screen_manager.add_widget(RoomLabelScreen(name='room_label_screen'))
-        self.screen_manager.add_widget(ConnectivityCheckScreen(name='connectivity_check'))
+        # Settings hub + its sub-screens are appliance-only. On the Windows/
+        # macOS desktop build the OS owns Wi-Fi, Bluetooth, audio devices,
+        # brightness, power, updates, etc., so the whole Settings tree is not
+        # registered. Every desktop path that could navigate here (status bar
+        # gear, briefing button, voice intents, realtime routes) is guarded
+        # accordingly. On the Linux appliance this block is unchanged.
+        if not IS_DESKTOP:
+            self.screen_manager.add_widget(SettingsScreen(name='settings'))
+            self.screen_manager.add_widget(AutoDeletePickerScreen(name='auto_delete_picker'))
+            self.screen_manager.add_widget(BrightnessPickerScreen(name='brightness_picker'))
+            self.screen_manager.add_widget(BrightnessSliderScreen(name='brightness_slider'))
+            self.screen_manager.add_widget(SpeechVolumePickerScreen(name='speech_volume_picker'))
+            self.screen_manager.add_widget(NotificationVolumePickerScreen(name='notification_volume_picker'))
+            self.screen_manager.add_widget(MicGainPickerScreen(name='mic_gain_picker'))
+            self.screen_manager.add_widget(IdleTimeoutPickerScreen(name='idle_timeout_picker'))
+            self.screen_manager.add_widget(MicTestScreen(name='mic_test'))
+            self.screen_manager.add_widget(UpdateCheckScreen(name='update_check'))
+            self.screen_manager.add_widget(UpdateInstallScreen(name='update_install'))
+            self.screen_manager.add_widget(UpdateChannelPickerScreen(name='update_channel_picker'))
+            self.screen_manager.add_widget(TimezonePickerScreen(name='timezone_picker'))
+            self.screen_manager.add_widget(AudioSinkPickerScreen(name='audio_output_picker'))
+            self.screen_manager.add_widget(AudioSourcePickerScreen(name='audio_input_picker'))
+            self.screen_manager.add_widget(WiFiForgetScreen(name='wifi_forget_screen'))
+            self.screen_manager.add_widget(BluetoothScreen(name='bluetooth_screen'))
+            self.screen_manager.add_widget(DateTimeScreen(name='datetime_screen'))
+            self.screen_manager.add_widget(StorageBreakdownScreen(name='storage_breakdown'))
+            self.screen_manager.add_widget(DiagnosticLogsScreen(name='diagnostic_logs'))
+            self.screen_manager.add_widget(AboutScreen(name='about_screen'))
+            self.screen_manager.add_widget(SendFeedbackScreen(name='send_feedback'))
+            self.screen_manager.add_widget(NotificationsSettingsScreen(name='notifications_settings'))
+            self.screen_manager.add_widget(SecuritySettingsScreen(name='security_settings'))
+            self.screen_manager.add_widget(IntegrationDetailScreen(name='integration_detail'))
+            self.screen_manager.add_widget(UsbInfoScreen(name='usb_info'))
+            self.screen_manager.add_widget(RoomLabelScreen(name='room_label_screen'))
+            self.screen_manager.add_widget(ConnectivityCheckScreen(name='connectivity_check'))
 
         self.screen_manager.add_widget(MeetingsScreen(name='meetings'))
         self.screen_manager.add_widget(MeetingDetailScreen(name='meeting_detail'))
@@ -1179,33 +1567,100 @@ class MeetingBoxApp(App):
         except Exception:
             logger.exception("TranscriptionOverlay failed to load")
 
-        # Quick pull-down panel — floats above everything, hidden by default.
+        # Voice control bar — visible only during active voice sessions.
+        # Added BEFORE QuickPanel so the panel slides on top of the pills.
         try:
-            self.quick_panel = QuickPanel()
-            self.quick_panel.app = self
-            self.root_layout.add_widget(self.quick_panel)
+            self._voice_control_bar = VoiceControlBar(app=self)
+            self.root_layout.add_widget(self._voice_control_bar)
+            self.screen_manager.bind(
+                current=lambda _sm, name: self._voice_control_bar.notify_screen(name)
+            )
         except Exception:
-            logger.exception("QuickPanel failed to load")
-            self.quick_panel = None
+            logger.exception("VoiceControlBar failed to load")
+            self._voice_control_bar = None
 
-        # Swipe handle — thin bar at the very top of the screen.
-        # Added LAST so it is drawn and hit-tested before other widgets.
-        # Uses touch.grab() so it is coordinate-system-independent.
-        try:
-            _handle = _SwipeHandle(app=self)
-            self.root_layout.add_widget(_handle)
-        except Exception:
-            logger.exception("SwipeHandle failed to load")
+        # Always-on-top Pepper navigation dock — Windows desktop companion only.
+        # On the Linux appliance / kiosk this is skipped entirely so the existing
+        # full-screen flow is untouched. The dock stays hidden until the app
+        # first reaches the home/ready state, then takes over as a floating dock.
+        self.dock_controller = None
+        if self._dock_enabled():
+            try:
+                from components.pepper_dock import DockController
+                self.dock_controller = DockController(app=self)
+                self.dock_controller.install()
+                self.screen_manager.bind(
+                    current=lambda _sm, name: self._dock_on_screen_change(name)
+                )
+            except Exception:
+                logger.exception("PepperDock failed to load")
+                self.dock_controller = None
+            # Launch automatically at Windows login so the dock is always present.
+            try:
+                import windows_autostart
+                windows_autostart.register(True)
+            except Exception:
+                logger.debug("windows_autostart registration failed", exc_info=True)
+
+        # Quick pull-down panel — appliance control center (brightness, Wi-Fi/BT
+        # radios, scan/connect, restart, power). On desktop the OS owns all of
+        # this, so the panel and its swipe/handle/button triggers are omitted.
+        self.quick_panel = None
+        if not IS_DESKTOP:
+            try:
+                self.quick_panel = QuickPanel()
+                self.quick_panel.app = self
+                self.root_layout.add_widget(self.quick_panel)
+            except Exception:
+                logger.exception("QuickPanel failed to load")
+                self.quick_panel = None
+
+            # Swipe handle — thin bar at the very top of the screen.
+            # Added LAST so it is drawn and hit-tested before other widgets.
+            # Uses touch.grab() so it is coordinate-system-independent.
+            try:
+                _handle = _SwipeHandle(app=self)
+                self.root_layout.add_widget(_handle)
+            except Exception:
+                logger.exception("SwipeHandle failed to load")
+            # Explicit top-edge shutter button as a guaranteed fallback trigger.
+            # Some kiosk window managers swallow top-edge swipe gestures before
+            # Kivy receives them; a visible tap target avoids that failure mode.
+            try:
+                _qp_btn = _QuickPanelButton(app=self)
+                self.root_layout.add_widget(_qp_btn)
+            except Exception:
+                logger.exception("QuickPanelButton failed to load")
 
         if SHOW_FPS:
             Clock.schedule_interval(self._log_fps, 1.0)
 
-        Window.bind(on_touch_down=self._reset_idle_timer)
+        # Idle "lock screen" auto-takeover and the swipe-down QuickPanel are
+        # appliance/touch behaviors. On desktop, skip the idle timer and the
+        # top-edge swipe detectors entirely (the OS provides lock/screensaver
+        # and a system tray for these controls).
+        if not IS_DESKTOP:
+            Window.bind(on_touch_down=self._reset_idle_timer)
+            # Backup swipe detector: catches top-edge swipes that miss the
+            # _SwipeHandle widget (e.g. touch starts just below its zone).
+            self._panel_swipe_uid: Optional[int] = None
+            self._panel_swipe_start_y: float = 0.0
+            Window.bind(on_touch_down=self._panel_swipe_down)
+            Window.bind(on_touch_move=self._panel_swipe_move)
+
+            # On Linux kiosk setups the window manager may intercept a top-edge
+            # swipe (intended for our QuickPanel) and minimize the app instead.
+            # Catch that event, restore immediately, and open the panel so the
+            # gesture still produces the expected result. On desktop this would
+            # fight the standard minimize button, so it is NOT bound there.
+            Window.bind(on_minimize=self._on_window_minimized)
 
         # Ensure the SDL window is mapped and on top (some WMs / SSH DISPLAY
-        # combinations leave it hidden until raised).
+        # combinations leave it hidden until raised). On desktop a single show
+        # is enough; the appliance re-asserts to beat kiosk WM races.
         Clock.schedule_once(lambda *_: self._ensure_window_visible(), 0)
-        Clock.schedule_once(lambda *_: self._ensure_window_visible(), 0.3)
+        if not IS_DESKTOP:
+            Clock.schedule_once(lambda *_: self._ensure_window_visible(), 0.3)
 
         logger.info("UI built – starting on splash screen")
         return self.root_layout
@@ -1218,6 +1673,85 @@ class MeetingBoxApp(App):
                 Window.raise_window()
         except Exception as e:
             logger.debug('ensure_window_visible: %s', e)
+
+    def _on_window_minimized(self, *_args):
+        """Fired when the OS/WM minimizes the app window.
+
+        On a Linux kiosk the WM can intercept a top-edge gesture and
+        minimize the window. We immediately restore and raise the window
+        so the app stays full-screen. We do NOT auto-open the QuickPanel
+        here — the user can swipe down deliberately to open it.
+        """
+        def _restore(_dt):
+            try:
+                if hasattr(Window, 'restore'):
+                    Window.restore()
+            except Exception:
+                pass
+            try:
+                if hasattr(Window, 'raise_window'):
+                    Window.raise_window()
+            except Exception:
+                pass
+
+        Clock.schedule_once(_restore, 0.05)
+
+    def _on_window_rotate_guard(self, _win, width, height):
+        """Re-apply xrandr landscape rotation if the display is auto-rotated to portrait.
+
+        When an accelerometer-based auto-rotation daemon (e.g. iio-sensor-proxy)
+        flips the xrandr rotation after session start, SDL2 fires a resize event
+        and the fullscreen window becomes portrait (height > width).  Detect that
+        here and immediately call xrandr to revert to the configured rotation so
+        the UI stays landscape.
+        """
+        if height <= width or width <= 0 or height <= 0:
+            return  # already landscape — nothing to do
+
+        logger.warning(
+            "Portrait resize detected (%dx%d) — display was auto-rotated; "
+            "reverting xrandr to landscape.",
+            width, height,
+        )
+        try:
+            import subprocess as _sp
+            _out = os.environ.get('MEETINGBOX_PANEL_OUTPUT', 'DSI-1')
+            _rot = os.environ.get('MEETINGBOX_PANEL_ROTATE', 'left')
+            _sp.Popen(
+                ['xrandr', '--output', _out, '--rotate', _rot],
+                stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
+            )
+        except Exception as _e:
+            logger.error("_on_window_rotate_guard: failed to revert xrandr: %s", _e)
+
+    def _panel_swipe_down(self, _window, touch):
+        """Window-level: record a touch that starts in the top-edge zone."""
+        zone = 72  # px from top of screen — just above the pill handle
+        if Window.height > 0 and touch.y >= Window.height - zone:
+            self._panel_swipe_uid = touch.uid
+            self._panel_swipe_start_y = touch.y
+        else:
+            self._panel_swipe_uid = None
+
+    def _panel_swipe_move(self, _window, touch):
+        """Window-level: open QuickPanel only on a clear downward drag from top zone.
+
+        A downward drag in Kivy coordinates means y decreases (y=0 is the
+        bottom of the screen). We require a 40 px downward delta so that
+        normal finger jitter on a button press (which sits near the top on
+        some screens) never accidentally opens the panel.
+        """
+        if self._panel_swipe_uid is None:
+            return
+        if touch.uid != self._panel_swipe_uid:
+            return
+        # Only open on a DOWNWARD drag (start_y > touch.y → moved down).
+        delta_down = self._panel_swipe_start_y - touch.y
+        if delta_down >= 40:
+            self._panel_swipe_uid = None  # consume — don't fire twice
+            qp = getattr(self, 'quick_panel', None)
+            if qp and not qp._visible:
+                qp.show()
 
     # ==================================================================
     # SETUP CHECK
@@ -1268,8 +1802,24 @@ class MeetingBoxApp(App):
             clear_active_profile_selection()
         except Exception as e:
             logger.debug("clear_active_profile_selection: %s", e)
+        # Purge all account-specific UI cache keys so that after pairing a new
+        # account the morning brief (and other screens) never briefly show stale
+        # data from the previous account before the fresh fetch completes.
+        for _stale_key in (
+            "morning_brief_context",
+            "morning_brief_gmail",
+            "emails_inbox",
+        ):
+            self._ui_data_cache.pop(_stale_key, None)
+            self._ui_data_cache_ts.pop(_stale_key, None)
+        self._ui_cache_inflight.discard("morning_brief_context")
+        self._ui_cache_inflight.discard("morning_brief_gmail")
+        self._ui_cache_inflight.discard("emails_inbox")
+        self._ui_cache_persist_to_disk()
         self._nav_stack.clear()
-        self.goto_screen('pair_device', 'fade')
+        # Desktop re-auth is the Google sign-in screen; the appliance uses the
+        # pairing-code screen.
+        self.goto_screen('sign_in' if IS_DESKTOP else 'pair_device', 'fade')
 
     def _pairing_watchdog(self, _dt):
         if USE_MOCK_BACKEND:
@@ -1324,14 +1874,30 @@ class MeetingBoxApp(App):
     # APP LIFECYCLE
     # ==================================================================
 
+    @staticmethod
+    def _close_native_splash(*_args):
+        """Close the PyInstaller bootloader splash once the Kivy window is up.
+
+        ``pyi_splash`` only exists in a frozen build that was packaged with a
+        Splash(); running from source (or a build without one) is a no-op.
+        """
+        try:
+            import pyi_splash  # type: ignore
+        except Exception:
+            return
+        try:
+            pyi_splash.close()
+        except Exception:
+            pass
+
     def on_start(self):
         logger.info("MeetingBox UI started")
+        # Hand off from the native boot splash to the live UI on the first frame.
+        Clock.schedule_once(self._close_native_splash, 0)
         self._ui_cache_load_from_disk()
-        if self._audio_supervisor is not None:
-            try:
-                self._audio_supervisor.start()
-            except Exception:
-                logger.exception("Failed to start in-process audio supervisor")
+        # NOTE: the audio capture child is intentionally NOT started here. It is
+        # spawned on first entry to the home screen via
+        # ``_ensure_audio_capture_started`` so onboarding starts up cleanly.
         self.voice_assistant.start()
         self._sync_voice_assistant_state()
         if not USE_MOCK_BACKEND:
@@ -1350,8 +1916,11 @@ class MeetingBoxApp(App):
         except Exception as e:  # noqa: BLE001
             logger.debug("weather client start failed: %s", e)
         # Kick off the idle countdown immediately so a freshly-booted device
-        # that gets no touches still falls asleep into the lock screen.
-        self._reset_idle_timer()
+        # that gets no touches still falls asleep into the lock screen. The
+        # idle "lock screen" is an appliance behavior; desktop relies on the
+        # OS lock/screensaver, so it is skipped there.
+        if not IS_DESKTOP:
+            self._reset_idle_timer()
         if self.needs_setup():
             self._setup_poll = Clock.schedule_interval(self._global_setup_check, 3.0)
         else:
@@ -1359,15 +1928,29 @@ class MeetingBoxApp(App):
         if not USE_MOCK_BACKEND:
             self._pairing_poll = Clock.schedule_interval(
                 self._pairing_watchdog, 45.0)
-            self._metrics_push = Clock.schedule_interval(
-                self._push_appliance_metrics_tick, 30.0)
-            Clock.schedule_once(lambda _dt: self._push_appliance_metrics_tick(0), 6.0)
+            # Appliance "device health" telemetry pushed to the web dashboard.
+            # On desktop this would report the user's PC as if it were an
+            # appliance, so it is disabled.
+            if not IS_DESKTOP:
+                self._metrics_push = Clock.schedule_interval(
+                    self._push_appliance_metrics_tick, 30.0)
+                Clock.schedule_once(
+                    lambda _dt: self._push_appliance_metrics_tick(0), 6.0)
+            else:
+                self._metrics_push = None
         else:
             self._metrics_push = None
 
+        # Desktop port only: actively check/request OS microphone permission early
+        # (Windows/macOS gate desktop-app mic access behind privacy switches).
+        if not sys.platform.startswith('linux'):
+            Clock.schedule_once(self._run_mic_permission_check, 3.0)
         # After boot-time API bursts settle, run connectivity / mic / model checks once.
         # A slightly later start avoids transient false-negatives during initial network churn.
-        Clock.schedule_once(self._run_startup_self_test_overlay, 8.0)
+        # Desktop (Windows/macOS) is a plain application: the OS owns the system,
+        # so the appliance boot self-test / system-check step is skipped there.
+        if not IS_DESKTOP:
+            Clock.schedule_once(self._run_startup_self_test_overlay, 8.0)
         # Cold-start prewarm for instant first-open calendar/emails.
         Clock.schedule_once(lambda _dt: run_async(self._ui_cache_bootstrap_async()), 0.8)
         # Centralized sync loop to keep caches hot across all screens.
@@ -1375,6 +1958,106 @@ class MeetingBoxApp(App):
             self._ui_sync_event.cancel()
         self._ui_sync_event = Clock.schedule_interval(self._ui_cache_sync_tick, 5.0)
         Clock.schedule_once(lambda _dt: self._ui_cache_sync_tick(0), 1.6)
+
+    def _ensure_audio_capture_started(self):
+        """Start the in-process audio capture child once, on first home entry.
+
+        Deferred from ``on_start`` so the onboarding flow (welcome → sign-in →
+        capabilities → ready) is not competing with the recorder for the mic or
+        for startup CPU. Idempotent: safe to call on every home entry.
+        """
+        if self._audio_supervisor_started:
+            return
+        self._audio_supervisor_started = True
+        if self._audio_supervisor is not None:
+            try:
+                self._audio_supervisor.start()
+            except Exception:
+                logger.exception("Failed to start in-process audio supervisor")
+
+    def _run_mic_permission_check(self, _dt):
+        """Desktop: probe mic access off-thread; if blocked, guide the user to grant it.
+
+        Win32 desktop apps get no OS consent popup, so the genuine "request" is to
+        attempt opening the mic; if Windows privacy blocks it we deep-link the user
+        to the microphone settings page. Disable with MEETINGBOX_MIC_PERMISSION_CHECK=0.
+        """
+        raw = (os.environ.get("MEETINGBOX_MIC_PERMISSION_CHECK") or "1").strip().lower()
+        if raw in ("0", "false", "no", "off"):
+            return
+        if getattr(self, "_mic_permission_checked", False):
+            return
+        self._mic_permission_checked = True
+
+        def _worker():
+            try:
+                import mic_permission
+                status = mic_permission.check_microphone()
+            except Exception:
+                logger.exception("mic permission check failed")
+                return
+            if status.ok:
+                logger.info("Microphone OK (%s).", status.detail)
+                return
+            logger.warning("Microphone not ready: %s (%s)", status.state, status.detail)
+            # Only interrupt the user for actionable cases (blocked by privacy, or
+            # no device). Ambiguous failures are left to the boot self-test overlay.
+            if status.state not in (
+                mic_permission.STATUS_DENIED,
+                mic_permission.STATUS_NO_DEVICE,
+            ):
+                return
+            Clock.schedule_once(
+                lambda _dt, s=status: self._show_mic_permission_popup(s), 0
+            )
+
+        threading.Thread(target=_worker, name="mic-permission", daemon=True).start()
+
+    def _show_mic_permission_popup(self, status):
+        """Modal explaining the mic issue with a one-click jump to OS settings."""
+        try:
+            import mic_permission
+            from kivy.uix.popup import Popup
+            from kivy.uix.boxlayout import BoxLayout
+            from kivy.uix.label import Label
+            from components.button import PrimaryButton
+            from config import FONT_SIZES
+        except Exception:
+            logger.exception("could not build mic permission popup")
+            return
+
+        if status.state == mic_permission.STATUS_NO_DEVICE:
+            title = "No microphone found"
+            msg = ("Pepper AI could not find a microphone. Plug one in (or enable your "
+                   "built-in mic), then restart Pepper AI to use voice and recording.")
+            show_settings = False
+        else:
+            title = "Allow microphone access"
+            msg = ("Pepper AI needs your microphone for the voice assistant and meeting "
+                   "recording. Windows is currently blocking microphone access for desktop "
+                   "apps.\n\nClick \"Open Settings\", turn on \"Microphone access\" and "
+                   "\"Let desktop apps access your microphone\", then restart Pepper AI.")
+            show_settings = True
+
+        root = BoxLayout(orientation="vertical", padding=16, spacing=12)
+        body = Label(text=msg, halign="left", valign="top", font_size=FONT_SIZES["small"] + 2)
+        body.bind(size=lambda w, *_: setattr(w, "text_size", (w.width, None)))
+        root.add_widget(body)
+
+        btn_row = BoxLayout(orientation="horizontal", size_hint=(1, None), height=52, spacing=10)
+        popup = Popup(title=title, content=root, size_hint=(0.86, 0.6), auto_dismiss=True)
+
+        if show_settings:
+            open_btn = PrimaryButton(text="Open Settings", font_size=FONT_SIZES["medium"])
+            open_btn.bind(on_release=lambda *_: mic_permission.open_privacy_settings())
+            btn_row.add_widget(open_btn)
+
+        close_btn = PrimaryButton(text="Continue", font_size=FONT_SIZES["medium"])
+        close_btn.bind(on_release=lambda *_: popup.dismiss())
+        btn_row.add_widget(close_btn)
+        root.add_widget(btn_row)
+
+        popup.open()
 
     def _run_startup_self_test_overlay(self, _dt):
         """Boot-time self-test modal (disable with MEETINGBOX_STARTUP_SELF_TEST=0)."""
@@ -1505,8 +2188,8 @@ class MeetingBoxApp(App):
                     vae = str(vae).strip().lower() in ("1", "true", "yes", "on")
                 self.voice_assistant_enabled = bool(vae)
 
-                vwp = (settings.get("voice_wake_phrase") or "hey tony").strip().lower() or "hey tony"
-                self.voice_wake_phrase_display = vwp[:1].upper() + vwp[1:] if vwp else "Hey Tony"
+                vwp = (settings.get("voice_wake_phrase") or "hey pepper").strip().lower() or "hey pepper"
+                self.voice_wake_phrase_display = vwp[:1].upper() + vwp[1:] if vwp else "Hey Pepper"
                 try:
                     sv = settings.get("assistant_speech_volume", 85)
                     if isinstance(sv, str):
@@ -1524,7 +2207,7 @@ class MeetingBoxApp(App):
                 # device is authed, pre-warm a Realtime standby session so the
                 # first wake word activates instantly.
                 try:
-                    self._schedule_voice_prewarm(delay=1.5)
+                    self._schedule_voice_prewarm(delay=0.2)
                 except Exception:
                     logger.debug("voice prewarm schedule (settings) failed", exc_info=True)
             except Exception as e:
@@ -1542,9 +2225,46 @@ class MeetingBoxApp(App):
     # NAVIGATION (with history stack & transitions)
     # ==================================================================
 
+    # Screens that belong to the open-summary workflow. While the user moves
+    # between these (acting on the summary — emailing it, making tasks, etc.)
+    # the grounded summary context must stay alive. Leaving to any other screen
+    # tears it down.
+    _SUMMARY_CTX_SCREENS = frozenset({
+        "summary_review", "email_draft", "voice_task_creation",
+        "calendar_event_creation", "voice_session", "calendar",
+    })
+
+    def _maybe_clear_summary_context(self, target: str) -> None:
+        """Drop the grounded summary context when leaving its workflow."""
+        if (
+            getattr(self, "_active_summary_meeting_id", None) is not None
+            and target not in self._SUMMARY_CTX_SCREENS
+        ):
+            self.end_summary_context_session()
+
+    def _dock_enabled(self) -> bool:
+        """True only for the Windows desktop companion (never the appliance)."""
+        if not (IS_WINDOWS and IS_DESKTOP) or FULLSCREEN:
+            return False
+        return os.getenv("MEETINGBOX_DOCK", "1") != "0"
+
+    def _dock_on_screen_change(self, name: str) -> None:
+        """Engage the floating dock on first reaching home; keep highlight synced."""
+        dc = getattr(self, "dock_controller", None)
+        if dc is None:
+            return
+        if not dc._engaged:
+            # Boot/onboarding runs in the normal window; the dock takes over the
+            # moment the app would otherwise land on the (now-unused) home screen.
+            if name == "home":
+                dc.engage()
+            return
+        dc.notify_screen(name)
+
     def goto_screen(self, screen_name: str, transition='fade'):
         """Navigate to *screen_name* with the specified transition."""
         logger.info(f"Nav → {screen_name} ({transition})")
+        self._maybe_clear_summary_context(screen_name)
 
         # Push current screen onto stack (avoid duplicates)
         current = self.screen_manager.current
@@ -1574,11 +2294,14 @@ class MeetingBoxApp(App):
             target = self._nav_stack.pop()
             # Skip non-core screens in stack when going back
             skip = {
-                'splash', 'welcome', 'network_choice', 'wifi_setup', 'wifi_connected',
-                'setup_progress', 'all_set', 'pair_device', 'meetingbox_ready',
+                'splash', 'sign_in', 'onboarding_welcome', 'onboarding_capabilities',
+                'onboarding_ready', 'welcome', 'network_choice', 'wifi_setup',
+                'wifi_connected', 'setup_progress', 'all_set', 'pair_device',
+                'meetingbox_ready',
             }
             while target in skip and self._nav_stack:
                 target = self._nav_stack.pop()
+            self._maybe_clear_summary_context(target)
             self._set_transition('slide_right')
             cur = self.screen_manager.current_screen
             if hasattr(cur, 'on_leave'):
@@ -1593,6 +2316,9 @@ class MeetingBoxApp(App):
             self.goto_screen('home', transition='fade')
 
     def _set_transition(self, kind):
+        old = self.screen_manager.transition
+        if old is not None and getattr(old, 'is_active', False):
+            old.stop()
         dur = TRANSITION_DURATION.get('fade', 0.3)
         if kind == 'fade':
             self.screen_manager.transition = FadeTransition(duration=dur)
@@ -1758,17 +2484,32 @@ class MeetingBoxApp(App):
 
     def on_recording_started(self, data):
         sid = data.get('session_id')
+        mode = (data.get('recording_mode') or self.current_recording_mode or "meeting").strip().lower()
+        if mode not in {"meeting", "note"}:
+            mode = "meeting"
         # API + local audio may both publish recording_started when Redis is shared.
         if sid and self.current_session_id == sid and self.recording_state.get('active'):
             return
         self.current_session_id = sid
+        self.current_recording_mode = mode
         self._transcription_done_for_session = None
         self._transcript_cta_satisfied_meeting_id = None
         self._transcript_cta_poll_meeting_id = None
         self.recording_state.update(active=True, paused=False, elapsed=0)
+        self._voice_start_in_flight = False
+        self._voice_start_confirmation_pending = False
         self._reset_recording_elapsed_clock()
         Clock.schedule_once(lambda _: self._suspend_voice_assistant_for_recording(), 0)
-        Clock.schedule_once(lambda _: self.goto_screen('recording', 'fade'), 0)
+        # If the user already started recording via the in-place morph on the
+        # Start-Recording page (optimistic start), we're on that screen and it is
+        # already showing the active recording UI — don't re-enter/reset it.
+        rec = self.screen_manager.get_screen('recording')
+        already_recording = (
+            self.screen_manager.current == 'recording'
+            and getattr(rec, 'is_recording_active', False)
+        )
+        if not already_recording:
+            Clock.schedule_once(lambda _: self.goto_screen('recording', 'fade'), 0)
 
     def _kick_post_stop_meeting_polls(self, sid):
         """HTTP fallbacks so processing screen gets transcript + summary without relying on WS."""
@@ -1787,9 +2528,12 @@ class MeetingBoxApp(App):
             logger.debug("Processing screen unavailable for metadata prime: %s", e)
             return
         if hasattr(screen, 'on_processing_started'):
+            mode = self.current_recording_mode if self.current_recording_mode in {"meeting", "note"} else "meeting"
+            title_prefix = "Notes" if mode == "note" else "Meeting"
             screen.on_processing_started({
-                'title': f'Meeting {sid}',
+                'title': f'{title_prefix} {sid}',
                 'duration': max(0, int(duration_seconds or 0)),
+                'recording_mode': mode,
             })
 
     def on_recording_stopped(self, data):
@@ -1845,6 +2589,10 @@ class MeetingBoxApp(App):
             Clock.schedule_once(lambda _: screen.on_audio_level(level), 0)
 
     def on_mic_test_level(self, data):
+        # The mic_test screen is appliance-only (not registered on desktop).
+        # Ignore any stray backend level events when it isn't present.
+        if not self.screen_manager.has_screen('mic_test'):
+            return
         level_data = data if 'level' in data else data.get('data', {})
         level = float(level_data.get('level', 0.0) or 0.0)
         screen = self.screen_manager.get_screen('mic_test')
@@ -1873,7 +2621,9 @@ class MeetingBoxApp(App):
         def _update_status(_dt):
             screen = self.screen_manager.get_screen('processing')
             if hasattr(screen, 'set_processing_status'):
-                screen.set_processing_status('Transcription done. Building meeting report…')
+                mode = (data.get('recording_mode') or self.current_recording_mode or "meeting").strip().lower()
+                text = 'Transcription done. Extracting notes…' if mode == "note" else 'Transcription done. Building meeting report…'
+                screen.set_processing_status(text)
 
         Clock.schedule_once(_update_status, 0)
 
@@ -1907,7 +2657,9 @@ class MeetingBoxApp(App):
         def _update_status(_dt):
             screen = self.screen_manager.get_screen('processing')
             if hasattr(screen, 'set_processing_status'):
-                screen.set_processing_status('Building meeting report…')
+                mode = (data.get('recording_mode') or self.current_recording_mode or "meeting").strip().lower()
+                text = 'Creating notes…' if mode == "note" else 'Building meeting report…'
+                screen.set_processing_status(text)
 
         Clock.schedule_once(_update_status, 0)
         self._auto_summarize(meeting_id)
@@ -1927,6 +2679,10 @@ class MeetingBoxApp(App):
         Clock.schedule_once(_advance, 0)
 
     def on_update_progress(self, data):
+        # The update_install screen is appliance-only (not registered on
+        # desktop; desktop updates ship via the installer). Ignore stray events.
+        if not self.screen_manager.has_screen('update_install'):
+            return
         progress = data.get('progress', 0)
         stage = data.get('stage', '')
         eta = data.get('eta', 0)
@@ -1939,6 +2695,11 @@ class MeetingBoxApp(App):
         """Handle summary_complete event from AI service (if it fires separately)."""
         meeting_id = data.get('meeting_id')
         summary = data.get('summary') or {}
+        mode = (data.get('recording_mode') or self.current_recording_mode or "meeting").strip().lower()
+        if mode not in {"meeting", "note"}:
+            mode = "meeting"
+        if isinstance(summary, dict):
+            summary.setdefault('recording_mode', mode)
         if not meeting_id:
             return
         if isinstance(summary, dict) and summary.get('status') == 'failed':
@@ -1958,9 +2719,14 @@ class MeetingBoxApp(App):
         ready_for_review = self._summary_payload_ready_for_review(summary or {})
         if ready_for_review:
             try:
+                if isinstance(summary, dict):
+                    summary.setdefault('recording_mode', self.current_recording_mode)
                 self._processing_summary_cache[meeting_id] = {'ok': True, 'summary': summary or {}}
             except Exception:
                 pass
+            if (self.current_recording_mode == "note"
+                    or str((summary or {}).get("recording_mode") or "").strip().lower() == "note"):
+                run_async(self._persist_note_tasks_from_summary(meeting_id, summary or {}))
         # Any path reaching here is the authoritative "summary ready" signal —
         # silence the fallback poll so we don't duplicate work.
         if ready_for_review and self._summary_poll_meeting_id == meeting_id:
@@ -2020,6 +2786,106 @@ class MeetingBoxApp(App):
             or ''
         )
         return bool(str(text).strip())
+
+    @staticmethod
+    def _note_todo_candidates(summary: dict) -> list[dict]:
+        """Build task rows when the server did not persist note todos."""
+        if not isinstance(summary, dict):
+            return []
+        created = summary.get("created_tasks") or []
+        if isinstance(created, list) and created:
+            return []
+
+        items: list[dict] = []
+        raw_action = summary.get("action_items")
+        if isinstance(raw_action, str):
+            try:
+                raw_action = json.loads(raw_action)
+            except json.JSONDecodeError:
+                raw_action = []
+        if isinstance(raw_action, list):
+            for row in raw_action:
+                if not isinstance(row, dict):
+                    continue
+                title = str(row.get("title") or row.get("task") or "").strip()
+                if not title:
+                    continue
+                items.append({
+                    "title": title,
+                    "due_date": row.get("due_date"),
+                    "description": str(row.get("description") or "").strip(),
+                })
+        if items:
+            return items
+
+        text = ""
+        inner = summary.get("summary")
+        if isinstance(inner, dict):
+            text = str(inner.get("summary") or "")
+        elif isinstance(inner, str):
+            text = inner
+        if not text:
+            text = str(summary.get("summary_text") or summary.get("text") or "")
+
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            for prefix in ("- ", "• ", "* "):
+                if line.startswith(prefix):
+                    line = line[len(prefix):].strip()
+                    break
+            else:
+                continue
+            if not line:
+                continue
+            full = line.rstrip(".")
+            words = full.split()
+            title = full
+            description = ""
+            if len(words) > 18:
+                title = " ".join(words[:8])
+                description = full
+            items.append({
+                "title": title,
+                "due_date": None,
+                "description": description,
+            })
+        return items
+
+    async def _persist_note_tasks_from_summary(self, meeting_id: str, summary: dict) -> None:
+        mode = str(
+            (summary or {}).get("recording_mode") or self.current_recording_mode or ""
+        ).strip().lower()
+        if mode != "note":
+            return
+        if meeting_id in self._note_tasks_persisted:
+            return
+
+        candidates = self._note_todo_candidates(summary or {})
+        if not candidates:
+            return
+
+        created: list[dict] = []
+        skipped: list[dict] = []
+        for item in candidates:
+            title = str(item.get("title") or "").strip()
+            if not title:
+                continue
+            res = await self.backend.create_commitment(
+                title=title,
+                due_date=item.get("due_date"),
+                description=item.get("description") or None,
+                confirm_duplicate=True,
+                source="note",
+            )
+            if res.get("error"):
+                skipped.append({"title": title, "error": res.get("error")})
+            elif res.get("id"):
+                created.append({"id": res.get("id"), "title": title})
+
+        self._note_tasks_persisted.add(meeting_id)
+        if isinstance(summary, dict):
+            summary["created_tasks"] = created
+            summary["skipped_tasks"] = skipped
 
     @classmethod
     def _summary_payload_ready_for_review(cls, summary: dict) -> bool:
@@ -2225,12 +3091,19 @@ class MeetingBoxApp(App):
     # RECORDING ACTIONS
     # ==================================================================
 
-    def start_recording(self):
+    def start_recording(self, recording_mode: str = "meeting", context: dict | None = None):
+        mode = (recording_mode or "meeting").strip().lower()
+        if mode not in {"meeting", "note"}:
+            mode = "meeting"
+        self.current_recording_mode = mode
+        # Pre-recording context (who/what/why) captured by the voice agent, to be
+        # stored as searchable metadata so the recording is findable later.
+        rec_context = context if isinstance(context, dict) else None
+        self._suspend_voice_assistant_for_recording()
+
         async def _start():
             last_exc: BaseException | None = None
             max_attempts = 3
-            Clock.schedule_once(lambda _: self._suspend_voice_assistant_for_recording(), 0)
-            await asyncio.sleep(0.35)
             for attempt in range(max_attempts):
                 if attempt > 0:
                     delay = 2.0 * attempt
@@ -2242,14 +3115,14 @@ class MeetingBoxApp(App):
                     )
                     await asyncio.sleep(delay)
                 try:
-                    result = await self.backend.start_recording()
+                    result = await self.backend.start_recording(mode, context=rec_context)
                     self.current_session_id = result['session_id']
-                    self.recording_state.update(active=True, paused=False, elapsed=0)
-                    self._voice_start_in_flight = False
-                    self._reset_recording_elapsed_clock()
-                    Clock.schedule_once(lambda _: self._suspend_voice_assistant_for_recording(), 0)
-                    Clock.schedule_once(
-                        lambda _: self.goto_screen('recording', 'fade'), 0)
+                    self.current_recording_mode = (
+                        result.get('recording_mode') or mode
+                    )
+                    # The backend only confirms that the start command was sent.
+                    # The recording screen opens from on_recording_started, which
+                    # is emitted by audio_capture.py after the mic stream is open.
                     return
                 except Exception as e:
                     last_exc = e
@@ -2428,6 +3301,9 @@ class MeetingBoxApp(App):
         (which fires once children pass), but doing it here as well covers
         gestures that don't reach a screen widget (e.g. global swipes).
         """
+        # Desktop has no idle "lock screen" takeover (the OS owns lock/sleep).
+        if IS_DESKTOP:
+            return
         if self.screen_manager and self.screen_manager.current == 'idle':
             self.goto_screen('home', 'fade')
 
@@ -2476,6 +3352,10 @@ class MeetingBoxApp(App):
             return False
         blocked = {
             'splash',
+            'sign_in',
+            'onboarding_welcome',
+            'onboarding_capabilities',
+            'onboarding_ready',
             'welcome',
             'room_name',
             'network_choice',
@@ -2547,7 +3427,7 @@ class MeetingBoxApp(App):
                 self.voice_indicator.set_state("speaking", "Speaking…")
             return
         if self.voice_assistant.available and self._voice_assistant_should_listen():
-            wkd = getattr(self, "voice_wake_phrase_display", None) or "Hey Tony"
+            wkd = getattr(self, "voice_wake_phrase_display", None) or "Hey Pepper"
             self.voice_indicator.set_state("idle", f'Say "{wkd}"')
             return
         self.voice_indicator.set_state("hidden")
@@ -2563,13 +3443,26 @@ class MeetingBoxApp(App):
     def _set_voice_runtime_state(self, state: str) -> None:
         self._voice_runtime_state = (state or "idle").strip().lower()
         self._refresh_voice_indicator()
+        vcb = getattr(self, "_voice_control_bar", None)
+        if vcb is not None:
+            # Synchronous (not deferred a frame) so the pill pair appears the
+            # same frame the state changes, instead of one frame late.
+            vcb.notify_state(self._voice_runtime_state)
 
     def _voice_mark_post_realtime_wake_suppression(self) -> None:
-        """Realtime PCM uses aplay, not _speak_text_blocking — apply same tail/guard timeline."""
+        """Suppress the wake word for a beat after a Realtime session ends.
+
+        Realtime PCM uses aplay (not _speak_text_blocking), so apply at least the
+        same TTS tail/guard timeline; but at the end of a whole conversation the
+        residual audio (the user's own goodbye tail, room echo, and the
+        warm-standby reconnect handshake) lingers longer, so honour a dedicated,
+        longer end-of-session guard to stop a false re-wake (the "says bye →
+        instantly re-opens a session" loop)."""
         import time as _time
 
-        deadline = _time.monotonic() + (
-            _tts_tail_silence_seconds() + _post_tts_wake_guard_seconds()
+        deadline = _time.monotonic() + max(
+            _tts_tail_silence_seconds() + _post_tts_wake_guard_seconds(),
+            _post_realtime_session_wake_guard_seconds(),
         )
         prev = float(getattr(self, "_wake_suppress_until_monotonic", 0.0) or 0.0)
         self._wake_suppress_until_monotonic = max(prev, deadline)
@@ -2637,7 +3530,22 @@ class MeetingBoxApp(App):
         self._realtime_launch_permitted = False
 
         timeout = max(2.0, self.voice_assistant.command_timeout_seconds)
-        lbl = getattr(self, "voice_wake_phrase_display", "Hey Tony") or "Hey Tony"
+        lbl = getattr(self, "voice_wake_phrase_display", "Hey Pepper") or "Hey Pepper"
+        try:
+            _logging.getLogger(__name__).info(
+                "VOICE_EVENT %s",
+                json.dumps(
+                    {
+                        "event": "wake_detected",
+                        "phrase": lbl,
+                        "realtime_enabled": bool(getattr(self, "voice_realtime_assistant", False)),
+                        "recording_active": bool(self.recording_state.get("active")),
+                    },
+                    sort_keys=True,
+                ),
+            )
+        except Exception:
+            pass
 
         def _wake_ui(_dt):
             self._set_voice_indicator_override(
@@ -2674,6 +3582,16 @@ class MeetingBoxApp(App):
             self._realtime_reconnect_count = 0  # fresh wake — reset reconnect budget
 
             def _kick_realtime(_dt):
+                # In dock mode a spoken "Hey Pepper" wake must surface the same
+                # voice page the logo opens; otherwise the panel keeps showing
+                # whatever screen was last open (e.g. Calendar). Navigating to
+                # voice_session also auto-opens the dock panel (notify_screen).
+                dc = getattr(self, "dock_controller", None)
+                if dc is not None and getattr(dc, "_engaged", False):
+                    try:
+                        self.goto_screen("voice_session", transition="fade")
+                    except Exception:
+                        logger.debug("dock wake → voice_session nav failed", exc_info=True)
                 self._show_home_listening_after_wake()
                 # Instant path: if a pre-warmed session is held in standby,
                 # just activate it (no mint, no connect, no greeting). Falls
@@ -2857,6 +3775,11 @@ class MeetingBoxApp(App):
     def _apply_amplitude_to_home(self, amplitude: float) -> None:
         if self.screen_manager is None:
             return
+        if getattr(self, "_voice_control_bar", None) is not None:
+            # Global overlay owns waveform animation; avoid waking legacy per-screen
+            # voice pills that would visually duplicate the global pill.
+            self._voice_control_bar.update_amplitude(amplitude)
+            return
         current = self.screen_manager.current
         if current == 'home':
             try:
@@ -2868,30 +3791,71 @@ class MeetingBoxApp(App):
                 self.screen_manager.get_screen('email_draft').update_amplitude(amplitude)
             except Exception:
                 pass
+        vcb = getattr(self, "_voice_control_bar", None)
+        if vcb is not None:
+            vcb.update_amplitude(amplitude)
 
-    def _realtime_handle_start_recording(self) -> None:
-        """Called when the realtime agent asks to start a meeting recording."""
+    def _realtime_handle_start_recording(
+        self, recording_mode: str = "meeting", context: dict | None = None
+    ) -> None:
+        """Called when the realtime agent asks to start a recording."""
         if self.recording_state.get("active"):
             logger.info("Realtime start_recording: already recording, ignoring.")
             return
         try:
-            self.start_recording()
+            self.start_recording(recording_mode, context=context)
         except Exception:
             logger.exception("Realtime start_recording callback failed")
 
-    def _realtime_voice_navigate(self, screen: str, target_date=None, target_tab=None) -> None:
+    def _voice_brief_facts(self) -> dict:
+        """Return the morning-brief facts the screen is currently rendering.
+
+        The Realtime voice session injects these into its per-section narration
+        directive so the spoken briefing always matches the on-screen cards.
+        Returns an empty dict when the screen hasn't rendered real data yet
+        (still loading), in which case the session keeps its existing behaviour.
+        """
+        try:
+            mb = self.screen_manager.get_screen("morning_brief")
+            facts = mb.voice_brief_facts()
+            if isinstance(facts, dict) and facts.get("ready"):
+                return facts
+        except Exception:
+            logger.debug("voice brief facts unavailable", exc_info=True)
+        return {}
+
+    def _realtime_voice_navigate(self, screen: str, target_date=None, target_tab=None, meeting_id=None, summary_data=None) -> None:
         """Open a main UI screen when the cloud Realtime model calls navigate_device_ui."""
         s = (screen or "").strip()
+
+        # show_meeting_summary opens a specific recording's summary page, which is
+        # not a fixed main screen (it needs the meeting/note id to load). Open the
+        # same light-theme Meeting Summary page the user reaches by tapping the
+        # "summary ready" notification.
+        if s == "summary_review":
+            mid = str(meeting_id or "").strip()
+            if mid:
+                try:
+                    self._voice_open_summary_review(mid, summary_data)
+                except Exception:
+                    logger.exception("Realtime navigate to summary_review failed")
+            return
+
         routes = {
             "home": ("home", "fade"),
+            "voice_session": ("voice_session", "slide_right"),
             "calendar": ("calendar", "slide_left"),
             "emails": ("emails", "slide_left"),
             "meetings": ("meetings", "slide_left"),
             "tasks": ("tasks", "slide_left"),
             "morning_brief": ("morning_brief", "slide_left"),
-            "settings": ("settings", "slide_left"),
-            "mic_test": ("mic_test", "slide_left"),
         }
+        # Settings and mic_test screens are not registered on desktop, so never
+        # offer them as realtime navigation targets there (unknown keys return
+        # safely below). The appliance keeps them.
+        if not IS_DESKTOP:
+            routes["settings"] = ("settings", "slide_left")
+            routes["mic_test"] = ("mic_test", "slide_left")
         pair = routes.get(s)
         if not pair:
             return
@@ -2948,6 +3912,29 @@ class MeetingBoxApp(App):
             except Exception:
                 logger.exception("Failed to set emails target_tab")
 
+        if name == "morning_brief" and target_tab:
+            try:
+                mb = self.screen_manager.get_screen("morning_brief")
+                # Keep the carousel swipe in sync with the spoken narration: the
+                # model calls this tool the moment it finishes a section, but that
+                # section's audio is still draining from the speaker queue. Defer
+                # the swipe until the queued audio finishes so the card flips as
+                # the next section's narration begins.
+                sess = (getattr(self, "_realtime_voice_session", None)
+                        or getattr(self, "_warm_voice_session", None))
+                delay = 0.0
+                if sess is not None and hasattr(sess, "audio_playback_remaining_s"):
+                    try:
+                        delay = float(sess.audio_playback_remaining_s())
+                    except Exception:
+                        delay = 0.0
+                Clock.schedule_once(
+                    lambda _dt, _t=target_tab, _mb=mb: _mb.set_active_section(_t),
+                    delay,
+                )
+            except Exception:
+                logger.exception("Failed to set morning_brief section")
+
         try:
             self.goto_screen(name, tr)
         except Exception:
@@ -2977,6 +3964,185 @@ class MeetingBoxApp(App):
         except Exception:
             logger.debug("send_user_text failed", exc_info=True)
 
+    # ──────────────────────────────────────────────────────────────────
+    # Active summary context session (voice agent grounded on open summary)
+    # ──────────────────────────────────────────────────────────────────
+    def _apply_pending_summary_context_to(self, sess) -> None:
+        """Hand any staged summary context to a session about to start/activate."""
+        pending = getattr(self, "_pending_summary_context", None)
+        if not pending or sess is None:
+            return
+        ctx, greeting = pending
+        self._pending_summary_context = None
+        try:
+            sess.apply_active_context(ctx, greeting)
+        except Exception:
+            logger.debug("apply_active_context on session failed", exc_info=True)
+
+    def start_summary_context_session(self, meeting_id: str, summary_data: dict) -> None:
+        """Auto-activate the voice agent and ground it on the open summary.
+
+        Called when a meeting/note summary screen opens. Builds a rich context
+        block from the summary, then either injects it into a live session or
+        stages it for the session that wake activation is about to start. No
+        wake word required.
+        """
+        if not meeting_id:
+            return
+        # Realtime assistant must be available for context grounding; the local
+        # Vosk fallback cannot use injected context, so skip silently otherwise.
+        if not (
+            getattr(self, "voice_realtime_assistant", False)
+            and REALTIME_VOICE_IMPLEMENTED
+            and get_device_auth_token().strip()
+            and not USE_MOCK_BACKEND
+            and not WAKE_LOCAL_VOICE_ONLY
+        ):
+            return
+        if self.recording_state.get("active"):
+            return
+        # Already grounded on this summary (e.g. on_enter fired twice) — skip.
+        if self._active_summary_meeting_id == meeting_id:
+            return
+        ctx, greeting = self._build_summary_context(summary_data or {})
+        if not ctx:
+            return
+        self._active_summary_meeting_id = meeting_id
+        sess = getattr(self, "_realtime_voice_session", None)
+        if sess is not None and not getattr(self, "_realtime_session_pending", False):
+            # A session is already live — inject directly.
+            try:
+                sess.apply_active_context(ctx, greeting)
+            except Exception:
+                logger.debug("live apply_active_context failed", exc_info=True)
+            return
+        # Stage for the session that wake activation will start, then wake.
+        self._pending_summary_context = (ctx, greeting)
+        Clock.schedule_once(lambda _dt: self._handle_voice_wake_phrase(""), 0)
+
+    def update_summary_context(self, meeting_id: str, summary_data: dict) -> None:
+        """Refresh the grounded context with richer data (e.g. action items
+        loaded after the detail fetch). Does NOT re-speak the greeting."""
+        if not meeting_id or self._active_summary_meeting_id != meeting_id:
+            return
+        ctx, _greeting = self._build_summary_context(summary_data or {})
+        if not ctx:
+            return
+        if self._pending_summary_context is not None:
+            # Session not started yet — update the staged greeting's context.
+            self._pending_summary_context = (ctx, self._pending_summary_context[1])
+            return
+        sess = getattr(self, "_realtime_voice_session", None)
+        if sess is not None:
+            try:
+                sess.apply_active_context(ctx, None)
+            except Exception:
+                logger.debug("update_summary_context apply failed", exc_info=True)
+
+    def end_summary_context_session(self) -> None:
+        """Tear down the summary context when the user leaves the summary.
+
+        The realtime session was auto-started (no wake word) purely to ground
+        the agent on the open summary. Leaving the summary workflow must fully
+        end that session — not merely clear its injected context — otherwise it
+        keeps the mic open, so _voice_assistant_should_listen() stays False and
+        the wake-word listener never resumes (and its unexpected-end
+        auto-reconnect re-grabs the mic), leaving the device unresponsive to the
+        wake phrase. sess.stop() marks the end as user-initiated, so no reconnect
+        fires. Mirrors _suspend_voice_assistant_for_recording().
+        """
+        self._pending_summary_context = None
+        if self._active_summary_meeting_id is None:
+            return
+        self._active_summary_meeting_id = None
+        if (
+            getattr(self, "_realtime_voice_session", None) is not None
+            or getattr(self, "_realtime_session_pending", False)
+        ):
+            try:
+                self._end_realtime_voice_session()
+            except Exception:
+                logger.debug("end summary realtime session failed", exc_info=True)
+
+    def _build_summary_context(self, data: dict) -> tuple[str, str]:
+        """Build the (context_text, greeting_instructions) for an open summary."""
+        data = data or {}
+        mode = str(
+            data.get("recording_mode") or data.get("content_type") or ""
+        ).strip().lower()
+        is_note = mode in {"note", "notes"}
+        kind = "Note" if is_note else "Meeting"
+
+        summary = data.get("summary")
+        if isinstance(summary, dict):
+            summary_text = (summary.get("summary") or "").strip()
+            block = summary
+        else:
+            summary_text = (summary or "").strip()
+            block = data
+
+        title = (data.get("title") or block.get("title") or "").strip()
+        if is_note and not title:
+            title = "Notes"
+
+        def _norm_item(item) -> str:
+            if isinstance(item, dict):
+                return str(
+                    item.get("task") or item.get("description")
+                    or item.get("text") or item.get("title") or ""
+                ).strip()
+            return str(item or "").strip()
+
+        def _norm_list(value) -> list[str]:
+            if not isinstance(value, (list, tuple)):
+                return []
+            out = []
+            for it in value:
+                s = _norm_item(it)
+                if s:
+                    out.append(s)
+            return out
+
+        action_items = _norm_list(block.get("action_items") or block.get("actions"))
+        decisions = _norm_list(block.get("decisions"))
+        participants = _norm_list(
+            block.get("participants") or data.get("participants")
+            or data.get("attendees") or block.get("attendees")
+        )
+
+        if not (summary_text or action_items or decisions):
+            return "", ""
+
+        lines = [
+            "ACTIVE SUMMARY CONTEXT (the user is viewing this on the device screen RIGHT NOW):",
+            f"Type: {kind}",
+        ]
+        if title:
+            lines.append(f"Title: {title}")
+        if participants:
+            lines.append("Participants: " + ", ".join(participants))
+        if summary_text:
+            lines.append("Summary:\n" + summary_text)
+        if action_items:
+            lines.append("Action items:\n" + "\n".join(f"- {a}" for a in action_items))
+        if decisions:
+            lines.append("Decisions:\n" + "\n".join(f"- {d}" for d in decisions))
+        lines.append(
+            "Resolve 'this', 'it', 'this " + kind.lower() + "', 'these action items' to THIS item. "
+            "Answer questions about it directly from the content above without searching. "
+            "Use it as the source when the user asks to email it, create tasks from it, or schedule a follow-up."
+        )
+        context_text = "\n".join(lines)
+
+        what = "note" if is_note else "summary"
+        greeting = (
+            f"Say exactly one short, warm sentence telling the user their {what} is ready and "
+            "offering to act on it now — for example 'Your "
+            f"{what}'s ready — want me to email it, create tasks, or set a follow-up?'. "
+            "Then stop and wait for their request. Do not read the summary aloud."
+        )
+        return context_text, greeting
+
     def _email_workflow_active(self) -> bool:
         """True while the email draft screen or recipient picker is on screen.
 
@@ -3000,24 +4166,54 @@ class MeetingBoxApp(App):
         """Navigate to / update the email draft screen from a show_email_draft directive."""
         if not isinstance(draft, dict):
             return
-        # The recipient picker's job ends once we're drafting — close it.
-        recip = getattr(self, "_recipient_overlay", None)
-        if recip is not None and recip.visible:
-            recip.close()
         try:
             sm = getattr(self, "screen_manager", None)
+            screen = sm.get_screen("email_draft") if sm else None
+            state = str(draft.get("state") or "drafting").strip().lower()
+            _terminal = {"sent": "send", "saved": "save", "discarded": "discard"}
+            _action = _terminal.get(state)
+            # If a tap already committed the fly-away (and we've left the draft
+            # screen), this terminal echo from the model must NOT yank the user
+            # back to the draft page — the card has already flown off.
+            if (_action and screen is not None
+                    and getattr(screen, "_flyaway_committed", False)):
+                try:
+                    screen.set_draft(draft)
+                except Exception:
+                    pass
+                return
             if sm is not None and sm.current != "email_draft":
                 self.goto_screen("email_draft")
-            screen = sm.get_screen("email_draft") if sm else None
             if screen is not None:
                 # A new draft beginning after the previous one was sent/saved/
                 # discarded must start blank — don't merge into the old fields.
-                state = str(draft.get("state") or "drafting").strip().lower()
                 if state == "drafting" and getattr(screen, "draft_is_terminal", False):
                     screen.reset()
                 screen.set_draft(draft)
+                # Voice-initiated send/save/discard: the model reports the terminal
+                # state here (no button tap). Fly the card off toward the
+                # transcription page, matching the tap-driven animation.
+                if _action:
+                    self._commit_email_action(_action)
+            # If a prior contact was resolved via "None of these" + manual email,
+            # progress any queued ambiguous contacts only after this UI update.
+            self._drain_recipient_picker_queue()
         except Exception:
             logger.exception("Failed to render email draft directive")
+
+    def _on_email_view_directive(self, view: dict) -> None:
+        """Navigate to / update the email view screen from a show_email_view directive."""
+        if not isinstance(view, dict):
+            return
+        try:
+            sm = getattr(self, "screen_manager", None)
+            if sm is not None and sm.current != "emails":
+                self.goto_screen("emails")
+            screen = sm.get_screen("emails") if sm else None
+            if screen is not None:
+                screen.set_email(view)
+        except Exception:
+            logger.exception("Failed to render email view directive")
 
     def _on_task_creation_directive(self, task: dict) -> None:
         """Navigate to the voice task creation screen with pre-filled data."""
@@ -3039,8 +4235,70 @@ class MeetingBoxApp(App):
         except Exception:
             logger.exception("Failed to show voice task creation screen")
 
+    @staticmethod
+    def _task_tab_for_due(due_at: str | None) -> str:
+        """Map a task's due date to the Tasks screen tab that holds it
+        (today→Today, future→Upcoming, none/past→Unplanned/Unfinished). Reuses
+        the screen's own bucketing so the tab always matches where the row lands."""
+        try:
+            from screens.tasks import _categorize
+            return _categorize({"status": "", "due_at": (due_at or "").strip()}) or "unplanned"
+        except Exception:
+            return "unplanned"
+
+    def _navigate_to_tasks(self, tab: str | None, optimistic: tuple | None = None) -> None:
+        """Open the Tasks screen on *tab*, optionally showing a just-created task
+        immediately (``optimistic`` = (title, due_date))."""
+        sm = getattr(self, "screen_manager", None)
+        if sm is None:
+            return
+        try:
+            tsk = sm.get_screen("tasks")
+            if optimistic and hasattr(tsk, "add_optimistic_task"):
+                title, due = optimistic
+                landed = tsk.add_optimistic_task(title, due)
+                tab = tab or landed
+            if tab and hasattr(tsk, "set_active_tab"):
+                tsk.set_active_tab(tab)
+        except Exception:
+            logger.debug("tasks navigation prep failed", exc_info=True)
+        # Instant swap so the Tasks list is already behind the gliding card.
+        self.goto_screen("tasks", transition="none")
+
+    def _commit_task_action(self, action: str, navigate) -> None:
+        """Fly the task card away (once), then run *navigate*."""
+        sm = getattr(self, "screen_manager", None)
+        if sm is None:
+            if callable(navigate):
+                navigate()
+            return
+        try:
+            screen = sm.get_screen("voice_task_creation")
+        except Exception:
+            screen = None
+        if screen is not None and getattr(screen, "_flyaway_committed", False):
+            return
+        on_creation = sm.current == "voice_task_creation"
+        if screen is not None:
+            screen._flyaway_committed = True
+        if on_creation and screen is not None:
+            # Premium Apple-style genie (same engine as email draft).
+            try:
+                from components.email_genie import play_genie
+                play_genie(self, screen, action, navigate,
+                           completion={"send": ("Task Created", True),
+                                       "discard": ("Discarded", False)},
+                           reveal_under=True)
+            except Exception:
+                logger.exception("task genie failed; falling back to plain nav")
+                if callable(navigate):
+                    navigate()
+        elif callable(navigate):
+            navigate()
+
     def _on_task_creation_confirm_tapped(self) -> None:
-        """User tapped Confirm — create the task and return to voice session."""
+        """User tapped Confirm — create the task and land on the Tasks screen
+        (on the tab that holds it) so they can see it appear."""
         task = getattr(self, "_pending_task_data", None) or {}
         title       = str(task.get("title")       or "").strip()
         description = str(task.get("description") or "").strip() or None
@@ -3048,6 +4306,7 @@ class MeetingBoxApp(App):
         self._pending_task_data = {}
 
         async def _create():
+            saved = False
             try:
                 result = await self.backend.create_commitment(
                     title=title,
@@ -3062,74 +4321,588 @@ class MeetingBoxApp(App):
                 else:
                     logger.info("Voice task created: %s", result.get("id"))
                     msg = "Task saved."
+                    saved = True
             except Exception:
                 logger.exception("voice task creation API call failed")
                 msg = "Sorry, I couldn't save the task."
-            Clock.schedule_once(lambda _dt: self._inject_task_result(msg), 0)
+
+            def _after(_dt):
+                self._inject_task_result(msg)
+                # Reconcile the optimistic row with the real backend data.
+                if saved:
+                    try:
+                        sm = getattr(self, "screen_manager", None)
+                        if sm is not None and sm.current == "tasks":
+                            sm.get_screen("tasks")._load_tasks()
+                    except Exception:
+                        logger.debug("tasks refresh after create failed", exc_info=True)
+            Clock.schedule_once(_after, 0)
 
         run_async(_create())
 
-        try:
-            sm = getattr(self, "screen_manager", None)
-            if sm is not None:
-                self.goto_screen("voice_session")
-        except Exception:
-            logger.debug("task creation confirm: navigation failed", exc_info=True)
+        tab = self._task_tab_for_due(due_date)
+
+        def _nav():
+            self._navigate_to_tasks(tab, optimistic=(title, due_date))
+
+        self._commit_task_action("send", _nav)
 
     def _on_task_creation_discard_tapped(self) -> None:
-        """User tapped Discard — cancel and return to voice session."""
+        """User tapped Discard — cancel and return to the transcription page."""
         self._pending_task_data = {}
         self._send_voice_user_text(
             "[BUTTON:Discard] — the user cancelled task creation. Acknowledge briefly.",
             interrupt=True,
         )
-        try:
-            sm = getattr(self, "screen_manager", None)
-            if sm is not None:
-                self.goto_screen("voice_session")
-        except Exception:
-            logger.debug("task creation discard: navigation failed", exc_info=True)
 
-    def _on_task_creation_dismiss_directive(self) -> None:
+        def _nav():
+            if getattr(self, "screen_manager", None) is not None:
+                self.goto_screen("voice_session", transition="none")
+
+        self._commit_task_action("discard", _nav)
+
+    def _on_task_creation_dismiss_directive(self, info: dict | None = None) -> None:
         """Voice confirm/discard — server already saved (confirm) or cancelled
-        (discard) the task, so just clear pending state and return to the voice
-        transcription screen. No API call and no injected voice turn here: the
-        model speaks from the confirm_task_creation / discard_task_creation result."""
+        (discard) the task. On a successful save send the user to the Tasks
+        screen (on the tab holding it) so it's visible; on cancel/failure return
+        to the voice transcription page. The model still speaks from its own
+        confirm_task_creation / discard_task_creation result."""
+        info = info if isinstance(info, dict) else {}
         self._pending_task_data = {}
-        try:
+        task = info.get("task") if isinstance(info.get("task"), dict) else None
+        created = bool(info.get("ok", True)) and task is not None
+
+        if created:
+            tab = self._task_tab_for_due(str(task.get("due_at") or ""))
+
+            def _nav():
+                # Server already persisted it; a fresh fetch on the Tasks screen
+                # will surface the row, so no optimistic insert needed here.
+                self._navigate_to_tasks(tab)
+
+            self._commit_task_action("send", _nav)
+            return
+
+        def _nav_voice():
             sm = getattr(self, "screen_manager", None)
             if sm is not None and sm.current == "voice_task_creation":
                 self.goto_screen("voice_session")
-        except Exception:
-            logger.debug("task creation voice dismiss: navigation failed", exc_info=True)
+
+        self._commit_task_action("discard", _nav_voice)
 
     def _inject_task_result(self, message: str) -> None:
         """Inject the task-creation outcome as a voice turn into the live session."""
         self._send_voice_user_text(message)
 
+    # ── Calendar event creation ──────────────────────────────────────────────
+
+    def _on_calendar_event_directive(self, event: dict) -> None:
+        """Navigate to the calendar event creation screen with pre-filled data.
+
+        Sits on top of the live voice-session transcript; fields fill
+        progressively as the agent collects them.
+        """
+        if not isinstance(event, dict):
+            return
+        event_id  = str(event.get("event_id") or "").strip() or None
+        name      = str(event.get("name") or event.get("title") or "").strip()
+        date      = str(event.get("date") or "").strip() or None
+        time_str  = str(event.get("time") or "").strip() or None
+        raw_dur   = event.get("duration_minutes")
+        try:
+            duration_minutes = int(raw_dur) if raw_dur not in (None, "", 0) else None
+        except (TypeError, ValueError):
+            duration_minutes = None
+        attendees_mode = str(event.get("attendees_mode") or "replace").strip().lower()
+        if attendees_mode not in ("replace", "append"):
+            attendees_mode = "replace"
+        attendees = event.get("attendees")
+        if isinstance(attendees, str):
+            attendees = [attendees] if attendees.strip() else []
+        elif not isinstance(attendees, list):
+            attendees = None
+
+        prev = getattr(self, "_pending_event_data", None) or {}
+        prev_event_id = str(prev.get("event_id") or "").strip() or None
+        # Fresh invite workflow: whenever the model opens the invite screen
+        # without an event_id, start from a clean state and never reuse stale
+        # discarded/completed draft fields from an older invite.
+        is_new_open = (event_id is None) and bool(event.get("reset", True))
+        is_switch_existing_event = bool(event_id and event_id != prev_event_id)
+        if is_new_open:
+            prev = {}
+            try:
+                self._recipient_picker_queue = []
+                self._recipient_picker_active = None
+                overlay = getattr(self, "_recipient_overlay", None)
+                if overlay is not None and overlay.visible:
+                    overlay.close()
+            except Exception:
+                logger.debug("calendar fresh-flow recipient reset skipped", exc_info=True)
+        elif is_switch_existing_event:
+            # Opening a different existing event must not carry over attendee chips
+            # from a previous draft/edit card.
+            prev = {}
+
+        if event_id:
+            prev["event_id"] = event_id
+        if name:
+            prev["name"] = name
+        if date is not None:
+            prev["date"] = date
+        if time_str is not None:
+            prev["time"] = time_str
+        if duration_minutes is not None:
+            prev["duration_minutes"] = duration_minutes
+
+        attendees_before = len(prev.get("attendees", []))
+        if attendees is not None:
+            clean = [str(a).strip() for a in attendees if str(a).strip()]
+            if attendees_mode == "append":
+                merged = list(prev.get("attendees", []))
+                for a in clean:
+                    if a not in merged:
+                        merged.append(a)
+                prev["attendees"] = merged
+            else:
+                prev["attendees"] = clean
+        elif is_new_open:
+            prev["attendees"] = []
+        elif is_switch_existing_event:
+            prev["attendees"] = []
+
+        self._pending_event_data = prev
+
+        # Voice-driven attendee selection: when the model records a picked contact
+        # by appending it here (e.g. the user said "the first one" instead of
+        # tapping), the on-screen recipient picker for that person is no longer
+        # needed — close it and surface the next queued picker so the flow does not
+        # desync. (A tap already closes its own picker in _on_recipient_selected.)
+        if len(prev.get("attendees", [])) > attendees_before:
+            try:
+                active_picker = (
+                    dict(getattr(self, "_recipient_picker_active", {}) or {})
+                    if isinstance(getattr(self, "_recipient_picker_active", None), dict)
+                    else {}
+                )
+                self._close_active_recipient_picker(
+                    active_picker,
+                    advance=True,
+                    cancel_pending=False,
+                )
+            except Exception:
+                logger.debug("voice attendee picker-close skipped", exc_info=True)
+
+        try:
+            sm = getattr(self, "screen_manager", None)
+            if sm is not None and sm.current != "calendar_event_creation":
+                self.goto_screen("calendar_event_creation")
+            screen = sm.get_screen("calendar_event_creation") if sm else None
+            if screen is not None:
+                if (is_new_open or is_switch_existing_event) and hasattr(screen, "reset"):
+                    screen.reset()
+                    # Fresh open (or switching to a different existing event) can
+                    # happen while already on the same screen, so on_enter() may not
+                    # run; reset action-commit state here.
+                    try:
+                        screen._flyaway_committed = False
+                        if hasattr(screen, "restore_action_visuals"):
+                            screen.restore_action_visuals()
+                    except Exception:
+                        logger.debug("calendar fresh-flow visual reset skipped", exc_info=True)
+                screen.set_event_data(
+                    name=prev.get("name"),
+                    date=prev.get("date"),
+                    time_str=prev.get("time"),
+                    duration_minutes=prev.get("duration_minutes"),
+                    attendees=prev.get("attendees"),
+                    attendees_mode="replace",
+                )
+            # Progress queued ambiguous contacts only after event UI is updated.
+            self._drain_recipient_picker_queue()
+        except Exception:
+            logger.exception("Failed to show calendar event creation screen")
+
+    def _on_calendar_event_confirm_tapped(self) -> None:
+        """User tapped Confirm — ask the agent to create/update the calendar
+        event. The actual write runs server-side via the agent's calendar tool;
+        we stay on the create screen until the server's dismiss directive arrives
+        (it then sends us to the Calendar screen so the event is visible)."""
+        self._send_voice_user_text(
+            "[BUTTON:Confirm] — create the calendar event now with the details on screen.",
+            interrupt=True,
+        )
+
+    def _commit_calendar_action(self, action: str, navigate) -> None:
+        """Fly the calendar event card away (once), then run *navigate*.
+
+        ``action`` is "send" for a confirmed create and "discard" for a cancel.
+        Plays the flourish only while the create screen is still current."""
+        sm = getattr(self, "screen_manager", None)
+        if sm is None:
+            if callable(navigate):
+                navigate()
+            return
+        try:
+            screen = sm.get_screen("calendar_event_creation")
+        except Exception:
+            screen = None
+        if screen is not None and getattr(screen, "_flyaway_committed", False):
+            # A duplicated dismiss/commit should still complete navigation.
+            if callable(navigate):
+                navigate()
+            return
+        on_creation = sm.current == "calendar_event_creation"
+        if screen is not None:
+            screen._flyaway_committed = True
+        if on_creation and screen is not None:
+            # Premium Apple-style genie (same engine as email draft).
+            try:
+                from components.email_genie import play_genie
+                play_genie(self, screen, action, navigate,
+                           completion={"send": ("Added to Calendar", True),
+                                       "discard": ("Discarded", False)},
+                           reveal_under=True)
+            except Exception:
+                logger.exception("calendar genie failed; falling back to plain nav")
+                if callable(navigate):
+                    navigate()
+        elif callable(navigate):
+            navigate()
+
+    def _on_calendar_event_discard_tapped(self) -> None:
+        """User tapped Discard — cancel and return to voice session."""
+        self._pending_event_data = {}
+        self._last_attendee_selection = {}
+        self._send_voice_user_text(
+            "[BUTTON:Discard] — the user cancelled creating the calendar event. Acknowledge briefly.",
+            interrupt=True,
+        )
+
+        def _nav():
+            if getattr(self, "screen_manager", None) is not None:
+                self.goto_screen("voice_session", transition="none")
+
+        self._commit_calendar_action("discard", _nav)
+
+    def _on_calendar_event_dismiss_directive(self, info: dict | None = None) -> None:
+        """Voice OR tap confirm/discard — the server already created/updated
+        (confirm) or cancelled (discard) the event. On a successful save, send
+        the user to the Calendar screen (on the event's day) so they can see the
+        event reflected; on cancel/failure, return to the voice transcript."""
+        info = info if isinstance(info, dict) else {}
+        created = bool(info.get("created"))
+        action = str(info.get("action") or "").strip().lower()
+        # Capture the on-screen details BEFORE clearing so we can optimistically
+        # show the event on the calendar immediately.
+        pend = dict(getattr(self, "_pending_event_data", None) or {})
+        # Prefer the server-confirmed date, fall back to what was on screen.
+        date_str = str(info.get("date") or "").strip() or str(pend.get("date") or "").strip()
+        self._pending_event_data = {}
+        self._last_attendee_selection = {}
+
+        try:
+            sm = getattr(self, "screen_manager", None)
+            if sm is None:
+                return
+
+            if created:
+                def _nav_calendar():
+                    # Force the calendar to re-fetch so the latest data lands shortly.
+                    self.invalidate_calendar_cache()
+                    # Optimistically drop the just-created event into the calendar
+                    # cache so it shows the instant the screen opens — the real
+                    # fetch then reconciles it. Skip for edits (would duplicate the
+                    # existing row).
+                    if action != "updated":
+                        try:
+                            self._optimistic_add_calendar_event(date_str, pend)
+                        except Exception:
+                            logger.debug("optimistic calendar insert failed", exc_info=True)
+                    target = None
+                    try:
+                        if date_str:
+                            from datetime import date as _date
+                            y, m, d = (int(p) for p in date_str[:10].split("-"))
+                            target = _date(y, m, d)
+                    except Exception:
+                        target = None
+                    self._realtime_voice_navigate("calendar", target_date=target)
+
+                # Fly the event card off toward the Calendar screen (where the
+                # freshly-added event is now visible).
+                self._commit_calendar_action("send", _nav_calendar)
+                return
+
+            # Cancelled or failed save — go back to the voice transcript.
+            def _nav_voice():
+                if sm.current == "calendar_event_creation":
+                    self.goto_screen("voice_session", transition="none")
+
+            self._commit_calendar_action("discard", _nav_voice)
+        except Exception:
+            logger.debug("calendar event dismiss: navigation failed", exc_info=True)
+
+    def invalidate_calendar_cache(self) -> None:
+        """Drop the freshness of every cached calendar week so the next load
+        re-fetches from the backend (used after creating/updating an event so it
+        reflects on the calendar instantly)."""
+        try:
+            for key in list(self._ui_data_cache_ts.keys()):
+                if str(key).startswith("calendar_week:"):
+                    self._ui_data_cache_ts.pop(key, None)
+        except Exception:
+            logger.debug("invalidate_calendar_cache failed", exc_info=True)
+
+    def _optimistic_add_calendar_event(self, date_str: str, pend: dict) -> None:
+        """Inject a just-created event into the cached calendar week so it shows
+        immediately when the calendar screen opens. The background re-fetch
+        (cache freshness was just cleared) reconciles it with the real event."""
+        from datetime import date as _date, datetime as _dt, timedelta as _td
+
+        date_str = (date_str or "").strip()[:10]
+        if not date_str:
+            return
+        try:
+            y, m, d = (int(p) for p in date_str.split("-"))
+            ev_date = _date(y, m, d)
+        except Exception:
+            return
+
+        title = str(pend.get("name") or "").strip() or "New event"
+        time_str = str(pend.get("time") or "").strip()
+        hh, mm = 9, 0
+        if time_str:
+            try:
+                parts = time_str.replace(".", ":").split(":")
+                hh = max(0, min(23, int(parts[0])))
+                mm = max(0, min(59, int(parts[1]))) if len(parts) > 1 else 0
+            except Exception:
+                hh, mm = 9, 0
+        start = _dt(ev_date.year, ev_date.month, ev_date.day, hh, mm)
+        end = start + _td(minutes=30)
+
+        # Build attendee rows (count is what the tile renders).
+        attendees = []
+        for a in (pend.get("attendees") or []):
+            s = str(a or "").strip()
+            if not s:
+                continue
+            email = s[s.find("<") + 1:s.find(">")].strip() if ("<" in s and ">" in s) else s
+            attendees.append({"email": email})
+
+        meeting = {
+            "title": title,
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+            "duration": 1800,
+            "attendees": attendees,
+            "_optimistic": True,
+        }
+
+        # Cache key uses the Monday of the event's week.
+        monday = ev_date - _td(days=ev_date.weekday())
+        key = f"calendar_week:{monday.isoformat()}"
+        week = self.ui_cache_get(key)
+        if not (isinstance(week, dict) and isinstance(week.get("days"), dict)):
+            week = {"days": {}}
+        days = week.setdefault("days", {})
+        day = days.setdefault(date_str, {})
+        meetings = day.setdefault("meetings", [])
+        if not any(
+            isinstance(mt, dict) and mt.get("title") == title and str(mt.get("start", ""))[:16] == start.isoformat()[:16]
+            for mt in meetings
+        ):
+            meetings.append(meeting)
+        # Write straight into the cache dict WITHOUT marking it fresh, so the
+        # calendar screen's _load_week still re-fetches and reconciles.
+        self._ui_data_cache[key] = week
+
     def _on_recipient_picker_directive(self, query: str, candidates: list, field: str = "to") -> None:
-        """Show the recipient confirmation overlay from a show_recipient_picker directive."""
+        """Queue and show recipient picker directives one-at-a-time."""
         overlay = getattr(self, "_recipient_overlay", None)
         if overlay is None:
             return
-        # Remember which email field this picker resolves — used by _on_recipient_selected
-        # to decide whether the confirmed contact goes into "to", "cc", or "bcc".
-        self._picker_current_field = field if field in ("to", "cc", "bcc") else "to"
+        norm_field = field if field in ("to", "cc", "bcc", "attendee") else "to"
+        queue = getattr(self, "_recipient_picker_queue", None)
+        if not isinstance(queue, list):
+            queue = []
+            self._recipient_picker_queue = queue
+        queue.append({
+            "query": str(query or ""),
+            "candidates": list(candidates or []),
+            "field": norm_field,
+        })
+        self._drain_recipient_picker_queue()
+
+    @staticmethod
+    def _recipient_picker_signature(payload: dict | None) -> tuple:
+        """Stable signature for duplicate picker suppression."""
+        if not isinstance(payload, dict):
+            return ("", (), "to")
+        query = str(payload.get("query") or "").strip().lower()
+        field = str(payload.get("field") or "to").strip().lower()
+        raw_candidates = payload.get("candidates")
+        candidates = raw_candidates if isinstance(raw_candidates, list) else []
+        emails: list[str] = []
+        for c in candidates:
+            if not isinstance(c, dict):
+                continue
+            em = str(c.get("email") or "").strip().lower()
+            if em:
+                emails.append(em)
+        return (query, tuple(emails), field)
+
+    def _drop_duplicate_picker_queue_entries(self, reference_picker: dict | None) -> None:
+        """Remove queued duplicates of an already-resolved picker."""
+        queue = getattr(self, "_recipient_picker_queue", None)
+        if not isinstance(queue, list) or not queue:
+            return
+        ref_sig = self._recipient_picker_signature(reference_picker)
+        filtered: list[dict] = []
+        for item in queue:
+            if not isinstance(item, dict):
+                continue
+            if self._recipient_picker_signature(item) == ref_sig:
+                continue
+            filtered.append(item)
+        self._recipient_picker_queue = filtered
+
+    def _clear_recipient_picker_queue(self) -> None:
+        """Cancel all queued pickers for the current unresolved contact flow."""
+        self._recipient_picker_queue = []
+
+    def _close_active_recipient_picker(
+        self,
+        active_picker: dict | None = None,
+        *,
+        advance: bool,
+        cancel_pending: bool,
+    ) -> None:
+        """Finish the active picker lifecycle exactly once.
+
+        ``advance=True`` means a valid selection resolved the current person, so
+        the next queued person may appear after the close animation. ``advance``
+        is false for outside dismiss / "None" because the current person is not
+        resolved and queued future pickers would feel random or persistent.
+        """
+        overlay = getattr(self, "_recipient_overlay", None)
+        if overlay is not None and overlay.visible:
+            try:
+                overlay.close(cancel_pending=cancel_pending)
+            except TypeError:
+                overlay.close()
+        self._recipient_picker_active = None
+        if active_picker:
+            self._drop_duplicate_picker_queue_entries(active_picker)
+        if not advance:
+            self._clear_recipient_picker_queue()
+            return
+        self._schedule_recipient_picker_drain()
+
+    def _schedule_recipient_picker_drain(self, delay: float = 0.22) -> None:
+        """Show the next queued picker after the current one has visually closed."""
         try:
-            overlay.show_candidates(query, candidates or [])
+            Clock.schedule_once(lambda _dt: self._drain_recipient_picker_queue(), delay)
         except Exception:
+            self._drain_recipient_picker_queue()
+
+    def _drain_recipient_picker_queue(self) -> None:
+        """Render the next unresolved picker only when no picker is visible."""
+        overlay = getattr(self, "_recipient_overlay", None)
+        if overlay is None:
+            return
+        if overlay.visible:
+            return
+        try:
+            if float(getattr(overlay, "opacity", 0.0) or 0.0) > 0.05:
+                return
+        except Exception:
+            pass
+        active = getattr(self, "_recipient_picker_active", None)
+        if isinstance(active, dict):
+            # Wait for selection/dismiss to clear the current active picker.
+            return
+        queue = getattr(self, "_recipient_picker_queue", None)
+        if not isinstance(queue, list) or not queue:
+            return
+        nxt = queue.pop(0)
+        self._recipient_picker_active = nxt
+        self._picker_current_field = str(nxt.get("field") or "to")
+        try:
+            overlay.show_candidates(str(nxt.get("query") or ""), list(nxt.get("candidates") or []))
+        except Exception:
+            self._recipient_picker_active = None
             logger.exception("Failed to render recipient picker directive")
 
     def _on_recipient_selected(self, index: int, contact: dict) -> None:
         # overlay.close() is already called by RecipientConfirmOverlay._on_row_tap
         # (after the 400 ms highlight), but guard anyway.
+        active_picker = (
+            dict(getattr(self, "_recipient_picker_active", {}) or {})
+            if isinstance(getattr(self, "_recipient_picker_active", None), dict)
+            else {}
+        )
         overlay = getattr(self, "_recipient_overlay", None)
-        if overlay is not None and overlay.visible:
-            overlay.close()
+        self._close_active_recipient_picker(
+            active_picker,
+            advance=True,
+            cancel_pending=False,
+        )
         email = (contact or {}).get("email", "")
         name = (contact or {}).get("name", "") or email
         if not email:
+            self._schedule_recipient_picker_drain()
             return
+
+        # Calendar attendee selection reuses this same picker overlay. When the
+        # picker was opened for an attendee (or we're on the calendar event
+        # screen), add the chosen contact as an attendee chip and stay put —
+        # do NOT route into the email draft flow.
+        field = getattr(self, "_picker_current_field", "to")
+        sm = getattr(self, "screen_manager", None)
+        on_cal = sm is not None and sm.current == "calendar_event_creation"
+        # Treat the pick as an attendee whenever we're in an active calendar-event
+        # flow — even if the model forgot to pass field="attendee" or the picker
+        # was shown before the event screen opened. _pending_event_data is only
+        # populated between show_calendar_event and the confirm/discard dismissal.
+        # An explicit email field (to/cc/bcc) still wins unless we're literally on
+        # the event screen, so email drafting is never misrouted.
+        in_event_flow = bool(getattr(self, "_pending_event_data", None))
+        explicit_email = field in ("to", "cc", "bcc")
+        if field == "attendee" or on_cal or (in_event_flow and not explicit_email):
+            try:
+                if sm is not None and sm.current != "calendar_event_creation":
+                    self.goto_screen("calendar_event_creation")
+                screen = sm.get_screen("calendar_event_creation") if sm else None
+                if screen is not None and hasattr(screen, "add_attendee"):
+                    disp = f"{name} <{email}>" if (name and name != email) else email
+                    screen.add_attendee(disp)
+                    pend = getattr(self, "_pending_event_data", None) or {}
+                    att = list(pend.get("attendees", []))
+                    if disp not in att:
+                        att.append(disp)
+                    pend["attendees"] = att
+                    self._pending_event_data = pend
+                    self._last_attendee_selection = {
+                        "name": name,
+                        "email": email,
+                        "display": disp,
+                        "query": str(active_picker.get("query") or name or email),
+                        "candidates": list(active_picker.get("candidates") or []),
+                    }
+            except Exception:
+                logger.debug("calendar attendee fill failed", exc_info=True)
+            # The tapped card IS the confirmation and the chip is already on the
+            # invite — phrase this so the model records the address and does NOT
+            # re-open the contact picker (which would make the popup reappear).
+            self._send_voice_user_text(
+                f"I selected {name} ({email}) as an attendee — they're confirmed and "
+                f"already added to the invite on screen. Do not look them up again.",
+                interrupt=True,
+            )
+            return
+
         # After confirming a recipient, ensure we land on the email draft page
         # so "go back to email screen" always works (even before show_email_draft
         # has arrived).  The screen starts in blank/loading state; set_draft()
@@ -3163,20 +4936,213 @@ class MeetingBoxApp(App):
         )
 
     def _on_recipient_dismissed(self) -> None:
-        overlay = getattr(self, "_recipient_overlay", None)
-        if overlay is not None:
-            overlay.close()
+        active_picker = (
+            dict(getattr(self, "_recipient_picker_active", {}) or {})
+            if isinstance(getattr(self, "_recipient_picker_active", None), dict)
+            else {}
+        )
+        self._close_active_recipient_picker(
+            active_picker,
+            advance=False,
+            cancel_pending=True,
+        )
 
     def _on_recipient_none(self) -> None:
         """User tapped 'None' in the recipient picker — inject voice turn."""
         # overlay already closed by RecipientConfirmOverlay._on_row_tap
-        self._send_voice_user_text("None of those.", interrupt=True)
+        active_picker = (
+            dict(getattr(self, "_recipient_picker_active", {}) or {})
+            if isinstance(getattr(self, "_recipient_picker_active", None), dict)
+            else {}
+        )
+        self._close_active_recipient_picker(
+            active_picker,
+            advance=False,
+            cancel_pending=False,
+        )
+        self._send_voice_user_text(
+            "I couldn't find the correct contact. Please provide the email address.",
+            interrupt=True,
+        )
+
+    @staticmethod
+    def _parse_recipient_voice_choice(text: str, max_index: int) -> int | None:
+        """Map spoken choice text to a 1-based picker index."""
+        s = str(text or "").strip().lower()
+        if not s or max_index <= 0:
+            return None
+
+        def _clamp(i: int) -> int | None:
+            return i if 1 <= i <= max_index else None
+
+        # Explicit "none" choice should always map to the final row.
+        if "none of these" in s or "none of those" in s:
+            return max_index
+
+        # Common ordinal/cardinal words used in speech.
+        word_to_idx = {
+            "first": 1, "one": 1, "1": 1,
+            "second": 2, "two": 2, "2": 2,
+            "third": 3, "three": 3, "3": 3,
+            "fourth": 4, "four": 4, "4": 4,
+            "fifth": 5, "five": 5, "5": 5,
+            "sixth": 6, "six": 6, "6": 6,
+            "seventh": 7, "seven": 7, "7": 7,
+            "eighth": 8, "eight": 8, "8": 8,
+            "ninth": 9, "nine": 9, "9": 9,
+            "tenth": 10, "ten": 10, "10": 10,
+        }
+        for token in re.findall(r"[a-z0-9]+", s):
+            idx = word_to_idx.get(token)
+            if idx is not None:
+                c = _clamp(idx)
+                if c is not None:
+                    return c
+
+        # Fallback for bare numerals in phrases.
+        m = re.search(r"\b(\d{1,2})\b", s)
+        if m:
+            try:
+                return _clamp(int(m.group(1)))
+            except Exception:
+                return None
+        return None
+
+    @staticmethod
+    def _match_recipient_voice_choice(text: str, candidates: list[dict]) -> int | None:
+        """Resolve voice choice by matching spoken name/email to candidates."""
+        s = str(text or "").strip().lower()
+        if not s:
+            return None
+        tokens = set(re.findall(r"[a-z0-9]+", s))
+        for i, c in enumerate(candidates or [], start=1):
+            email = str((c or {}).get("email") or "").strip().lower()
+            name = str((c or {}).get("name") or "").strip().lower()
+            if email and email in s:
+                return i
+            if name and name in s:
+                return i
+            if name:
+                ntoks = [t for t in re.findall(r"[a-z0-9]+", name) if len(t) >= 3]
+                if ntoks and all(t in tokens for t in ntoks[:2]):
+                    return i
+        return None
+
+    def _try_apply_active_picker_voice_choice(self, text: str) -> bool:
+        """Apply a voice selection to the currently-visible picker if possible."""
+        try:
+            recip = getattr(self, "_recipient_overlay", None)
+            active = getattr(self, "_recipient_picker_active", None)
+            if not (
+                isinstance(active, dict)
+                and recip is not None
+                and recip.visible
+            ):
+                return False
+            candidates = list(active.get("candidates") or [])
+            max_index = len(candidates) + 1
+            idx = self._parse_recipient_voice_choice(text, max_index)
+            if idx is None:
+                idx = self._match_recipient_voice_choice(text, candidates)
+            if idx is None:
+                return False
+            return bool(hasattr(recip, "select_index") and recip.select_index(idx))
+        except Exception:
+            logger.debug("voice recipient choice parsing failed", exc_info=True)
+            return False
+
+    @staticmethod
+    def _looks_like_picker_correction(text: str) -> bool:
+        s = str(text or "").strip().lower()
+        if not s:
+            return False
+        correction_cues = (
+            "no i meant",
+            "i meant",
+            "not that one",
+            "wrong one",
+            "wrong contact",
+            "wrong email",
+            "the first one",
+            "the second one",
+            "the third one",
+            "the fourth one",
+            "the fifth one",
+            "first one",
+            "second one",
+            "third one",
+            "fourth one",
+            "fifth one",
+        )
+        return any(c in s for c in correction_cues)
+
+    @staticmethod
+    def _remove_one_local_dot(email: str) -> str:
+        s = str(email or "").strip()
+        if "@" not in s:
+            return s
+        local, domain = s.split("@", 1)
+        if "." not in local:
+            return s
+        idx = local.find(".")
+        local = local[:idx] + local[idx + 1:]
+        return f"{local}@{domain}"
+
+    # ── Action fly-away animation (send / save / discard card flies off) ─────
+    # The premium genie lives in components/email_genie.py (play_genie); each
+    # creation screen's committer calls it directly.
+
+    def _commit_email_action(self, action: str) -> None:
+        """Fly the email card away (once) and land on the transcription page.
+
+        Triggered both by a button tap (optimistic) and by the server's terminal
+        ``show_email_draft`` state (voice-initiated send/save/discard)."""
+        sm = getattr(self, "screen_manager", None)
+        if sm is None:
+            return
+        try:
+            screen = sm.get_screen("email_draft")
+        except Exception:
+            screen = None
+        if screen is None or getattr(screen, "_flyaway_committed", False):
+            return
+        screen._flyaway_committed = True
+        # Mark the draft terminal immediately so draft_is_terminal returns True
+        # on the next show_email_draft directive, ensuring reset() is called for
+        # the next fresh draft — regardless of whether the model echoes a terminal
+        # state back via show_email_draft.
+        _terminal_states = {"send": "sent", "save": "saved", "discard": "discarded"}
+        screen._state = _terminal_states.get(action, "discarded")
+        try:
+            screen._cancel_auto_back()
+        except Exception:
+            pass
+        target = "voice_session" if sm.has_screen("voice_session") else "home"
+
+        def _nav():
+            if sm.current == "email_draft":
+                # Instant swap so the transcription page is simply *there* behind
+                # the card as it glides off — no competing cross-fade/ghosting.
+                self.goto_screen(target, transition="none")
+
+        if sm.current == "email_draft":
+            # Premium Apple-style genie (shared engine; calendar/task use play_genie).
+            try:
+                from components.email_genie import play_email_genie
+                play_email_genie(self, screen, action, _nav)
+            except Exception:
+                logger.exception("email genie failed; falling back to plain nav")
+                _nav()
+        else:
+            _nav()
 
     def _on_email_draft_send_tapped(self) -> None:
         self._send_voice_user_text("Yes, send it.")
+        self._commit_email_action("send")
 
     def _on_email_draft_save_tapped(self) -> None:
         self._send_voice_user_text("Save it as a draft.")
+        self._commit_email_action("save")
 
     def _on_email_draft_discard_tapped(self) -> None:
         # Use an unambiguous signal so the model does NOT confuse this with a
@@ -3185,6 +5151,7 @@ class MeetingBoxApp(App):
         self._send_voice_user_text(
             "[BUTTON:Discard] — delete this draft immediately, do NOT save it to Gmail drafts."
         )
+        self._commit_email_action("discard")
 
     def _sync_transcript_overlay_mode(self, screen_name: str | None = None) -> None:
         """Sync the transcript overlay mode for the current screen.
@@ -3201,9 +5168,10 @@ class MeetingBoxApp(App):
         )
         # Always compact — the full-screen overlay mode is no longer used.
         overlay.set_compact(True)
-        if name in ('home', 'voice_session', 'email_draft', 'voice_task_creation'):
-            # Home + voice-session + email_draft + voice_task_creation all handle
-            # transcription natively; keep overlay hidden.
+        if name in ('home', 'voice_session', 'email_draft', 'voice_task_creation', 'calendar_event_creation', 'tasks', 'calendar', 'morning_brief'):
+            # Home + voice-session + email_draft + voice_task_creation handle
+            # transcription natively; the tasks and calendar screens intentionally
+            # hide the bottom transcript strip. Keep the overlay hidden on all of these.
             overlay.suppress_auto_show = True
             overlay.hide()
         else:
@@ -3219,21 +5187,70 @@ class MeetingBoxApp(App):
         except Exception:
             pass
 
+    def _schedule_say_bar_update(self, speaker: str, text: str) -> None:
+        """Coalesce streaming say-bar updates into a single pending frame.
+
+        Transcript deltas/partials previously scheduled a fresh
+        ``Clock.schedule_once`` per token, so a long response could leave a
+        growing backlog of one-shots if the UI thread fell behind. Only the
+        latest text matters for the say bar, so keep just one pending callback
+        and let it read the most recent value. Callers run on the Kivy thread.
+        """
+        self._pending_say_bar = (speaker, text)
+        if getattr(self, "_say_bar_update_ev", None) is not None:
+            return
+
+        def _apply(_dt):
+            self._say_bar_update_ev = None
+            pending = getattr(self, "_pending_say_bar", None)
+            if not pending:
+                return
+            sp, tx = pending
+            if (self.screen_manager is not None
+                    and self.screen_manager.current in ('home', 'voice_session')):
+                try:
+                    self.screen_manager.get_screen('home').update_say_bar_transcription(sp, tx)
+                except Exception:
+                    pass
+
+        self._say_bar_update_ev = Clock.schedule_once(_apply, 0)
+
     def _end_realtime_voice_session(self) -> None:
+        # Capture connection/start state BEFORE resetting it below. The
+        # post-session wake suppression and the short-failed local fallback both
+        # depend on whether the session actually connected. Reading these after
+        # the reset (the previous behaviour) made `connected` always False, so
+        # the wake suppression never armed — the conversation tail / room echo
+        # was instantly misheard as the wake phrase and re-opened a session
+        # right after the user said goodbye.
+        started = getattr(self, "_realtime_session_start_monotonic", None)
+        connected = getattr(self, "_realtime_connected_ok", False)
         self._realtime_mic_acquired = False
         self._realtime_connected_ok = False
         self._pending_user_msg_id = None
+        self._current_user_msg_id = None
+        self._user_msg_by_item.clear()
+        # The grounded summary context lives only as long as this session; the
+        # injected context dies with the websocket, so just reset local tracking
+        # so the next session can re-ground on a freshly opened summary.
+        self._active_summary_meeting_id = None
+        self._pending_summary_context = None
         self._set_voice_runtime_state("idle")
         if self._transcript_overlay is not None:
             self._transcript_overlay.hide()
+            # Drop this conversation's chat widgets now that the session ended.
+            # They were previously only cleared when the *next* session started,
+            # so every past conversation stayed laid out in memory and the UI
+            # got progressively heavier the longer the device ran.
+            self._transcript_overlay.clear_session()
         # Tear down the email workflow when the voice session ends.
         recip = getattr(self, "_recipient_overlay", None)
         if recip is not None and recip.visible:
             recip.close()
-        # Navigate back to home if the user is still on the email draft screen.
+        # Navigate back to home if the user is still on a voice-driven screen.
         try:
             sm = getattr(self, "screen_manager", None)
-            if sm is not None and sm.current == "email_draft":
+            if sm is not None and sm.current in ("email_draft", "emails"):
                 self.goto_screen("home")
         except Exception:
             pass
@@ -3247,8 +5264,6 @@ class MeetingBoxApp(App):
             pass
         Clock.schedule_once(lambda _dt: self._clear_home_say_bar(), 0)
         sess = self._realtime_voice_session
-        started = getattr(self, "_realtime_session_start_monotonic", None)
-        connected = getattr(self, "_realtime_connected_ok", False)
         if sess is not None:
             try:
                 sess.stop()
@@ -3344,6 +5359,7 @@ class MeetingBoxApp(App):
         self._realtime_connected_ok = False
         self._realtime_session_start_monotonic = time.monotonic()
         self._sync_voice_assistant_state()
+        self._apply_pending_summary_context_to(sess)
         try:
             sess.activate()
         except Exception:
@@ -3533,7 +5549,18 @@ class MeetingBoxApp(App):
             unexpected = False
             try:
                 if sess is not None:
-                    activated = bool(getattr(sess, "_activate_requested", True))
+                    # "activated" must only be False for a warm-standby session
+                    # that dropped before it was ever woken — that is the lone
+                    # case we discard quietly. A cold session (minted directly on
+                    # wake when no warm standby was ready) never calls activate(),
+                    # so _activate_requested stays False; treating it as "not
+                    # activated" would skip _end_realtime_voice_session(), leaving
+                    # the mic held and the wake listener paused forever (the
+                    # second-wake-dead bug). Qualify on _prewarm so only true
+                    # warm-standby drops take the discard path.
+                    is_warm_standby = bool(getattr(sess, "_prewarm", False))
+                    requested = bool(getattr(sess, "_activate_requested", True))
+                    activated = requested or not is_warm_standby
                 if sess is not None and hasattr(sess, "ended_unexpectedly"):
                     unexpected = bool(sess.ended_unexpectedly())
             except Exception:
@@ -3547,44 +5574,28 @@ class MeetingBoxApp(App):
                     if self._warm_voice_session is _s:
                         self._warm_voice_session = None
                     self._warm_voice_pending = False
-                    self._schedule_voice_prewarm(delay=1.0)
+                    self._schedule_voice_prewarm(delay=0.2)
                 Clock.schedule_once(_after_warm_end, 0)
                 return
 
             def _after_end(_dt):
                 self._end_realtime_voice_session()
                 if unexpected:
-                    # Only auto-reconnect once per wake-word event.  If the
-                    # reconnect session also ends unexpectedly we fall back to
-                    # wake listening rather than looping forever and locking
-                    # the mic away from the wake listener.
-                    reconnect_count = getattr(self, "_realtime_reconnect_count", 0)
-                    if reconnect_count < 1:
-                        self._realtime_reconnect_count = reconnect_count + 1
-                        logger.info("Realtime session ended unexpectedly; auto-reconnecting (attempt %d).", reconnect_count + 1)
-                        # Re-arm the launch permission (normally set by the
-                        # wake word) so the reconnect bypasses the arming check.
-                        self._realtime_launch_permitted = True
-
-                        def _reconnect(_dt2):
-                            try:
-                                self._start_realtime_voice_session()
-                            except Exception:
-                                logger.exception("Realtime auto-reconnect failed")
-
-                        Clock.schedule_once(_reconnect, 0.3)
-                    else:
-                        self._realtime_reconnect_count = 0
-                        logger.info(
-                            "Realtime session ended unexpectedly after reconnect attempt; "
-                            "returning to wake listening."
-                        )
-                        self._schedule_voice_prewarm(delay=1.0)
-                else:
-                    # Clean end of a conversation — re-arm a warm standby
-                    # session so the NEXT wake word is instant again.
-                    self._realtime_reconnect_count = 0
-                    self._schedule_voice_prewarm(delay=1.0)
+                    # An unexpected drop (network stall, OpenAI session cap)
+                    # must NOT silently re-open a LIVE, hot-mic session. Doing
+                    # so made the assistant answer ambient speech with no wake
+                    # word after a network-induced close had already dumped the
+                    # user to the home screen ("yes I'm listening" out of
+                    # nowhere). Re-arm a WARM STANDBY instead: the session is
+                    # reconnected in the background and held silent until the
+                    # next "Hey Pepper", so the next wake is still instant but
+                    # the mic never goes live on its own.
+                    logger.info(
+                        "Realtime session ended unexpectedly; re-arming warm "
+                        "standby (wake word required to resume)."
+                    )
+                self._realtime_reconnect_count = 0
+                self._schedule_voice_prewarm(delay=0.2)
 
             Clock.schedule_once(_after_end, 0)
 
@@ -3609,15 +5620,11 @@ class MeetingBoxApp(App):
                     duration=None,
                 )
                 self._sync_voice_assistant_state()
-                # Clear previous session's transcript and show overlay
+                # Clear the previous session's transcript history. The bottom
+                # transcript strip itself is retired (old UI) and never shown;
+                # home/voice-session transcription is handled by the say bar.
                 if self._transcript_overlay is not None:
                     self._transcript_overlay.clear_session()
-                    self._sync_transcript_overlay_mode()
-                    # Home and voice_session both handle transcription natively;
-                    # on all other screens show the compact overlay strip.
-                    if not (self.screen_manager
-                            and self.screen_manager.current in ('home', 'voice_session')):
-                        self._transcript_overlay.show()
                 # Reset home say bar for the new session
                 self._clear_home_say_bar()
 
@@ -3625,6 +5632,9 @@ class MeetingBoxApp(App):
 
         def _on_rt_state(state: str) -> None:
             self._set_voice_runtime_state(state)
+            if getattr(self, "_voice_control_bar", None) is not None:
+                # Global overlay is the single source of truth for pill state.
+                return
 
             def _update_home(_dt):
                 if self.screen_manager is None:
@@ -3640,9 +5650,24 @@ class MeetingBoxApp(App):
                         self.screen_manager.get_screen('email_draft').set_voice_session_state(state)
                     except Exception:
                         pass
+                elif current == 'emails':
+                    try:
+                        self.screen_manager.get_screen('emails').set_voice_session_state(state)
+                    except Exception:
+                        pass
                 elif current == 'voice_task_creation':
                     try:
                         self.screen_manager.get_screen('voice_task_creation').set_voice_session_state(state)
+                    except Exception:
+                        pass
+                elif current == 'calendar_event_creation':
+                    try:
+                        self.screen_manager.get_screen('calendar_event_creation').set_voice_session_state(state)
+                    except Exception:
+                        pass
+                elif current == 'summary_review':
+                    try:
+                        self.screen_manager.get_screen('summary_review').set_voice_session_state(state)
                     except Exception:
                         pass
 
@@ -3663,48 +5688,69 @@ class MeetingBoxApp(App):
             if not getattr(self, "_pending_user_msg_id", None):
                 self._pending_user_msg_id = overlay.add_user_message("…")
             # Update home say bar with a placeholder immediately
-            def _say_bar_placeholder(_dt):
-                if (self.screen_manager is not None
-                        and self.screen_manager.current in ('home', 'voice_session')):
-                    try:
-                        self.screen_manager.get_screen('home').update_say_bar_transcription("You", "…")
-                    except Exception:
-                        pass
-            Clock.schedule_once(_say_bar_placeholder, 0)
+            self._schedule_say_bar_update("You", "…")
 
-        def _on_user_transcript(text: str, is_final: bool = True) -> None:
+        def _on_user_transcript_rejected(item_id: str = "") -> None:
+            # The turn's transcript was rejected as a phantom (echo/noise
+            # hallucination). Remove the turn's bubble — whether it is still
+            # the "…" placeholder or was already painted by streaming
+            # partials — so the rejected turn leaves no trace on screen.
+            overlay = self._transcript_overlay
+            bound = self._user_msg_by_item.pop(item_id, None) if item_id else None
+            pending = getattr(self, "_pending_user_msg_id", None)
+            if overlay is not None:
+                if bound:
+                    overlay.remove_message(bound)
+                if pending and pending != bound:
+                    overlay.remove_message(pending)
+            self._pending_user_msg_id = None
+            if bound and getattr(self, "_current_user_msg_id", None) == bound:
+                self._current_user_msg_id = None
+
+        def _on_user_transcript(
+            text: str, is_final: bool = True, item_id: str = ""
+        ) -> None:
             overlay = self._transcript_overlay
             if overlay is None:
                 return
+            bound = self._user_msg_by_item.get(item_id) if item_id else None
             pending = getattr(self, "_pending_user_msg_id", None)
             current = getattr(self, "_current_user_msg_id", None)
-            if pending:
+            if bound:
+                # This turn already has a bubble: update it in place, even if
+                # a newer turn's placeholder exists. A slow transcription for
+                # turn N must never leak into turn N+1's bubble.
+                overlay.update_user_message(bound, text)
+                msg_id = bound
+            elif pending:
                 # First transcript event for this utterance: replace the "…"
                 # placeholder and remember the bubble id for subsequent deltas.
                 overlay.update_user_message(pending, text)
                 msg_id = pending
                 self._pending_user_msg_id = None
                 self._current_user_msg_id = msg_id
-            elif current:
-                # Subsequent partial delta or the final .completed event:
-                # update the same bubble in place — never create a new one.
+            elif current and not item_id:
+                # Live caption partial (no item identity): update the active
+                # bubble in place — never create a new one.
                 overlay.update_user_message(current, text)
                 msg_id = current
             else:
-                # No placeholder and no active bubble (e.g. speech_stopped
-                # never fired): create a fresh bubble and track it.
+                # No placeholder and no bubble for this turn (e.g.
+                # speech_stopped never fired): create a fresh bubble.
                 msg_id = overlay.add_user_message(text)
                 self._current_user_msg_id = msg_id
+            if item_id:
+                self._user_msg_by_item[item_id] = msg_id
+                while len(self._user_msg_by_item) > 8:
+                    self._user_msg_by_item.pop(next(iter(self._user_msg_by_item)))
 
             # Also update home say bar / voice-session transcript with user text
-            def _say_bar_user(_dt, _t=text):
-                if (self.screen_manager is not None
-                        and self.screen_manager.current in ('home', 'voice_session')):
-                    try:
-                        self.screen_manager.get_screen('home').update_say_bar_transcription("You", _t)
-                    except Exception:
-                        pass
-            Clock.schedule_once(_say_bar_user, 0)
+            self._schedule_say_bar_update("You", text)
+
+            # Parse picker choices on partials too; final ASR can be clipped
+            # ("The") while a prior partial already contained "first one".
+            if self._try_apply_active_picker_voice_choice(text):
+                return
 
             # Grammar correction — run only on the FINAL transcript so we
             # don't fire an API call (and flicker the bubble) for every
@@ -3713,6 +5759,87 @@ class MeetingBoxApp(App):
             # correction pass.
             if not is_final:
                 return
+            try:
+                # Immediate mistake recovery while editing invite attendees:
+                # after a wrong picker choice, let "No, I meant first/second"
+                # reopen and resolve the same contact without restarting flow.
+                if self._looks_like_picker_correction(text):
+                    last = getattr(self, "_last_attendee_selection", None) or {}
+                    if isinstance(last, dict) and last.get("email"):
+                        max_index = len(list(last.get("candidates") or [])) + 1
+                        idx = self._parse_recipient_voice_choice(text, max_index)
+                        if idx is None:
+                            idx = self._match_recipient_voice_choice(
+                                text, list(last.get("candidates") or [])
+                            )
+                        if idx is not None and max_index > 1:
+                            sm = getattr(self, "screen_manager", None)
+                            screen = sm.get_screen("calendar_event_creation") if sm else None
+                            old_disp = str(last.get("display") or "").strip()
+                            old_name = str(last.get("name") or "").strip() or str(last.get("email") or "").strip()
+                            if screen is not None and old_disp and hasattr(screen, "remove_attendee"):
+                                screen.remove_attendee(old_disp)
+                            pend = getattr(self, "_pending_event_data", None) or {}
+                            old_list = list(pend.get("attendees", []))
+                            pend["attendees"] = [a for a in old_list if str(a).strip() != old_disp]
+                            self._pending_event_data = pend
+                            self._recipient_picker_queue.insert(0, {
+                                "query": str(last.get("query") or old_name),
+                                "candidates": list(last.get("candidates") or []),
+                                "field": "attendee",
+                            })
+                            self._send_voice_user_text(
+                                f"I removed {old_name} and reopened choices. Please select again.",
+                                interrupt=True,
+                            )
+                            self._last_attendee_selection = {}
+                            self._drain_recipient_picker_queue()
+                            return
+            except Exception:
+                logger.debug("calendar attendee correction recovery failed", exc_info=True)
+
+            try:
+                # In-draft attendee email cleanup ("remove dot from Vivek's email").
+                txt = str(text or "").strip().lower()
+                if "remove dot" in txt and "email" in txt:
+                    pend = getattr(self, "_pending_event_data", None) or {}
+                    att = list(pend.get("attendees", []))
+                    if att:
+                        target_idx = None
+                        for i, item in enumerate(att):
+                            raw = str(item or "").strip()
+                            em = raw[raw.find("<") + 1:raw.find(">")].strip() if ("<" in raw and ">" in raw) else raw
+                            nm = raw.split("<", 1)[0].strip().lower() if "<" in raw else em.split("@", 1)[0].lower()
+                            if nm and nm in txt:
+                                target_idx = i
+                                break
+                        if target_idx is None:
+                            target_idx = len(att) - 1
+                        raw = str(att[target_idx] or "").strip()
+                        if "<" in raw and ">" in raw:
+                            disp_name = raw.split("<", 1)[0].strip()
+                            em_old = raw[raw.find("<") + 1:raw.find(">")].strip()
+                            em_new = self._remove_one_local_dot(em_old)
+                            updated = f"{disp_name} <{em_new}>" if disp_name else em_new
+                        else:
+                            em_old = raw
+                            em_new = self._remove_one_local_dot(em_old)
+                            updated = em_new
+                        if updated != raw:
+                            att[target_idx] = updated
+                            pend["attendees"] = att
+                            self._pending_event_data = pend
+                            sm = getattr(self, "screen_manager", None)
+                            screen = sm.get_screen("calendar_event_creation") if sm else None
+                            if screen is not None and hasattr(screen, "set_attendees"):
+                                screen.set_attendees(att)
+                            self._send_voice_user_text(
+                                f"Updated that attendee email to {em_new}.",
+                                interrupt=True,
+                            )
+                            return
+            except Exception:
+                logger.debug("calendar attendee dot edit failed", exc_info=True)
             if not text or len(text) < 4:
                 return
             _backend = BACKEND_URL
@@ -3755,14 +5882,7 @@ class MeetingBoxApp(App):
                 return
             overlay.stream_ai_message(item_id, accumulated)
             # Also update home say bar / voice-session transcript with AI text
-            def _say_bar_ai(_dt, _t=accumulated):
-                if (self.screen_manager is not None
-                        and self.screen_manager.current in ('home', 'voice_session')):
-                    try:
-                        self.screen_manager.get_screen('home').update_say_bar_transcription("AI", _t)
-                    except Exception:
-                        pass
-            Clock.schedule_once(_say_bar_ai, 0)
+            self._schedule_say_bar_update("AI", accumulated)
 
         try:
             if not prewarm:
@@ -3784,12 +5904,17 @@ class MeetingBoxApp(App):
                 on_ai_transcript=_on_ai_transcript,
                 on_ai_transcript_delta=_on_ai_transcript_delta,
                 on_user_speech_stopped=_on_user_speech_stopped,
+                on_user_transcript_rejected=_on_user_transcript_rejected,
                 on_email_draft=self._on_email_draft_directive,
+                on_email_view=self._on_email_view_directive,
                 on_recipient_picker=self._on_recipient_picker_directive,
                 on_task_creation=self._on_task_creation_directive,
                 on_task_dismiss=self._on_task_creation_dismiss_directive,
+                on_calendar_event=self._on_calendar_event_directive,
+                on_calendar_event_dismiss=self._on_calendar_event_dismiss_directive,
                 on_start_recording=self._realtime_handle_start_recording,
                 should_suppress_farewell=self._email_workflow_active,
+                brief_data_provider=self._voice_brief_facts,
                 prewarm=prewarm,
             )
             if prewarm:
@@ -3801,6 +5926,7 @@ class MeetingBoxApp(App):
             else:
                 self._realtime_voice_session = sess
                 self._sync_voice_assistant_state()
+                self._apply_pending_summary_context_to(sess)
                 sess.start()
         except Exception:
             logger.exception("Realtime voice session failed to start")
@@ -3853,7 +5979,16 @@ class MeetingBoxApp(App):
 
             aplay = shutil.which("aplay")
             if not aplay:
-                logger.debug("aplay not found — cannot play OpenAI TTS audio")
+                # No ALSA (Windows/macOS): play the raw 24 kHz PCM16 through
+                # PortAudio via the cross-platform audio_output helper.
+                try:
+                    import audio_output
+
+                    if audio_output.play_pcm16(audio_bytes, sample_rate=24000, channels=1):
+                        return True
+                    logger.debug("OpenAI TTS PortAudio playback failed")
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("OpenAI TTS PortAudio playback error: %s", exc)
                 return False
 
             import tempfile
@@ -3905,6 +6040,23 @@ class MeetingBoxApp(App):
             # --- 0. OpenAI TTS via server (natural AI voice — best quality) ---
             if self._speak_via_openai_tts(phrase):
                 return True
+
+            # --- 0b. Windows/macOS native speech (SAPI5 / NSSpeechSynthesizer) ---
+            # The offline Linux engines below (piper/mimic3/espeak) do not exist
+            # on desktop OSes, so use the OS speech engine via pyttsx3.
+            if not sys.platform.startswith("linux"):
+                try:
+                    import tts_windows
+
+                    if tts_windows.is_available():
+                        vol = int(getattr(self, "assistant_speech_volume", 85) or 85)
+                        if tts_windows.speak(phrase, volume=vol):
+                            return True
+                        logger.debug("Windows/macOS TTS returned False")
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("Windows/macOS TTS error: %s", exc)
+                # No further offline engines exist on this OS.
+                return False
 
             amp_n = self._espeak_amplitude()
             if amp_n <= 0:
@@ -4246,7 +6398,8 @@ class MeetingBoxApp(App):
         if not self._voice_start_confirmation_pending:
             return
         self._voice_start_confirmation_pending = False
-        self._voice_reply(self.voice_confirmation_text, state="speaking", duration=3.0)
+        msg = "Notes started" if self.current_recording_mode == "note" else self.voice_confirmation_text
+        self._voice_reply(msg, state="speaking", duration=3.0)
 
     def _handle_voice_intent(self, intent: VoiceIntent) -> None:
         Clock.schedule_once(lambda _dt, iv=intent: self._process_voice_intent(iv), 0)
@@ -4257,7 +6410,7 @@ class MeetingBoxApp(App):
         # single Result(), which fires this intent callback in parallel
         # with the Realtime mint. Without this guard the device plays
         # an espeak reply ("Opening inbox.") on top of Realtime's audio.
-        if (
+        realtime_suppresses_local = (
             getattr(self, "voice_realtime_assistant", False)
             and REALTIME_VOICE_IMPLEMENTED
             and bool(get_device_auth_token().strip())
@@ -4265,7 +6418,8 @@ class MeetingBoxApp(App):
             and not WAKE_LOCAL_VOICE_ONLY
             # confirm/cancel are answers to a local prompt, not new commands
             and intent.name not in ("confirm", "cancel")
-        ):
+        )
+        if realtime_suppresses_local:
             return
 
         if intent.name == "confirm":
@@ -4302,6 +6456,16 @@ class MeetingBoxApp(App):
         detail = self.screen_manager.get_screen("meeting_detail")
         detail.set_meeting_id(meeting_id)
         self.goto_screen("meeting_detail", "slide_left")
+
+    def _voice_open_summary_review(self, meeting_id: str, summary_data=None) -> None:
+        """Open the Meeting Summary page for a recording — the same screen the
+        user reaches by tapping the post-summary notification. The server passes
+        the resolved summary so the page paints immediately; the screen also
+        re-fetches the full detail from the backend to enrich it."""
+        screen = self.screen_manager.get_screen("summary_review")
+        if hasattr(screen, "set_meeting_data"):
+            screen.set_meeting_data(meeting_id, summary_data if isinstance(summary_data, dict) else {})
+        self.goto_screen("summary_review", "fade")
 
     def _voice_save_setting_async(self, payload: dict, failure_text: str | None = None) -> None:
         async def _save():
@@ -4662,7 +6826,20 @@ class MeetingBoxApp(App):
             self._reset_idle_timer()
             self._sync_voice_assistant_state()
             self._set_voice_indicator_override("starting", "Starting meeting", 4.0)
-            self.start_recording()
+            self.start_recording(context=_voice_phrase_context(intent))
+            return
+
+        if intent.name == "start_note":
+            if self.recording_state.get("active"):
+                self._voice_reply("A recording is already running.", duration=3.0)
+                return
+            logger.info('Voice trigger accepted ("hey buddy" -> "start note")')
+            self._voice_start_in_flight = True
+            self._voice_start_confirmation_pending = True
+            self._reset_idle_timer()
+            self._sync_voice_assistant_state()
+            self._set_voice_indicator_override("starting", "Starting notes", 4.0)
+            self.start_recording("note", context=_voice_phrase_context(intent))
             return
 
         if intent.name == "stop_meeting":
@@ -4714,6 +6891,12 @@ class MeetingBoxApp(App):
             return
 
         if intent.name == "open_settings":
+            if IS_DESKTOP:
+                self._voice_reply(
+                    "Settings are managed in Windows and the web dashboard.",
+                    duration=3.5,
+                )
+                return
             self.goto_screen("settings", "slide_left")
             self._voice_reply("Opening settings.", duration=2.5)
             return
@@ -4756,6 +6939,12 @@ class MeetingBoxApp(App):
             return
 
         if intent.name == "test_microphone":
+            if IS_DESKTOP:
+                self._voice_reply(
+                    "Microphone settings are managed in Windows.",
+                    duration=3.5,
+                )
+                return
             self.goto_screen("mic_test", "slide_left")
             self._voice_reply("Opening microphone test.", duration=3.0)
             return
@@ -4794,6 +6983,19 @@ class MeetingBoxApp(App):
             self._voice_reply(
                 "Privacy mode is on." if active else "Privacy mode is off.",
                 duration=3.0,
+            )
+            return
+
+        # Appliance-only hardware/kiosk commands: on desktop the OS owns the
+        # display, power and lock/screensaver, so decline politely instead of
+        # silently no-opping (brightness/screen/restart/shutdown/factory reset).
+        if IS_DESKTOP and intent.name in (
+            "brightness", "screen_off", "wake_screen",
+            "restart_device", "power_off", "factory_reset",
+        ):
+            self._voice_reply(
+                "That's handled by your computer, not Pepper AI.",
+                duration=3.5,
             )
             return
 
@@ -4856,9 +7058,14 @@ class MeetingBoxApp(App):
             return
 
         if intent.name == "help":
-            self._voice_reply(
-                "I can start, stop, pause or resume meetings, open settings or meetings, check time, WiFi, storage, version and calendar, change privacy or brightness, turn the screen off, and restart or shut down with confirmation."
-            )
+            if IS_DESKTOP:
+                self._voice_reply(
+                    "I can start, stop, pause or resume meetings, open settings or meetings, check time, storage, version and calendar, change privacy, and manage your emails and tasks."
+                )
+            else:
+                self._voice_reply(
+                    "I can start, stop, pause or resume meetings, open settings or meetings, check time, WiFi, storage, version and calendar, change privacy or brightness, turn the screen off, and restart or shut down with confirmation."
+                )
             return
 
         self._voice_reply("I can't do that yet.")
@@ -4877,19 +7084,17 @@ class MeetingBoxApp(App):
 # ==================================================================
 
 class _SwipeHandle(Widget):
-    """Invisible (but tappable) bar at the top of the screen.
+    """Visual-only pull-handle bar at the top of the screen.
 
-    A simple tap OR a short downward drag on this widget opens the
-    QuickPanel.  Using a real widget + touch.grab() is far more reliable
-    than Window-level coordinate math, which breaks when touchscreen
-    drivers use inverted or scaled Y axes.
-
-    Visual: a subtle white pill line (iOS-style pull handle) drawn in
-    the center of the bar so users can see where to interact.
+    This widget draws the visible pill indicator so users know there is a
+    swipe target, but it does NOT intercept or grab any touch events.
+    Swipe detection is handled entirely by the Window-level
+    ``_panel_swipe_down`` / ``_panel_swipe_move`` handlers in
+    ``MeetingBoxApp``, which avoids stealing touches from UI buttons that
+    sit near the top of the screen (e.g. the voice-session Back button).
     """
 
-    _HANDLE_H = 22      # widget height in px
-    _DRAG_THRESHOLD = 8  # px of downward drag that triggers the panel
+    _HANDLE_H = 64      # widget height in px  (≈10 % of a 600 px screen)
 
     def __init__(self, app, **kwargs):
         from kivy.graphics import Color, RoundedRectangle
@@ -4898,60 +7103,62 @@ class _SwipeHandle(Widget):
         kwargs.setdefault("pos_hint", {"top": 1})
         super().__init__(**kwargs)
         self._app = app
-        self._start_y: float | None = None
 
-        # Subtle pill indicator so users know this area is interactive
+        # Visible pill indicator — centred near the bottom of the handle bar
         with self.canvas:
-            Color(1, 1, 1, 0.18)
+            Color(1, 1, 1, 0.30)
             self._pill = RoundedRectangle(radius=[3])
         self.bind(pos=self._draw, size=self._draw)
         self._draw()
 
     def _draw(self, *_):
-        pw, ph = 36, 4
-        self._pill.pos = (self.center_x - pw / 2,
-                          self.y + (self.height - ph) / 2)
+        pw, ph = 48, 5
+        self._pill.pos = (self.center_x - pw / 2, self.y + 6)
         self._pill.size = (pw, ph)
 
-    # ------------------------------------------------------------------
-    # Touch handling
-    # ------------------------------------------------------------------
+
+class _QuickPanelButton(Widget):
+    """Small top-edge button that always opens the QuickPanel."""
+
+    def __init__(self, app, **kwargs):
+        from kivy.graphics import Color, Line, RoundedRectangle
+
+        kwargs.setdefault("size_hint", (None, None))
+        kwargs.setdefault("size", (50, 26))
+        kwargs.setdefault("pos_hint", {"right": 0.985, "top": 0.995})
+        super().__init__(**kwargs)
+        self._app = app
+
+        with self.canvas:
+            Color(1, 1, 1, 0.18)
+            self._bg = RoundedRectangle(radius=[8])
+            Color(1, 1, 1, 0.85)
+            self._l1 = Line(width=1.2)
+            self._l2 = Line(width=1.2)
+            self._l3 = Line(width=1.2)
+        self.bind(pos=self._draw, size=self._draw)
+        self._draw()
+
+    def _draw(self, *_):
+        self._bg.pos = self.pos
+        self._bg.size = self.size
+        left = self.x + 13
+        right = self.right - 13
+        y_mid = self.center_y
+        self._l1.points = [left, y_mid + 5, right, y_mid + 5]
+        self._l2.points = [left, y_mid, right, y_mid]
+        self._l3.points = [left, y_mid - 5, right, y_mid - 5]
 
     def on_touch_down(self, touch):
+        vcb = getattr(self._app, "_voice_control_bar", None)
+        if vcb is not None and vcb.is_touch_on_controls(*touch.pos):
+            return False
         if not self.collide_point(*touch.pos):
             return False
-        self._start_y = touch.y
-        touch.grab(self)
-        return True     # consume the touch so it doesn't fall through
-
-    def on_touch_move(self, touch):
-        if touch.grab_current is not self:
-            return False
-        if self._start_y is None:
-            return True
-        # Downward drag (in Kivy y=0 is bottom, so "down" = y decreases)
-        moved_down = self._start_y - touch.y
-        # Also handle inverted-Y touchscreens (y increases when moving down)
-        moved_any = abs(self._start_y - touch.y)
-        if moved_any >= self._DRAG_THRESHOLD:
-            self._open_panel()
-        return True
-
-    def on_touch_up(self, touch):
-        if touch.grab_current is not self:
-            return False
-        # Tap (very little movement) also opens the panel
-        if self._start_y is not None:
-            if abs(self._start_y - touch.y) < self._DRAG_THRESHOLD:
-                self._open_panel()
-        touch.ungrab(self)
-        self._start_y = None
-        return True
-
-    def _open_panel(self):
         qp = getattr(self._app, "quick_panel", None)
         if qp and not qp._visible:
             qp.show()
+        return True
 
 
 # ==================================================================
@@ -5007,23 +7214,44 @@ def main():
                 flush=True,
             )
 
-    try:
-        result = subprocess.run(
-            ['ls', '-la', '/tmp/.X11-unix/'],
-            capture_output=True, text=True, timeout=5)
-        print(f"[MeetingBox] X11 socket dir: {result.stdout.strip()}", flush=True)
-    except Exception as e:
-        print(f"[MeetingBox] X11 socket check failed: {e}", flush=True)
+    if sys.platform.startswith('linux'):
+        try:
+            result = subprocess.run(
+                ['ls', '-la', '/tmp/.X11-unix/'],
+                capture_output=True, text=True, timeout=5)
+            print(f"[MeetingBox] X11 socket dir: {result.stdout.strip()}", flush=True)
+        except Exception as e:
+            print(f"[MeetingBox] X11 socket check failed: {e}", flush=True)
 
-    _diagnose_xauthority_for_docker()
+        _diagnose_xauthority_for_docker()
 
     logger.info("Starting MeetingBox Device UI")
     print(
         f"[MeetingBox] Kivy UI starting — full log: {LOG_FILE}",
         flush=True,
     )
+
+    # Single-instance guard (desktop): a second launch must not fight over the
+    # mic, config dir, or backend socket. Disabled when MEETINGBOX_ALLOW_MULTI=1.
+    _instance_handle = None
+    if (os.environ.get("MEETINGBOX_ALLOW_MULTI") or "").strip().lower() not in ("1", "true", "yes", "on"):
+        try:
+            from single_instance import acquire as _acquire_instance
+            _instance_handle = _acquire_instance()
+            if _instance_handle is None:
+                print(
+                    "[MeetingBox] Another MeetingBox window is already running — exiting.",
+                    flush=True,
+                )
+                sys.exit(0)
+        except SystemExit:
+            raise
+        except Exception as _e:
+            logger.warning("single-instance guard skipped: %s", _e)
+
     try:
         app = MeetingBoxApp()
+        app._single_instance_handle = _instance_handle
         app.run()
     except KeyboardInterrupt:
         logger.info("Interrupted by user")
@@ -5037,7 +7265,11 @@ def main():
         print("[MeetingBox] Traceback:", flush=True)
         for _line in tb_str.rstrip().splitlines():
             print(f"[MeetingBox]   {_line}", flush=True)
-        sys.stdout.flush()
+        try:
+            if sys.stdout is not None:
+                sys.stdout.flush()
+        except Exception:
+            pass
         logger.exception(f"Fatal error: {e}")
         sys.exit(1)
 

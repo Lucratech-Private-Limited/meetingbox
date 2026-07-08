@@ -1,7 +1,7 @@
 """
 Local wake-word voice control for the device UI.
 
-Listens for a configurable wake phrase (default: "hey tony"), then accepts
+Listens for a configurable wake phrase (default: "hey pepper"), then accepts
 follow-up commands covering meetings, navigation, device controls, and a small
 confirmation flow for destructive actions.
 """
@@ -180,6 +180,29 @@ def _best_phrase_similarity(text: str, target: str) -> float:
     )
 
 
+# Tokens the recognizer / accents commonly produce for the "hey" attention word.
+_HEY_TOKENS = frozenset({
+    "hey", "hay", "heya", "hi", "he", "ey", "hej", "hai", "ay",
+})
+# Tokens the Vosk small model / accents commonly produce for "pepper". Matching
+# an explicit set (rather than a loose whole-phrase ratio) is what lets us wake
+# on accented "pepper" without falsely waking on the everyday word "pepper"
+# spoken without a preceding "hey".
+_PEPPER_TOKENS = frozenset({
+    "pepper", "peppa", "pepa", "peper", "pepe", "paper", "pepperr",
+    "pepar", "peppr", "pehper", "peppie", "peppah", "peppar", "peppe",
+    "peppa", "pepah",
+})
+
+
+def _token_close(tok: str, target: str, threshold: float) -> bool:
+    if not tok or not target:
+        return False
+    if tok == target:
+        return True
+    return SequenceMatcher(None, tok, target).ratio() >= threshold
+
+
 def _build_intent_specs(start_commands: list[str]) -> tuple[_IntentSpec, ...]:
     start_aliases = tuple(
         dict.fromkeys(
@@ -199,10 +222,19 @@ def _build_intent_specs(start_commands: list[str]) -> tuple[_IntentSpec, ...]:
             ]
         )
     )
+    note_aliases = (
+        "take notes", "take a note", "start taking notes", "start a note",
+        "create a note", "make a note", "new note", "record a note",
+        "capture my thoughts", "capture a thought", "note this", "jot this down",
+        "start notes", "begin notes",
+    )
     # Lower threshold (0.68) for the high-frequency action commands so they
     # trigger reliably even when the Vosk small model drops a word or two.
     _ACT = 0.68
     return (
+        # Note intent is listed before start_meeting so an explicit "take notes"
+        # maps to note mode; plain "start recording" still falls to start_meeting.
+        _IntentSpec("start_note", note_aliases, threshold=_ACT),
         _IntentSpec("start_meeting", start_aliases, threshold=_ACT),
         _IntentSpec("stop_meeting", (
             "stop meeting", "end meeting", "stop recording", "finish meeting",
@@ -313,6 +345,28 @@ class VoiceCommandInterpreter:
         self.action_cooldown_seconds = max(0.5, action_cooldown_seconds)
         self.confirmation_timeout_seconds = max(2.0, confirmation_timeout_seconds)
         self._intent_specs = _build_intent_specs(start_commands)
+        # Wake sensitivity. The Vosk small model mis-transcribes accented
+        # "Hey Pepper" into nearby words ("hey peppa", "hey paper", "hey pepe"),
+        # which a strict whole-phrase similarity rejected. We instead match
+        # structurally: a "hey"-like token immediately followed by a
+        # "pepper"-like token. This wakes on the first try across accents while
+        # NOT waking on the everyday word "pepper" spoken without a "hey".
+        parts = self.wake_phrase.split()
+        self._wake_prefix = parts[0] if parts else "hey"
+        self._wake_keyword = parts[-1] if parts else self.wake_phrase
+        if self._wake_keyword == "pepper":
+            self._keyword_tokens = _PEPPER_TOKENS
+        else:
+            self._keyword_tokens = frozenset({self._wake_keyword})
+        # Fuzzy bar for the keyword token (lower = easier wake / more false
+        # wakes). The explicit token set above already covers common variants;
+        # this catches additional near-misses. Env-tunable.
+        try:
+            self._wake_keyword_threshold = float(
+                os.getenv("VOICE_ASSISTANT_WAKE_THRESHOLD", "") or 0.82
+            )
+        except ValueError:
+            self._wake_keyword_threshold = 0.82
         self._awaiting_command_until = 0.0
         self._awaiting_confirmation_until = 0.0
         self._last_action_at = 0.0
@@ -332,8 +386,32 @@ class VoiceCommandInterpreter:
         self._awaiting_confirmation_until = 0.0
 
     def _heard_wake_phrase(self, text: str) -> bool:
-        # Slightly looser fuzzy match so noisy rooms / small-model errors still wake reliably.
-        return _best_phrase_similarity(text, self.wake_phrase) >= 0.77
+        # Structural match: a "hey"-like token IMMEDIATELY followed by a
+        # "pepper"-like token. Robust to accents / small-model errors
+        # ("hey peppa", "hey paper", "hey pepe") yet won't fire on a bare
+        # "pepper" said mid-conversation.
+        norm = _normalize_text(text)
+        if not norm:
+            return False
+        if self.wake_phrase and self.wake_phrase in norm:
+            return True
+        words = norm.split()
+        for i in range(len(words) - 1):
+            if self._is_prefix_token(words[i]) and self._is_keyword_token(words[i + 1]):
+                return True
+        return False
+
+    def _is_prefix_token(self, w: str) -> bool:
+        if self._wake_prefix == "hey":
+            # Explicit set covers the real recognizer variants; keep the fuzzy
+            # bar high so common words like "the" don't read as "hey".
+            return w in _HEY_TOKENS or _token_close(w, "hey", 0.85)
+        return _token_close(w, self._wake_prefix, 0.78)
+
+    def _is_keyword_token(self, w: str) -> bool:
+        if w in self._keyword_tokens:
+            return True
+        return _token_close(w, self._wake_keyword, self._wake_keyword_threshold)
 
     def _matches_any(self, text: str, phrases: tuple[str, ...], threshold: float = 0.76) -> bool:
         return any(_best_phrase_similarity(text, phrase) >= threshold for phrase in phrases)
@@ -358,9 +436,10 @@ class VoiceCommandInterpreter:
         residual = [w for w in words if w not in wake_set and w not in fillers]
         if not residual:
             return True
-        # Wake phrase with transcript typos (e.g. "hey toni") — at most one extra word and very close.
+        # Wake phrase (already matched above) plus at most one extra short word
+        # (e.g. "hey peppa now") still counts as a wake-only utterance.
         wake_wc = len(self.wake_phrase.split())
-        if len(words) <= wake_wc + 1 and _best_phrase_similarity(norm, self.wake_phrase) >= 0.88:
+        if len(words) <= wake_wc + 1:
             return True
         return False
 
@@ -451,7 +530,7 @@ class VoiceAssistant:
         self._on_amplitude = on_amplitude
         self._on_conversation_turn = on_conversation_turn
         self.enabled = _env_flag("VOICE_ASSISTANT_ENABLED", True)
-        self.wake_phrase = (os.getenv("VOICE_ASSISTANT_WAKE_PHRASE") or "hey tony").strip() or "hey tony"
+        self.wake_phrase = (os.getenv("VOICE_ASSISTANT_WAKE_PHRASE") or "hey pepper").strip() or "hey pepper"
         self.start_commands = [
             cmd.strip()
             for cmd in (
@@ -629,7 +708,9 @@ class VoiceAssistant:
                 self._stop_event.wait(10.0)
                 continue
             if self._stream is None and not self._open_stream():
-                self._stop_event.wait(4.0)
+                # Short backoff: after a realtime session ends the shared mic may
+                # take a moment to free up; retry soon so re-waking isn't delayed.
+                self._stop_event.wait(1.0)
                 continue
             try:
                 chunk = self._audio_queue.get(timeout=0.5)

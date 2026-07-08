@@ -1,0 +1,192 @@
+#!/usr/bin/env python3
+"""
+meetingbox-wifi-connect — privileged Wi-Fi join helper.
+
+Workaround for a NetworkManager client/daemon version skew: the device-ui
+container (Debian 13 / nmcli 1.52) talks to an older host NetworkManager
+daemon (e.g. 1.46). The newer nmcli serialises the `mac-address-denylist`
+property which the older daemon rejects with:
+
+    802-11-wireless.mac-address-denylist: unknown property
+
+This helper bypasses nmcli's client-side serialisation entirely and calls the
+NetworkManager D-Bus API (`AddAndActivateConnection`) directly via `gdbus`,
+sending only properties the older daemon understands. It must run as root
+(invoked via sudo) so PolicyKit allows controlling networking.
+
+Usage:
+    meetingbox-wifi-connect <iface> <ssid> <keymgmt> [psk]
+
+    keymgmt: "wpa-psk" for secured networks, "open" / "none" for open ones.
+
+Prints a single JSON line: {"status": "connected"|"failed", "message": "..."}
+Exit code 0 on success, non-zero on failure.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import subprocess
+import sys
+import time
+
+NM = "org.freedesktop.NetworkManager"
+NM_PATH = "/org/freedesktop/NetworkManager"
+SETTINGS_PATH = "/org/freedesktop/NetworkManager/Settings"
+
+
+def gdbus(args: list[str], timeout: float = 30) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["gdbus"] + args, capture_output=True, text=True, timeout=timeout
+    )
+
+
+def _gv_str(value: str) -> str:
+    """Quote a Python string as a GVariant double-quoted string."""
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _device_path(iface: str) -> str | None:
+    r = gdbus([
+        "call", "--system", "--dest", NM, "--object-path", NM_PATH,
+        "--method", f"{NM}.GetDeviceByIpIface", iface,
+    ])
+    m = re.search(r"(/org/freedesktop/NetworkManager/Devices/\d+)", r.stdout)
+    return m.group(1) if m else None
+
+
+def _delete_profiles_with_id(conn_id: str) -> None:
+    """Remove existing saved profiles whose id matches, to avoid duplicates."""
+    ls = gdbus([
+        "call", "--system", "--dest", NM, "--object-path", SETTINGS_PATH,
+        "--method", f"{NM}.Settings.ListConnections",
+    ])
+    needle = "'id': <" + _gv_str(conn_id) + ">"
+    alt_needle = "'id': <'" + conn_id + "'>"
+    for path in re.findall(r"(/org/freedesktop/NetworkManager/Settings/\d+)", ls.stdout):
+        g = gdbus([
+            "call", "--system", "--dest", NM, "--object-path", path,
+            "--method", f"{NM}.Settings.Connection.GetSettings",
+        ])
+        if needle in g.stdout or alt_needle in g.stdout:
+            gdbus([
+                "call", "--system", "--dest", NM, "--object-path", path,
+                "--method", f"{NM}.Settings.Connection.Delete",
+            ])
+
+
+def _active_state(active_path: str) -> int | None:
+    r = gdbus([
+        "call", "--system", "--dest", NM, "--object-path", active_path,
+        "--method", "org.freedesktop.DBus.Properties.Get",
+        f"{NM}.Connection.Active", "State",
+    ])
+    m = re.search(r"uint32\s+(\d+)", r.stdout)
+    return int(m.group(1)) if m else None
+
+
+def main() -> int:
+    if len(sys.argv) < 4:
+        print(json.dumps({"status": "failed", "message": "usage: <iface> <ssid> <keymgmt> [psk]"}))
+        return 2
+
+    iface = sys.argv[1]
+    ssid = sys.argv[2]
+    keymgmt = (sys.argv[3] or "").strip().lower()
+    psk = sys.argv[4] if len(sys.argv) > 4 else ""
+
+    if not ssid:
+        print(json.dumps({"status": "failed", "message": "SSID is required"}))
+        return 2
+
+    devpath = _device_path(iface)
+    if not devpath:
+        print(json.dumps({"status": "failed", "message": f"Wi-Fi device {iface} not found"}))
+        return 2
+
+    # Reuse the SSID as the connection id; clean up old duplicates first.
+    try:
+        _delete_profiles_with_id(ssid)
+    except Exception:
+        pass
+
+    ssid_bytes = ",".join("byte 0x%02x" % b for b in ssid.encode("utf-8"))
+    parts = [
+        "{",
+        "'connection': {'id': <%s>, 'type': <'802-11-wireless'>, 'autoconnect': <true>}," % _gv_str(ssid),
+        "'802-11-wireless': {'ssid': <[%s]>, 'mode': <'infrastructure'>}," % ssid_bytes,
+    ]
+    if keymgmt in ("wpa-psk", "wpa", "wpa2", "psk"):
+        parts.append(
+            "'802-11-wireless-security': {'key-mgmt': <'wpa-psk'>, 'psk': <%s>}," % _gv_str(psk)
+        )
+    parts.append("'ipv4': {'method': <'auto'>},")
+    parts.append("'ipv6': {'method': <'auto'>}")
+    parts.append("}")
+    conn = "".join(parts)
+
+    r = gdbus([
+        "call", "--system", "--dest", NM, "--object-path", NM_PATH,
+        "--method", f"{NM}.AddAndActivateConnection",
+        conn, devpath, "/",
+    ])
+    if r.returncode != 0:
+        msg = (r.stderr or r.stdout or "Connection failed").strip()
+        msg = re.sub(r"^Error:\s*GDBus\.Error:[^:]+:\s*", "", msg)
+        print(json.dumps({"status": "failed", "message": msg[:300]}))
+        return 2
+
+    active = re.findall(r"(/org/freedesktop/NetworkManager/(?:ActiveConnection|Devices)/\d+)", r.stdout)
+    active_path = None
+    for p in re.findall(r"(/org/freedesktop/NetworkManager/ActiveConnection/\d+)", r.stdout):
+        active_path = p
+        break
+
+    # Poll until the active connection reaches ACTIVATED (2) or fails.
+    deadline = time.time() + 25
+    last_state = None
+    while time.time() < deadline:
+        if active_path:
+            st = _active_state(active_path)
+            last_state = st
+            if st == 2:  # ACTIVATED
+                print(json.dumps({"status": "connected", "message": f"Connected to {ssid}"}))
+                return 0
+            if st == 4:  # DEACTIVATED
+                break
+        time.sleep(1.0)
+
+    # Fall back: check whether the device reports the SSID as connected.
+    chk = gdbus([
+        "call", "--system", "--dest", NM, "--object-path", NM_PATH,
+        "--method", f"{NM}.GetDeviceByIpIface", iface,
+    ])
+    if chk.returncode == 0:
+        # Best-effort: ask nmcli (read path is fine) for the active ssid.
+        try:
+            out = subprocess.run(
+                ["nmcli", "-t", "-f", "ACTIVE,SSID", "dev", "wifi"],
+                capture_output=True, text=True, timeout=8,
+            ).stdout
+            for line in out.splitlines():
+                a, _, s = line.partition(":")
+                if a.strip().lower() == "yes" and s.strip() == ssid:
+                    print(json.dumps({"status": "connected", "message": f"Connected to {ssid}"}))
+                    return 0
+        except Exception:
+            pass
+
+    print(json.dumps({
+        "status": "failed",
+        "message": f"Could not activate {ssid} (state={last_state}). Check the password.",
+    }))
+    return 2
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception as e:  # noqa: BLE001
+        print(json.dumps({"status": "failed", "message": str(e)[:300]}))
+        sys.exit(2)

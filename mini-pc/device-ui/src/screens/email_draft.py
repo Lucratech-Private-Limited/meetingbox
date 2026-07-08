@@ -36,7 +36,9 @@ import logging
 import math
 import time
 
+from kivy.animation import Animation
 from kivy.clock import Clock
+from kivy.core.window import Window
 from kivy.graphics import Color, Ellipse, Line, Rectangle, RoundedRectangle
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.floatlayout import FloatLayout
@@ -45,6 +47,7 @@ from kivy.uix.label import Label
 from kivy.uix.scrollview import ScrollView
 from kivy.uix.widget import Widget
 
+from components.live_wifi_icon import LiveWifiIcon as _WifiIcon
 from config import ASSETS_DIR, DISPLAY_HEIGHT, DISPLAY_WIDTH
 from screens.base_screen import BaseScreen
 from screens.home import _BatteryWidget, _VoiceStatePill  # noqa: PLC2701
@@ -101,37 +104,6 @@ _C_BTN_SEND    = (0.063, 0.780, 0.427, 1.0)  # #10C76D
 _FONT_SB = "42dot-SB"
 _FONT_MD = "42dot-Med"
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# WiFi icon  (reused verbatim from voice_session.py)
-# ──────────────────────────────────────────────────────────────────────────────
-class _WifiIcon(Widget):
-    _COL = (0.0, 0.0, 0.0, 1.0)
-
-    def __init__(self, **kw):
-        super().__init__(**kw)
-        with self.canvas:
-            self._c    = Color(*self._COL)
-            self._arc1 = Line(width=1.4)
-            self._arc2 = Line(width=1.4)
-            self._arc3 = Line(width=1.4)
-            self._dotc = Color(*self._COL)
-            self._dot  = Ellipse()
-        self.bind(pos=self._redraw, size=self._redraw)
-        Clock.schedule_once(self._redraw, 0)
-
-    def _redraw(self, *_) -> None:
-        w, h = self.size
-        if w <= 1 or h <= 1:
-            return
-        cx = self.x + w / 2
-        cy = self.y + h * 0.08
-        for arc, frac in [(self._arc1, 0.30), (self._arc2, 0.58), (self._arc3, 0.86)]:
-            r = h * frac
-            arc.ellipse = (cx - r, cy - r, 2 * r, 2 * r, 45, 135)
-        dr = h * 0.09
-        self._dot.pos  = (cx - dr, cy - dr)
-        self._dot.size = (dr * 2, dr * 2)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -319,12 +291,14 @@ class _PillButton(BoxLayout):
         ]
         with self.canvas.before:
             self._shadow_layers = []
+            self._shadow_colors = []
             for _, alpha in _S:
-                Color(0, 0, 0, alpha)
+                self._shadow_colors.append(Color(0, 0, 0, alpha))
                 self._shadow_layers.append(RoundedRectangle(radius=[self._pill_r]))
             Color(*bg_color)
             self._bg = RoundedRectangle(radius=[self._pill_r])
         self._shadow_spec = _S
+        self._press_depth = 0.0
         self.bind(pos=self._sync, size=self._sync)
         lbl = Label(
             text=text,
@@ -340,11 +314,21 @@ class _PillButton(BoxLayout):
 
     def _sync(self, *_):
         # Fixed 4px y-offset (Figma spec); half_e in raw pixels (no _ff — avoids min-6 clamp).
+        # On press the shadow drops a touch further for the native "lift" cue.
+        extra = 2.0 * self._press_depth
         for layer, (half_e, _) in zip(self._shadow_layers, self._shadow_spec):
-            layer.pos  = (self.x - half_e, self.y - 4 - half_e)
+            layer.pos  = (self.x - half_e, self.y - 4 - extra - half_e)
             layer.size = (self.width + 2 * half_e, self.height + 2 * half_e)
         self._bg.pos  = self.pos
         self._bg.size = self.size
+
+    def set_press_shadow(self, depth: float) -> None:
+        """Slightly deepen the drop shadow during the press (depth 0→1)."""
+        depth = 0.0 if depth < 0.0 else 1.0 if depth > 1.0 else depth
+        self._press_depth = depth
+        for col, (_, base_alpha) in zip(self._shadow_colors, self._shadow_spec):
+            col.a = base_alpha * (1.0 + 0.6 * depth)
+        self._sync()
 
     def set_enabled(self, enabled: bool):
         self._enabled = enabled
@@ -386,6 +370,9 @@ class EmailDraftScreen(BaseScreen):
         self._auto_back_ev:  object | None = None
         # Lifecycle state of the current draft (drafting/ready/sending/sent/saved/discarded).
         self._state = "drafting"
+        # Card widget reference + guard so the send/save/discard fly-away plays once.
+        self._card = None
+        self._flyaway_committed = False
 
         # Draft state store — missing keys are preserved across updates
         self._fields: dict = {
@@ -514,6 +501,8 @@ class EmailDraftScreen(BaseScreen):
 
         card.add_widget(inner)
         root.add_widget(card)
+        # Reference kept so the action fly-away overlay can snapshot the card.
+        self._card = card
 
         # 4 · Action buttons below card  (y=688, h=60)
         btn_y = _y(688, 60)
@@ -536,26 +525,12 @@ class EmailDraftScreen(BaseScreen):
         root.add_widget(self._save_btn)
         root.add_widget(self._send_btn)
 
-        # 5 · Voice-state pill  (910, 17)  222 × 47
-        self._voice_pill = _VoiceStatePill(
-            size_hint=(_sw(222), _sh(47)),
-            pos_hint={"x": _x(910), "y": _y(17, 47)},
-        )
-        self._voice_pill.opacity = 1.0
-        root.add_widget(self._voice_pill)
+        # Voice-state pill: rendered exclusively by the global VoiceControlBar
+        # (see voice_control_bar.py) for consistent size/position/font.
+        # self._voice_pill stays None here on purpose; existing
+        # `if self._voice_pill:` guards below no-op safely.
 
-        # 6 · WiFi icon  (1147, 31)  29 × 20
-        root.add_widget(_WifiIcon(
-            size_hint=(_sw(29), _sh(20)),
-            pos_hint={"x": _x(1147), "y": _y(31, 20)},
-        ))
-
-        # 7 · Battery  (1191, 30)  47 × 21
-        self._battery = _BatteryWidget(
-            size_hint=(_sw(47), _sh(21)),
-            pos_hint={"x": _x(1191), "y": _y(30, 21)},
-        )
-        root.add_widget(self._battery)
+        # (WiFi + battery indicators removed — not relevant for the desktop app.)
 
         self.add_widget(root)
 
@@ -564,6 +539,7 @@ class EmailDraftScreen(BaseScreen):
     def on_enter(self) -> None:
         self._listening = False
         self._amplitude = 0.0
+        self.restore_action_visuals()
         if self._voice_pill:
             self._voice_pill.set_state_text("Listening")
             self._voice_pill.opacity = 1.0
@@ -609,8 +585,10 @@ class EmailDraftScreen(BaseScreen):
         """Clear all draft fields and return to blank state."""
         self._cancel_auto_back()
         self._state = "drafting"
+        self._flyaway_committed = False
         self._fields = {"to": [], "cc": [], "bcc": [], "subject": "", "body": ""}
         self._refresh_ui()
+        self.restore_action_visuals()
         if self._voice_pill:
             self._voice_pill.set_state_text("Listening")
         self._set_buttons_enabled(True)
@@ -705,6 +683,59 @@ class EmailDraftScreen(BaseScreen):
         for btn in (self._send_btn, self._save_btn, self._discard_btn):
             if btn:
                 btn.set_enabled(enabled)
+
+    # ── Genie action animation hooks (driven by main.py) ──────────────────────
+
+    def _action_btn(self, action: str):
+        return {"send": self._send_btn, "save": self._save_btn,
+                "discard": self._discard_btn}.get(action)
+
+    def flash_button(self, action: str) -> None:
+        """Quick press blink on the tapped button so the press is noticeable."""
+        btn = self._action_btn(action)
+        if btn is None:
+            return
+        Animation.cancel_all(btn, "opacity")
+        (Animation(opacity=0.45, duration=0.08, t="out_quad")
+         + Animation(opacity=1.0, duration=0.08, t="in_quad")).start(btn)
+
+    def prepare_genie(self, action: str) -> None:
+        """Fade the action buttons away while the live card minimizes toward the
+        target. For save/discard the chosen CTA stays put as the card's sink."""
+        keep = self._action_btn(action) if action in ("save", "discard") else None
+        for b in (self._send_btn, self._save_btn, self._discard_btn):
+            if b is None or b is keep:
+                continue
+            Animation.cancel_all(b, "opacity")
+            Animation(opacity=0.0, duration=0.4, t="out_quad").start(b)
+
+    def restore_action_visuals(self) -> None:
+        if self._card is not None:
+            try:
+                from components.action_flyaway import _cleanup_minimize
+                _cleanup_minimize(self._card)
+            except Exception:
+                pass
+            self._card.opacity = 1
+        for b in (self._send_btn, self._save_btn, self._discard_btn):
+            if b is not None:
+                Animation.cancel_all(b, "opacity")
+                b.opacity = 1
+                # Clear any residual press-shadow lift from the genie animation.
+                if hasattr(b, "set_press_shadow"):
+                    try:
+                        b.set_press_shadow(0.0)
+                    except Exception:
+                        pass
+
+    def genie_target(self, action: str):
+        """Window-coord sink point: top-right corner for Send, else the CTA."""
+        if action == "send":
+            return (float(Window.width), float(Window.height))
+        btn = self._action_btn(action)
+        if btn is not None:
+            return tuple(btn.to_window(btn.center_x, btn.center_y))
+        return (float(Window.width), float(Window.height))
 
     # ── Auto-return to home on terminal state ─────────────────────────────────
 

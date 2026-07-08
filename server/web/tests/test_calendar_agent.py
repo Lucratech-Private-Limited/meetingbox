@@ -607,3 +607,384 @@ class TestServiceExtensions:
             )
         body = events_resource.insert.call_args.kwargs["body"]
         assert "conferenceData" not in body
+
+
+
+class TestCalendarAmbiguityFixes:
+    def test_bulk_remove_attendee_by_name_expands_to_event_ids(self, tmp_path, monkeypatch):
+        uid, asvc = _bootstrap_db(tmp_path, monkeypatch)
+
+        fake_events = {
+            "events": [
+                {
+                    "id": "evt-1",
+                    "summary": "Birthday Party",
+                    "start": {"dateTime": "2026-06-16T20:00:00+05:30"},
+                    "attendees": [
+                        {"email": "shiva@example.com", "name": "Shiva"},
+                        {"email": "host@example.com", "name": "Host"},
+                    ],
+                },
+                {
+                    "id": "evt-2",
+                    "summary": "Lunch",
+                    "start": {"dateTime": "2026-06-16T13:00:00+05:30"},
+                    "attendees": [
+                        {"email": "shiva@example.com", "name": "Shiva"},
+                    ],
+                },
+                {
+                    "id": "evt-3",
+                    "summary": "Other",
+                    "start": {"dateTime": "2026-06-16T10:00:00+05:30"},
+                    "attendees": [
+                        {"email": "someone@example.com", "name": "Someone"},
+                    ],
+                },
+            ],
+            "count": 3,
+        }
+
+        with patch.object(asvc, "lookup_contacts", return_value=[{"email": "shiva@example.com", "name": "Shiva"}]),              patch.object(asvc, "calendar_list_upcoming", return_value=fake_events),              patch.object(asvc, "plan_calendar_steps", return_value=[
+                {
+                    "tool": "calendar_update_event",
+                    "args": {"attendees_remove": ["shiva"], "date": "2026-06-16"},
+                    "is_write": True,
+                }
+             ]),              patch.object(asvc, "route_intent", return_value=asvc.RouteResult(agent_id="calendar_agent", method="triggers")):
+            r = asvc.process_assistant_intent(
+                message="Remove shiva from all the meetings today",
+                user_id=uid,
+                meeting_id=None,
+            )
+
+        queued = [x for x in (r.get("tool_results") or []) if x.get("tool") == "calendar_update_event" and x.get("queued")]
+        assert len(queued) == 2
+        assert {q.get("event_id") for q in queued} == {"evt-1", "evt-2"}
+
+    def test_delete_by_title_and_time_picks_correct_duplicate(self):
+        from services.calendar import find_and_delete_event
+
+        events_resource = MagicMock()
+        events_resource.list.return_value.execute.return_value = {
+            "items": [
+                {
+                    "id": "evt-8pm",
+                    "summary": "Birthday Party",
+                    "start": {"dateTime": "2026-06-16T20:00:00+05:30"},
+                },
+                {
+                    "id": "evt-9pm",
+                    "summary": "Birthday Party",
+                    "start": {"dateTime": "2026-06-16T21:00:00+05:30"},
+                },
+            ]
+        }
+        events_resource.delete.return_value.execute.return_value = {}
+
+        svc = MagicMock()
+        svc.events.return_value = events_resource
+
+        with patch("services.calendar.build", return_value=svc):
+            out = find_and_delete_event(
+                credentials=MagicMock(),
+                title_hint="birthday party",
+                date_hint="2026-06-16",
+                time_hint="20:00",
+                timezone="Asia/Kolkata",
+            )
+
+        assert out.get("event_id") == "evt-8pm"
+        assert events_resource.delete.call_args.kwargs["eventId"] == "evt-8pm"
+
+
+
+class TestCalendarAmbiguityE2EFlow:
+    def test_e2e_remove_shiva_from_all_meetings_today_executes_updates(self, tmp_path, monkeypatch):
+        uid, asvc = _bootstrap_db(tmp_path, monkeypatch)
+
+        fake_events = {
+            "events": [
+                {
+                    "id": "evt-a",
+                    "summary": "Birthday Party",
+                    "start": {"dateTime": "2026-06-16T11:00:00+05:30"},
+                    "attendees": [
+                        {"email": "shiva@example.com", "name": "Shiva"},
+                        {"email": "host@example.com", "name": "Host"},
+                    ],
+                },
+                {
+                    "id": "evt-b",
+                    "summary": "Lunch",
+                    "start": {"dateTime": "2026-06-16T14:00:00+05:30"},
+                    "attendees": [
+                        {"email": "shiva@example.com", "name": "Shiva"},
+                        {"email": "other@example.com", "name": "Other"},
+                    ],
+                },
+            ],
+            "count": 2,
+        }
+
+        def _fake_update(_uid: str, payload: dict):
+            return {
+                "id": payload.get("event_id"),
+                "summary": payload.get("title") or "",
+                "attendees": [
+                    {"email": "host@example.com"}
+                ],
+            }
+
+        with patch.object(asvc, "lookup_contacts", return_value=[{"email": "shiva@example.com", "name": "Shiva"}]),              patch.object(asvc, "calendar_list_upcoming", return_value=fake_events),              patch.object(asvc, "plan_calendar_steps", return_value=[
+                {
+                    "tool": "calendar_update_event",
+                    "args": {"attendees_remove": ["shiva"], "date": "2026-06-16"},
+                    "is_write": True,
+                }
+             ]),              patch.object(asvc, "route_intent", return_value=asvc.RouteResult(agent_id="calendar_agent", method="triggers")),              patch.object(asvc, "calendar_update_from_payload", side_effect=_fake_update):
+            routed = asvc.process_assistant_intent(
+                message="Remove shiva from all the meetings today",
+                user_id=uid,
+                meeting_id=None,
+                source="voice_realtime",
+            )
+
+            queued = [t for t in (routed.get("tool_results") or []) if t.get("tool") == "calendar_update_event" and t.get("queued")]
+            assert len(queued) == 2
+
+            # Approve both queued updates to verify end-to-end execution path.
+            for item in queued:
+                pending_id = item.get("pending_id")
+                assert pending_id
+                approved = asvc.approve_pending_action(pending_id, uid)
+                assert approved.get("status") == "completed"
+
+    def test_e2e_delete_lunch_at_2pm_uses_time_hint_and_deletes_correct_event(self, tmp_path, monkeypatch):
+        uid, asvc = _bootstrap_db(tmp_path, monkeypatch)
+
+        captured_payloads: list[dict] = []
+
+        def _fake_delete(_uid: str, payload: dict):
+            captured_payloads.append(dict(payload))
+            # Simulate resolver picking the 2 PM duplicate
+            assert payload.get("time_hint") == "14:00"
+            return {
+                "deleted": True,
+                "event_id": "evt-lunch-2pm",
+                "summary": "Lunch",
+                "start": {"dateTime": "2026-06-16T14:00:00+05:30"},
+            }
+
+        with patch.object(asvc, "plan_calendar_steps", return_value=[
+                {
+                    "tool": "calendar_delete_event",
+                    "args": {"title": "Delete the lunch event at 2PM", "date": "2026-06-16"},
+                    "is_write": True,
+                }
+             ]),              patch.object(asvc, "route_intent", return_value=asvc.RouteResult(agent_id="calendar_agent", method="triggers")),              patch.object(asvc, "calendar_delete_from_payload", side_effect=_fake_delete):
+            routed = asvc.process_assistant_intent(
+                message="Delete the lunch event at 2PM",
+                user_id=uid,
+                meeting_id=None,
+                source="voice_realtime",
+            )
+
+            queued = [t for t in (routed.get("tool_results") or []) if t.get("tool") == "calendar_delete_event" and t.get("queued")]
+            assert len(queued) == 1
+            pending_id = queued[0].get("pending_id")
+            assert pending_id
+
+            approved = asvc.approve_pending_action(pending_id, uid)
+            assert approved.get("status") == "completed"
+            assert captured_payloads, "delete tool should be invoked"
+            assert captured_payloads[-1].get("time_hint") == "14:00"
+
+
+
+def test_e2e_delete_lunch_start_time_only_normalizes_to_time_hint(tmp_path, monkeypatch):
+    uid, asvc = _bootstrap_db(tmp_path, monkeypatch)
+
+    captured_payloads: list[dict] = []
+
+    def _fake_delete(_uid: str, payload: dict):
+        captured_payloads.append(dict(payload))
+        assert payload.get("time_hint") == "14:00"
+        return {
+            "deleted": True,
+            "event_id": "evt-lunch-2pm",
+            "summary": "Lunch",
+            "start": {"dateTime": "2026-06-16T14:00:00+05:30"},
+        }
+
+    with patch.object(asvc, "plan_calendar_steps", return_value=[
+            {
+                "tool": "calendar_delete_event",
+                "args": {"title": "lunch", "date": "2026-06-16", "start_time": "2026-06-16T14:00:00"},
+                "is_write": True,
+            }
+         ]),          patch.object(asvc, "route_intent", return_value=asvc.RouteResult(agent_id="calendar_agent", method="triggers")),          patch.object(asvc, "calendar_delete_from_payload", side_effect=_fake_delete):
+        routed = asvc.process_assistant_intent(
+            message="Delete the lunch event at 2PM",
+            user_id=uid,
+            meeting_id=None,
+            source="voice_realtime",
+        )
+
+        queued = [t for t in (routed.get("tool_results") or []) if t.get("tool") == "calendar_delete_event" and t.get("queued")]
+        assert len(queued) == 1
+        pending_id = queued[0].get("pending_id")
+        assert pending_id
+
+        approved = asvc.approve_pending_action(pending_id, uid)
+        assert approved.get("status") == "completed"
+
+    assert captured_payloads, "delete tool should be invoked"
+
+
+
+def test_delete_exact_title_ignores_substring_same_time():
+    from services.calendar import find_and_delete_event
+
+    events_resource = MagicMock()
+    events_resource.list.return_value.execute.return_value = {
+        "items": [
+            {
+                "id": "evt-reminder-2pm",
+                "summary": "Lunch reminder",
+                "start": {"dateTime": "2026-06-16T14:00:00+05:30"},
+            },
+            {
+                "id": "evt-lunch-2pm",
+                "summary": "Lunch",
+                "start": {"dateTime": "2026-06-16T14:00:00+05:30"},
+            },
+            {
+                "id": "evt-lunch-3pm",
+                "summary": "Lunch",
+                "start": {"dateTime": "2026-06-16T15:00:00+05:30"},
+            },
+        ]
+    }
+    events_resource.delete.return_value.execute.return_value = {}
+    svc = MagicMock()
+    svc.events.return_value = events_resource
+
+    with patch("services.calendar.build", return_value=svc):
+        out = find_and_delete_event(
+            credentials=MagicMock(),
+            title_hint="Lunch",
+            date_hint="2026-06-16",
+            time_hint="14:00",
+            timezone="Asia/Kolkata",
+        )
+
+    assert out.get("event_id") == "evt-lunch-2pm"
+    assert events_resource.delete.call_args.kwargs["eventId"] == "evt-lunch-2pm"
+
+
+def test_delete_prefers_exact_title_generically():
+    from services.calendar import find_and_delete_event
+
+    events_resource = MagicMock()
+    events_resource.list.return_value.execute.return_value = {
+        "items": [
+            {
+                "id": "evt-planning-prep",
+                "summary": "Planning prep",
+                "start": {"dateTime": "2026-06-16T10:00:00+05:30"},
+            },
+            {
+                "id": "evt-planning",
+                "summary": "Planning",
+                "start": {"dateTime": "2026-06-16T10:00:00+05:30"},
+            },
+        ]
+    }
+    events_resource.delete.return_value.execute.return_value = {}
+    svc = MagicMock()
+    svc.events.return_value = events_resource
+
+    with patch("services.calendar.build", return_value=svc):
+        out = find_and_delete_event(
+            credentials=MagicMock(),
+            title_hint="Planning",
+            date_hint="2026-06-16",
+            time_hint="10:00",
+            timezone="Asia/Kolkata",
+        )
+
+    assert out.get("event_id") == "evt-planning"
+    assert events_resource.delete.call_args.kwargs["eventId"] == "evt-planning"
+
+
+def test_delete_same_title_same_time_uses_duration_when_available():
+    from services.calendar import find_and_delete_event
+
+    events_resource = MagicMock()
+    events_resource.list.return_value.execute.return_value = {
+        "items": [
+            {
+                "id": "evt-review-short",
+                "summary": "Review",
+                "start": {"dateTime": "2026-06-16T11:00:00+05:30"},
+                "end": {"dateTime": "2026-06-16T11:30:00+05:30"},
+            },
+            {
+                "id": "evt-review-long",
+                "summary": "Review",
+                "start": {"dateTime": "2026-06-16T11:00:00+05:30"},
+                "end": {"dateTime": "2026-06-16T12:00:00+05:30"},
+            },
+        ]
+    }
+    events_resource.delete.return_value.execute.return_value = {}
+    svc = MagicMock()
+    svc.events.return_value = events_resource
+
+    with patch("services.calendar.build", return_value=svc):
+        out = find_and_delete_event(
+            credentials=MagicMock(),
+            title_hint="Review",
+            date_hint="2026-06-16",
+            time_hint="11:00",
+            duration_minutes=60,
+            timezone="Asia/Kolkata",
+        )
+
+    assert out.get("event_id") == "evt-review-long"
+    assert events_resource.delete.call_args.kwargs["eventId"] == "evt-review-long"
+
+
+def test_delete_same_title_same_time_without_duration_stays_ambiguous():
+    from services.calendar import find_and_delete_event
+
+    events_resource = MagicMock()
+    events_resource.list.return_value.execute.return_value = {
+        "items": [
+            {
+                "id": "evt-review-short",
+                "summary": "Review",
+                "start": {"dateTime": "2026-06-16T11:00:00+05:30"},
+                "end": {"dateTime": "2026-06-16T11:30:00+05:30"},
+            },
+            {
+                "id": "evt-review-long",
+                "summary": "Review",
+                "start": {"dateTime": "2026-06-16T11:00:00+05:30"},
+                "end": {"dateTime": "2026-06-16T12:00:00+05:30"},
+            },
+        ]
+    }
+    svc = MagicMock()
+    svc.events.return_value = events_resource
+
+    with patch("services.calendar.build", return_value=svc):
+        with pytest.raises(ValueError, match="Multiple matching events"):
+            find_and_delete_event(
+                credentials=MagicMock(),
+                title_hint="Review",
+                date_hint="2026-06-16",
+                time_hint="11:00",
+                timezone="Asia/Kolkata",
+            )

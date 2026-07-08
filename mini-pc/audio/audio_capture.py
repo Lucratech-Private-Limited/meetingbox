@@ -15,8 +15,12 @@ from urllib import request as urlrequest
 
 import numpy as np
 import pyaudio
-import webrtcvad
 import yaml
+
+try:
+  import webrtcvad
+except Exception:  # pragma: no cover - optional on platforms without a wheel
+  webrtcvad = None
 
 try:
   import sounddevice as sd
@@ -26,7 +30,36 @@ except ImportError:
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
 logger = logging.getLogger("meetingbox.audio")
 
+
+def _install_certifi_opener() -> None:
+    """Make urllib verify TLS against the bundled certifi CA bundle.
+
+    On Windows/macOS, ``urlopen`` builds its SSL context from the OS system
+    trust store. On machines with AV "HTTPS scanning" (e.g. Kaspersky) or a
+    stale root store, that path can reject a valid server cert with
+    ``CERTIFICATE_VERIFY_FAILED: certificate has expired`` — which kills the
+    audio-command long-poll and upload paths even though the cert is fine.
+    certifi ships a current CA bundle with the app, so pin every ``urlopen``
+    to it (matching the device-ui httpx/websockets TLS trust).
+    """
+    if not sys.platform.startswith(("win", "darwin")):
+        return  # Linux appliance uses the OS store as before.
+    try:
+        import ssl
+        import certifi
+
+        ctx = ssl.create_default_context(cafile=certifi.where())
+        opener = urlrequest.build_opener(urlrequest.HTTPSHandler(context=ctx))
+        urlrequest.install_opener(opener)
+        logger.info("Audio HTTP TLS using certifi bundle: %s", certifi.where())
+    except Exception as e:  # pragma: no cover - defensive
+        logger.warning("Could not install certifi TLS opener (using system trust): %s", e)
+
+
+_install_certifi_opener()
+
 DEVICE_AUTH_TOKEN_FILE = os.getenv("DEVICE_AUTH_TOKEN_FILE", "/data/config/device_auth_token").strip()
+DEVICE_AUTH_TOKEN_REVOKED_MARKER = Path(DEVICE_AUTH_TOKEN_FILE).with_name("device_auth_token.revoked")
 # Device identity (multi-device scoping). Set via the ``DEVICE_ID`` env
 # var or resolved at startup from ``/api/device/pairing-status`` using
 # the persisted device auth token. Tagged on every emitted event so the
@@ -150,7 +183,24 @@ def _load_device_auth_token() -> str:
           return token
     except OSError as exc:
       logger.warning("Could not read device auth token file %s: %s", path, exc)
+  try:
+    if DEVICE_AUTH_TOKEN_REVOKED_MARKER.is_file():
+      return ""
+  except OSError:
+    pass
   return os.getenv("DEVICE_AUTH_TOKEN", "").strip()
+
+
+def _mark_device_auth_token_revoked() -> None:
+  try:
+    Path(DEVICE_AUTH_TOKEN_FILE).unlink(missing_ok=True)
+  except OSError as exc:
+    logger.warning("Could not remove revoked device auth token file %s: %s", DEVICE_AUTH_TOKEN_FILE, exc)
+  try:
+    DEVICE_AUTH_TOKEN_REVOKED_MARKER.parent.mkdir(parents=True, exist_ok=True)
+    DEVICE_AUTH_TOKEN_REVOKED_MARKER.write_text("revoked\n", encoding="utf-8")
+  except OSError as exc:
+    logger.warning("Could not write device auth revoke marker %s: %s", DEVICE_AUTH_TOKEN_REVOKED_MARKER, exc)
 
 
 class AudioCaptureService:
@@ -160,7 +210,38 @@ class AudioCaptureService:
   ``audio_supervisor`` running inside the device-ui process).
   """
 
+  @staticmethod
+  def _resolve_config_path(config_path: str) -> str:
+    """Find config.yaml across source/frozen layouts.
+
+    Order: explicit env override, the given path if it exists (cwd), next to
+    this module, the PyInstaller bundle dir (sys._MEIPASS), and finally next
+    to the frozen executable.
+    """
+    import os as _os
+    import sys as _sys
+
+    env_cfg = (_os.environ.get("MEETINGBOX_AUDIO_CONFIG") or "").strip()
+    candidates = []
+    if env_cfg:
+      candidates.append(env_cfg)
+    candidates.append(config_path)
+    candidates.append(_os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "config.yaml"))
+    meipass = getattr(_sys, "_MEIPASS", None)
+    if meipass:
+      candidates.append(_os.path.join(meipass, "config.yaml"))
+    if getattr(_sys, "frozen", False):
+      candidates.append(_os.path.join(_os.path.dirname(_sys.executable), "config.yaml"))
+    for cand in candidates:
+      try:
+        if cand and _os.path.isfile(cand):
+          return cand
+      except OSError:
+        continue
+    return config_path
+
   def __init__(self, config_path: str = "config.yaml") -> None:
+    config_path = self._resolve_config_path(config_path)
     with open(config_path, "r") as f:
       self.config = yaml.safe_load(f)
 
@@ -174,13 +255,14 @@ class AudioCaptureService:
     self.is_paused = False
     self.is_mic_test = False
     self.current_session_id: str | None = None
+    self.current_recording_mode = "meeting"
     self._recording_thread: object | None = None  # threading.Thread
     self._mic_test_thread: object | None = None  # threading.Thread
     self._output_path: Path | None = None
     self._wav_writer: wave.Wave_write | None = None
     self._last_level_emit_at = 0.0
     self._mic_status: str | None = None
-    self.vad = webrtcvad.Vad(self.config["vad"]["aggressiveness"])
+    self.vad = webrtcvad.Vad(self.config["vad"]["aggressiveness"]) if webrtcvad is not None else None
 
     storage_cfg = self.config.get("storage", {})
     self.temp_dir = Path(os.getenv("TEMP_SEGMENTS_DIR", storage_cfg.get("temp_dir", "/data/audio/temp")))
@@ -198,10 +280,16 @@ class AudioCaptureService:
       self.input_gain = 1.0
     if self.input_gain > 1.0:
       logger.info("Applying AUDIO_INPUT_GAIN=%sx to captured microphone samples", self.input_gain)
-    self.capture_backend = os.getenv("AUDIO_CAPTURE_BACKEND", "arecord").strip().lower()
+    # arecord is Linux/ALSA only. On Windows/macOS default to the PortAudio
+    # (sounddevice) backend so no ALSA tooling is required.
+    _default_backend = "arecord" if sys.platform.startswith("linux") else "sounddevice"
+    self.capture_backend = os.getenv("AUDIO_CAPTURE_BACKEND", _default_backend).strip().lower()
     if self.capture_backend not in ("arecord", "pyaudio", "sounddevice"):
-      logger.warning("Unknown AUDIO_CAPTURE_BACKEND=%r; using arecord", self.capture_backend)
-      self.capture_backend = "arecord"
+      logger.warning("Unknown AUDIO_CAPTURE_BACKEND=%r; using %s", self.capture_backend, _default_backend)
+      self.capture_backend = _default_backend
+    if self.capture_backend == "arecord" and not sys.platform.startswith("linux"):
+      logger.info("arecord backend is Linux-only; switching to sounddevice on this OS")
+      self.capture_backend = "sounddevice" if sd is not None else "pyaudio"
     if self.capture_backend == "sounddevice" and sd is None:
       logger.warning("AUDIO_CAPTURE_BACKEND=sounddevice requested but sounddevice is unavailable; using pyaudio")
       self.capture_backend = "pyaudio"
@@ -263,6 +351,18 @@ class AudioCaptureService:
     configured = (os.getenv("AUDIO_ALSA_INPUT_DEVICE") or "").strip()
     if configured:
       return configured
+    # Check PulseAudio/PipeWire for a Bluetooth source first.
+    # BT devices are not ALSA hardware cards — they only exist as pactl
+    # sources (bluez_input.*). When found, set it as PulseAudio default
+    # and probe ``arecord -L`` for the right virtual PCM that routes
+    # through PulseAudio/PipeWire (pipewire / pulse / default — depends
+    # on which ALSA plugin packages are installed in this container).
+    bt_source = self._pulse_bt_source()
+    if bt_source:
+      self._pulse_set_default_source(bt_source)
+      pcm = self._pick_pulse_pcm()
+      logger.info("arecord: Bluetooth source=%s → using PCM %r", bt_source, pcm)
+      return pcm
     try:
       cards = Path("/proc/asound/cards").read_text(encoding="utf-8", errors="ignore")
     except OSError:
@@ -271,6 +371,52 @@ class AudioCaptureService:
     # numeric hw index, so moving USB ports does not change the configured mic.
     if "USB-Audio" in cards and "[Device" in cards:
       return "plughw:CARD=Device,DEV=0"
+    return "default"
+
+  _BT_PULSE_KEYWORDS = ("bluez", "bluetooth", "a2dp", "hsp", "hfp")
+
+  def _pulse_bt_source(self) -> str | None:
+    """Return the first Bluetooth source from PulseAudio/PipeWire, or None."""
+    try:
+      import subprocess as _sp
+      r = _sp.run(
+        ["pactl", "list", "sources", "short"],
+        capture_output=True, text=True, timeout=5,
+      )
+      for line in r.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 2:
+          name = parts[1].strip()
+          low = name.lower()
+          if any(k in low for k in self._BT_PULSE_KEYWORDS) and ".monitor" not in name:
+            return name
+    except Exception:
+      pass
+    return None
+
+  def _pulse_set_default_source(self, name: str) -> None:
+    try:
+      import subprocess as _sp
+      _sp.run(["pactl", "set-default-source", name], capture_output=True, timeout=4, check=False)
+    except Exception:
+      pass
+
+  def _pick_pulse_pcm(self) -> str:
+    """Return best ALSA PCM that routes through PulseAudio/PipeWire.
+
+    'pulse' needs libasound2-plugins; 'pipewire' needs pipewire-alsa;
+    'default' is always present but only forwards to PA/PW when one of
+    the above plugin packages is installed.  Order: pipewire > pulse > default.
+    """
+    try:
+      import subprocess as _sp
+      r = _sp.run(["arecord", "-L"], capture_output=True, text=True, timeout=5)
+      pcms = {line.strip() for line in r.stdout.splitlines() if line and not line.startswith(" ")}
+    except Exception:
+      pcms = set()
+    for name in ("pipewire", "pulse", "default"):
+      if name in pcms:
+        return name
     return "default"
 
   def _open_input_stream(self, mic_index):
@@ -452,6 +598,8 @@ class AudioCaptureService:
       usb_keywords = [
         "usb", "uac", "respeaker", "jabra", "samson", "blue", "yeti",
         "rode", "fifine", "tonor", "boya", "maono", "external", "webcam", "camera",
+        # Bluetooth devices — prioritized equally with USB external devices
+        "bluetooth", "bluez", "a2dp", "hsp", "hfp", "headset", "hands-free",
       ]
       builtin_keywords = ["hdmi", "built-in", "bcm", "broadcom", "headphone", "analog", "spdif", "iec958"]
       if is_generic_alias(name):
@@ -576,6 +724,8 @@ class AudioCaptureService:
       usb_keywords = (
         "usb", "uac", "respeaker", "jabra", "samson", "blue", "yeti",
         "rode", "fifine", "tonor", "boya", "maono", "external",
+        # Bluetooth devices — treated as external, preventing built-in mic fallback
+        "bluetooth", "bluez", "a2dp", "hsp", "hfp", "headset", "hands-free",
       )
       usb_candidates = [
         c for c in candidates
@@ -730,7 +880,7 @@ class AudioCaptureService:
 
   # --- Recording lifecycle ---------------------------------------------
 
-  def start_recording(self, session_id: str | None = None) -> bool:
+  def start_recording(self, session_id: str | None = None, recording_mode: str = "meeting") -> bool:
     if self.is_recording:
       logger.warning("Already recording")
       return False
@@ -739,8 +889,12 @@ class AudioCaptureService:
 
     if session_id is None:
       session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    mode = (recording_mode or "meeting").strip().lower()
+    if mode not in {"meeting", "note"}:
+      mode = "meeting"
 
     self.current_session_id = session_id
+    self.current_recording_mode = mode
     self.is_recording = True
     self.is_paused = False
     self._mic_status = None
@@ -766,30 +920,56 @@ class AudioCaptureService:
       logger.exception("Failed to open WAV for session %s", session_id)
       return False
 
-    try:
-      mic_index = self.find_mic_device()
-      self.stream = self._open_input_stream(mic_index)
-      self._emit_mic_status("connected")
-    except Exception as exc:
-      self.stream = None
+    mic_wait_started_at = time.monotonic()
+    last_exc: Exception | None = None
+    while self.stream is None and time.monotonic() - mic_wait_started_at < 10.0:
+      try:
+        mic_index = self.find_mic_device()
+        self.stream = self._open_input_stream(mic_index)
+        self._emit_mic_status("connected")
+      except Exception as exc:
+        last_exc = exc
+        self.stream = None
+        self._emit_mic_status(
+          "waiting",
+          message="Waiting for the microphone to become available.",
+        )
+        time.sleep(0.25)
+
+    if self.stream is None:
+      self.is_recording = False
+      self.current_session_id = None
+      self._stop_close_stream()
+      if self._wav_writer is not None:
+        try:
+          self._wav_writer.close()
+        except Exception:
+          pass
+      self._wav_writer = None
+      self._output_path = None
       logger.warning(
-        "Recording session %s started without an available mic; will keep retrying: %s",
+        "Recording session %s could not acquire a microphone before start: %s",
         session_id,
-        exc,
-        exc_info=True,
+        last_exc,
       )
-      self._emit_mic_status("waiting", message="No microphone available yet. Recording will attach when a mic is connected.")
+      self._emit_event({
+        "type": "error",
+        "error_type": "Microphone unavailable",
+        "message": "Could not start recording because the microphone was not available.",
+      })
+      return False
 
     self._emit_event({
       "type": "recording_started",
       "session_id": session_id,
+      "recording_mode": mode,
       "timestamp": datetime.now().isoformat(),
     })
 
     logger.info("Recording started - session %s", session_id)
     return True
 
-  def _build_multipart_payload(self, wav_path: Path, session_id: str) -> tuple[str, bytes]:
+  def _build_multipart_payload(self, wav_path: Path, session_id: str, recording_mode: str = "meeting") -> tuple[str, bytes]:
     boundary = f"----MeetingBoxBoundary{uuid.uuid4().hex}"
     crlf = b"\r\n"
     chunks: list[bytes] = []
@@ -798,6 +978,11 @@ class AudioCaptureService:
     chunks.append(b'Content-Disposition: form-data; name="session_id"')
     chunks.append(b"")
     chunks.append(session_id.encode("utf-8"))
+
+    chunks.append(f"--{boundary}".encode("utf-8"))
+    chunks.append(b'Content-Disposition: form-data; name="recording_mode"')
+    chunks.append(b"")
+    chunks.append((recording_mode or "meeting").encode("utf-8"))
 
     chunks.append(f"--{boundary}".encode("utf-8"))
     chunks.append(
@@ -811,13 +996,13 @@ class AudioCaptureService:
     body = crlf.join(chunks) + crlf
     return boundary, body
 
-  def _upload_recording_via_api(self, wav_path: Path, session_id: str) -> bool:
+  def _upload_recording_via_api(self, wav_path: Path, session_id: str, recording_mode: str = "meeting") -> bool:
     if not wav_path.exists():
       logger.error("Upload skipped: WAV file does not exist (%s)", wav_path)
       return False
 
     try:
-      boundary, body = self._build_multipart_payload(wav_path, session_id)
+      boundary, body = self._build_multipart_payload(wav_path, session_id, recording_mode)
       headers = {"Content-Type": f"multipart/form-data; boundary={boundary}"}
       if self._upload_auth_token:
         headers["Authorization"] = f"Bearer {self._upload_auth_token}"
@@ -838,6 +1023,17 @@ class AudioCaptureService:
     except urlerror.HTTPError as e:
       detail = e.read().decode("utf-8", errors="ignore")
       logger.error("Upload HTTP error for %s: %s %s", session_id, e.code, detail[:200])
+      if e.code in (401, 403):
+        _mark_device_auth_token_revoked()
+        self._upload_auth_token = ""
+        self._emit_event({
+          "type": "error",
+          "error_type": "Device pairing expired",
+          "message": "This device is no longer paired with the server. Pair it again before recording.",
+          "session_id": session_id,
+          "recording_mode": recording_mode,
+          "timestamp": datetime.now().isoformat(),
+        })
     except Exception as e:
       logger.error("Upload failed for %s: %s", session_id, e)
     return False
@@ -850,6 +1046,7 @@ class AudioCaptureService:
       self._emit_event({
         "type": "recording_stopped",
         "session_id": sid,
+        "recording_mode": self.current_recording_mode,
         "path": None,
         "timestamp": datetime.now().isoformat(),
       })
@@ -881,22 +1078,25 @@ class AudioCaptureService:
     self._output_path = None
 
     session_id = self.current_session_id
+    recording_mode = self.current_recording_mode
     uploaded = False
     attempted_upload = False
     if self.upload_on_stop and final_path and session_id:
       attempted_upload = True
-      uploaded = self._upload_recording_via_api(final_path, session_id)
+      uploaded = self._upload_recording_via_api(final_path, session_id, recording_mode)
 
-    if attempted_upload and not uploaded:
+    if attempted_upload and not uploaded and self._upload_auth_token:
       self._emit_event({
         "type": "error",
         "error_type": "Upload Failed",
         "message": "Could not upload audio for cloud transcription/summarization.",
         "session_id": session_id,
+        "recording_mode": recording_mode,
         "timestamp": datetime.now().isoformat(),
       })
 
     self.current_session_id = None
+    self.current_recording_mode = "meeting"
     self._mic_status = None
     return session_id
 
@@ -956,6 +1156,8 @@ class AudioCaptureService:
 
   def process_audio_chunk(self, chunk: bytes) -> bool:
     """Return True if this chunk likely contains speech."""
+    if self.vad is None:
+      return True  # No VAD available: treat every chunk as speech.
     # webrtcvad supports 8000, 16000, 32000, 48000 Hz
     if self.RATE in (8000, 16000, 32000, 48000):
       vad_rate = self.RATE
@@ -1269,7 +1471,8 @@ class AudioCaptureService:
     action = command.get("action")
     if action == "start_recording":
       session_id = command.get("session_id")
-      if self.start_recording(session_id):
+      mode = command.get("recording_mode") or command.get("mode") or "meeting"
+      if self.start_recording(session_id, mode):
         thread = threading.Thread(target=self.recording_loop, daemon=True)
         thread.start()
         self._recording_thread = thread

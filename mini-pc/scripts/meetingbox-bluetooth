@@ -1,0 +1,19 @@
+#!/bin/sh
+# Control Bluetooth from inside device-ui container via nsenter into host namespace.
+#
+# Usage (called by bluetooth_local.py via sudo):
+#   sh meetingbox-bluetooth power on
+#   sh meetingbox-bluetooth power off
+#   sh meetingbox-bluetooth show
+#
+# Requires: docker-compose pid: host, privileged: true,
+#           rebuilt image with sudoers entry for /bin/sh /usr/local/bin/meetingbox-bluetooth *
+
+# When powering on, first lift the rfkill soft block that is set by default
+# after boot (bluetoothctl power on alone returns org.bluez.Error.Failed when
+# the adapter is rfkill-blocked, even as root in the host namespace).
+if [ "$1" = "power" ] && [ "$2" = "on" ]; then
+    nsenter -t 1 -m -u -i -n -p -- rfkill unblock bluetooth 2>/dev/null || true
+fi
+
+exec nsenter -t 1 -m -u -i -n -p -- bluetoothctl "$@"

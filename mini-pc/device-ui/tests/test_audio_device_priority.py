@@ -28,6 +28,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import audio_device_resolve as adr  # noqa: E402
 import mic_input_resolve as mir  # noqa: E402
 
+# These tests assert the Linux ALSA/PulseAudio device-priority logic. On the
+# Windows/macOS desktop port that logic is intentionally short-circuited (the
+# port uses the PortAudio default device), so the suite only applies on Linux.
+pytestmark = pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="Linux-only ALSA/PulseAudio device-priority resolution (bypassed on desktop port)",
+)
+
 
 # ---------------------------------------------------------------------------
 # Fixtures / helpers

@@ -76,6 +76,7 @@ class TextInputDialog(FloatLayout):
             padding=18,
             spacing=10,
         )
+        self._card = card
         with card.canvas.before:
             Color(*COLORS["surface"])
             self._card_bg = RoundedRectangle(
@@ -160,10 +161,13 @@ class TextInputDialog(FloatLayout):
             pass
 
     def on_touch_down(self, touch):
-        # Tap outside the card (the dim overlay) closes the dialog.
-        for child in self.children:
-            if hasattr(child, "collide_point") and child.collide_point(*touch.pos):
-                return super().on_touch_down(touch)
+        # Tap outside the card closes the dialog.
+        # Inside-card touches must always be consumed so they don't fall through
+        # to underlying QuickPanel controls (e.g. restart/power buttons).
+        card = getattr(self, "_card", None)
+        if card is not None and card.collide_point(*touch.pos):
+            super().on_touch_down(touch)
+            return True
         self._dismiss()
         return True
 

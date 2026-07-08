@@ -61,7 +61,19 @@ SCOPES_BY_PROVIDER = {
         "https://www.googleapis.com/auth/calendar.readonly",
         "https://www.googleapis.com/auth/userinfo.email",
     ]),
+    # Combined Google connection: one consent grants both Gmail and Calendar.
+    "google": " ".join([
+        "https://www.googleapis.com/auth/gmail.send",
+        "https://www.googleapis.com/auth/gmail.compose",
+        "https://www.googleapis.com/auth/gmail.readonly",
+        "https://www.googleapis.com/auth/calendar.events",
+        "https://www.googleapis.com/auth/calendar.readonly",
+        "https://www.googleapis.com/auth/userinfo.email",
+    ]),
 }
+
+# Providers that the combined "google" connection expands into (stored as separate rows).
+GOOGLE_COMBINED_PROVIDERS = ("gmail", "calendar")
 
 INTEGRATION_CAPABILITIES = {
     "gmail": {
@@ -768,16 +780,27 @@ async def oauth_callback(
 
     token_data = resp.json()
 
+    # The combined "google" connection stores the same tokens under both gmail and
+    # calendar rows so the rest of the app keeps reading per-provider credentials.
+    save_targets = list(GOOGLE_COMBINED_PROVIDERS) if provider == "google" else [provider]
+
     try:
-        result = _save_tokens(user_id, provider, token_data, scopes)
-        email = result.get("email", "")
+        email = ""
+        for target in save_targets:
+            result = _save_tokens(user_id, target, token_data, scopes)
+            email = result.get("email", "") or email
     except Exception as e:
         logger.error("Failed to save tokens for %s: %s", provider, e)
         return RedirectResponse(
             url=f"{frontend_base}/settings?integration=error&reason=save_failed",
         )
 
-    provider_name = "Gmail" if provider == "gmail" else "Google Calendar"
+    if provider == "google":
+        provider_name = "Google"
+    elif provider == "gmail":
+        provider_name = "Gmail"
+    else:
+        provider_name = "Google Calendar"
     return RedirectResponse(
         url=f"{frontend_base}/settings?integration=success&provider={quote_plus(provider_name)}&email={quote_plus(email)}",
     )
@@ -789,25 +812,40 @@ async def oauth_callback(
 
 @router.post("/integrations/{provider}/disconnect")
 async def disconnect_integration(provider: str, current_user: dict = Depends(get_current_user)):
-    """Remove stored OAuth tokens for an integration."""
+    """Remove stored OAuth tokens for an integration.
+
+    The combined "google" provider disconnects both gmail and calendar at once.
+    """
     user_id = current_user["id"]
-    integration = _get_integration(user_id, provider)
-    if not integration:
+
+    targets = list(GOOGLE_COMBINED_PROVIDERS) if provider == "google" else [provider]
+    integrations = [(t, _get_integration(user_id, t)) for t in targets]
+    found = [(t, row) for t, row in integrations if row]
+    if not found:
         raise HTTPException(status_code=404, detail=f"{provider} is not connected")
 
-    try:
-        async with httpx.AsyncClient() as http:
-            await http.post(
-                REVOKE_URL,
-                params={"token": integration["access_token"]},
-                timeout=10,
-            )
-    except Exception:
-        pass
+    # gmail and calendar share the same refresh token under the combined flow, so a
+    # single revoke is enough; revoke each distinct access token best-effort anyway.
+    revoked_tokens: set[str] = set()
+    for _, row in found:
+        access_token = row.get("access_token")
+        if not access_token or access_token in revoked_tokens:
+            continue
+        revoked_tokens.add(access_token)
+        try:
+            async with httpx.AsyncClient() as http:
+                await http.post(
+                    REVOKE_URL,
+                    params={"token": access_token},
+                    timeout=10,
+                )
+        except Exception:
+            pass
 
     conn = get_connection()
     try:
-        conn.execute("DELETE FROM integrations WHERE user_id = ? AND provider = ?", (user_id, provider))
+        for target in targets:
+            conn.execute("DELETE FROM integrations WHERE user_id = ? AND provider = ?", (user_id, target))
         conn.commit()
     finally:
         conn.close()

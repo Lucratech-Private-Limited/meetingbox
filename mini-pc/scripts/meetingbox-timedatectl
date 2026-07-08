@@ -1,0 +1,12 @@
+#!/bin/sh
+# Run timedatectl on the host from inside the device-ui container.
+#
+# Usage (called by system_clock_util.py via sudo):
+#   meetingbox-timedatectl set-timezone Asia/Kolkata
+#   meetingbox-timedatectl set-ntp true
+#   meetingbox-timedatectl set-time "2026-05-21 14:30:00"
+#
+# Requires: docker-compose pid: host, privileged: true,
+#           rebuilt image with sudoers entry for this path.
+
+exec nsenter -t 1 -m -u -i -n -p -- timedatectl "$@"

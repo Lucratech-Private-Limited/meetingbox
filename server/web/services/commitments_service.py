@@ -201,7 +201,7 @@ def upsert_commitment(user_id: str, payload: dict[str, Any]) -> dict[str, Any]:
                 ),
             )
             conn.commit()
-            cur2 = conn.execute("SELECT * FROM user_commitments WHERE id = ?", (cid,))
+            cur2 = conn.execute("SELECT * FROM user_commitments WHERE id = ? AND user_id = ?", (cid, uid))
             row = cur2.fetchone()
             return dict(row) if row else {}
 
@@ -247,7 +247,7 @@ def upsert_commitment(user_id: str, payload: dict[str, Any]) -> dict[str, Any]:
             ),
         )
         conn.commit()
-        cur2 = conn.execute("SELECT * FROM user_commitments WHERE id = ?", (nid,))
+        cur2 = conn.execute("SELECT * FROM user_commitments WHERE id = ? AND user_id = ?", (nid, uid))
         row = cur2.fetchone()
         return dict(row) if row else {}
     finally:

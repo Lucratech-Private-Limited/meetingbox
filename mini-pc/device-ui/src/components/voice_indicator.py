@@ -1,5 +1,5 @@
 """
-Floating visual indicator for the local Tony voice assistant.
+Floating visual indicator for the local Pepper voice assistant.
 """
 
 from kivy.animation import Animation
@@ -96,7 +96,7 @@ class VoiceAssistantIndicator(BoxLayout):
 
         text_col = BoxLayout(orientation="vertical", spacing=_suv(2))
         self.title_label = Label(
-            text="Tony",
+            text="Pepper",
             font_size=_suf(FONT_SIZES["small"] + 1),
             color=COLORS["white"],
             bold=True,
@@ -107,7 +107,7 @@ class VoiceAssistantIndicator(BoxLayout):
         text_col.add_widget(self.title_label)
 
         self.subtitle_label = Label(
-            text='Say "Hey Tony"',
+            text='Say "Hey Pepper"',
             font_size=_suf(FONT_SIZES["tiny"] + 1),
             color=COLORS["gray_300"],
             halign="left",
@@ -117,7 +117,7 @@ class VoiceAssistantIndicator(BoxLayout):
         text_col.add_widget(self.subtitle_label)
 
         self._orb_text = Label(
-            text="T",
+            text="P",
             font_size=_suf(FONT_SIZES["medium"]),
             bold=True,
             color=COLORS["white"],
@@ -158,8 +158,8 @@ class VoiceAssistantIndicator(BoxLayout):
         self.opacity = 1.0
         if state == "idle":
             self._bg_color.rgba = (0.07, 0.10, 0.16, 0.92)
-            self.title_label.text = "Tony"
-            self.subtitle_label.text = message or 'Say "Hey Tony"'
+            self.title_label.text = "Pepper"
+            self.subtitle_label.text = message or 'Say "Hey Pepper"'
             self._set_palette(COLORS["blue"])
             anim = Animation(glow_alpha=0.12, pulse_scale=1.02, duration=1.4) + Animation(
                 glow_alpha=0.04, pulse_scale=0.98, duration=1.4
@@ -167,7 +167,7 @@ class VoiceAssistantIndicator(BoxLayout):
         elif state == "wake":
             self._bg_color.rgba = (0.08, 0.13, 0.20, 0.96)
             self.title_label.text = "Listening"
-            self.subtitle_label.text = message or 'Heard "Hey Tony"'
+            self.subtitle_label.text = message or 'Heard "Hey Pepper"'
             self._set_palette((0.26, 0.72, 0.98, 1))
             anim = Animation(glow_alpha=0.32, pulse_scale=1.18, duration=0.38) + Animation(
                 glow_alpha=0.10, pulse_scale=0.98, duration=0.42
@@ -182,7 +182,7 @@ class VoiceAssistantIndicator(BoxLayout):
             )
         elif state == "speaking":
             self._bg_color.rgba = (0.07, 0.15, 0.11, 0.96)
-            self.title_label.text = "Tony"
+            self.title_label.text = "Pepper"
             self.subtitle_label.text = message or "Meeting start"
             self._set_palette(COLORS["green"])
             anim = Animation(glow_alpha=0.34, pulse_scale=1.20, duration=0.30) + Animation(

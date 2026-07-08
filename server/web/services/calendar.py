@@ -183,6 +183,8 @@ def find_and_delete_event(
     event_id: str | None = None,
     title_hint: str | None = None,
     date_hint: str | None = None,
+    time_hint: str | None = None,
+    duration_minutes: int | None = None,
     timezone: str | None = None,
 ) -> dict:
     """
@@ -253,13 +255,53 @@ def find_and_delete_event(
     )
     events = result.get("items", [])
 
-    # Fuzzy match by title
     title_lower = title_hint.strip().lower()
-    matches = [e for e in events if title_lower in (e.get("summary") or "").lower()]
+    def _title_match_rank(event: dict) -> int:
+        summary = (event.get("summary") or "").strip().lower()
+        if summary == title_lower:
+            return 3
+        if summary.startswith(title_lower):
+            return 2
+        if title_lower in summary:
+            return 1
+        return 0
+
+    def _event_start_local(event: dict) -> datetime | None:
+        start_raw = str((event.get("start") or {}).get("dateTime") or "").strip()
+        if not start_raw:
+            return None
+        try:
+            start_dt = datetime.fromisoformat(start_raw.replace("Z", "+00:00"))
+            if start_dt.tzinfo is None:
+                start_dt = start_dt.replace(tzinfo=zone)
+            return start_dt.astimezone(zone)
+        except Exception:
+            return None
+
+    def _event_duration_minutes(event: dict) -> int | None:
+        start_dt = _event_start_local(event)
+        end_raw = str((event.get("end") or {}).get("dateTime") or "").strip()
+        if not start_dt or not end_raw:
+            return None
+        try:
+            end_dt = datetime.fromisoformat(end_raw.replace("Z", "+00:00"))
+            if end_dt.tzinfo is None:
+                end_dt = end_dt.replace(tzinfo=zone)
+            return int(round((end_dt.astimezone(zone) - start_dt).total_seconds() / 60))
+        except Exception:
+            return None
+
+    ranked = [(_title_match_rank(e), e) for e in events]
+    ranked = [(rank, e) for rank, e in ranked if rank > 0]
+    if ranked:
+        best_title_rank = max(rank for rank, _ in ranked)
+        matches = [e for rank, e in ranked if rank == best_title_rank]
+    else:
+        matches = []
 
     if not matches:
         raise ValueError(f"No event matching '{title_hint}' found near {date_hint or 'today'}.")
-    if len(matches) > 1:
+    if len(matches) > 1 and date_hint:
         # Narrow using resolved date string (YYYY-MM-DD) — works regardless of hint phrasing
         narrowed = [
             e for e in matches
@@ -268,11 +310,38 @@ def find_and_delete_event(
         if narrowed:
             matches = narrowed
 
+    if len(matches) > 1 and time_hint:
+        target_hhmm = str(time_hint).strip()[:5]
+        time_narrowed: list[dict] = []
+        for e in matches:
+            start_dt = _event_start_local(e)
+            if start_dt and start_dt.strftime("%H:%M") == target_hhmm:
+                time_narrowed.append(e)
+        if time_narrowed:
+            matches = time_narrowed
+
+    if len(matches) > 1 and duration_minutes:
+        try:
+            target_duration = int(duration_minutes)
+        except (TypeError, ValueError):
+            target_duration = 0
+        if target_duration > 0:
+            duration_narrowed = [
+                e for e in matches
+                if _event_duration_minutes(e) == target_duration
+            ]
+            if duration_narrowed:
+                matches = duration_narrowed
+
     if len(matches) > 1:
         summaries = ", ".join(
-            f"'{e.get('summary')}' on {(e.get('start') or {}).get('dateTime', (e.get('start') or {}).get('date', '?'))[:10]}"
+            f"'{e.get('summary')}' at {((e.get('start') or {}).get('dateTime') or (e.get('start') or {}).get('date') or '?')[:16]}"
             for e in matches[:4]
         )
+        if time_hint:
+            raise ValueError(
+                f"Multiple matching events found near {time_hint}: {summaries}. Please include a clearer title or exact date/time."
+            )
         raise ValueError(f"Multiple matching events found: {summaries}. Please be more specific.")
 
     ev = matches[0]
@@ -292,6 +361,7 @@ def update_event(
     title_hint: str | None = None,
     date_hint: str | None = None,
     timezone: str | None = None,
+    attendees_replace: list[str] | None = None,
     attendees_add: list[str] | None = None,
     attendees_remove: list[str] | None = None,
     title: str | None = None,
@@ -390,7 +460,18 @@ def update_event(
     ev_id = ev["id"]
     patch_body: dict = {}
 
-    if attendees_add or attendees_remove:
+    if attendees_replace is not None:
+        seen: set[str] = set()
+        merged: list[dict] = []
+        for email in attendees_replace:
+            em = (email or "").strip()
+            low = em.lower()
+            if not em or low in seen:
+                continue
+            seen.add(low)
+            merged.append({"email": em})
+        patch_body["attendees"] = merged
+    elif attendees_add or attendees_remove:
         existing_pairs = [
             (a["email"], a) for a in (ev.get("attendees") or []) if a.get("email")
         ]

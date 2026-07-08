@@ -1,4 +1,4 @@
-import { apiClient } from './client'
+import { apiClient, ASSISTANT_INTENT_TIMEOUT_MS } from './client'
 
 export interface AssistantIntentResponse {
   audit_id: string
@@ -25,10 +25,14 @@ export async function postAssistantIntent(
   message: string,
   meetingId?: string | null
 ): Promise<AssistantIntentResponse> {
-  const { data } = await apiClient.post<AssistantIntentResponse>('/api/assistant/intent', {
-    message,
-    meeting_id: meetingId ?? null,
-  })
+  const { data } = await apiClient.post<AssistantIntentResponse>(
+    '/api/assistant/intent',
+    {
+      message,
+      meeting_id: meetingId ?? null,
+    },
+    { timeout: ASSISTANT_INTENT_TIMEOUT_MS }
+  )
   return data
 }
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Any
+import re
 
 from googleapiclient.errors import HttpError
 
@@ -183,6 +184,7 @@ def calendar_update_from_payload(user_id: str, payload: dict[str, Any]) -> dict[
 
   attendees_add = payload.get("attendees_add") if isinstance(payload.get("attendees_add"), list) else []
   attendees_remove = payload.get("attendees_remove") if isinstance(payload.get("attendees_remove"), list) else []
+  attendees_replace = payload.get("attendees_replace") if isinstance(payload.get("attendees_replace"), list) else None
   new_title = str(payload.get("new_title") or "").strip() or None
   description = payload.get("description")
   if description is None:
@@ -206,6 +208,7 @@ def calendar_update_from_payload(user_id: str, payload: dict[str, Any]) -> dict[
       title_hint=title_hint,
       date_hint=date_hint,
       timezone=timezone,
+      attendees_replace=attendees_replace,
       attendees_add=attendees_add if attendees_add else None,
       attendees_remove=attendees_remove if attendees_remove else None,
       title=new_title,
@@ -257,34 +260,64 @@ def calendar_rsvp_from_payload(user_id: str, payload: dict[str, Any]) -> dict[st
 
 
 def _extract_event_title(raw: str) -> str:
-  """
-  Defensively extract just the event name from a potentially full sentence.
-  The LLM planner sometimes puts the full request sentence as the 'title' arg.
-  """
-  import re
-  raw = raw.strip()
-  # If short enough, use as-is
-  if len(raw) <= 60 and not any(w in raw.lower() for w in ("delete ", "remove ", "cancel ", "the calendar", "scheduled")):
-    return raw
-  # Try quoted string first: "Focus Time" or 'Focus Time'
-  quoted = re.search(r'"([^"]{2,60})"', raw) or re.search(r"'([^']{2,60})'", raw)
+  """Extract a clean event title from free-form delete/update phrasing."""
+  s = (raw or "").strip()
+  if not s:
+    return ""
+
+  quoted = re.search(r'"([^"]{2,100})"', s) or re.search(r"'([^']{2,100})'", s)
   if quoted:
     return quoted.group(1).strip()
-  # Try "titled X", "named X", "called X" patterns
-  named = re.search(
-    r'(?:titled|named|called)\s+"?\'?([A-Za-z0-9 _\-]{2,60}?)\'?"?\s+(?:scheduled|on|at|for|from|tomorrow|today|in\b)',
-    raw, re.I,
-  )
-  if named:
-    return named.group(1).strip()
-  # Fall back to the first few words (likely the event name before qualifying text)
-  words = raw.split()
-  for i, w in enumerate(words):
-    if w.lower() in ("scheduled", "on", "at", "from", "in", "tomorrow", "today", "the", "delete", "remove", "cancel"):
-      if i > 0:
-        return " ".join(words[:i]).strip()
-  return raw[:60].strip()
 
+  s = re.sub(r"^(?:please\s+)?(?:delete|remove|cancel|drop|clear|get rid of)\s+", "", s, flags=re.I).strip()
+  s = re.sub(r"\bevent\b", "", s, flags=re.I).strip()
+
+  stop = re.search(
+    r"\s+(?:at\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?|on\s+\d{4}-\d{2}-\d{2}|today|tomorrow|next\s+\w+|this\s+\w+)\b",
+    s,
+    flags=re.I,
+  )
+  if stop:
+    s = s[:stop.start()].strip()
+
+  s = re.sub(r"\s+", " ", s).strip(" .,:;!-")
+  return s[:120]
+
+
+def _extract_time_hint(raw: str) -> str | None:
+  s = (raw or "").strip()
+  if not s:
+    return None
+  m = re.search(r"\b(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b", s, flags=re.I)
+  if not m:
+    return None
+
+  hh = int(m.group(1))
+  mm = int(m.group(2) or "0")
+  ampm = (m.group(3) or "").lower()
+  if ampm == "pm" and hh < 12:
+    hh += 12
+  elif ampm == "am" and hh == 12:
+    hh = 0
+  if hh > 23 or mm > 59:
+    return None
+  return f"{hh:02d}:{mm:02d}"
+
+
+def _normalize_time_hint(raw: str | None) -> str | None:
+  s = str(raw or "").strip()
+  if not s:
+    return None
+  m24 = re.fullmatch(r"(\d{1,2}):(\d{2})", s)
+  if m24:
+    hh = int(m24.group(1))
+    mm = int(m24.group(2))
+    if 0 <= hh <= 23 and 0 <= mm <= 59:
+      return f"{hh:02d}:{mm:02d}"
+  iso = re.search(r"T(\d{2}):(\d{2})", s)
+  if iso:
+    return f"{iso.group(1)}:{iso.group(2)}"
+  return _extract_time_hint(s)
 
 def calendar_delete_from_payload(user_id: str, payload: dict[str, Any]) -> dict[str, Any]:
   if not user_id:
@@ -296,6 +329,10 @@ def calendar_delete_from_payload(user_id: str, payload: dict[str, Any]) -> dict[
   raw_title = str(payload.get("title") or payload.get("title_hint") or "").strip()
   title_hint = _extract_event_title(raw_title) if raw_title else None
   date_hint = str(payload.get("date") or payload.get("date_hint") or payload.get("start_time") or "").strip() or None
+  time_hint = _normalize_time_hint(payload.get("time_hint") or payload.get("time") or payload.get("start_time"))
+  if not time_hint and raw_title:
+    time_hint = _normalize_time_hint(raw_title)
+  duration_minutes = payload.get("duration_minutes") or payload.get("duration_hint")
   timezone = str(payload.get("timezone") or default_calendar_tz_name())
   try:
     return find_and_delete_event(
@@ -303,13 +340,14 @@ def calendar_delete_from_payload(user_id: str, payload: dict[str, Any]) -> dict[
       event_id=event_id,
       title_hint=title_hint,
       date_hint=date_hint,
+      time_hint=time_hint,
+      duration_minutes=int(duration_minutes) if duration_minutes else None,
       timezone=timezone,
     )
   except HttpError as e:
     raise _wrap_google_error(e) from e
   except ValueError as e:
     raise ToolError(str(e)) from e
-
 
 def calendar_suggest_free_slots(user_id: str, args: dict | None = None) -> dict[str, Any]:
   if not user_id:

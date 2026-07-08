@@ -15,6 +15,7 @@ from kivy.uix.widget import Widget
 from async_helper import run_async
 from components.button import PrimaryButton, SecondaryButton
 from config import COLORS, FONT_SIZES, SPACING, display_now
+from platform_compat import IS_DESKTOP, TAP_OR_CLICK
 from screens.base_screen import BaseScreen
 
 _BULLET_RE = re.compile(r"^\s*[-•]\s+")
@@ -77,7 +78,20 @@ class _AssistantOrb(FloatLayout):
             self._inner_color = Color(0.22, 0.53, 0.98, 0.82)
             self._inner = Ellipse(pos=self.pos, size=self.size)
         self.bind(pos=self._sync, size=self._sync)
-        self._event = Clock.schedule_interval(self._tick, 1 / 24)
+        # Animation runs only while the Briefing screen is on-screen (see
+        # BriefingScreen.on_enter / on_leave). Previously this 24 fps interval
+        # started at construction and was never cancelled, so it pulsed for the
+        # whole device lifetime even when Briefing was never opened.
+        self._event = None
+
+    def start(self):
+        if self._event is None:
+            self._event = Clock.schedule_interval(self._tick, 1 / 24)
+
+    def stop(self):
+        if self._event is not None:
+            self._event.cancel()
+            self._event = None
 
     def _sync(self, *_args):
         pad = min(self.width, self.height) * 0.22
@@ -114,8 +128,8 @@ class BriefingScreen(BaseScreen):
         self.make_dark_bg(root)
 
         header = BoxLayout(orientation="horizontal", size_hint=(1, None), height=sv(76), spacing=sv(12))
-        orb = _AssistantOrb(size=(sv(58), sv(58)))
-        header.add_widget(orb)
+        self._orb = _AssistantOrb(size=(sv(58), sv(58)))
+        header.add_widget(self._orb)
 
         title_col = BoxLayout(orientation="vertical", spacing=sv(2))
         self.kicker = Label(
@@ -192,7 +206,7 @@ class BriefingScreen(BaseScreen):
         self.response_label = Label(
             text=(
                 "Good day. I can brief your calendar, scan your inbox, and recall recent meeting follow-ups.\n\n"
-                "Tap a card above to begin. Writes like email/calendar changes still require approval on web."
+                f"{TAP_OR_CLICK} a card above to begin. Writes like email/calendar changes still require approval on web."
             ),
             markup=False,
             font_size=sf(FONT_SIZES["body"]),
@@ -211,13 +225,18 @@ class BriefingScreen(BaseScreen):
         root.add_widget(card)
 
         bottom = BoxLayout(orientation="horizontal", size_hint=(1, None), height=sv(56), spacing=sv(10))
-        meeting_btn = SecondaryButton(text="Meetings", size_hint=(0.34, 1))
+        # Desktop has no in-app Settings screen; omit the Settings button and
+        # let Meetings + Home fill the row. Appliance keeps all three.
+        meeting_w = 0.5 if IS_DESKTOP else 0.34
+        home_w = 0.5 if IS_DESKTOP else 0.32
+        meeting_btn = SecondaryButton(text="Meetings", size_hint=(meeting_w, 1))
         meeting_btn.bind(on_release=lambda *_: self.goto("meetings", transition="slide_left"))
         bottom.add_widget(meeting_btn)
-        settings_btn = SecondaryButton(text="Settings", size_hint=(0.34, 1))
-        settings_btn.bind(on_release=lambda *_: self.goto("settings", transition="slide_left"))
-        bottom.add_widget(settings_btn)
-        home_btn = PrimaryButton(text="Home", size_hint=(0.32, 1))
+        if not IS_DESKTOP:
+            settings_btn = SecondaryButton(text="Settings", size_hint=(0.34, 1))
+            settings_btn.bind(on_release=lambda *_: self.goto("settings", transition="slide_left"))
+            bottom.add_widget(settings_btn)
+        home_btn = PrimaryButton(text="Home", size_hint=(home_w, 1))
         home_btn.bind(on_release=lambda *_: self.goto("home", transition="slide_right"))
         bottom.add_widget(home_btn)
         root.add_widget(bottom)
@@ -238,6 +257,10 @@ class BriefingScreen(BaseScreen):
 
     def on_enter(self):
         self.title.text = f"Tony · {display_now().strftime('%A')}"
+        self._orb.start()
+
+    def on_leave(self):
+        self._orb.stop()
 
     def run_assistant(self, prompt: str, label: str):
         if self._loading:

@@ -53,6 +53,26 @@ def test_realtime_session_503_when_disabled(tmp_path, monkeypatch):
     assert res.status_code == 503
 
 
+def test_device_settings_default_wake_phrase_is_pepper(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEVICE_SETTINGS_PATH", str(tmp_path / "device_settings.json"))
+    from routes import device as device_routes
+
+    importlib.reload(device_routes)
+    settings = device_routes._load_settings()
+    assert settings["voice_wake_phrase"] == "hey pepper"
+
+
+def test_device_settings_migrates_tony_default_back_to_pepper(tmp_path, monkeypatch):
+    settings_path = tmp_path / "device_settings.json"
+    settings_path.write_text('{"voice_wake_phrase": "hey tony"}', encoding="utf-8")
+    monkeypatch.setenv("DEVICE_SETTINGS_PATH", str(settings_path))
+    from routes import device as device_routes
+
+    importlib.reload(device_routes)
+    settings = device_routes._load_settings()
+    assert settings["voice_wake_phrase"] == "hey pepper"
+
+
 def test_realtime_session_ok_with_mock_openai(tmp_path, monkeypatch):
     app, uid = _app_with_user(
         tmp_path,
@@ -389,6 +409,10 @@ def test_realtime_session_mock_receives_turn_detection_fields(tmp_path, monkeypa
     assert td.get("interrupt_response") is True
     nr = inp.get("noise_reduction") or {}
     assert nr.get("type") == "far_field"
+    transcription = inp.get("transcription") or {}
+    assert transcription.get("model") == "gpt-4o-transcribe"
+    assert transcription.get("language") == "en"
+    assert "prompt" not in transcription
     assert outp.get("voice") == "shimmer"
     assert "reasoning" in captured and captured["reasoning"]["effort"] == "minimal"
 
@@ -669,6 +693,73 @@ def test_realtime_tool_approve_requires_choice_when_multiple_pending(tmp_path, m
     assert out.get("error") == "pending_id_required"
     assert isinstance(out.get("pending_choices"), list)
     assert len(out["pending_choices"]) == 2
+
+
+def test_confirm_calendar_event_blocked_without_approval(tmp_path, monkeypatch):
+    """The unified approval gate must refuse to write when confirmed_by_user is
+    missing — no Google call, no event created."""
+    app, uid = _app_with_user(tmp_path, monkeypatch, MEETINGBOX_REALTIME_VOICE_ENABLED="1")
+    import auth
+
+    token = auth.create_access_token({"sub": uid})
+    client = TestClient(app)
+    res = client.post(
+        "/api/voice/realtime/tools/invoke",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "call_id": "cal_no_appr",
+            "name": "confirm_calendar_event",
+            "arguments": '{"name":"Sync","date":"2026-06-21","time":"15:00"}',
+        },
+    )
+    assert res.status_code == 200
+    out = json.loads(res.json()["output"])
+    assert out.get("error") == "confirmation_required"
+    assert out.get("truth_status", {}).get("writes_committed") is False
+
+
+def test_confirm_calendar_event_blocked_on_refusal_phrase(tmp_path, monkeypatch):
+    """confirmed_by_user=true but a deferral phrase must still be refused."""
+    app, uid = _app_with_user(tmp_path, monkeypatch, MEETINGBOX_REALTIME_VOICE_ENABLED="1")
+    import auth
+
+    token = auth.create_access_token({"sub": uid})
+    client = TestClient(app)
+    res = client.post(
+        "/api/voice/realtime/tools/invoke",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "call_id": "cal_refuse",
+            "name": "confirm_calendar_event",
+            "arguments": '{"name":"Sync","date":"2026-06-21","time":"15:00",'
+                         '"confirmed_by_user":true,"confirmation_phrase":"not now, later"}',
+        },
+    )
+    assert res.status_code == 200
+    out = json.loads(res.json()["output"])
+    assert out.get("error") == "confirmation_phrase_required"
+    assert out.get("truth_status", {}).get("writes_committed") is False
+
+
+def test_confirm_task_creation_blocked_without_approval(tmp_path, monkeypatch):
+    app, uid = _app_with_user(tmp_path, monkeypatch, MEETINGBOX_REALTIME_VOICE_ENABLED="1")
+    import auth
+
+    token = auth.create_access_token({"sub": uid})
+    client = TestClient(app)
+    res = client.post(
+        "/api/voice/realtime/tools/invoke",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "call_id": "task_no_appr",
+            "name": "confirm_task_creation",
+            "arguments": '{"title":"Call the bank"}',
+        },
+    )
+    assert res.status_code == 200
+    out = json.loads(res.json()["output"])
+    assert out.get("error") == "confirmation_required"
+    assert out.get("truth_status", {}).get("writes_committed") is False
 
 
 def test_e2e_realtime_get_briefing_user_asks_meetings_tomorrow_has_data(tmp_path, monkeypatch):

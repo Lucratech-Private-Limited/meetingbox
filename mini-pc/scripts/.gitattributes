@@ -1,5 +1,6 @@
 # POSIX shell shebang breaks if these are checked out with CRLF (sudo: command not found).
 meetingbox-host-reboot text eol=lf
 meetingbox-host-poweroff text eol=lf
+meetingbox-host-orientation-lock text eol=lf
 kiosk-compose-up.sh text eol=lf
 gdm-kiosk-session.sh text eol=lf

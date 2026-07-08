@@ -77,6 +77,7 @@ SOURCE_USER_COMMITMENT = "user_commitment"
 SOURCE_MEETING_ARTIFACTS = "meeting_artifacts"
 SOURCE_ASSISTANT_PENDING_OUTCOME = "assistant_pending_outcome"
 SOURCE_VOICE_MEMORY = "voice_memory"
+SOURCE_VOICE_NOTE = "voice_note"
 
 _memory_singleton: Any = None
 
@@ -126,8 +127,16 @@ def _env_ingest_enabled(name: str) -> bool:
         return False
     if raw in ("1", "true", "yes", "on"):
         return True
-    # Backward-compatible default: when unset, keep chat-turn ingest ON.
-    if name == "MEETINGBOX_MEM0_INGEST_CHAT":
+    # Backward-compatible defaults: critical ingest pipelines are ON unless explicitly disabled.
+    # Gmail, calendar, and auto-summary are left opt-in (require Google credentials; silent
+    # failures on unconfigured deployments would be noisy).
+    _INGEST_DEFAULT_ON = {
+        "MEETINGBOX_MEM0_INGEST_CHAT",
+        "MEETINGBOX_MEM0_INGEST_PENDING_OUTCOMES",   # email sends, calendar writes, task approvals
+        "MEETINGBOX_MEM0_INGEST_MEETING_ARTIFACTS",  # meeting summaries and participants
+        "MEETINGBOX_MEM0_INGEST_NOTES",              # personal notes — always on
+    }
+    if name in _INGEST_DEFAULT_ON:
         return True
     return False
 
@@ -217,6 +226,31 @@ def _memory():
             return None
 
     return _memory_singleton
+
+
+def warm_search_path() -> None:
+    """Best-effort: exercise the Mem0 search + get_all paths once so the
+    embedding model, DB connections and graph extractor are hot before the
+    first real voice session. Cold first-call is ~3 s; warmed is ~0.4 s.
+    Safe to call from a background thread at startup; swallows all errors.
+    """
+    try:
+        if mem0_disabled_globally():
+            return
+        m = _memory()
+        if not m:
+            return
+        try:
+            m.search("warmup readiness ping", filters={"user_id": "__warmup__"}, top_k=1)
+        except Exception:
+            logger.debug("mem0 warm: search probe failed", exc_info=True)
+        try:
+            m.get_all(filters={"user_id": "__warmup__", "agent_id": "voice_explicit"}, top_k=1)
+        except Exception:
+            logger.debug("mem0 warm: get_all probe failed", exc_info=True)
+        logger.info("Mem0: search/get_all paths warmed")
+    except Exception:
+        logger.debug("mem0 warm: unexpected failure", exc_info=True)
 
 
 def _mem0_search_raw(user_id: str, query: str, top_k: int) -> Any:
@@ -658,13 +692,20 @@ def _do_ingest_meeting_sqlite_artifacts(uid: str, mid: str) -> None:
     parts: list[str] = []
     try:
         cur = conn.cursor()
-        cur.execute("SELECT user_id, title FROM meetings WHERE id = ?", (mid,))
+        cur.execute("SELECT user_id, title, participants, recording_mode FROM meetings WHERE id = ?", (mid,))
         m = cur.fetchone()
         if not m or (m.get("user_id") or "").strip() != uid:
+            return
+        # Never ingest note-mode recordings as "Meeting archive" facts — notes
+        # have their own Mem0 ingest path (maybe_ingest_note / source=voice_note).
+        if (m.get("recording_mode") or "").strip().lower() == "note":
             return
         mt = (m.get("title") or "").strip()
         if mt:
             parts.append(f"Meeting title: {mt}")
+        participants = (m.get("participants") or "").strip()
+        if participants:
+            parts.append(f"Meeting participants: {participants[:2000]}")
 
         cur.execute(
             """
@@ -773,6 +814,55 @@ def _do_ingest_meeting_sqlite_artifacts(uid: str, mid: str) -> None:
         _cb_record_error()
 
 
+def _infer_rejection_preference(uid: str, tool_name: str, brief_label: str) -> None:
+    """Background thread: call GPT to infer a user preference from a rejected action.
+
+    Stores the inferred preference under voice_explicit so the voice assistant
+    learns the user's behavioral patterns from declined suggestions.
+    Only fires for "rejected" outcomes with a non-empty brief_label.
+    """
+    try:
+        import openai
+
+        model = os.getenv("MEETINGBOX_PROFILER_MODEL", "gpt-4o-mini")
+        client = openai.OpenAI()
+        resp = client.chat.completions.create(
+            model=model,
+            max_tokens=80,
+            temperature=0.1,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You analyze rejected AI actions to infer one short user preference. "
+                        "If a clear preference is evident, output a single sentence starting with "
+                        "'User prefers not to' or 'User does not want'. "
+                        "If no clear preference can be inferred, output exactly: no_inference"
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"User rejected this AI action:\n"
+                        f"Tool: {tool_name}\n"
+                        f"Description: {brief_label[:400]}"
+                    ),
+                },
+            ],
+        )
+        preference = (resp.choices[0].message.content or "").strip()
+        if not preference or preference == "no_inference" or len(preference) < 16:
+            return
+        ingest_voice_explicit_memory(
+            uid,
+            fact=preference,
+            context_note=f"Inferred from rejected action: {tool_name}",
+        )
+        logger.info("preference_reinforce: stored inferred preference user=%s tool=%s", uid, tool_name)
+    except Exception:
+        logger.debug("preference_reinforce: inference failed user=%s tool=%s", uid, tool_name, exc_info=True)
+
+
 def maybe_ingest_pending_assistant_outcome(
     user_id: str | None,
     *,
@@ -782,7 +872,11 @@ def maybe_ingest_pending_assistant_outcome(
     brief_label: str | None = None,
     error: str | None = None,
 ) -> None:
-    """Record approve/reject/fail outcomes for queued assistant writes (short Mem0 digest)."""
+    """Record approve/reject/fail outcomes for queued assistant writes (short Mem0 digest).
+
+    When status is 'rejected' and brief_label is non-empty, fires a background
+    thread to infer and store a behavioral preference from the rejection signal.
+    """
     uid = (user_id or "").strip()
     pid = (pending_id or "").strip()
     if not uid or not pid:
@@ -800,6 +894,21 @@ def maybe_ingest_pending_assistant_outcome(
         text,
         {"pending_id": pid, "tool": tool_name, "status": status},
     )
+    # Preference reinforcement: infer a behavioral preference from rejections.
+    if (
+        status == "rejected"
+        and brief_label
+        and len((brief_label or "").strip()) >= 8
+        and not mem0_writes_disabled()
+        and not _cb_is_open()
+    ):
+        t = threading.Thread(
+            target=_infer_rejection_preference,
+            args=(uid, tool_name, brief_label.strip()),
+            daemon=True,
+            name=f"pref-infer-{uid[:8]}",
+        )
+        t.start()
 
 
 def _get_soft_deleted_ids(user_id: str) -> set[str]:
@@ -909,7 +1018,22 @@ def soft_delete_all_user_memories(user_id: str, deleted_by: str = "admin") -> in
         # get_all may return a list of dicts or a dict with a "results" key
         if isinstance(all_mems, dict):
             all_mems = all_mems.get("results") or []
-        memory_ids = [r.get("id") for r in all_mems if r.get("id")]
+        # Defensive ownership check: only soft-delete entries that belong to uid.
+        # Guards against a Mem0 backend regression returning a foreign entry from
+        # the scoped get_all, which would accidentally blacklist someone else's memory.
+        valid_mems = []
+        for r in all_mems:
+            if not r.get("id"):
+                continue
+            entry_uid = str(r.get("user_id") or "").strip()
+            if entry_uid and entry_uid != uid:
+                logger.warning(
+                    "soft_delete_all_user_memories: skipping foreign mem0 entry id=%s owner=%s expected=%s",
+                    r["id"], entry_uid, uid,
+                )
+                continue
+            valid_mems.append(r)
+        memory_ids = [r["id"] for r in valid_mems]
     except Exception:
         logger.exception("mem0 soft_delete_all_user_memories get_all failed user=%s", uid)
         return 0
@@ -951,3 +1075,68 @@ def delete_user_memories(user_id: str) -> None:
     if not user_id or mem0_disabled_globally():
         return
     soft_delete_all_user_memories(str(user_id), deleted_by="admin")
+
+
+# ── Notes memory helpers ──────────────────────────────────────────────────────
+
+
+def maybe_ingest_note(user_id: str | None, row: dict[str, Any]) -> None:
+    """Push a user note into Mem0 so the voice agent can recall it later.
+
+    Default ON; set MEETINGBOX_MEM0_INGEST_NOTES=0 to disable.
+    """
+    if not user_id or not isinstance(row, dict) or not row.get("id"):
+        return
+
+    title = (row.get("title") or "").strip()
+    content = (row.get("content") or "").strip()
+    if not title and not content:
+        return
+
+    parts = ["User note:"]
+    if title:
+        parts.append(f"Title: {title}")
+    if content:
+        parts.append(f"Content: {content[:6000]}")
+    tags = row.get("tags") or []
+    if isinstance(tags, list) and tags:
+        parts.append(f"Tags: {', '.join(str(t) for t in tags)}")
+
+    text = "\n".join(parts)
+    note_id = str(row["id"])
+    _optional_ingest(
+        user_id,
+        "MEETINGBOX_MEM0_INGEST_NOTES",
+        SOURCE_VOICE_NOTE,
+        text,
+        {"note_id": note_id, "pinned": str(bool(row.get("pinned")))},
+    )
+
+
+def delete_note_from_mem0(user_id: str, note_id: str) -> None:
+    """Best-effort removal of a note's Mem0 memories by metadata note_id."""
+    if not user_id or not note_id or mem0_disabled_globally():
+        return
+    m = _memory()
+    if not m:
+        return
+    uid = str(user_id)
+    nid = str(note_id)
+
+    def _do_delete() -> None:
+        if _cb_is_open():
+            return
+        try:
+            results = m.get_all(filters={"user_id": uid, "metadata": {"note_id": nid}}, top_k=50)
+            memories = results if isinstance(results, list) else (results or {}).get("results", [])
+            for mem in (memories or []):
+                mid = mem.get("id") if isinstance(mem, dict) else None
+                if mid:
+                    m.delete(mid)
+            logger.info("mem0 note delete note_id=%s deleted=%d", nid, len(memories or []))
+            _cb_record_ok()
+        except Exception:
+            logger.debug("mem0 note delete failed note_id=%s", nid, exc_info=True)
+            _cb_record_error()
+
+    _MEM0_EXECUTOR.submit(_do_delete)

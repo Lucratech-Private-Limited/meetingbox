@@ -660,3 +660,58 @@ def get_sink_volume_pct() -> int | None:
         except Exception:
             pass
     return None
+
+
+def get_source_volume_pct() -> int | None:
+    """Read current default audio input (mic) gain as 0–150. Returns None on failure."""
+    import re as _re
+    exe = shutil.which("wpctl")
+    if exe:
+        try:
+            out = subprocess.check_output(
+                [exe, "get-volume", "@DEFAULT_AUDIO_SOURCE@"],
+                timeout=3,
+                stderr=subprocess.DEVNULL,
+                env={**os.environ},
+            ).decode(errors="ignore")
+            for part in out.split():
+                try:
+                    return min(150, int(round(float(part) * 100)))
+                except ValueError:
+                    continue
+        except Exception:
+            pass
+    exe = shutil.which("pactl")
+    if exe:
+        try:
+            out = subprocess.check_output(
+                [exe, "get-source-volume", "@DEFAULT_SOURCE@"],
+                timeout=3,
+                stderr=subprocess.DEVNULL,
+                env={**os.environ},
+            ).decode(errors="ignore")
+            m = _re.search(r"(\d+)%", out)
+            if m:
+                return int(m.group(1))
+        except Exception:
+            pass
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Do Not Disturb — simple in-process flag; checked by voice assistant
+# ---------------------------------------------------------------------------
+
+_dnd_active: bool = False
+
+
+def get_dnd() -> bool:
+    """Return True if Do Not Disturb mode is currently active."""
+    return _dnd_active
+
+
+def set_dnd(active: bool) -> None:
+    """Enable or disable Do Not Disturb mode."""
+    global _dnd_active
+    _dnd_active = bool(active)
+    logger.info("DND %s", "ON" if _dnd_active else "OFF")

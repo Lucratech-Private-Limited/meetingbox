@@ -20,3 +20,29 @@ logs/
 .DS_Store
 Thumbs.db
 
+# --- local debug / scratch artifacts (agent debugging sessions; never commit) ---
+tmp_*
+.tmp
+.commit_msg*
+.deploy_*.sh
+.run_*.sh
+.test_*.py
+.check_logs.sh
+.clear_pending.py
+.find_user.py
+.inspect_db.py
+.prep_http_smoke.sh
+.push_release.sh
+head_assist_check.py
+mini-pc/_*.log
+mini-pc/build_out.txt
+mini-pc/device-ui/_*.txt
+mini-pc/device-ui/*.png
+mini-pc/dist_mock/
+
+# --- secrets / local machine state (never commit) ---
+.server_key.pem
+.gen_jwt.py
+mini-pc/env
+server/data/app.db
+

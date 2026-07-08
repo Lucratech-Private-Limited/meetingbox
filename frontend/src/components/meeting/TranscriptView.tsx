@@ -22,14 +22,14 @@ export default function TranscriptView({ segments }: TranscriptViewProps) {
   )
 
   return (
-    <div className="bg-white rounded-lg border border-gray-200 p-6">
+    <div className="bg-app-surface rounded-lg border border-app-border p-6">
 
       {/* Controls */}
-      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 mb-6 pb-4 border-b border-gray-200">
+      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 mb-6 pb-4 border-b border-app-border">
         <div className="flex-1 max-w-md">
           <div className="relative">
             <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
-              <svg className="h-5 w-5 text-gray-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <svg className="h-5 w-5 text-app-ink-faint" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
               </svg>
             </div>
@@ -38,7 +38,7 @@ export default function TranscriptView({ segments }: TranscriptViewProps) {
               placeholder="Search transcript..."
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              className="block w-full pl-10 pr-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-primary-500 focus:border-transparent text-sm"
+              className="block w-full pl-10 pr-3 py-2 border border-app-border-light rounded-lg bg-app-surface text-app-ink focus:ring-2 focus:ring-primary-500 focus:border-transparent text-sm"
             />
           </div>
         </div>
@@ -48,15 +48,15 @@ export default function TranscriptView({ segments }: TranscriptViewProps) {
             type="checkbox"
             checked={showTimestamps}
             onChange={(e) => setShowTimestamps(e.target.checked)}
-            className="h-4 w-4 text-primary-600 border-gray-300 rounded focus:ring-primary-500"
+            className="h-4 w-4 text-primary-600 border-app-border-light rounded focus:ring-primary-500"
           />
-          <span className="ml-2 text-sm text-gray-700">Show timestamps</span>
+          <span className="ml-2 text-sm text-app-ink-muted">Show timestamps</span>
         </label>
       </div>
 
       {/* Transcript body */}
       {filteredSegments.length === 0 ? (
-        <p className="text-gray-500 text-center py-8">
+        <p className="text-app-ink-subtle text-center py-8">
           {searchQuery ? 'No matches found' : 'No transcript available'}
         </p>
       ) : (
@@ -64,17 +64,17 @@ export default function TranscriptView({ segments }: TranscriptViewProps) {
           {filteredSegments.map((segment) => (
             <div key={segment.segment_num} className="flex items-start space-x-3">
               {showTimestamps && (
-                <span className="text-xs text-gray-400 font-mono mt-1 flex-shrink-0 w-12">
+                <span className="text-xs text-app-ink-faint font-mono mt-1 flex-shrink-0 w-12">
                   {formatTimestamp(segment.start_time)}
                 </span>
               )}
               <div className="flex-1">
                 {segment.speaker_id && (
-                  <span className="text-sm font-medium text-gray-900 mr-2">
+                  <span className="text-sm font-medium text-app-ink mr-2">
                     Speaker {segment.speaker_id}:
                   </span>
                 )}
-                <span className="text-gray-700">
+                <span className="text-app-ink-muted">
                   {searchQuery ? (
                     <HighlightedText text={segment.text} query={searchQuery} />
                   ) : (
